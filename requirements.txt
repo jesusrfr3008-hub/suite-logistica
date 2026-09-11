@@ -7,5 +7,9 @@ pywin32>=306; sys_platform == "win32"
 # psycopg2-binary conecta con Postgres (DATABASE_URL, ver app.py) y gunicorn
 # es el servidor de produccion que arranca la app ahi (ver Procfile). Ninguna
 # de las dos afecta el uso local en Windows (sys_platform sigue igual).
-psycopg2-binary==2.9.9
+# 2.9.9 no trae wheel precompilado para la version de Python que usa el
+# builder de Railway y el build fallaba tratando de compilarlo desde
+# codigo fuente (faltan headers de gcc/postgres en esa imagen) -- 2.9.10
+# si trae wheel para esa version, se sube sin compilar nada.
+psycopg2-binary==2.9.10
 gunicorn==23.0.0
