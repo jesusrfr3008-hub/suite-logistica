@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Comparativo de Importaciones · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-0">Comparativo de Importaciones</h3>
+    <div class="text-muted small">Todas las importaciones valoradas en la misma moneda para comparar entre sí.</div>
+  </div>
+  <a href="{{ url_for('importaciones_list') }}" class="btn btn-outline-secondary">← Volver al listado</a>
+</div>
+
+<form class="row g-2 mb-3 align-items-end">
+  <div class="col-auto">
+    <label class="form-label small mb-0">Ver todo en</label>
+    <select class="form-select" name="moneda" onchange="this.form.submit()">
+      <option value="CLP" {% if moneda_vista == 'CLP' %}selected{% endif %}>Pesos (CLP)</option>
+      <option value="USD" {% if moneda_vista == 'USD' %}selected{% endif %}>Dólares (USD)</option>
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Proveedor</label>
+    <select class="form-select" name="proveedor_id" onchange="this.form.submit()">
+      <option value="">Todos los proveedores</option>
+      {% for p in proveedores %}
+      <option value="{{ p.id }}" {% if proveedor_sel|string == p.id|string %}selected{% endif %}>{{ p.nombre }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</form>
+
+<p class="text-muted small">
+  <i class="bi bi-info-circle me-1"></i>
+  La conversión usa el tipo de cambio cargado en cada importación (Dólar Aduanero para pasar a USD/CLP). Esta
+  vista es solo para comparar de un vistazo — el registro original de cada importación sigue en su propia
+  moneda de factura (entra a "Ver costeo" para verla tal como se cargó).
+</p>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Proveedor</th>
+          <th>N° Factura</th>
+          <th>Fecha factura</th>
+          <th>Moneda factura</th>
+          <th class="text-end">FOB ({{ moneda_vista }})</th>
+          <th class="text-end">CIF ({{ moneda_vista }})</th>
+          <th class="text-end">Gastos ({{ moneda_vista }})</th>
+          <th class="text-end">Costo total ({{ moneda_vista }})</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in filas %}
+        <tr>
+          <td>{{ f.imp.proveedor.nombre }}</td>
+          <td>{{ f.imp.numero_factura or '-' }}</td>
+          <td>{{ f.imp.fecha_factura or '-' }}</td>
+          <td>{{ f.imp.moneda_factura }}</td>
+          <td class="text-end">{{ "{:,.0f}".format(f.fob) }}</td>
+          <td class="text-end">{{ "{:,.0f}".format(f.cif) }}</td>
+          <td class="text-end">{{ "{:,.0f}".format(f.gastos) }}</td>
+          <td class="text-end fw-bold">{{ "{:,.0f}".format(f.costo_total) }}</td>
+          <td class="text-end"><a href="{{ url_for('importaciones_detalle', importacion_id=f.imp.id) }}" class="btn btn-sm btn-outline-primary">Ver costeo</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="text-center text-muted py-4">No hay importaciones registradas todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+      {% if filas %}
+      <tfoot>
+        <tr class="table-light">
+          <td colspan="7" class="text-end fw-bold">Total general ({{ moneda_vista }})</td>
+          <td class="text-end fw-bold">{{ "{:,.0f}".format(total_general) }}</td>
+          <td></td>
+        </tr>
+      </tfoot>
+      {% endif %}
+    </table>
+  </div>
+</div>
+
+{% endblock %}

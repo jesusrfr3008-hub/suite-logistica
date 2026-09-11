@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Costeo de Importaciones · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <h3 class="section-title mb-0">Costeo de Importaciones</h3>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('importaciones_comparativo') }}" class="btn btn-outline-secondary"><i class="bi bi-bar-chart-line"></i> Comparativo</a>
+    {% if hay_despachos_pendientes %}
+    <a href="{{ url_for('importaciones_nueva') }}" class="btn btn-brand"><i class="bi bi-plus-lg"></i> Nueva importación</a>
+    {% else %}
+    <button type="button" class="btn btn-brand" disabled title="No hay despachos recibidos sin costear todavía">
+      <i class="bi bi-plus-lg"></i> Nueva importación
+    </button>
+    {% endif %}
+  </div>
+</div>
+
+{% if not hay_despachos_pendientes %}
+<div class="alert alert-light border">
+  <i class="bi bi-info-circle me-1"></i>
+  El Costeo normalmente se genera desde el módulo <a href="{{ url_for('despachos_list') }}">Despachos</a>
+  (botón "Generar costeo desde este despacho") una vez que un despacho está completo y recibido. "Nueva
+  importación" se habilita cuando haya un despacho recibido que todavía no tenga costeo.
+</div>
+{% endif %}
+
+<form class="row g-2 mb-3">
+  <div class="col-auto">
+    <select class="form-select" name="proveedor_id" onchange="this.form.submit()">
+      <option value="">Todos los proveedores</option>
+      {% for p in proveedores %}
+      <option value="{{ p.id }}" {% if proveedor_sel|string == p.id|string %}selected{% endif %}>{{ p.nombre }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</form>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Proveedor</th>
+          <th>N° Factura</th>
+          <th>Fecha factura</th>
+          <th># Parciales</th>
+          <th class="text-end">FOB USD</th>
+          <th class="text-end">Costo total CLP</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for imp in importaciones %}
+        <tr>
+          <td>{{ imp.proveedor.nombre }}</td>
+          <td>{{ imp.numero_factura or '-' }}</td>
+          <td>{{ imp.fecha_factura or '-' }}</td>
+          <td>{{ imp.parciales.count() }}</td>
+          <td class="text-end">{{ "%.2f"|format(resumenes[imp.id].fob_usd) }}</td>
+          <td class="text-end">{{ "{:,.0f}".format(resumenes[imp.id].costo_total_clp) }}</td>
+          <td class="text-end"><a href="{{ url_for('importaciones_detalle', importacion_id=imp.id) }}" class="btn btn-sm btn-outline-primary">Ver costeo</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-4">No hay importaciones registradas todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

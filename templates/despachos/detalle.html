@@ -1,0 +1,258 @@
+{% extends "base.html" %}
+{% block title %}Despacho {{ despacho.numero_tracking or ('#' ~ despacho.id) }} · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-1">Despacho {{ despacho.numero_tracking or ('#' ~ despacho.id) }}</h3>
+    <span class="badge bg-info text-dark fs-6">{{ despacho.status }}</span>
+    {% if despacho.courier %}<span class="text-muted">· {{ despacho.courier }}</span>{% endif %}
+    {% if despacho.numero_tracking and not despacho.url_seguimiento %}
+    <div class="text-muted small mt-1">
+      No reconocemos automáticamente este courier para armar el link de seguimiento — puedes pegar la
+      URL de seguimiento a mano desde "Editar".
+    </div>
+    {% endif %}
+  </div>
+  <div class="d-flex gap-2">
+    {% if despacho.url_seguimiento %}
+    <a href="{{ despacho.url_seguimiento }}" target="_blank" rel="noopener" class="btn btn-outline-success btn-sm">
+      <i class="bi bi-geo-alt"></i> Ver seguimiento online
+    </a>
+    {% endif %}
+    <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-toggle="modal" data-bs-target="#modalEditarDespacho">Editar</button>
+    <form method="post" action="{{ url_for('despachos_eliminar', despacho_id=despacho.id) }}" onsubmit="return confirm('¿Eliminar este despacho? Las órdenes asociadas no se borran, solo quedan sueltas.');">
+      <button type="submit" class="btn btn-outline-danger btn-sm">Eliminar despacho</button>
+    </form>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-md-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small">Fecha de envío</div>
+      <div class="fs-5">{{ despacho.fecha_envio or '-' }}</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small">Fecha estimada de llegada</div>
+      <div class="fs-5">{{ despacho.fecha_estimada_llegada or '-' }}</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small">Órdenes asociadas</div>
+      <div class="fs-5">{{ ordenes|length }}</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small">Proveedor(es)</div>
+      <div class="fs-6">{{ despacho.proveedores|map(attribute='nombre')|join(', ') or '-' }}</div>
+    </div>
+  </div>
+</div>
+
+{% if despacho.notas %}
+<div class="alert alert-light border">{{ despacho.notas }}</div>
+{% endif %}
+
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <h5 class="section-title mb-0">Órdenes en este despacho</h5>
+    <div class="d-flex gap-2">
+      <form method="post" action="{{ url_for('despachos_aduana_masivo', despacho_id=despacho.id) }}" onsubmit="return confirm('¿Marcar en internación de aduanas TODAS las líneas de TODAS las órdenes de este despacho que estén en \'Orden Despachada\'?');">
+        <button type="submit" class="btn btn-sm btn-outline-primary"><i class="bi bi-bank me-1"></i>Marcar todo en aduana</button>
+      </form>
+      <form method="post" action="{{ url_for('despachos_recibido_masivo', despacho_id=despacho.id) }}" onsubmit="return confirm('¿Marcar como recibidas en bodega TODAS las líneas de TODAS las órdenes de este despacho que estén en \'Internación Aduanas\'?');">
+        <button type="submit" class="btn btn-sm btn-outline-success"><i class="bi bi-box-seam me-1"></i>Marcar todo recibido</button>
+      </form>
+    </div>
+  </div>
+
+  {% if ordenes %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr>
+          <th>PO</th>
+          <th>Proveedor</th>
+          <th>Estado</th>
+          <th class="text-end"># Líneas</th>
+          <th class="text-end">Total</th>
+          <th>Documentos</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in ordenes %}
+        <tr>
+          <td>{{ o.numero_po }}</td>
+          <td>{{ o.proveedor.nombre }}</td>
+          <td><span class="badge bg-info text-dark">{{ o.estado }}</span></td>
+          <td class="text-end">{{ o.lineas.count() }}</td>
+          <td class="text-end">{{ "%.2f"|format(o.total) }} {{ o.moneda }}</td>
+          <td>
+            {% for doc in o.documentos %}
+            <a href="{{ url_for('ordenes_documento_ver', orden_id=o.id, doc_id=doc.id) }}" target="_blank" rel="noopener" class="badge bg-secondary text-decoration-none">{{ doc.tipo }}</a>
+            {% else %}
+            <span class="text-muted small">Sin documentos</span>
+            {% endfor %}
+          </td>
+          <td class="text-end">
+            <a href="{{ url_for('ordenes_detalle', orden_id=o.id) }}" class="btn btn-sm btn-outline-primary">Ver orden</a>
+            <form method="post" action="{{ url_for('despachos_quitar_orden', despacho_id=despacho.id, orden_id=o.id) }}" class="d-inline" onsubmit="return confirm('¿Quitar esta orden del despacho?');">
+              <button type="submit" class="btn btn-sm btn-outline-secondary">Quitar</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted mb-0">Todavía no hay órdenes asociadas a este despacho.</p>
+  {% endif %}
+</div>
+
+<div class="card p-3 mb-3">
+  <h6 class="mb-2">Asociar más órdenes</h6>
+  {% if candidatas %}
+  <form method="post" action="{{ url_for('despachos_asociar', despacho_id=despacho.id) }}">
+    <div class="table-responsive mb-2">
+      <table class="table table-sm align-middle mb-0">
+        <thead>
+          <tr>
+            <th style="width:30px;"></th>
+            <th>PO</th>
+            <th>Proveedor</th>
+            <th>Estado</th>
+            <th class="text-end"># Líneas</th>
+            <th class="text-end">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for o in candidatas %}
+          <tr>
+            <td><input type="checkbox" name="orden_ids" value="{{ o.id }}"></td>
+            <td>{{ o.numero_po }}</td>
+            <td>{{ o.proveedor.nombre }}</td>
+            <td><span class="badge bg-info text-dark">{{ o.estado }}</span></td>
+            <td class="text-end">{{ o.lineas.count() }}</td>
+            <td class="text-end">{{ "%.2f"|format(o.total) }} {{ o.moneda }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <button type="submit" class="btn btn-sm btn-brand">Asociar seleccionadas</button>
+  </form>
+  {% else %}
+  <p class="text-muted mb-0">No hay otras órdenes disponibles para asociar en este momento.</p>
+  {% endif %}
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <h6 class="mb-0">Costeo de importaciones</h6>
+    {% if not despacho.importaciones_generadas %}
+    <form method="post" action="{{ url_for('despachos_generar_importacion', despacho_id=despacho.id) }}" onsubmit="return confirm('¿Generar una Importación (Costeo) con las líneas despachadas de todas las órdenes de este despacho?');">
+      <button type="submit" class="btn btn-sm btn-brand" {% if not listo_para_costeo %}disabled{% endif %}>
+        <i class="bi bi-calculator me-1"></i> Generar costeo desde este despacho
+      </button>
+    </form>
+    {% else %}
+    <span class="badge bg-success"><i class="bi bi-check2-circle me-1"></i>Costeo ya generado</span>
+    {% endif %}
+  </div>
+  <p class="text-muted small mb-2">
+    Crea una nueva Importación con un Parcial precargado con los productos y cantidades realmente
+    despachadas de estas órdenes (sin retipear nada). Después solo completas el tipo de cambio,
+    flete/seguro y gastos compartidos.
+  </p>
+  {% if despacho.importaciones_generadas %}
+  <p class="text-muted small mb-2">
+    <i class="bi bi-info-circle me-1"></i>
+    Este despacho ya tiene un costeo generado — para evitar duplicados no se puede generar otro desde
+    aquí. Si necesitas rehacerlo, elimina la importación de abajo primero.
+  </p>
+  {% elif not listo_para_costeo %}
+  <p class="text-muted small mb-2">
+    <i class="bi bi-exclamation-circle me-1"></i>
+    {% if not ordenes %}
+    Asocia al menos una orden a este despacho para poder generar el costeo.
+    {% else %}
+    Para generar el costeo, primero todas las líneas de las órdenes de este despacho deben quedar
+    <strong>"Recibido"</strong> en bodega — usa "Marcar todo en aduana" y luego "Marcar todo recibido" arriba.
+    {% endif %}
+  </p>
+  {% endif %}
+  {% if despacho.importaciones_generadas %}
+  <ul class="list-unstyled mb-0">
+    {% for imp in despacho.importaciones_generadas %}
+    <li><a href="{{ url_for('importaciones_detalle', importacion_id=imp.id) }}">Importación #{{ imp.id }} — {{ imp.proveedor.nombre }}{% if imp.numero_factura %} — Factura {{ imp.numero_factura }}{% endif %}</a></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>
+
+<!-- Modal: editar despacho -->
+<div class="modal fade" id="modalEditarDespacho" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('despachos_editar', despacho_id=despacho.id) }}">
+        <div class="modal-header">
+          <h5 class="modal-title">Editar despacho</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">Courier / Embarcador</label>
+              <input type="text" class="form-control" name="courier" value="{{ despacho.courier or '' }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">N° de tracking / AWB</label>
+              <input type="text" class="form-control" name="numero_tracking" value="{{ despacho.numero_tracking or '' }}">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Status</label>
+              <select class="form-select" name="status">
+                {% for s in estados %}
+                <option value="{{ s }}" {% if s == despacho.status %}selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Fecha de envío</label>
+              <input type="date" class="form-control" name="fecha_envio" value="{{ despacho.fecha_envio or '' }}">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Fecha estimada de llegada</label>
+              <input type="date" class="form-control" name="fecha_estimada_llegada" value="{{ despacho.fecha_estimada_llegada or '' }}">
+            </div>
+            <div class="col-12">
+              <label class="form-label">URL de seguimiento (opcional)</label>
+              <input type="url" class="form-control" name="url_tracking_manual" value="{{ despacho.url_tracking_manual or '' }}" placeholder="https://...">
+              <div class="form-text">
+                Para DHL, FedEx, UPS o TNT el link se arma solo con el Courier + N° de tracking de
+                arriba. Para cualquier otro courier o agente, pega aquí la URL de seguimiento que te
+                haya dado (tiene prioridad sobre el link automático).
+              </div>
+            </div>
+            <div class="col-12">
+              <label class="form-label">Notas</label>
+              <textarea class="form-control" name="notas" rows="2">{{ despacho.notas or '' }}</textarea>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-brand">Guardar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

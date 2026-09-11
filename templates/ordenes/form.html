@@ -1,0 +1,363 @@
+{% extends "base.html" %}
+{% block title %}Nueva Orden de Compra · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-3">Nueva Orden de Compra</h3>
+
+<form method="post" id="formOrden">
+  <div class="card p-3 mb-3">
+    <div class="row g-3">
+      <div class="col-md-3">
+        <label class="form-label">Empresa compradora *</label>
+        <select class="form-select" name="empresa_id" required>
+          <option value="">Seleccione...</option>
+          {% for e in empresas %}
+          <option value="{{ e.id }}">{{ e.nombre }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Proveedor *</label>
+        <select class="form-select" name="proveedor_id" id="proveedorSelect" required>
+          <option value="">Seleccione un proveedor...</option>
+          {% for p in proveedores %}
+          <option value="{{ p.id }}" data-moneda="{{ p.moneda_default }}" {% if proveedor_id == p.id %}selected{% endif %}>{{ p.nombre }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-2">
+        <label class="form-label">Fecha de emisión</label>
+        <input type="date" class="form-control" name="fecha_emision" value="{{ now.strftime('%Y-%m-%d') if now else '' }}">
+      </div>
+      <div class="col-md-2">
+        <label class="form-label">Moneda</label>
+        <select class="form-select" name="moneda" id="monedaSelect">
+          <option value="USD">USD</option>
+          <option value="EURO">EURO</option>
+          <option value="CLP">CLP</option>
+        </select>
+      </div>
+      <div class="col-md-2">
+        <label class="form-label">Notas</label>
+        <input type="text" class="form-control" name="notas" placeholder="Opcional">
+      </div>
+    </div>
+  </div>
+
+  <div class="card p-3 mb-3">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h5 class="section-title mb-0">Productos del proveedor</h5>
+      <input type="text" class="form-control w-auto" id="buscarProducto" placeholder="Buscar por código o descripción..." style="min-width:280px;" disabled>
+    </div>
+    <p class="text-muted small" id="hintProveedor">Selecciona un proveedor para ver su catálogo.</p>
+    <div class="table-responsive" style="max-height: 320px; overflow-y:auto;">
+      <table class="table table-sm table-hover" id="tablaCatalogo">
+        <thead>
+          <tr>
+            <th>Código</th>
+            <th>Descripción</th>
+            <th>Empaque</th>
+            <th class="text-end">Precio/Caja</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="cuerpoCatalogo"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Ronda M (2026-09-10, punto 1): elegir variante (ej. dioptria de un
+       lente MEDICONTUR) antes de agregar la linea -- el precio siempre es
+       el del codigo padre, no de la variante. -->
+  <div class="modal fade" id="modalElegirVarianteForm" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Elige la variante</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small mb-1" id="tituloProductoVarianteForm"></p>
+          <input type="text" class="form-control form-control-sm mb-2" id="buscarVarianteForm" placeholder="Filtrar por código o descripción...">
+          <div class="list-group" id="listaVariantesForm" style="max-height:280px; overflow-y:auto;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card p-3 mb-3">
+    <h5 class="section-title">Líneas de la orden</h5>
+    <div class="d-flex align-items-end gap-2 mb-2 p-2 bg-light rounded flex-wrap">
+      <div>
+        <label class="form-label small mb-0">Aplicar fecha est. despacho a las líneas seleccionadas</label>
+        <input type="date" class="form-control form-control-sm" id="fechaMasiva">
+      </div>
+      <button type="button" class="btn btn-sm btn-outline-secondary" id="btnAplicarFechaMasiva">Aplicar a seleccionadas</button>
+      <button type="button" class="btn btn-sm btn-link" id="btnSeleccionarTodas">Seleccionar todas</button>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle" id="tablaLineas">
+        <thead>
+          <tr>
+            <th style="width:30px;"><input type="checkbox" id="checkTodas"></th>
+            <th>Código</th>
+            <th>Descripción</th>
+            <th style="width:100px;">Cant. cajas</th>
+            <th style="width:120px;">Precio/caja</th>
+            <th style="width:110px;">Subtotal</th>
+            <th style="width:160px;">Fecha est. despacho</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="cuerpoLineas">
+          <tr id="filaVacia"><td colspan="8" class="text-center text-muted py-3">Agrega productos desde el catálogo de arriba.</td></tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="5" class="text-end fw-bold">Total</td>
+            <td class="fw-bold" id="totalOrden">0.00</td>
+            <td colspan="2"></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+
+  <div class="d-flex gap-2">
+    <button type="submit" class="btn btn-brand">Crear orden de compra</button>
+    <a href="{{ url_for('ordenes_list') }}" class="btn btn-outline-secondary">Cancelar</a>
+  </div>
+</form>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const proveedorSelect = document.getElementById('proveedorSelect');
+const monedaSelect = document.getElementById('monedaSelect');
+const buscarProducto = document.getElementById('buscarProducto');
+const cuerpoCatalogo = document.getElementById('cuerpoCatalogo');
+const cuerpoLineas = document.getElementById('cuerpoLineas');
+const filaVacia = document.getElementById('filaVacia');
+const hintProveedor = document.getElementById('hintProveedor');
+const totalOrdenEl = document.getElementById('totalOrden');
+
+let lineasAgregadas = {};
+let lineaIndex = 0;
+// Ronda M (2026-09-10, punto 1): producto pendiente de elegir variante en
+// el modal (ej. dioptria de un lente MEDICONTUR).
+let productoPendienteVariante = null;
+const modalVarianteForm = new bootstrap.Modal(document.getElementById('modalElegirVarianteForm'));
+
+function fmt(n) {
+  return (Math.round(n * 100) / 100).toFixed(2);
+}
+
+function claveLinea(productoId, varianteCodigo) {
+  return `${productoId}::${varianteCodigo || ''}`;
+}
+
+async function cargarCatalogo(q) {
+  const proveedorId = proveedorSelect.value;
+  if (!proveedorId) {
+    cuerpoCatalogo.innerHTML = '';
+    buscarProducto.disabled = true;
+    hintProveedor.textContent = 'Selecciona un proveedor para ver su catálogo.';
+    return;
+  }
+  hintProveedor.textContent = 'Cargando catálogo...';
+  const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(q || '')}`);
+  const productos = await resp.json();
+  cuerpoCatalogo.innerHTML = '';
+  if (productos.length === 0) {
+    hintProveedor.textContent = 'Sin resultados en el catálogo de este proveedor.';
+  } else {
+    hintProveedor.textContent = `${productos.length} producto(s) encontrados (máx. 50 mostrados).`;
+  }
+  productos.forEach(p => {
+    // Un producto CON variantes nunca se marca "ya agregado" a nivel de
+    // catálogo -- puede agregarse mas de una vez con variantes distintas
+    // (ej. dos dioptrias distintas del mismo lente); la duplicidad real se
+    // valida al elegir la variante especifica.
+    const yaAgregado = !p.tiene_variantes && !!lineasAgregadas[claveLinea(p.id, null)];
+    const tr = document.createElement('tr');
+    if (yaAgregado) tr.className = 'text-muted';
+    tr.innerHTML = `
+      <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}</td>
+      <td style="max-width:380px;">${p.descripcion}</td>
+      <td>${p.empaque}</td>
+      <td class="text-end">${fmt(p.precio_caja)}</td>
+      <td class="text-end">${yaAgregado
+        ? '<span class="badge bg-secondary">Ya agregado</span>'
+        : '<button type="button" class="btn btn-sm btn-outline-primary btn-agregar">Agregar</button>'}</td>
+    `;
+    if (!yaAgregado) tr.querySelector('.btn-agregar').addEventListener('click', () => {
+      if (p.tiene_variantes) {
+        abrirModalVariante(p);
+      } else {
+        agregarLinea(p, null);
+      }
+    });
+    cuerpoCatalogo.appendChild(tr);
+  });
+}
+
+async function abrirModalVariante(producto) {
+  productoPendienteVariante = producto;
+  document.getElementById('tituloProductoVarianteForm').textContent = `${producto.codigo} — ${producto.descripcion}`;
+  document.getElementById('buscarVarianteForm').value = '';
+  const lista = document.getElementById('listaVariantesForm');
+  lista.innerHTML = '<p class="text-muted small px-2">Cargando variantes...</p>';
+  modalVarianteForm.show();
+  const resp = await fetch(`/api/productos/${producto.id}/variantes`);
+  producto._variantes = await resp.json();
+  renderListaVariantesForm('');
+}
+
+function renderListaVariantesForm(filtro) {
+  const f = (filtro || '').toLowerCase();
+  const lista = document.getElementById('listaVariantesForm');
+  lista.innerHTML = '';
+  (productoPendienteVariante?._variantes || [])
+    .filter(v => !f || v.codigo.toLowerCase().includes(f) || v.descripcion.toLowerCase().includes(f))
+    .slice(0, 60)
+    .forEach(v => {
+      const yaAgregada = !!lineasAgregadas[claveLinea(productoPendienteVariante.id, v.codigo)];
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'list-group-item list-group-item-action py-1 small' + (yaAgregada ? ' text-muted' : '');
+      item.textContent = yaAgregada ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`;
+      item.addEventListener('click', () => {
+        if (yaAgregada) {
+          alert(`'${v.codigo}' ya fue agregado a esta orden. Ajusta la cantidad en su fila en vez de agregarlo de nuevo.`);
+          return;
+        }
+        agregarLinea(productoPendienteVariante, v);
+        modalVarianteForm.hide();
+      });
+      lista.appendChild(item);
+    });
+}
+document.getElementById('buscarVarianteForm').addEventListener('input', (e) => renderListaVariantesForm(e.target.value));
+
+function agregarLinea(producto, variante) {
+  const varianteCodigo = variante ? variante.codigo : null;
+  const varianteDescripcion = variante ? variante.descripcion : '';
+  const clave = claveLinea(producto.id, varianteCodigo);
+  if (lineasAgregadas[clave]) {
+    alert(`'${varianteCodigo || producto.codigo}' ya fue agregado a esta orden. Ajusta la cantidad en su fila en vez de agregarlo de nuevo.`);
+    return; // ya agregado, evitar duplicado directo (se puede ajustar cantidad en la fila)
+  }
+  if (filaVacia) filaVacia.remove();
+
+  const idx = lineaIndex++;
+  lineasAgregadas[clave] = idx;
+
+  const codigoMostrar = varianteCodigo || producto.codigo;
+  const descripcionMostrar = variante ? variante.descripcion : producto.descripcion;
+
+  const tr = document.createElement('tr');
+  tr.dataset.productoId = producto.id;
+  tr.dataset.claveLinea = clave;
+  tr.innerHTML = `
+    <td><input type="checkbox" class="check-linea"></td>
+    <td>${codigoMostrar}
+      <input type="hidden" name="producto_id" value="${producto.id}">
+      <input type="hidden" name="variante_codigo" value="${varianteCodigo || ''}">
+      <input type="hidden" name="variante_descripcion" value="${varianteDescripcion}">
+    </td>
+    <td style="max-width:320px;">${descripcionMostrar}</td>
+    <td><input type="number" min="1" step="1" class="form-control form-control-sm cantidad" name="cantidad_cajas" value="1" required></td>
+    <td><input type="number" min="0" step="0.01" class="form-control form-control-sm precio" name="precio_unitario_pactado" value="${producto.precio_caja}"></td>
+    <td class="subtotal">${fmt(producto.precio_caja)}</td>
+    <td><input type="date" class="form-control form-control-sm fecha-linea" name="fecha_estimada_despacho"></td>
+    <td class="text-end"><button type="button" class="btn btn-sm btn-outline-danger btn-quitar">&times;</button></td>
+  `;
+  cuerpoLineas.appendChild(tr);
+
+  const cantidadInput = tr.querySelector('.cantidad');
+  const precioInput = tr.querySelector('.precio');
+  const subtotalCell = tr.querySelector('.subtotal');
+
+  function recalcular() {
+    const cant = parseInt(cantidadInput.value, 10) || 0;
+    const precio = parseFloat(precioInput.value) || 0;
+    subtotalCell.textContent = fmt(cant * precio);
+    recalcularTotal();
+  }
+
+  cantidadInput.addEventListener('input', recalcular);
+  precioInput.addEventListener('input', recalcular);
+  tr.querySelector('.btn-quitar').addEventListener('click', () => {
+    delete lineasAgregadas[clave];
+    tr.remove();
+    if (cuerpoLineas.children.length === 0) {
+      cuerpoLineas.appendChild(filaVacia);
+    }
+    recalcularTotal();
+  });
+
+  recalcularTotal();
+}
+
+function recalcularTotal() {
+  let total = 0;
+  cuerpoLineas.querySelectorAll('tr').forEach(tr => {
+    const cant = parseInt(tr.querySelector('.cantidad')?.value, 10) || 0;
+    const precio = parseFloat(tr.querySelector('.precio')?.value) || 0;
+    total += cant * precio;
+  });
+  totalOrdenEl.textContent = fmt(total);
+}
+
+document.getElementById('btnAplicarFechaMasiva').addEventListener('click', () => {
+  const fecha = document.getElementById('fechaMasiva').value;
+  if (!fecha) {
+    alert('Ingresa primero una fecha.');
+    return;
+  }
+  let aplicadas = 0;
+  cuerpoLineas.querySelectorAll('tr').forEach(tr => {
+    const check = tr.querySelector('.check-linea');
+    if (check && check.checked) {
+      tr.querySelector('.fecha-linea').value = fecha;
+      aplicadas++;
+    }
+  });
+  if (aplicadas === 0) {
+    alert('Selecciona al menos una línea (casillas de la primera columna).');
+  }
+});
+
+document.getElementById('btnSeleccionarTodas').addEventListener('click', () => {
+  const marcar = !document.getElementById('checkTodas').checked;
+  document.getElementById('checkTodas').checked = marcar;
+  cuerpoLineas.querySelectorAll('.check-linea').forEach(c => c.checked = marcar);
+});
+
+document.getElementById('checkTodas').addEventListener('change', (e) => {
+  cuerpoLineas.querySelectorAll('.check-linea').forEach(c => c.checked = e.target.checked);
+});
+
+proveedorSelect.addEventListener('change', () => {
+  const opt = proveedorSelect.options[proveedorSelect.selectedIndex];
+  if (opt && opt.dataset.moneda) {
+    monedaSelect.value = opt.dataset.moneda.includes('EUR') ? 'EURO' : opt.dataset.moneda;
+  }
+  buscarProducto.disabled = !proveedorSelect.value;
+  buscarProducto.value = '';
+  cargarCatalogo('');
+});
+
+let debounceTimer;
+buscarProducto.addEventListener('input', () => {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => cargarCatalogo(buscarProducto.value), 300);
+});
+
+if (proveedorSelect.value) {
+  buscarProducto.disabled = false;
+  cargarCatalogo('');
+}
+</script>
+{% endblock %}

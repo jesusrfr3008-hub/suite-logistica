@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-3">Dashboard</h3>
+
+<div class="row g-3 mb-4">
+  <div class="col-6 col-md-3">
+    <div class="card card-stat p-3">
+      <div class="text-muted small">Proveedores activos</div>
+      <div class="stat-value">{{ total_proveedores }}</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card card-stat p-3">
+      <div class="text-muted small">Productos en catálogo</div>
+      <div class="stat-value">{{ total_productos }}</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card card-stat p-3">
+      <div class="text-muted small">Órdenes de compra</div>
+      <div class="stat-value">{{ total_ordenes }}</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="card card-stat p-3">
+      <div class="text-muted small">Órdenes en curso</div>
+      <div class="stat-value">{{ ordenes_pendientes }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-6 col-lg-4">
+    <a href="{{ url_for('proveedores_list') }}" class="text-decoration-none">
+      <div class="card card-module p-3 h-100">
+        <div class="d-flex align-items-center gap-3">
+          <i class="bi bi-people-fill fs-2 text-primary"></i>
+          <div>
+            <div class="fw-semibold">Mantenimiento de Proveedores</div>
+            <div class="text-muted small">Crear, editar y gestionar proveedores y su catálogo.</div>
+          </div>
+        </div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-6 col-lg-4">
+    <a href="{{ url_for('ordenes_list') }}" class="text-decoration-none">
+      <div class="card card-module p-3 h-100">
+        <div class="d-flex align-items-center gap-3">
+          <i class="bi bi-cart-check-fill fs-2 text-primary"></i>
+          <div>
+            <div class="fw-semibold">Compras / Órdenes de Compra</div>
+            <div class="text-muted small">Generar PO personalizadas por proveedor y hacer seguimiento.</div>
+          </div>
+        </div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-6 col-lg-4">
+    <div class="card card-module disabled p-3 h-100">
+      <div class="d-flex align-items-center gap-3">
+        <i class="bi bi-truck fs-2 text-secondary"></i>
+        <div>
+          <div class="fw-semibold">Despachos y Transporte</div>
+          <div class="text-muted small">Próximamente: despachos parciales/consolidados, vía, AWB y tracking online.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6 col-lg-4">
+    <a href="{{ url_for('importaciones_list') }}" class="text-decoration-none">
+      <div class="card card-module p-3 h-100">
+        <div class="d-flex align-items-center gap-3">
+          <i class="bi bi-cash-coin fs-2 text-primary"></i>
+          <div>
+            <div class="fw-semibold">Costeo de Importaciones</div>
+            <div class="text-muted small">Distribuye costos, derechos y gastos de aduana por parcial y producto.</div>
+          </div>
+        </div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-6 col-lg-4">
+    <div class="card card-module disabled p-3 h-100">
+      <div class="d-flex align-items-center gap-3">
+        <i class="bi bi-bar-chart-fill fs-2 text-secondary"></i>
+        <div>
+          <div class="fw-semibold">Reportes y Ventas</div>
+          <div class="text-muted small">Próximamente: reportes de compras, costos, rotación y proyección.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6 col-lg-4">
+    <div class="card card-module disabled p-3 h-100">
+      <div class="d-flex align-items-center gap-3">
+        <i class="bi bi-bell-fill fs-2 text-secondary"></i>
+        <div>
+          <div class="fw-semibold">Dashboards y Notificaciones</div>
+          <div class="text-muted small">Próximamente: control y alertas automáticas.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3">
+  <h5 class="section-title">Últimas órdenes de compra</h5>
+  {% if ultimas_ordenes %}
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>N° PO</th>
+          <th>Proveedor</th>
+          <th>Fecha emisión</th>
+          <th>Estado</th>
+          <th class="text-end">Total</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in ultimas_ordenes %}
+        <tr>
+          <td>{{ o.numero_po }}</td>
+          <td>{{ o.proveedor.nombre }}</td>
+          <td>{{ o.fecha_emision }}</td>
+          <td><span class="badge bg-secondary badge-estado">{{ o.estado }}</span></td>
+          <td class="text-end">{{ "%.2f"|format(o.total) }} {{ o.moneda }}</td>
+          <td class="text-end"><a href="{{ url_for('ordenes_detalle', orden_id=o.id) }}" class="btn btn-sm btn-outline-primary">Ver</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted mb-0">Aún no hay órdenes de compra. <a href="{{ url_for('ordenes_nueva') }}">Crear la primera</a>.</p>
+  {% endif %}
+</div>
+
+{% endblock %}

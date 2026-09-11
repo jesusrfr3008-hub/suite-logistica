@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Tipo de cambio mensual · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h3 class="section-title mb-0">Tipo de cambio mensual</h3>
+    <div class="text-muted small">El Dólar Aduanero y la paridad Euro/USD son los mismos para todas las operaciones de un mismo mes — cárgalos una vez y se autocompletan al crear una importación nueva ese mes (siguen siendo editables caso a caso).</div>
+  </div>
+  <button class="btn btn-brand" data-bs-toggle="modal" data-bs-target="#modalNuevoTC"><i class="bi bi-plus-lg"></i> Agregar mes</button>
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Mes</th>
+          <th class="text-end">T/C aduanero (CLP/USD)</th>
+          <th class="text-end">Paridad EUR/USD</th>
+          <th>Notas</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for tc in tipos %}
+        <tr>
+          <td>{{ tc.nombre_mes }} {{ tc.anio }}</td>
+          <td class="text-end">{{ "{:,.2f}".format(tc.tc_aduanero) }}</td>
+          <td class="text-end">{{ "%.4f"|format(tc.paridad_eur_usd) }}</td>
+          <td>{{ tc.notas or '-' }}</td>
+          <td class="text-end">
+            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarTC{{ tc.id }}">Editar</button>
+            <form method="post" action="{{ url_for('tipo_cambio_eliminar', tc_id=tc.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar el tipo de cambio de {{ tc.nombre_mes }} {{ tc.anio }}?');">
+              <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-center text-muted py-4">No hay tipos de cambio cargados todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Modal: nuevo -->
+<div class="modal fade" id="modalNuevoTC" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('tipo_cambio_nuevo') }}">
+        <div class="modal-header"><h5 class="modal-title">Agregar tipo de cambio del mes</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6">
+            <label class="form-label">Mes</label>
+            <select class="form-select" name="mes" required>
+              {% for i in range(1, 13) %}<option value="{{ i }}">{{ ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'][i-1] }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6"><label class="form-label">Año</label><input type="number" class="form-control" name="anio" value="{{ hoy_anio }}" required></div>
+          <div class="col-6"><label class="form-label">T/C aduanero (CLP/USD) *</label><input type="number" step="0.01" class="form-control" name="tc_aduanero" required></div>
+          <div class="col-6"><label class="form-label">Paridad EUR/USD *</label><input type="number" step="0.0001" class="form-control" name="paridad_eur_usd" value="1" required></div>
+          <div class="col-12"><label class="form-label">Notas</label><input class="form-control" name="notas"></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% for tc in tipos %}
+<!-- Modal: editar -->
+<div class="modal fade" id="modalEditarTC{{ tc.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('tipo_cambio_editar', tc_id=tc.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar {{ tc.nombre_mes }} {{ tc.anio }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6"><label class="form-label">T/C aduanero (CLP/USD)</label><input type="number" step="0.01" class="form-control" name="tc_aduanero" value="{{ tc.tc_aduanero }}"></div>
+          <div class="col-6"><label class="form-label">Paridad EUR/USD</label><input type="number" step="0.0001" class="form-control" name="paridad_eur_usd" value="{{ tc.paridad_eur_usd }}"></div>
+          <div class="col-12"><label class="form-label">Notas</label><input class="form-control" name="notas" value="{{ tc.notas or '' }}"></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% endblock %}

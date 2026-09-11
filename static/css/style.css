@@ -1,0 +1,78 @@
+:root {
+  --brand-dark: #0f2f4c;
+  --brand: #14507e;
+  --brand-light: #eaf1f7;
+  --accent: #d98324;
+}
+
+body {
+  background-color: #f4f6f9;
+}
+
+.app-navbar {
+  background-color: var(--brand-dark);
+}
+
+.navbar .nav-link.active {
+  color: #fff !important;
+  font-weight: 600;
+}
+
+.card-stat {
+  border: none;
+  border-radius: 0.75rem;
+  box-shadow: 0 1px 4px rgba(15, 47, 76, 0.08);
+}
+
+.card-stat .stat-value {
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--brand-dark);
+}
+
+.card-module {
+  border: none;
+  border-radius: 0.75rem;
+  box-shadow: 0 1px 4px rgba(15, 47, 76, 0.08);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.card-module:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(15, 47, 76, 0.12);
+}
+
+.card-module.disabled {
+  opacity: 0.55;
+}
+
+.badge-estado {
+  font-weight: 600;
+}
+
+.table-hover tbody tr:hover {
+  background-color: var(--brand-light);
+}
+
+.section-title {
+  color: var(--brand-dark);
+  font-weight: 700;
+}
+
+.btn-brand {
+  background-color: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+
+.btn-brand:hover {
+  background-color: var(--brand-dark);
+  border-color: var(--brand-dark);
+  color: #fff;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}

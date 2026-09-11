@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Orden de Compra {{ orden.numero_po }}</title>
+  <style>
+    @page { size: A4 portrait; margin: 12mm 14mm; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", Arial, Helvetica, sans-serif;
+      font-size: 12px;
+      color: #212529;
+      margin: 0;
+      padding: 18px;
+    }
+    .toolbar {
+      display: flex; gap: 8px; margin-bottom: 16px;
+    }
+    .toolbar button, .toolbar a {
+      font-family: inherit; font-size: 13px; padding: 7px 14px; border-radius: 6px;
+      text-decoration: none; cursor: pointer; border: 1px solid #14507e;
+    }
+    .toolbar .btn-primario { background: #14507e; color: #fff; }
+    .toolbar .btn-secundario { background: #fff; color: #14507e; }
+    @media print { .toolbar { display: none; } }
+
+    .encabezado {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      border-bottom: 3px solid #0f2f4c; padding-bottom: 10px; margin-bottom: 14px;
+    }
+    .comprador { display: flex; align-items: center; gap: 12px; max-width: 60%; }
+    .comprador img { max-height: 56px; max-width: 180px; object-fit: contain; }
+    .comprador .datos-comprador { font-size: 11px; line-height: 1.35; }
+    .comprador .nombre-comprador { font-size: 15px; font-weight: 700; color: #0f2f4c; }
+    .titulo-oc { text-align: right; }
+    .titulo-oc h1 { font-size: 20px; margin: 0 0 2px 0; color: #0f2f4c; letter-spacing: 0.5px; }
+    .titulo-oc .numero { font-size: 15px; font-weight: 700; }
+    .titulo-oc .meta { font-size: 11px; color: #444; margin-top: 4px; line-height: 1.5; }
+
+    .aviso-sin-empresa {
+      background: #fff3cd; border: 1px solid #ffe08a; color: #7a5b00;
+      padding: 6px 10px; border-radius: 4px; font-size: 11px; margin-bottom: 12px;
+    }
+
+    .bloque-proveedor {
+      margin-bottom: 14px; padding: 8px 10px; background: #f4f6f9; border-radius: 6px;
+    }
+    .bloque-proveedor .etiqueta { font-size: 10px; letter-spacing: 0.5px; color: #666; text-transform: uppercase; }
+    .bloque-proveedor .nombre-proveedor { font-size: 13px; font-weight: 700; color: #0f2f4c; }
+    .bloque-proveedor .linea { font-size: 11px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    thead { display: table-header-group; }
+    tr { page-break-inside: avoid; }
+    th, td { border: 1px solid #ccc; padding: 5px 7px; }
+    th { background: #212529; color: #fff; font-weight: 600; text-align: center; }
+    td.num, th.num { text-align: right; }
+    tbody tr:nth-child(even) { background: #f7f9fb; }
+    tfoot td { font-weight: 700; background: #eaf1f7; }
+
+    .notas-oc { margin-top: 12px; font-size: 11px; }
+    .pie-documento { margin-top: 22px; font-size: 10px; color: #888; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button class="btn-primario" onclick="window.print()">Imprimir / Guardar como PDF</button>
+    <a class="btn-secundario" href="{{ url_for('ordenes_detalle', orden_id=orden.id) }}">Volver</a>
+  </div>
+
+  {% if not orden.empresa %}
+  <div class="aviso-sin-empresa">
+    Esta orden todavía no tiene una empresa compradora asignada — edítala desde el detalle de la orden
+    para que sus datos y logo aparezcan aquí como "Comprador".
+  </div>
+  {% endif %}
+
+  <div class="encabezado">
+    <div class="comprador">
+      {% if orden.empresa and orden.empresa.logo_nombre_archivo %}
+      <img src="{{ url_for('empresas_logo', empresa_id=orden.empresa.id) }}" alt="Logo {{ orden.empresa.nombre }}">
+      {% endif %}
+      <div class="datos-comprador">
+        <div class="nombre-comprador">{{ orden.empresa.nombre if orden.empresa else 'Empresa compradora sin asignar' }}</div>
+        {% if orden.empresa %}
+        {% if orden.empresa.direccion %}<div>{{ orden.empresa.direccion }}</div>{% endif %}
+        {% if orden.empresa.rut %}<div>RUT: {{ orden.empresa.rut }}</div>{% endif %}
+        {% if orden.empresa.telefono or orden.empresa.email %}<div>{{ orden.empresa.telefono or '' }}{% if orden.empresa.telefono and orden.empresa.email %} · {% endif %}{{ orden.empresa.email or '' }}</div>{% endif %}
+        {% endif %}
+      </div>
+    </div>
+    <div class="titulo-oc">
+      <h1>ORDEN DE COMPRA</h1>
+      <div class="numero">N° {{ orden.numero_po }}</div>
+      <div class="meta">
+        Fecha emisión: {{ orden.fecha_emision }}<br>
+        Moneda: {{ orden.moneda }}
+      </div>
+    </div>
+  </div>
+
+  <div class="bloque-proveedor">
+    <div class="etiqueta">Proveedor</div>
+    <div class="nombre-proveedor">{{ orden.proveedor.nombre }}</div>
+    {% if orden.proveedor.direccion %}<div class="linea">{{ orden.proveedor.direccion }}</div>{% endif %}
+    {% if orden.proveedor.pais %}<div class="linea">{{ orden.proveedor.pais }}</div>{% endif %}
+    {% if orden.proveedor.contacto_nombre %}<div class="linea">{{ orden.proveedor.contacto_nombre }}</div>{% endif %}
+    {% if orden.proveedor.contacto_email or orden.proveedor.contacto_telefono %}
+    <div class="linea">{{ orden.proveedor.contacto_email or '' }}{% if orden.proveedor.contacto_email and orden.proveedor.contacto_telefono %} · {% endif %}{{ orden.proveedor.contacto_telefono or '' }}</div>
+    {% endif %}
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Código</th>
+        <th>Descripción</th>
+        <th class="num">Cant. Cajas</th>
+        <th class="num">Cant. Unidades</th>
+        <th class="num">Precio Caja</th>
+        <th class="num">Subtotal</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for l in lineas %}
+      <tr>
+        <td>{{ l.codigo_mostrar }}</td>
+        <td>{{ l.descripcion_mostrar }}</td>
+        <td class="num">{{ l.cantidad_cajas|numero_flex }}</td>
+        <td class="num">{{ l.cantidad_unidades|numero_flex }}</td>
+        <td class="num">{{ l.precio_unitario_pactado|numero_flex }}</td>
+        <td class="num">{{ l.subtotal|numero_flex }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <td colspan="5" style="text-align:right;">TOTAL</td>
+        <td class="num">{{ orden.total|numero_flex }} {{ orden.moneda }}</td>
+      </tr>
+    </tfoot>
+  </table>
+
+  {% if orden.notas %}
+  <div class="notas-oc"><strong>Notas:</strong> {{ orden.notas }}</div>
+  {% endif %}
+
+  <div class="pie-documento">Documento generado por Suite Logística el {{ orden.creado_en.strftime('%Y-%m-%d %H:%M') }}.</div>
+</body>
+</html>

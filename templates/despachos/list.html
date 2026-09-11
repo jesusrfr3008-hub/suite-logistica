@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Despachos · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="section-title mb-0">Despachos</h3>
+  {% if hay_candidatas %}
+  <a href="{{ url_for('despachos_nuevo') }}" class="btn btn-brand"><i class="bi bi-plus-lg"></i> Nuevo despacho</a>
+  {% else %}
+  <button type="button" class="btn btn-brand" disabled title="No hay órdenes Confirmadas todavía sin despacho">
+    <i class="bi bi-plus-lg"></i> Nuevo despacho
+  </button>
+  {% endif %}
+</div>
+
+{% if not hay_candidatas %}
+<div class="alert alert-light border">
+  <i class="bi bi-info-circle me-1"></i>
+  No hay órdenes en estado "Orden Confirmada" todavía sin asociar a un despacho — "Nuevo despacho" se
+  habilita en cuanto tengas al menos una en
+  <a href="{{ url_for('ordenes_list', estado='Orden Confirmada') }}">Compras / Órdenes</a>.
+</div>
+{% endif %}
+
+<div class="alert alert-light border">
+  Un despacho agrupa una o varias órdenes ya despachadas bajo un mismo número de seguimiento/tracking
+  (útil cuando el courier consolida varias órdenes en un mismo envío). Solo aparecen aquí las órdenes
+  cuyas líneas ya están en "Orden Despachada" o más adelante.
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Tracking</th>
+          <th>Courier</th>
+          <th>Status</th>
+          <th>Fecha envío</th>
+          <th>Fecha est. llegada</th>
+          <th># Órdenes</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in despachos %}
+        <tr>
+          <td>
+            {{ d.numero_tracking or '-' }}
+            {% if d.url_seguimiento %}
+            <a href="{{ d.url_seguimiento }}" target="_blank" rel="noopener" title="Ver seguimiento online" class="ms-1">
+              <i class="bi bi-geo-alt"></i>
+            </a>
+            {% endif %}
+          </td>
+          <td>{{ d.courier or '-' }}</td>
+          <td><span class="badge bg-info text-dark">{{ d.status }}</span></td>
+          <td>{{ d.fecha_envio or '-' }}</td>
+          <td>{{ d.fecha_estimada_llegada or '-' }}</td>
+          <td>{{ d.ordenes.count() }}</td>
+          <td class="text-end"><a href="{{ url_for('despachos_detalle', despacho_id=d.id) }}" class="btn btn-sm btn-outline-primary">Ver</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-4">No hay despachos registrados todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

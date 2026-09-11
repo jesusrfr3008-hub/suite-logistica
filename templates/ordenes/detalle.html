@@ -1,0 +1,680 @@
+{% extends "base.html" %}
+{% block title %}{{ orden.numero_po }} · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+  <div>
+    <h3 class="section-title mb-0">{{ orden.numero_po }}</h3>
+    <div class="text-muted">
+      {% if orden.empresa %}
+      Empresa: <strong>{{ orden.empresa.nombre }}</strong>
+      {% else %}
+      Empresa: <span class="badge bg-warning text-dark">Sin asignar</span>
+      {% endif %}
+      · Proveedor: <a href="{{ url_for('proveedores_detalle', proveedor_id=orden.proveedor.id) }}">{{ orden.proveedor.nombre }}</a>
+      · Emitida: {{ orden.fecha_emision }} · Moneda: {{ orden.moneda }}
+      {% if orden.despacho %}
+      · Despacho: <a href="{{ url_for('despachos_detalle', despacho_id=orden.despacho.id) }}">{{ orden.despacho.numero_tracking or ('#' ~ orden.despacho.id) }}</a>
+      <span class="badge bg-info text-dark">{{ orden.despacho.status }}</span>
+      {% endif %}
+      <button class="btn btn-sm btn-link p-0 ms-1" data-bs-toggle="modal" data-bs-target="#modalEditarOrden">Editar</button>
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('ordenes_imprimir', orden_id=orden.id) }}" target="_blank" class="btn btn-outline-secondary"><i class="bi bi-printer"></i> Imprimir / PDF</a>
+    <div class="btn-group">
+      <button type="button" class="btn btn-outline-primary dropdown-toggle" data-bs-toggle="dropdown">
+        <i class="bi bi-envelope"></i> Enviar al proveedor
+      </button>
+      <ul class="dropdown-menu dropdown-menu-end">
+        <li>
+          <form method="post" action="{{ url_for('ordenes_enviar_outlook', orden_id=orden.id) }}">
+            <button type="submit" class="dropdown-item">
+              <i class="bi bi-microsoft me-1"></i> Enviar por Outlook (PDF adjunto)
+            </button>
+          </form>
+        </li>
+        <li><a class="dropdown-item" href="{{ url_for('ordenes_pdf', orden_id=orden.id) }}"><i class="bi bi-file-earmark-pdf me-1"></i> Descargar PDF</a></li>
+        <li><a class="dropdown-item" href="{{ url_for('ordenes_mailto', orden_id=orden.id) }}"><i class="bi bi-envelope me-1"></i> Enviar por correo (sin adjuntar PDF)</a></li>
+      </ul>
+    </div>
+    {% if orden.estado == 'Cancelada' %}
+    <form method="post" action="{{ url_for('ordenes_reactivar', orden_id=orden.id) }}">
+      <button class="btn btn-outline-success">Reactivar orden</button>
+    </form>
+    {% elif orden.despacho %}
+    <form method="post" action="{{ url_for('ordenes_cancelar', orden_id=orden.id) }}" onsubmit="return confirm('¿Cancelar esta orden completa? Como ya está asociada a un despacho, no se borra: queda marcada como Cancelada.');">
+      <button class="btn btn-outline-danger">Cancelar orden</button>
+    </form>
+    {% else %}
+    <form method="post" action="{{ url_for('ordenes_cancelar', orden_id=orden.id) }}" onsubmit="return confirm('¿Cancelar esta orden completa? Se eliminará del sistema junto con sus líneas y documentos — esta acción no se puede deshacer.');">
+      <button class="btn btn-outline-danger">Cancelar orden</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Modal: editar cabecera de la orden (ronda K: empresa compradora, N° de PO, moneda, notas) -->
+<div class="modal fade" id="modalEditarOrden" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('ordenes_editar', orden_id=orden.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar orden {{ orden.numero_po }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-12">
+            <label class="form-label">Empresa compradora</label>
+            <select class="form-select" name="empresa_id">
+              <option value="">Sin asignar</option>
+              {% for e in empresas %}
+              <option value="{{ e.id }}" {% if orden.empresa_id == e.id %}selected{% endif %}>{{ e.nombre }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-12">
+            <label class="form-label">N° de PO</label>
+            <input class="form-control" name="numero_po" value="{{ orden.numero_po }}" required>
+            <div class="form-text">Úsalo para hacer coincidir la numeración con las OC que ya enviaste al proveedor antes de tener este sistema.</div>
+          </div>
+          <div class="col-6">
+            <label class="form-label">Fecha de emisión</label>
+            <input type="date" class="form-control" name="fecha_emision" value="{{ orden.fecha_emision }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Moneda</label>
+            <select class="form-select" name="moneda">
+              {% for m in ['USD', 'EURO', 'CLP'] %}<option value="{{ m }}" {% if orden.moneda == m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-12"><label class="form-label">Notas</label><input class="form-control" name="notas" value="{{ orden.notas or '' }}"></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-5">
+    <div class="card p-3 h-100">
+      <h6 class="text-muted">Estado general</h6>
+      <div class="mb-2">
+        {% if orden.estado == 'Cancelada' %}
+          <span class="badge bg-dark fs-6">Cancelada</span>
+        {% elif orden.estado == 'Anulada' %}
+          <span class="badge bg-dark fs-6">Anulada</span>
+        {% elif orden.estado == 'En proceso (mixto)' %}
+          <span class="badge bg-warning text-dark fs-6">En proceso (etapas mixtas)</span>
+        {% else %}
+          <span class="badge bg-primary fs-6">{{ orden.estado }}</span>
+        {% endif %}
+      </div>
+      <div class="d-flex flex-wrap gap-3">
+        <div>
+          <div class="fw-semibold text-success">{{ orden.total_confirmadas }}</div>
+          <div class="small text-muted">confirmados</div>
+        </div>
+        <div>
+          <div class="fw-semibold text-secondary">{{ orden.total_pendientes_confirmacion }}</div>
+          <div class="small text-muted">pendientes por confirmar</div>
+        </div>
+        {% if orden.total_anuladas > 0 %}
+        <div>
+          <div class="fw-semibold text-dark">{{ orden.total_anuladas }}</div>
+          <div class="small text-muted">anulados</div>
+        </div>
+        {% endif %}
+      </div>
+      <div class="small text-muted mt-2">
+        {% set resumen = orden.resumen_etapas %}
+        {% for etapa in etapas %}
+          {% if resumen[etapa] > 0 %}{{ resumen[etapa] }} en "{{ etapa }}"{% if not loop.last %} · {% endif %}{% endif %}
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card p-3 h-100">
+      <h6 class="text-muted">Total orden</h6>
+      <div class="stat-value">{{ "%.2f"|format(orden.total) }} {{ orden.moneda }}</div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card p-3 h-100">
+      <h6 class="text-muted">Cajas pendientes por despachar</h6>
+      <div class="stat-value">{{ orden.total_unidades_pendientes|round(0)|int }}</div>
+    </div>
+  </div>
+</div>
+
+{% if orden.notas %}
+<div class="alert alert-light border">{{ orden.notas }}</div>
+{% endif %}
+
+{% if otras_partes %}
+<div class="alert alert-info">
+  <i class="bi bi-signpost-split-fill me-1"></i>
+  Este PO <strong>{{ orden.numero_po }}</strong> está dividido en {{ otras_partes|length + 1 }} partes
+  (los productos confirmados y los pendientes de confirmar quedaron en órdenes separadas, cada una
+  con su propio seguimiento y documentos, pero con el mismo número de PO):
+  <div class="d-flex flex-wrap gap-2 mt-2">
+    <span class="badge bg-primary">Esta orden: {{ orden.estado }}</span>
+    {% for otra in otras_partes %}
+    <a href="{{ url_for('ordenes_detalle', orden_id=otra.id) }}" class="badge bg-secondary text-decoration-none">
+      Ver otra parte: {{ otra.estado }} →
+    </a>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <h5 class="section-title mb-0">Líneas de la orden</h5>
+    {% if orden.estado not in ('Cancelada', 'Anulada') %}
+    <button type="button" class="btn btn-sm btn-brand no-print" data-bs-toggle="modal" data-bs-target="#modalAgregarProducto">
+      <i class="bi bi-plus-lg"></i> Agregar producto
+    </button>
+    {% endif %}
+  </div>
+
+  <div class="d-flex align-items-center gap-3 mb-2 p-2 bg-light rounded flex-wrap no-print">
+    <div class="dropdown">
+      <button class="btn btn-sm btn-brand dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+        <i class="bi bi-list-check"></i> Acciones sobre seleccionadas
+      </button>
+      <ul class="dropdown-menu">
+        <li><button type="button" class="dropdown-item" data-bs-toggle="modal" data-bs-target="#modalAccionConfirmar"><i class="bi bi-check2-circle me-1"></i> Confirmado</button></li>
+        <li><button type="button" class="dropdown-item" data-bs-toggle="modal" data-bs-target="#modalAccionFecha"><i class="bi bi-calendar-event me-1"></i> Fecha despacho</button></li>
+        <li><hr class="dropdown-divider"></li>
+        <li><button type="button" class="dropdown-item" id="btnAccionRetroceder"><i class="bi bi-arrow-counterclockwise me-1"></i> Cambiar estado (volver a etapa anterior)</button></li>
+        <li><button type="button" class="dropdown-item text-danger" id="btnAccionAnular"><i class="bi bi-x-circle me-1"></i> Anular</button></li>
+      </ul>
+    </div>
+    <span class="text-muted small" id="contadorSeleccionadas">0 seleccionadas</span>
+    <button type="button" class="btn btn-sm btn-link" id="btnSeleccionarTodasDet">Seleccionar todas</button>
+  </div>
+
+  <p class="text-muted small mb-2 no-print">
+    <i class="bi bi-info-circle me-1"></i>
+    Para despachar líneas confirmadas, avanzarlas por aduana o marcarlas como recibidas, usa el
+    módulo <a href="{{ url_for('despachos_list') }}">Despachos</a>: allí se asocian las órdenes
+    confirmadas a un despacho (tracking/guía) y todo el lote avanza junto.
+  </p>
+
+  <!-- Formularios ocultos para las acciones masivas que no requieren datos adicionales -->
+  <form method="post" action="{{ url_for('ordenes_lineas_retroceder_masivo', orden_id=orden.id) }}" id="formRetrocederMasivo"></form>
+  <form method="post" action="{{ url_for('ordenes_lineas_anular_masivo', orden_id=orden.id) }}" id="formAnularMasivo"></form>
+
+  <!-- Modal: confirmar seleccionadas -->
+  <div class="modal fade" id="modalAccionConfirmar" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <form method="post" action="{{ url_for('ordenes_lineas_confirmar_masivo', orden_id=orden.id) }}" id="formConfirmarMasivo">
+          <div class="modal-header">
+            <h5 class="modal-title">Confirmar líneas seleccionadas</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body">
+            <p class="text-muted small mb-2">Se confirmarán las líneas seleccionadas que estén en "Emisión de Orden" (las demás se omiten).</p>
+            <label class="form-label">Fecha despacho confirmada *</label>
+            <input type="date" class="form-control" name="fecha_estimada_despacho_confirmada" required>
+          </div>
+          <div class="modal-footer">
+            <button type="submit" class="btn btn-brand">Confirmar seleccionadas</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: aplicar fecha estimada de despacho -->
+  <div class="modal fade" id="modalAccionFecha" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <form method="post" action="{{ url_for('ordenes_lineas_fecha_masiva', orden_id=orden.id) }}" id="formFechaMasiva">
+          <div class="modal-header">
+            <h5 class="modal-title">Aplicar fecha estimada de despacho</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body">
+            <p class="text-muted small mb-2">Fecha de planificación (no requiere confirmación del proveedor).</p>
+            <label class="form-label">Fecha estimada de despacho *</label>
+            <input type="date" class="form-control" name="fecha_estimada_despacho" required>
+          </div>
+          <div class="modal-footer">
+            <button type="submit" class="btn btn-outline-secondary">Aplicar a seleccionadas</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: agregar producto nuevo a la orden ya creada -->
+  <div class="modal fade" id="modalAgregarProducto" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <form method="post" action="{{ url_for('ordenes_linea_nueva', orden_id=orden.id) }}" id="formAgregarProducto">
+          <div class="modal-header">
+            <h5 class="modal-title">Agregar producto a la orden</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body">
+            <div class="mb-2">
+              <label class="form-label small">Buscar en el catálogo de {{ orden.proveedor.nombre }}</label>
+              <input type="text" class="form-control form-control-sm" id="buscarCatalogoOrden" placeholder="Código o descripción...">
+              <div class="list-group mt-1" id="resultadosCatalogoOrden" style="max-height:180px; overflow-y:auto;"></div>
+            </div>
+            <div class="row g-2">
+              <input type="hidden" name="producto_id" id="campoProductoIdOrden" required>
+              <input type="hidden" name="variante_codigo" id="campoVarianteCodigoOrden">
+              <input type="hidden" name="variante_descripcion" id="campoVarianteDescripcionOrden">
+              <div class="col-4"><label class="form-label">Código</label><input class="form-control" id="campoCodigoOrden" disabled></div>
+              <div class="col-8"><label class="form-label">Descripción</label><input class="form-control" id="campoDescripcionOrden" disabled></div>
+            </div>
+            <div class="mt-2" id="bloqueVarianteOrden" hidden>
+              <label class="form-label small mb-1">Este producto tiene variantes — elige la que corresponde (el precio es siempre el del código padre):</label>
+              <input type="text" class="form-control form-control-sm mb-1" id="buscarVarianteOrden" placeholder="Filtrar por código o descripción...">
+              <div class="list-group" id="listaVariantesOrden" style="max-height:180px; overflow-y:auto;"></div>
+              <p class="text-muted small mb-0 mt-1" id="varianteElegidaOrden"></p>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-4"><label class="form-label">Cant. cajas *</label><input type="number" min="1" step="1" class="form-control" name="cantidad_cajas" id="campoCantidadOrden" required></div>
+              <div class="col-4"><label class="form-label">Precio/caja pactado</label><input type="number" min="0" step="0.01" class="form-control" name="precio_unitario_pactado" id="campoPrecioOrden"></div>
+              <div class="col-4"><label class="form-label">Fecha est. despacho</label><input type="date" class="form-control" name="fecha_estimada_despacho"></div>
+            </div>
+            <p class="text-muted small mb-0 mt-2" id="avisoDuplicadoOrden"></p>
+          </div>
+          <div class="modal-footer">
+            <button type="submit" class="btn btn-brand" id="btnGuardarProductoOrden" disabled>Agregar producto</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th style="width:30px;"></th>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th class="text-end">Cant. cajas</th>
+          <th class="text-end">Precio/caja</th>
+          <th class="text-end">Subtotal</th>
+          <th>Fecha est. despacho</th>
+          <th>Etapa</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for l in lineas %}
+        <tr class="{% if l.anulada %}table-secondary text-muted{% endif %}" data-producto-id="{{ l.producto_id }}" data-variante-codigo="{{ l.variante_codigo or '' }}" data-anulada="{{ 'true' if l.anulada else 'false' }}">
+          <td><input type="checkbox" class="check-linea-det" value="{{ l.id }}"></td>
+          <td>{{ l.codigo_mostrar }}</td>
+          <td style="max-width:260px;">{{ l.descripcion_mostrar }}</td>
+          <td class="text-end">{{ l.cantidad_cajas }} <span class="text-muted small">({{ l.cantidad_unidades }} u.)</span></td>
+          <td class="text-end">{{ "%.2f"|format(l.precio_unitario_pactado) }}</td>
+          <td class="text-end">{{ "%.2f"|format(l.subtotal) }}</td>
+          <td>{{ l.fecha_estimada_despacho or '-' }}</td>
+          <td>
+            {% if l.anulada %}<span class="badge bg-dark">Anulada</span>
+            {% elif l.etapa == 'Recibido' %}<span class="badge bg-success">{{ l.etapa }}</span>
+            {% elif l.etapa == 'Emisión de Orden' %}<span class="badge bg-secondary">{{ l.etapa }}</span>
+            {% else %}<span class="badge bg-info text-dark">{{ l.etapa }}</span>{% endif %}
+            {% if l.despacho_parcial %}<span class="badge bg-warning text-dark">Parcial {{ l.cantidad_despachada_cajas }}/{{ l.cantidad_cajas }}</span>{% endif %}
+          </td>
+          <td class="text-end no-print">
+            <div class="d-flex gap-1 justify-content-end">
+              {% if l.anulada %}
+              <form method="post" action="{{ url_for('ordenes_linea_reactivar', orden_id=orden.id, linea_id=l.id) }}">
+                <button class="btn btn-sm btn-outline-success">Reactivar</button>
+              </form>
+              {% elif l.bloqueada %}
+              {# Ya despachada: a partir de aqui el lote avanza (aduana / recibido) y se
+                 gestiona en bloque desde "Acciones sobre seleccionadas" arriba, no linea
+                 por linea -- no hay ninguna accion individual que tenga sentido aqui. #}
+              <span class="text-muted small">—</span>
+              {% else %}
+              <div class="dropdown">
+                <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">
+                  Acciones
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end">
+                  {% if l.etapa == 'Emisión de Orden' %}
+                  <li><button type="button" class="dropdown-item" data-bs-toggle="modal" data-bs-target="#modalConfirmar{{ l.id }}">Confirmar</button></li>
+                  {% endif %}
+                  {% if l.etapa_anterior %}
+                  <li>
+                    <form method="post" action="{{ url_for('ordenes_linea_retroceder', orden_id=orden.id, linea_id=l.id) }}" onsubmit="return confirm('¿Devolver esta línea a la etapa anterior?');">
+                      <button type="submit" class="dropdown-item">↩ Cambiar estado (etapa anterior)</button>
+                    </form>
+                  </li>
+                  {% endif %}
+                  <li><hr class="dropdown-divider"></li>
+                  <li>
+                    <form method="post" action="{{ url_for('ordenes_linea_anular', orden_id=orden.id, linea_id=l.id) }}" onsubmit="return confirm('¿Anular esta línea?');">
+                      <button type="submit" class="dropdown-item text-danger">Anular</button>
+                    </form>
+                  </li>
+                </ul>
+              </div>
+              <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalLinea{{ l.id }}">Editar</button>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="text-center text-muted py-4">Esta orden no tiene líneas.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card p-3">
+  <h5 class="section-title mb-3">Documentos de la orden</h5>
+  <form method="post" action="{{ url_for('ordenes_documento_subir', orden_id=orden.id) }}" enctype="multipart/form-data" class="row g-2 align-items-end mb-3">
+    <div class="col-auto">
+      <label class="form-label small mb-0">Tipo de documento</label>
+      <select class="form-select form-select-sm" name="tipo">
+        {% for t in tipos_documento %}
+        <option value="{{ t }}">{{ t }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-auto">
+      <label class="form-label small mb-0">Archivo (PDF, JPG, PNG)</label>
+      <input type="file" class="form-control form-control-sm" name="archivo" accept=".pdf,.jpg,.jpeg,.png" required>
+    </div>
+    <div class="col-auto">
+      <button type="submit" class="btn btn-sm btn-brand">Subir documento</button>
+    </div>
+  </form>
+
+  {% if documentos %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th>Tipo</th>
+          <th>Archivo</th>
+          <th>Fecha subida</th>
+          <th class="text-end">Acciones</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in documentos %}
+        <tr>
+          <td><span class="badge bg-secondary">{{ d.tipo }}</span></td>
+          <td>
+            <a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener">{{ d.nombre_original }}</a>
+          </td>
+          <td>{{ d.fecha_subida.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td class="text-end">
+            <a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline-secondary">Ver</a>
+            <a href="{{ url_for('ordenes_documento_descargar', orden_id=orden.id, doc_id=d.id) }}" class="btn btn-sm btn-outline-primary">Descargar</a>
+            <form method="post" action="{{ url_for('ordenes_documento_eliminar', orden_id=orden.id, doc_id=d.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar este documento?');">
+              <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted mb-0">Aún no hay documentos cargados para esta orden (Invoice, Guía de despacho, Certificado de origen, Factura del agente de aduanas, Gastos de internación, etc.).</p>
+  {% endif %}
+</div>
+
+{% for l in lineas %}
+<div class="modal fade" id="modalConfirmar{{ l.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('ordenes_linea_confirmar', orden_id=orden.id, linea_id=l.id) }}">
+        <div class="modal-header">
+          <h5 class="modal-title">Confirmar disponibilidad: {{ l.codigo_mostrar }}</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body row g-2">
+          <p class="text-muted small">El proveedor confirmó que este producto está disponible para despacho. Registra la fecha de despacho que te entregó.</p>
+          <div class="col-12"><label class="form-label">Fecha despacho confirmada *</label><input type="date" class="form-control" name="fecha_estimada_despacho_confirmada" required></div>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-brand">Confirmar línea</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div class="modal fade" id="modalLinea{{ l.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Editar línea: {{ l.codigo_mostrar }}</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form method="post" id="formLinea{{ l.id }}" action="{{ url_for('ordenes_linea_actualizar', orden_id=orden.id, linea_id=l.id) }}">
+        <div class="modal-body row g-2">
+          <div class="col-6"><label class="form-label">Cant. cajas</label><input type="number" step="1" min="0" class="form-control" name="cantidad_cajas" value="{{ l.cantidad_cajas }}"></div>
+          <div class="col-6"><label class="form-label">Precio/caja pactado</label><input type="number" step="0.01" min="0" class="form-control" name="precio_unitario_pactado" value="{{ l.precio_unitario_pactado }}"></div>
+          <div class="col-6"><label class="form-label">Fecha estimada despacho (planificación)</label><input type="date" class="form-control" name="fecha_estimada_despacho" value="{{ l.fecha_estimada_despacho or '' }}"></div>
+          <div class="col-6"><label class="form-label">Cajas ya despachadas</label><input type="number" step="1" min="0" max="{{ l.cantidad_cajas }}" class="form-control" name="cantidad_despachada_cajas" value="{{ l.cantidad_despachada_cajas }}"></div>
+          <div class="col-12"><hr><div class="text-muted small mb-1">Confirmación del proveedor</div></div>
+          <div class="col-6"><label class="form-label">Fecha disponibilidad confirmada</label><input type="date" class="form-control" name="fecha_disponibilidad_confirmada" value="{{ l.fecha_disponibilidad_confirmada or '' }}"></div>
+          <div class="col-6"><label class="form-label">Fecha despacho confirmada</label><input type="date" class="form-control" name="fecha_estimada_despacho_confirmada" value="{{ l.fecha_estimada_despacho_confirmada or '' }}"></div>
+        </div>
+      </form>
+      <div class="modal-footer d-flex justify-content-between">
+        <form method="post" action="{{ url_for('ordenes_linea_eliminar', orden_id=orden.id, linea_id=l.id) }}" onsubmit="return confirm('¿Eliminar esta línea de la orden?');">
+          <button type="submit" class="btn btn-outline-danger btn-sm">Eliminar línea</button>
+        </form>
+        <button type="submit" form="formLinea{{ l.id }}" class="btn btn-brand">Guardar cambios</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function actualizarContadorSeleccionadas() {
+  const n = document.querySelectorAll('.check-linea-det:checked').length;
+  const el = document.getElementById('contadorSeleccionadas');
+  if (el) el.textContent = n + (n === 1 ? ' seleccionada' : ' seleccionadas');
+}
+
+document.querySelectorAll('.check-linea-det').forEach(b => b.addEventListener('change', actualizarContadorSeleccionadas));
+
+document.getElementById('btnSeleccionarTodasDet').addEventListener('click', () => {
+  const boxes = document.querySelectorAll('.check-linea-det');
+  const marcar = ![...boxes].every(b => b.checked);
+  boxes.forEach(b => b.checked = marcar);
+  actualizarContadorSeleccionadas();
+});
+
+function adjuntarSeleccionadas(form) {
+  form.querySelectorAll('input[name="linea_ids"]').forEach(el => el.remove());
+  const seleccionadas = document.querySelectorAll('.check-linea-det:checked');
+  seleccionadas.forEach(b => {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = 'linea_ids';
+    input.value = b.value;
+    form.appendChild(input);
+  });
+  if (seleccionadas.length === 0) {
+    alert('Selecciona al menos una línea de la tabla antes de continuar.');
+    return false;
+  }
+  return true;
+}
+
+document.getElementById('formFechaMasiva').addEventListener('submit', (e) => {
+  if (!adjuntarSeleccionadas(e.target)) e.preventDefault();
+});
+document.getElementById('formConfirmarMasivo').addEventListener('submit', (e) => {
+  if (!adjuntarSeleccionadas(e.target)) e.preventDefault();
+});
+
+document.getElementById('btnAccionRetroceder').addEventListener('click', () => {
+  const form = document.getElementById('formRetrocederMasivo');
+  if (!adjuntarSeleccionadas(form)) return;
+  if (confirm('¿Devolver las líneas seleccionadas a su etapa anterior?')) form.submit();
+});
+document.getElementById('btnAccionAnular').addEventListener('click', () => {
+  const form = document.getElementById('formAnularMasivo');
+  if (!adjuntarSeleccionadas(form)) return;
+  if (confirm('¿Anular las líneas seleccionadas? Dejarán de contar como pendientes y no avanzarán de etapa hasta que las reactives.')) form.submit();
+});
+
+// --- Modal "Agregar producto": busqueda en catalogo + aviso de duplicidad (punto 9) ---
+// Ronda M (2026-09-10, punto 1): si el producto tiene variantes (ej.
+// dioptrias de lentes MEDICONTUR), no se agrega directo -- primero hay que
+// elegir la variante especifica en la lista que aparece debajo.
+(function () {
+  const proveedorId = {{ orden.proveedor_id }};
+  const input = document.getElementById('buscarCatalogoOrden');
+  const resultados = document.getElementById('resultadosCatalogoOrden');
+  const campoProductoId = document.getElementById('campoProductoIdOrden');
+  const campoVarianteCodigo = document.getElementById('campoVarianteCodigoOrden');
+  const campoVarianteDescripcion = document.getElementById('campoVarianteDescripcionOrden');
+  const campoCodigo = document.getElementById('campoCodigoOrden');
+  const campoDescripcion = document.getElementById('campoDescripcionOrden');
+  const campoCantidad = document.getElementById('campoCantidadOrden');
+  const campoPrecio = document.getElementById('campoPrecioOrden');
+  const aviso = document.getElementById('avisoDuplicadoOrden');
+  const btnGuardar = document.getElementById('btnGuardarProductoOrden');
+  const bloqueVariante = document.getElementById('bloqueVarianteOrden');
+  const buscarVariante = document.getElementById('buscarVarianteOrden');
+  const listaVariantes = document.getElementById('listaVariantesOrden');
+  const varianteElegida = document.getElementById('varianteElegidaOrden');
+
+  let variantesProductoActual = [];
+
+  function productoYaEnOrden(productoId, varianteCodigo) {
+    return [...document.querySelectorAll('tr[data-producto-id]')].some(
+      tr => tr.dataset.productoId === String(productoId)
+        && (tr.dataset.varianteCodigo || '') === (varianteCodigo || '')
+        && tr.dataset.anulada !== 'true'
+    );
+  }
+
+  function limpiarVariante() {
+    bloqueVariante.hidden = true;
+    listaVariantes.innerHTML = '';
+    buscarVariante.value = '';
+    varianteElegida.textContent = '';
+    campoVarianteCodigo.value = '';
+    campoVarianteDescripcion.value = '';
+    variantesProductoActual = [];
+  }
+
+  function renderListaVariantes(filtro) {
+    const f = (filtro || '').toLowerCase();
+    listaVariantes.innerHTML = '';
+    variantesProductoActual
+      .filter(v => !f || v.codigo.toLowerCase().includes(f) || v.descripcion.toLowerCase().includes(f))
+      .slice(0, 60)
+      .forEach(v => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'list-group-item list-group-item-action py-1 small';
+        item.textContent = `${v.codigo} — ${v.descripcion}`;
+        item.addEventListener('click', () => elegirVariante(v));
+        listaVariantes.appendChild(item);
+      });
+  }
+
+  function elegirVariante(v) {
+    if (productoYaEnOrden(campoProductoId.value, v.codigo)) {
+      alert(`'${v.codigo}' ya está en esta orden. Ajusta la cantidad en esa línea en vez de agregarla de nuevo.`);
+      return;
+    }
+    campoVarianteCodigo.value = v.codigo;
+    campoVarianteDescripcion.value = v.descripcion;
+    campoCodigo.value = v.codigo;
+    campoDescripcion.value = v.descripcion;
+    varianteElegida.innerHTML = `Variante elegida: <strong>${v.codigo}</strong> — ${v.descripcion}`;
+    varianteElegida.className = 'text-success small mb-0 mt-1';
+    aviso.textContent = '';
+    btnGuardar.disabled = false;
+  }
+
+  async function seleccionarProducto(p) {
+    limpiarVariante();
+    campoProductoId.value = p.id;
+    campoCodigo.value = p.codigo;
+    campoDescripcion.value = p.descripcion;
+    campoPrecio.value = p.precio_caja;
+    aviso.textContent = '';
+    aviso.className = 'text-muted small mb-0 mt-2';
+    resultados.innerHTML = '';
+    input.value = `${p.codigo} — ${p.descripcion}`;
+
+    if (p.tiene_variantes) {
+      btnGuardar.disabled = true;
+      bloqueVariante.hidden = false;
+      varianteElegida.textContent = 'Elige una variante de la lista de abajo.';
+      varianteElegida.className = 'text-muted small mb-0 mt-1';
+      const resp = await fetch(`/api/productos/${p.id}/variantes`);
+      variantesProductoActual = await resp.json();
+      renderListaVariantes('');
+      return;
+    }
+
+    if (productoYaEnOrden(p.id, null)) {
+      alert(`'${p.codigo}' ya está en esta orden. Ajusta la cantidad en esa línea en vez de agregarla de nuevo.`);
+      aviso.textContent = 'Este producto ya está en la orden — no se puede agregar de nuevo.';
+      aviso.className = 'text-danger small mb-0 mt-2';
+      campoProductoId.value = '';
+      btnGuardar.disabled = true;
+      return;
+    }
+    btnGuardar.disabled = false;
+  }
+
+  buscarVariante.addEventListener('input', () => renderListaVariantes(buscarVariante.value));
+
+  let debounce;
+  input.addEventListener('input', () => {
+    clearTimeout(debounce);
+    campoProductoId.value = '';
+    btnGuardar.disabled = true;
+    limpiarVariante();
+    debounce = setTimeout(async () => {
+      if (!input.value) { resultados.innerHTML = ''; return; }
+      const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(input.value)}`);
+      const productos = await resp.json();
+      resultados.innerHTML = '';
+      productos.slice(0, 15).forEach(p => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        const duplicado = !p.tiene_variantes && productoYaEnOrden(p.id, null);
+        item.className = 'list-group-item list-group-item-action py-1 small' + (duplicado ? ' text-muted' : '');
+        item.textContent = duplicado ? `${p.codigo} — ${p.descripcion} (ya en la orden)` : `${p.codigo} — ${p.descripcion}`;
+        item.addEventListener('click', () => seleccionarProducto(p));
+        resultados.appendChild(item);
+      });
+    }, 300);
+  });
+
+  document.getElementById('modalAgregarProducto').addEventListener('hidden.bs.modal', () => {
+    input.value = '';
+    resultados.innerHTML = '';
+    campoProductoId.value = '';
+    campoCodigo.value = '';
+    campoDescripcion.value = '';
+    campoCantidad.value = '';
+    campoPrecio.value = '';
+    aviso.textContent = '';
+    limpiarVariante();
+    btnGuardar.disabled = true;
+  });
+})();
+</script>
+{% endblock %}

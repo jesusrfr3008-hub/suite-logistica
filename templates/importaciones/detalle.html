@@ -1,0 +1,1291 @@
+{% extends "base.html" %}
+{% block title %}Importación {{ imp.numero_factura }} · Suite Logística{% endblock %}
+{% block content %}
+
+<style>
+  /* Tabla de productos costeados (ronda G, puntos 4 y 5): encabezados
+     centrados y con fondo oscuro para que destaquen, con flecha de
+     ordenamiento; scroll vertical propio (con el encabezado fijo) para no
+     tener que desplazar toda la pantalla cuando hay muchos productos. */
+  .tabla-scroll { max-height: 480px; overflow-y: auto; }
+  .tabla-costeo thead th {
+    text-align: center;
+    vertical-align: middle;
+    background: #212529;
+    color: #fff;
+    white-space: nowrap;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  .tabla-costeo thead th[data-sort] { cursor: pointer; user-select: none; }
+  .tabla-costeo thead th[data-sort]::after { content: " \21C5"; opacity: .45; font-size: .75em; }
+  .tabla-costeo thead th[data-sort].sort-asc::after { content: " \25B2"; opacity: 1; }
+  .tabla-costeo thead th[data-sort].sort-desc::after { content: " \25BC"; opacity: 1; }
+  .panel-gastos-compacto .table { font-size: .85rem; }
+  .panel-gastos-compacto .card-body, .panel-gastos-compacto.card { padding: .75rem; }
+
+  /* Tarjetas resumen del costeo (ronda H, punto 1): mismo tamaño/alto entre
+     sí y un sombreado + borde mas vistoso que el card-stat generico del
+     dashboard (no se toca .card-stat global para no afectar otras
+     pantallas). */
+  .card-stat-costeo {
+    border: 1px solid rgba(15, 47, 76, 0.15) !important;
+    box-shadow: 0 6px 18px rgba(15, 47, 76, 0.14) !important;
+  }
+
+  /* Menu de engranaje (ronda H, puntos 2 y 3): reemplaza los botones
+     grandes de Editar/Eliminar/Documentos al lado de cada fila por un solo
+     botón compacto con dropdown. */
+  .btn-engranaje {
+    width: 2rem; height: 2rem; padding: 0; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .dropdown-menu .dropdown-header-adjuntar {
+    font-size: .75rem; font-weight: 600; text-transform: uppercase;
+    color: #6c757d; padding: .25rem 1rem 0;
+  }
+  .dropdown-menu .dropdown-item-sub { padding-left: 1.75rem; }
+</style>
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+  <div>
+    <h3 class="section-title mb-0">Importación: {{ imp.numero_factura or '(sin número)' }}</h3>
+    <div class="text-muted">
+      Proveedor: <a href="{{ url_for('proveedores_detalle', proveedor_id=imp.proveedor.id) }}">{{ imp.proveedor.nombre }}</a>
+      · Fecha factura: {{ imp.fecha_factura or '-' }} · Moneda factura: {{ imp.moneda_factura }}
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <button class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarImportacion">Editar datos</button>
+    <form method="post" action="{{ url_for('importaciones_eliminar', importacion_id=imp.id) }}" onsubmit="return confirm('¿Eliminar esta importación y todo su costeo?');">
+      <button class="btn btn-outline-danger">Eliminar</button>
+    </form>
+  </div>
+</div>
+
+{% if imp.despacho %}
+<div class="alert alert-info d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+  <div>
+    <i class="bi bi-truck me-1"></i>
+    Esta importación se generó desde el despacho
+    <a href="{{ url_for('despachos_detalle', despacho_id=imp.despacho.id) }}">{{ imp.despacho.numero_tracking or ('#' ~ imp.despacho.id) }}</a>
+    — desde ahí puedes ver las órdenes de origen y sus documentos (Invoice, Guía de despacho, etc.).
+  </div>
+</div>
+{% endif %}
+
+<div class="row g-3 mb-4">
+  <div class="col-12 col-md-4">
+    <div class="card card-stat card-stat-costeo p-3 h-100">
+      <div class="text-muted small">CIF total ({{ imp.moneda_factura }})</div>
+      {% if imp.moneda_factura not in ['USD', 'CLP'] %}
+      <div class="stat-value">{{ resultado.totales.cif_moneda_factura|moneda }}<span class="fs-6"> {{ imp.moneda_factura }}</span></div>
+      <div class="text-muted small mt-1">≈ {{ resultado.totales.cif_usd|moneda }} USD · {{ resultado.totales.cif_clp|clp }} CLP</div>
+      {% else %}
+      <div class="stat-value">{{ resultado.totales.cif_usd|moneda }}<span class="fs-6"> USD</span></div>
+      <div class="text-muted small mt-1">≈ {{ resultado.totales.cif_clp|clp }} CLP</div>
+      {% endif %}
+    </div>
+  </div>
+  <div class="col-12 col-md-4">
+    <div class="card card-stat card-stat-costeo p-3 h-100">
+      <div class="text-muted small">Gastos totales</div>
+      <div class="stat-value">{{ resultado.totales.gastos_clp|clp }}<span class="fs-6"> CLP</span></div>
+    </div>
+  </div>
+  <div class="col-12 col-md-4">
+    <div class="card card-stat card-stat-costeo p-3 h-100">
+      <div class="text-muted small">Costo total importación</div>
+      <div class="stat-value">{{ resultado.totales.costo_total_clp|clp }}<span class="fs-6"> CLP</span></div>
+      <div class="text-muted small mt-1">
+        ≈ {{ resultado.totales.costo_total_usd|moneda }} USD
+        {% if imp.moneda_factura not in ['USD', 'CLP'] %}
+        · {{ resultado.totales.costo_total_moneda_factura|moneda }} {{ imp.moneda_factura }}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3 mb-3 bg-light border">
+  <div class="text-muted small mb-1">Consolidado — todos los parciales</div>
+  <div class="row g-2 small">
+    <div class="col-auto">FOB:
+      <strong>{{ resultado.totales.fob_moneda_factura|moneda }} {{ imp.moneda_factura }}</strong>
+      {% if imp.moneda_factura != 'USD' %}<span class="text-muted">· {{ resultado.totales.fob_usd|moneda }} USD</span>{% endif %}
+    </div>
+    {% if resultado.usa_flete_item %}
+    <div class="col-auto">Flete:
+      <strong>{{ resultado.totales.flete_moneda|moneda }} {{ imp.moneda_factura }}</strong>
+      {% if imp.moneda_factura != 'USD' %}<span class="text-muted">· {{ resultado.totales.flete_usd|moneda }} USD</span>{% endif %}
+    </div>
+    {% endif %}
+    {% if resultado.usa_seguro_item %}
+    <div class="col-auto">Seguro:
+      <strong>{{ resultado.totales.seguro_moneda|moneda }} {{ imp.moneda_factura }}</strong>
+      {% if imp.moneda_factura != 'USD' %}<span class="text-muted">· {{ resultado.totales.seguro_usd|moneda }} USD</span>{% endif %}
+    </div>
+    {% endif %}
+    {% if resultado.usa_otros_items %}
+    <div class="col-auto">Otros ítems:
+      <strong>{{ resultado.totales.otros_items_moneda|moneda }} {{ imp.moneda_factura }}</strong>
+      {% if imp.moneda_factura != 'USD' %}<span class="text-muted">· {{ resultado.totales.otros_items_usd|moneda }} USD</span>{% endif %}
+    </div>
+    {% endif %}
+    <div class="col-auto">Gastos totales: <strong>{{ resultado.totales.gastos_clp|clp }} CLP</strong></div>
+    <div class="col-auto">Costo total importación: <strong>{{ resultado.totales.costo_total_clp|clp }} CLP</strong></div>
+  </div>
+</div>
+
+<h5 class="section-title mb-2">Parciales (Declaraciones de Ingreso)</h5>
+
+<ul class="nav nav-tabs mb-3 flex-wrap" role="tablist">
+  {% for pr in resultado.parciales %}
+  {% set parcial = pr.parcial %}
+  <li class="nav-item" role="presentation">
+    <button class="nav-link {% if loop.first %}active{% endif %}" id="tab-btn-{{ parcial.id }}"
+            data-bs-toggle="tab" data-bs-target="#panel-{{ parcial.id }}" type="button" role="tab">
+      {{ parcial.referencia or parcial.numero_parcial or ('Parcial ' ~ loop.index) }}
+    </button>
+  </li>
+  {% endfor %}
+  <li class="nav-item" role="presentation">
+    <button class="nav-link text-success" type="button" data-bs-toggle="modal" data-bs-target="#modalNuevoParcial">
+      <i class="bi bi-plus-lg"></i> Agregar parcial
+    </button>
+  </li>
+</ul>
+
+<div class="tab-content mb-3">
+  {% for pr in resultado.parciales %}
+  {% set parcial = pr.parcial %}
+  <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="panel-{{ parcial.id }}" role="tabpanel">
+    <div class="card p-3 mb-3">
+      <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-2">
+        <div>
+          <span class="fw-bold">{{ parcial.referencia or parcial.numero_parcial or ('Parcial ' ~ loop.index) }}</span>
+          {% if parcial.numero_parcial %}<span class="text-muted small ms-2">DIN: {{ parcial.numero_parcial }}</span>{% endif %}
+          <span class="badge bg-light text-dark border ms-2">{{ parcial.via_embarque }}</span>
+          {% if parcial.tipo_regimen %}<span class="badge bg-secondary ms-1">{{ parcial.tipo_regimen }}</span>{% endif %}
+        </div>
+        <div class="d-flex gap-1">
+          <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarParcial{{ parcial.id }}">Editar</button>
+          <button class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#modalNuevaLinea{{ parcial.id }}">+ Producto</button>
+          <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#modalCargaLotes{{ parcial.id }}">Carga Lotes</button>
+          <form method="post" action="{{ url_for('parciales_eliminar', parcial_id=parcial.id) }}" onsubmit="return confirm('¿Eliminar este parcial y sus líneas?');">
+            <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="row g-2 mb-1 small text-muted">
+        <div class="col-auto">FOB parcial:
+          <strong>{{ pr.fob_usd|moneda }} USD</strong>
+          {% if imp.moneda_factura not in ['USD', 'CLP'] %}<span class="text-muted">· {{ pr.fob_moneda|moneda }} {{ imp.moneda_factura }}</span>{% endif %}
+        </div>
+        {% if resultado.usa_flete_item %}
+        <div class="col-auto">Flete (factura, {{ imp.moneda_factura }}):
+          {% if imp.moneda_factura != 'USD' %}
+          <strong>{{ pr.flete_moneda|moneda }} {{ imp.moneda_factura }}</strong>
+          <span class="text-muted">· {{ pr.flete_usd|moneda }} USD</span>
+          {% else %}
+          <strong>{{ pr.flete_usd|moneda }} USD</strong>
+          {% endif %}
+        </div>
+        {% endif %}
+        {% if resultado.usa_seguro_item %}
+        <div class="col-auto">Seguro (factura, {{ imp.moneda_factura }}):
+          {% if imp.moneda_factura != 'USD' %}
+          <strong>{{ pr.seguro_moneda|moneda }} {{ imp.moneda_factura }}</strong>
+          <span class="text-muted">· {{ pr.seguro_usd|moneda }} USD</span>
+          {% else %}
+          <strong>{{ pr.seguro_usd|moneda }} USD</strong>
+          {% endif %}
+        </div>
+        {% endif %}
+        {% if resultado.usa_otros_items %}
+        <div class="col-auto">Otros ítems factura ({{ imp.moneda_factura }}):
+          {% if imp.moneda_factura != 'USD' %}
+          <strong>{{ pr.otros_items_moneda|moneda }} {{ imp.moneda_factura }}</strong>
+          <span class="text-muted">· {{ pr.otros_items_usd|moneda }} USD</span>
+          {% else %}
+          <strong>{{ pr.otros_items_usd|moneda }} USD</strong>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+      <div class="row g-2 mb-2 small text-muted">
+        <div class="col-auto">CIF parcial:
+          <strong>{{ pr.cif_clp|clp }} CLP</strong>
+          <span class="text-muted">(≈ {{ pr.cif_usd|moneda }} USD{% if imp.moneda_factura not in ['USD', 'CLP'] %} · {{ pr.cif_moneda|moneda }} {{ imp.moneda_factura }}{% endif %})</span>
+        </div>
+        {% if pr.usa_flete_gasto %}
+        <div class="col-auto">Flete Int. (gasto): <strong>{{ pr.flete_gasto_clp|clp }} CLP</strong></div>
+        {% endif %}
+        {% if pr.usa_derechos %}
+        <div class="col-auto">Derechos: <strong>{{ pr.derechos_clp|clp }} CLP</strong></div>
+        {% endif %}
+        <div class="col-auto">Gastos asignados: <strong>{{ (pr.otros_gastos_clp if (pr.usa_flete_gasto or pr.usa_derechos) else pr.gastos_clp)|clp }} CLP</strong></div>
+        <div class="col-auto">Costo total parcial: <strong>{{ pr.costo_total_clp|clp }} CLP</strong></div>
+      </div>
+
+      <div class="d-flex align-items-center gap-3 mb-2 p-2 bg-light rounded flex-wrap no-print">
+        <span class="text-muted small contador-sel" data-parcial="{{ parcial.id }}">0 seleccionadas</span>
+        <button type="button" class="btn btn-sm btn-link btn-seleccionar-todas" data-parcial="{{ parcial.id }}">Seleccionar todas</button>
+        {% if resultado.parciales|length > 1 %}
+        <form method="post" action="{{ url_for('parcial_lineas_mover_masivo') }}" class="d-flex align-items-center gap-2 form-mover-parcial" data-parcial="{{ parcial.id }}">
+          <select class="form-select form-select-sm" name="destino_parcial_id" style="width:auto;">
+            {% for pr2 in resultado.parciales %}
+              {% if pr2.parcial.id != parcial.id %}
+              <option value="{{ pr2.parcial.id }}">Mover a: {{ pr2.parcial.referencia or pr2.parcial.numero_parcial or ('Parcial ' ~ loop.index) }}</option>
+              {% endif %}
+            {% endfor %}
+          </select>
+          <button type="submit" class="btn btn-sm btn-outline-primary">Mover seleccionadas</button>
+        </form>
+        {% endif %}
+      </div>
+
+      <div class="table-responsive tabla-scroll">
+        <table class="table table-sm align-middle mb-0 tabla-costeo">
+          <thead>
+            <tr>
+              <th style="width:30px;"></th>
+              <th data-sort="text">Código</th>
+              <th data-sort="text">Descripción</th>
+              <th data-sort="text">Lote</th>
+              <th data-sort="num">Cant.</th>
+              <th data-sort="num">Valor unit. ({{ imp.moneda_factura }})</th>
+              <th data-sort="num">Total FOB ({{ imp.moneda_factura }})</th>
+              {% if resultado.usa_flete_item %}<th data-sort="num">Flete ({{ imp.moneda_factura }})</th>{% endif %}
+              {% if resultado.usa_seguro_item %}<th data-sort="num">Seguro ({{ imp.moneda_factura }})</th>{% endif %}
+              {% if resultado.usa_otros_items %}<th data-sort="num">Otros ítems ({{ imp.moneda_factura }})</th>{% endif %}
+              <th data-sort="num">CIF (CLP)</th>
+              {% if pr.usa_flete_gasto %}<th data-sort="num">Flete Int. (CLP)</th>{% endif %}
+              {% if pr.usa_derechos %}<th data-sort="num">Derechos (CLP)</th>{% endif %}
+              <th data-sort="num">Gastos (CLP)</th>
+              <th data-sort="num">Costo total (CLP)</th>
+              <th data-sort="num">Costo unit. (CLP)</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for info in pr.lineas %}
+            {% set l = info.linea %}
+            <tr>
+              <td><input type="checkbox" class="check-linea-parcial" data-parcial="{{ parcial.id }}" value="{{ l.id }}"></td>
+              <td>{{ l.codigo }}</td>
+              <td style="max-width:220px;">{{ l.descripcion }}</td>
+              <td>
+                {% if l.lotes|length > 1 %}
+                <a class="link-lotes" data-bs-toggle="collapse" href="#lotes-{{ l.id }}" role="button" aria-expanded="false">
+                  <i class="bi bi-caret-down-fill"></i> {{ l.lotes|length }} lotes
+                </a>
+                <div class="collapse small mt-1" id="lotes-{{ l.id }}">
+                  <ul class="list-unstyled mb-0 ps-0">
+                    {% for lo in l.lotes %}
+                    <li>{{ lo.codigo_lote or '(sin código)' }} — {{ lo.fecha_vencimiento.strftime('%d-%m-%Y') if lo.fecha_vencimiento else 'sin fecha' }} · {{ lo.cantidad_unidades }} un.</li>
+                    {% endfor %}
+                  </ul>
+                </div>
+                {% elif l.lotes|length == 1 %}
+                {{ l.lotes[0].codigo_lote or '-' }}{% if l.lotes[0].fecha_vencimiento %} <span class="text-muted small">({{ l.lotes[0].fecha_vencimiento.strftime('%d-%m-%Y') }})</span>{% endif %}
+                {% else %}
+                {{ l.codigo_lote or '-' }}
+                {% endif %}
+              </td>
+              <td class="text-end">{{ l.cantidad_unidades }}</td>
+              <td class="text-end">{{ l.valor_unitario_moneda|moneda }}</td>
+              <td class="text-end">{{ info.valor_total_moneda|moneda }}</td>
+              {% if resultado.usa_flete_item %}<td class="text-end">{{ (info.flete_moneda if imp.moneda_factura != 'USD' else info.flete_usd)|moneda }}</td>{% endif %}
+              {% if resultado.usa_seguro_item %}<td class="text-end">{{ (info.seguro_moneda if imp.moneda_factura != 'USD' else info.seguro_usd)|moneda }}</td>{% endif %}
+              {% if resultado.usa_otros_items %}<td class="text-end">{{ (info.otros_items_moneda if imp.moneda_factura != 'USD' else info.otros_items_usd)|moneda }}</td>{% endif %}
+              <td class="text-end">{{ info.cif_clp|clp }}</td>
+              {% if pr.usa_flete_gasto %}<td class="text-end">{{ info.flete_gasto_clp|clp }}</td>{% endif %}
+              {% if pr.usa_derechos %}<td class="text-end">{{ info.derechos_clp|clp }}</td>{% endif %}
+              <td class="text-end">{{ (info.otros_gastos_clp if (pr.usa_flete_gasto or pr.usa_derechos) else info.gastos_clp)|clp }}</td>
+              <td class="text-end fw-bold">{{ info.costo_total_clp|clp }}</td>
+              <td class="text-end">{{ info.costo_unitario_clp|clp }}</td>
+              <td class="text-end">
+                <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarLinea{{ l.id }}">Editar</button>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="17" class="text-center text-muted py-3">Sin productos en este parcial.</td></tr>
+            {% endfor %}
+          </tbody>
+          {% if pr.lineas %}
+          <tfoot>
+            <tr class="table-light fw-bold">
+              <td colspan="6" class="text-end">Subtotal parcial:</td>
+              <td class="text-end">{{ pr.fob_moneda|moneda }}</td>
+              {% if resultado.usa_flete_item %}<td class="text-end">{{ (pr.flete_moneda if imp.moneda_factura != 'USD' else pr.flete_usd)|moneda }}</td>{% endif %}
+              {% if resultado.usa_seguro_item %}<td class="text-end">{{ (pr.seguro_moneda if imp.moneda_factura != 'USD' else pr.seguro_usd)|moneda }}</td>{% endif %}
+              {% if resultado.usa_otros_items %}<td class="text-end">{{ (pr.otros_items_moneda if imp.moneda_factura != 'USD' else pr.otros_items_usd)|moneda }}</td>{% endif %}
+              <td class="text-end">{{ pr.cif_clp|clp }}</td>
+              {% if pr.usa_flete_gasto %}<td class="text-end">{{ pr.flete_gasto_clp|clp }}</td>{% endif %}
+              {% if pr.usa_derechos %}<td class="text-end">{{ pr.derechos_clp|clp }}</td>{% endif %}
+              <td class="text-end">{{ (pr.otros_gastos_clp if (pr.usa_flete_gasto or pr.usa_derechos) else pr.gastos_clp)|clp }}</td>
+              <td class="text-end">{{ pr.costo_total_clp|clp }}</td>
+              <td class="text-end"></td>
+              <td></td>
+            </tr>
+          </tfoot>
+          {% endif %}
+        </table>
+      </div>
+    </div>
+  </div>
+  {% else %}
+  <div class="alert alert-light border">Agrega un parcial para empezar a cargar productos.</div>
+  {% endfor %}
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-lg-6">
+    <div class="card p-3 h-100 panel-gastos-compacto">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h5 class="section-title mb-0">Flete, Seguro y otros ítems de la factura</h5>
+        <div class="d-flex gap-1 align-items-center">
+          <button class="btn btn-sm btn-brand" data-bs-toggle="modal" data-bs-target="#modalNuevoCargo">+ Agregar ítem</button>
+          <div class="dropdown">
+            <button class="btn btn-sm btn-outline-secondary btn-engranaje" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="Opciones">
+              <i class="bi bi-gear-fill"></i>
+            </button>
+            <ul class="dropdown-menu dropdown-menu-end">
+              <li><button class="dropdown-item" type="button" data-modo-cargo="editar">Editar</button></li>
+              <li><button class="dropdown-item text-danger" type="button" data-modo-cargo="eliminar">Eliminar</button></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="alert alert-secondary py-1 px-2 small d-none mb-2 d-flex align-items-center justify-content-between" id="barraModoCargo">
+        <span id="textoModoCargo"></span>
+        <span class="text-nowrap">
+          <button type="button" class="btn btn-sm btn-outline-danger d-none" id="btnEliminarSeleccionCargo">Eliminar seleccionados</button>
+          <button type="button" class="btn btn-sm btn-link" id="btnCancelarModoCargo">Cancelar</button>
+        </span>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0" id="tablaCargos">
+          <thead>
+            <tr>
+              <th class="col-check-cargo" style="display:none;"></th>
+              <th>Concepto</th>
+              <th>Referencia</th>
+              <th class="text-end">Monto</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for c in imp.cargos_adicionales %}
+            <tr>
+              <td class="col-check-cargo" style="display:none;">
+                <input type="checkbox" class="form-check-input check-cargo" value="{{ c.id }}" data-editar="#modalEditarCargo{{ c.id }}">
+              </td>
+              <td>{{ c.concepto }}</td>
+              <td>{{ c.referencia or '-' }}</td>
+              <td class="text-end">
+                {{ c.monto_moneda|moneda }} {{ c.moneda }}
+                {% if c.moneda != 'USD' %}<div class="text-muted small">≈ {{ c.monto_usd|moneda }} USD · T/C {{ c.tipo_cambio|moneda(4) }}</div>{% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-center text-muted py-3">Sin ítems cargados (Flete, Seguro, Handling Fee, etc.).</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card p-3 h-100 panel-gastos-compacto">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h5 class="section-title mb-0">Gastos compartidos del embarque</h5>
+        <div class="d-flex gap-1 align-items-center">
+          <button class="btn btn-sm btn-brand" data-bs-toggle="modal" data-bs-target="#modalNuevoGasto">+ Agregar gasto</button>
+          <div class="dropdown">
+            <button class="btn btn-sm btn-outline-secondary btn-engranaje" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="Opciones">
+              <i class="bi bi-gear-fill"></i>
+            </button>
+            <ul class="dropdown-menu dropdown-menu-end">
+              <li><h6 class="dropdown-header-adjuntar mb-0">Adjuntar</h6></li>
+              <li><button class="dropdown-item dropdown-item-sub" type="button" data-bs-toggle="modal" data-bs-target="#modalLegajo">Legajo</button></li>
+              <li><button class="dropdown-item dropdown-item-sub" type="button" data-modo-gasto="concepto">Concepto</button></li>
+              <li><hr class="dropdown-divider"></li>
+              <li><button class="dropdown-item" type="button" data-modo-gasto="editar">Editar</button></li>
+              <li><button class="dropdown-item text-danger" type="button" data-modo-gasto="eliminar">Eliminar</button></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="alert alert-secondary py-1 px-2 small d-none mb-2 d-flex align-items-center justify-content-between" id="barraModoGasto">
+        <span id="textoModoGasto"></span>
+        <span class="text-nowrap">
+          <button type="button" class="btn btn-sm btn-outline-danger d-none" id="btnEliminarSeleccionGasto">Eliminar seleccionados</button>
+          <button type="button" class="btn btn-sm btn-link" id="btnCancelarModoGasto">Cancelar</button>
+        </span>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0" id="tablaGastos">
+          <thead>
+            <tr>
+              <th class="col-check-gasto" style="display:none;"></th>
+              <th>Concepto</th>
+              <th>Referencia</th>
+              <th class="text-end">Monto CLP</th>
+              <th>Aplica a</th>
+              <th class="text-center">Docs</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for g in imp.gastos %}
+            <tr>
+              <td class="col-check-gasto" style="display:none;">
+                <input type="checkbox" class="form-check-input check-gasto" value="{{ g.id }}" data-editar="#modalEditarGasto{{ g.id }}" data-docs="#modalDocsGasto{{ g.id }}">
+              </td>
+              <td>{{ g.concepto }}</td>
+              <td>{{ g.referencia or '-' }}</td>
+              <td class="text-end">
+                {{ g.monto_clp|clp }} CLP
+                {% if g.moneda != 'CLP' %}<div class="text-muted small">{{ g.monto_original|moneda }} {{ g.moneda }} · T/C {{ g.tipo_cambio|moneda(4) }}</div>{% endif %}
+              </td>
+              <td>
+                {% if g.parciales_aplicables %}
+                  {% for p in g.parciales_aplicables %}<span class="badge bg-secondary">{{ p.referencia or p.numero_parcial or ('Parcial ' ~ p.id) }}</span>{% endfor %}
+                {% else %}
+                  <span class="badge bg-info text-dark">Todos los parciales</span>
+                {% endif %}
+              </td>
+              <td class="text-center">
+                {% if g.documentos.count() %}
+                <button type="button" class="btn btn-sm btn-link p-0" data-bs-toggle="modal" data-bs-target="#modalDocsGasto{{ g.id }}" title="Documentos adjuntos">
+                  <i class="bi bi-paperclip"></i> {{ g.documentos.count() }}
+                </button>
+                {% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-center text-muted py-3">Sin gastos compartidos cargados.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Formularios ocultos para eliminacion multiple (ronda I): el JS de mas
+     abajo inyecta los ids seleccionados como inputs hidden antes de
+     enviarlos. -->
+<form id="formEliminarCargosMultiple" method="post" action="{{ url_for('cargos_eliminar_multiple', importacion_id=imp.id) }}" class="d-none"></form>
+<form id="formEliminarGastosMultiple" method="post" action="{{ url_for('gastos_eliminar_multiple', importacion_id=imp.id) }}" class="d-none"></form>
+
+<!-- Modal: editar importacion -->
+<div class="modal fade" id="modalEditarImportacion" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('importaciones_editar', importacion_id=imp.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar importación</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6"><label class="form-label">N° Factura</label><input class="form-control" name="numero_factura" value="{{ imp.numero_factura or '' }}"></div>
+          <div class="col-6"><label class="form-label">Fecha factura</label><input type="date" class="form-control" name="fecha_factura" value="{{ imp.fecha_factura or '' }}"></div>
+          <div class="col-6"><label class="form-label">Moneda factura</label>
+            <select class="form-select" name="moneda_factura">
+              {% for m in ['EURO','USD','CLP'] %}<option value="{{ m }}" {% if imp.moneda_factura==m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6">
+            <label class="form-label">Mes de la operación (autocompleta T/C)</label>
+            <select class="form-select" id="selMesOperacionEditar">
+              <option value="">— Elegir mes cargado en Configuración —</option>
+              {% for tc in tipos_cambio %}
+              <option value="{{ tc.id }}" data-aduanero="{{ tc.tc_aduanero }}" data-paridad="{{ tc.paridad_eur_usd }}">{{ tc.nombre_mes }} {{ tc.anio }}</option>
+              {% endfor %}
+            </select>
+            <div class="form-text">La factura puede ser de un mes y la internación/recepción de otro — elige acá el mes cuyo tipo de cambio corresponde a esta operación. Sigue siendo editable después.</div>
+          </div>
+          <div class="col-6"><label class="form-label">TC aduanero (CLP/USD)</label><input type="number" step="0.01" class="form-control" id="campoTcAduaneroEditar" name="tipo_cambio_aduanero" value="{{ imp.tipo_cambio_aduanero }}"></div>
+          <div class="col-6"><label class="form-label">TC moneda factura / USD</label><input type="number" step="0.0001" class="form-control" id="campoTcMonedaEditar" name="tipo_cambio_moneda_usd" value="{{ imp.tipo_cambio_moneda_usd }}"></div>
+          <div class="col-6">
+            <label class="form-label">Condición de compra</label>
+            <select class="form-select" name="condicion_compra">
+              {% for c in condiciones %}<option value="{{ c }}" {% if imp.condicion_compra==c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+            </select>
+            <div class="form-text">Solo informativo — el Incoterm pactado con el proveedor.</div>
+          </div>
+          <div class="col-6"></div>
+          <div class="col-12">
+            <div class="form-text mt-0">
+              Flete, Seguro, Handling Fee y otros ítems de la factura se cargan en la sección
+              "Flete, Seguro y otros ítems de la factura" de esta pantalla, no acá.
+            </div>
+          </div>
+          <div class="col-12"><label class="form-label">Notas</label><textarea class="form-control" name="notas" rows="2">{{ imp.notas or '' }}</textarea></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: nuevo parcial -->
+<div class="modal fade" id="modalNuevoParcial" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('parciales_nuevo', importacion_id=imp.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Agregar parcial</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6"><label class="form-label">Referencia (nombre de la pestaña)</label><input class="form-control" name="referencia" placeholder="Ej: Parcial 1"></div>
+          <div class="col-6"><label class="form-label">N° Parcial / DIN</label><input class="form-control" name="numero_parcial"></div>
+          <div class="col-6"><label class="form-label">Régimen (informativo)</label>
+            <select class="form-select" name="tipo_regimen">
+              {% for r in regimenes.keys() %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6"><label class="form-label">Vía</label>
+            <select class="form-select" name="via_embarque">
+              {% for v in vias %}<option value="{{ v }}">{{ v }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-12"><label class="form-label">Notas</label><textarea class="form-control" name="notas" rows="2"></textarea></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: nuevo gasto -->
+<div class="modal fade" id="modalNuevoGasto" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('gastos_nuevo', importacion_id=imp.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Agregar gasto compartido</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6">
+            <label class="form-label">Concepto *</label>
+            <select class="form-select" name="concepto" required>
+              {% for c in conceptos_gasto %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6"></div>
+          <div class="col-4">
+            <label class="form-label">Moneda *</label>
+            <select class="form-select campo-moneda-gasto" name="moneda" required>
+              <option value="CLP" selected>CLP</option>
+              <option value="USD">USD</option>
+              <option value="EURO">EURO</option>
+            </select>
+          </div>
+          <div class="col-4"><label class="form-label">Monto *</label><input type="number" step="0.01" class="form-control" name="monto_original" required></div>
+          <div class="col-4 campo-tc-gasto" style="display:none;"><label class="form-label">T/C a CLP</label><input type="number" step="0.01" class="form-control" name="tipo_cambio"></div>
+          <div class="col-12"><label class="form-label">Referencia</label><input class="form-control" name="referencia" placeholder="Ej: FC 40796 AGUNSA ALMACENES"></div>
+          <div class="col-12">
+            <label class="form-label">Aplica a</label>
+            <div class="form-text mb-1">Si no marcas ninguno, se prorratea entre TODOS los parciales.</div>
+            {% for pr in resultado.parciales %}
+            <div class="form-check">
+              <input type="checkbox" class="form-check-input" name="parcial_ids" value="{{ pr.parcial.id }}" id="gastoNuevoParcial{{ pr.parcial.id }}">
+              <label class="form-check-label" for="gastoNuevoParcial{{ pr.parcial.id }}">{{ pr.parcial.referencia or pr.parcial.numero_parcial or ('Parcial ' ~ pr.parcial.id) }}</label>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Legajo -- archivo consolidado de todas las facturas/documentos
+     de esta importacion (ronda H, punto 3, opcion "Adjuntar > Legajo"). Se
+     abre desde el menu de engranaje de cualquier fila de Gastos compartidos,
+     por eso es un solo modal (no uno por gasto). -->
+<div class="modal fade" id="modalLegajo" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">Legajo — archivo consolidado de la importación</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body">
+        {% if imp.legajos.count() %}
+        <ul class="list-group mb-3">
+          {% for doc in imp.legajos %}
+          <li class="list-group-item d-flex justify-content-between align-items-center">
+            <div>
+              <a href="{{ url_for('importacion_legajo_ver', importacion_id=imp.id, doc_id=doc.id) }}" target="_blank">{{ doc.nombre_original }}</a>
+              {% if doc.descripcion %}<div class="text-muted small">{{ doc.descripcion }}</div>{% endif %}
+            </div>
+            <div class="text-nowrap">
+              <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('importacion_legajo_descargar', importacion_id=imp.id, doc_id=doc.id) }}">Descargar</a>
+              <form method="post" action="{{ url_for('importacion_legajo_eliminar', importacion_id=imp.id, doc_id=doc.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar este documento?');">
+                <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+              </form>
+            </div>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-muted small">Sin legajo adjunto todavía.</p>
+        {% endif %}
+        <form method="post" action="{{ url_for('importacion_legajo_subir', importacion_id=imp.id) }}" enctype="multipart/form-data" class="row g-2">
+          <div class="col-12">
+            <label class="form-label small">Descripción (opcional)</label>
+            <input class="form-control form-control-sm" name="descripcion" placeholder="Ej: Facturas completas del embarque">
+          </div>
+          <div class="col-12">
+            <label class="form-label small">Archivo (PDF, Word, Excel o imagen)</label>
+            <input type="file" class="form-control form-control-sm" name="archivo" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png" required>
+          </div>
+          <div class="col-12"><button type="submit" class="btn btn-sm btn-brand">Subir documento</button></div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: nuevo item de factura (Flete/Seguro/Handling Fee/Otros) -->
+<div class="modal fade" id="modalNuevoCargo" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('cargos_nuevo', importacion_id=imp.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Agregar ítem de la factura</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6">
+            <label class="form-label">Concepto *</label>
+            <select class="form-select" name="concepto" required>
+              {% for c in conceptos_item_factura %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6"></div>
+          <div class="col-4">
+            <label class="form-label">Moneda *</label>
+            <select class="form-select campo-moneda-cargo" name="moneda" required>
+              {% for m in ['EURO','USD','CLP'] %}<option value="{{ m }}" {% if m==imp.moneda_factura %}selected{% endif %}>{{ m }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-4"><label class="form-label">Monto *</label><input type="number" step="0.01" class="form-control" name="monto_moneda" required></div>
+          <div class="col-4 campo-tc-cargo"><label class="form-label">Unid. por 1 USD</label><input type="number" step="0.0001" class="form-control" name="tipo_cambio" value="{{ imp.tipo_cambio_moneda_usd }}"></div>
+          <div class="col-12"><label class="form-label">Referencia</label><input class="form-control" name="referencia" placeholder="Ej: Línea 24 de la Invoice"></div>
+          <div class="col-12">
+            <div class="form-text mt-0">
+              Monto = <strong>total de la factura completa</strong> para este concepto (no el de un parcial
+              en particular). Por defecto se precarga en la moneda de la factura ({{ imp.moneda_factura }}) —
+              cámbiala solo si este ítem puntual lo paga otro proveedor en otra moneda.
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% for c in imp.cargos_adicionales %}
+<!-- Modal: editar item de factura -->
+<div class="modal fade" id="modalEditarCargo{{ c.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('cargos_editar', cargo_id=c.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar ítem de la factura</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6">
+            <label class="form-label">Concepto</label>
+            <select class="form-select" name="concepto" required>
+              {% if c.concepto not in conceptos_item_factura %}
+              <option value="{{ c.concepto }}" selected>{{ c.concepto }} (anterior)</option>
+              {% endif %}
+              {% for co in conceptos_item_factura %}<option value="{{ co }}" {% if c.concepto==co %}selected{% endif %}>{{ co }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6"></div>
+          <div class="col-4">
+            <label class="form-label">Moneda</label>
+            <select class="form-select campo-moneda-cargo" name="moneda" required>
+              {% for m in ['EURO','USD','CLP'] %}<option value="{{ m }}" {% if c.moneda==m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-4"><label class="form-label">Monto</label><input type="number" step="0.01" class="form-control" name="monto_moneda" value="{{ c.monto_moneda }}"></div>
+          <div class="col-4 campo-tc-cargo"><label class="form-label">Unid. por 1 USD</label><input type="number" step="0.0001" class="form-control" name="tipo_cambio" value="{{ c.tipo_cambio }}"></div>
+          <div class="col-12"><label class="form-label">Referencia</label><input class="form-control" name="referencia" value="{{ c.referencia or '' }}"></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% for pr in resultado.parciales %}
+{% set parcial = pr.parcial %}
+<!-- Modal: editar parcial -->
+<div class="modal fade" id="modalEditarParcial{{ parcial.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('parciales_editar', parcial_id=parcial.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar parcial</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6"><label class="form-label">Referencia (nombre de la pestaña)</label><input class="form-control" name="referencia" value="{{ parcial.referencia or '' }}"></div>
+          <div class="col-6"><label class="form-label">N° Parcial / DIN</label><input class="form-control" name="numero_parcial" value="{{ parcial.numero_parcial or '' }}"></div>
+          <div class="col-6"><label class="form-label">Régimen (informativo)</label>
+            <select class="form-select" name="tipo_regimen">
+              {% for r in regimenes.keys() %}<option value="{{ r }}" {% if parcial.tipo_regimen==r %}selected{% endif %}>{{ r }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6"><label class="form-label">Vía</label>
+            <select class="form-select" name="via_embarque">
+              {% for v in vias %}<option value="{{ v }}" {% if parcial.via_embarque==v %}selected{% endif %}>{{ v }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-12"><label class="form-label">Notas</label><textarea class="form-control" name="notas" rows="2">{{ parcial.notas or '' }}</textarea></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: nueva linea para este parcial -->
+<div class="modal fade" id="modalNuevaLinea{{ parcial.id }}" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('parcial_lineas_nueva', parcial_id=parcial.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Agregar producto al parcial {{ parcial.referencia or parcial.numero_parcial or parcial.id }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+          <div class="mb-2">
+            <label class="form-label small">Buscar en el catálogo de {{ imp.proveedor.nombre }} (opcional, autocompleta)</label>
+            <input type="text" class="form-control form-control-sm buscar-catalogo" data-proveedor="{{ imp.proveedor.id }}" data-parcial="{{ parcial.id }}" placeholder="Código o descripción...">
+            <div class="list-group mt-1 resultados-catalogo" data-parcial="{{ parcial.id }}" style="max-height:160px; overflow-y:auto;"></div>
+          </div>
+          <div class="row g-2">
+            <input type="hidden" name="producto_id" class="campo-producto-id">
+            <div class="col-4"><label class="form-label">Código *</label><input class="form-control campo-codigo" name="codigo" required></div>
+            <div class="col-8"><label class="form-label">Descripción *</label><input class="form-control campo-descripcion" name="descripcion" required></div>
+            <div class="col-4"><label class="form-label">Código de lote</label><input class="form-control" name="codigo_lote"></div>
+            <div class="col-4"><label class="form-label">Fecha vencimiento</label><input type="date" class="form-control" name="fecha_vencimiento"></div>
+            <div class="col-4"><label class="form-label">Cantidad (unidades) *</label><input type="number" min="1" step="1" class="form-control" name="cantidad_unidades" required></div>
+            <div class="col-6"><label class="form-label">Valor unitario ({{ imp.moneda_factura }}) *</label><input type="number" step="0.0001" class="form-control campo-precio" name="valor_unitario_moneda" required></div>
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: carga masiva de lotes -->
+<div class="modal fade" id="modalCargaLotes{{ parcial.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('parcial_lotes_cargar', parcial_id=parcial.id) }}" enctype="multipart/form-data">
+        <div class="modal-header"><h5 class="modal-title">Carga de Lotes — {{ parcial.referencia or parcial.numero_parcial or parcial.id }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+          <p class="small text-muted">Sube un archivo .xlsx o .csv con las columnas <strong>Código de Producto</strong>, <strong>Lote</strong> y <strong>Fecha vencimiento</strong> — una fila por cada unidad física. Las cantidades de cada lote se calculan agrupando esas filas, para que siempre cuadren con el total de unidades.</p>
+          <input type="file" class="form-control" name="archivo_lotes" accept=".xlsx,.xls,.csv" required>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Cargar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% for info in resultado.lineas %}
+{% set l = info.linea %}
+<!-- Modal: editar linea -->
+<div class="modal fade" id="modalEditarLinea{{ l.id }}" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">Editar producto: {{ l.codigo }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+      <form id="formLineaImp{{ l.id }}" method="post" action="{{ url_for('parcial_lineas_editar', linea_id=l.id) }}">
+        <div class="modal-body">
+          <div class="row g-2">
+            <div class="col-4"><label class="form-label">Código</label><input class="form-control" name="codigo" value="{{ l.codigo }}" required></div>
+            <div class="col-8"><label class="form-label">Descripción</label><input class="form-control" name="descripcion" value="{{ l.descripcion }}" required></div>
+            <div class="col-4"><label class="form-label">Cantidad total (unidades)</label><input type="number" min="1" step="1" class="form-control campo-cantidad-total" name="cantidad_unidades" value="{{ l.cantidad_unidades }}"></div>
+            <div class="col-8"><label class="form-label">Valor unitario ({{ imp.moneda_factura }})</label><input type="number" step="0.0001" class="form-control" name="valor_unitario_moneda" value="{{ l.valor_unitario_moneda }}"></div>
+          </div>
+          <hr>
+          <div class="d-flex justify-content-between align-items-center mb-1">
+            <label class="form-label mb-0">Lotes</label>
+            <button type="button" class="btn btn-sm btn-outline-success btn-agregar-lote">+ Lote</button>
+          </div>
+          <div class="filas-lotes">
+            {% for lo in l.lotes %}
+            <div class="row g-2 mb-1 align-items-end fila-lote">
+              <div class="col-4"><input class="form-control form-control-sm" name="lote_codigo" placeholder="Código de lote" value="{{ lo.codigo_lote or '' }}"></div>
+              <div class="col-4"><input type="date" class="form-control form-control-sm" name="lote_fecha" value="{{ lo.fecha_vencimiento or '' }}"></div>
+              <div class="col-3"><input type="number" min="0" step="1" class="form-control form-control-sm campo-cantidad-lote" name="lote_cantidad" placeholder="Unidades" value="{{ lo.cantidad_unidades }}"></div>
+              <div class="col-1"><button type="button" class="btn btn-sm btn-outline-danger btn-quitar-lote">&times;</button></div>
+            </div>
+            {% else %}
+            <div class="row g-2 mb-1 align-items-end fila-lote">
+              <div class="col-4"><input class="form-control form-control-sm" name="lote_codigo" placeholder="Código de lote"></div>
+              <div class="col-4"><input type="date" class="form-control form-control-sm" name="lote_fecha"></div>
+              <div class="col-3"><input type="number" min="0" step="1" class="form-control form-control-sm campo-cantidad-lote" name="lote_cantidad" placeholder="Unidades"></div>
+              <div class="col-1"><button type="button" class="btn btn-sm btn-outline-danger btn-quitar-lote">&times;</button></div>
+            </div>
+            {% endfor %}
+          </div>
+          <div class="small texto-suma-lotes mt-1"></div>
+        </div>
+      </form>
+      <div class="modal-footer d-flex justify-content-between">
+        <form method="post" action="{{ url_for('parcial_lineas_eliminar', linea_id=l.id) }}" onsubmit="return confirm('¿Eliminar este producto del costeo?');">
+          <button type="submit" class="btn btn-outline-danger btn-sm">Eliminar</button>
+        </form>
+        <button type="submit" form="formLineaImp{{ l.id }}" class="btn btn-brand">Guardar</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% for g in imp.gastos %}
+<!-- Modal: editar gasto -->
+<div class="modal fade" id="modalEditarGasto{{ g.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('gastos_editar', gasto_id=g.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar gasto</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6">
+            <label class="form-label">Concepto</label>
+            <select class="form-select" name="concepto" required>
+              {% if g.concepto not in conceptos_gasto %}
+              <option value="{{ g.concepto }}" selected>{{ g.concepto }} (anterior)</option>
+              {% endif %}
+              {% for c in conceptos_gasto %}<option value="{{ c }}" {% if g.concepto==c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6"></div>
+          <div class="col-4">
+            <label class="form-label">Moneda</label>
+            <select class="form-select campo-moneda-gasto" name="moneda" required>
+              {% for m in ['CLP', 'USD', 'EURO'] %}<option value="{{ m }}" {% if g.moneda==m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-4"><label class="form-label">Monto</label><input type="number" step="0.01" class="form-control" name="monto_original" value="{{ g.monto_original }}"></div>
+          <div class="col-4 campo-tc-gasto" style="display:{% if g.moneda != 'CLP' %}block{% else %}none{% endif %};"><label class="form-label">T/C a CLP</label><input type="number" step="0.01" class="form-control" name="tipo_cambio" value="{{ g.tipo_cambio }}"></div>
+          <div class="col-12"><label class="form-label">Referencia</label><input class="form-control" name="referencia" value="{{ g.referencia or '' }}"></div>
+          <div class="col-12">
+            <label class="form-label">Aplica a</label>
+            <div class="form-text mb-1">Si no marcas ninguno, se prorratea entre TODOS los parciales.</div>
+            {% for pr in resultado.parciales %}
+            <div class="form-check">
+              <input type="checkbox" class="form-check-input" name="parcial_ids" value="{{ pr.parcial.id }}" id="gastoEditar{{ g.id }}Parcial{{ pr.parcial.id }}"
+                {% if pr.parcial in g.parciales_aplicables %}checked{% endif %}>
+              <label class="form-check-label" for="gastoEditar{{ g.id }}Parcial{{ pr.parcial.id }}">{{ pr.parcial.referencia or pr.parcial.numero_parcial or ('Parcial ' ~ pr.parcial.id) }}</label>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: documentos del gasto (comprobante de pago, factura del agente, etc.) -->
+<div class="modal fade" id="modalDocsGasto{{ g.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">Documentos — {{ g.concepto }} {{ g.referencia or '' }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body">
+        {% if g.documentos.count() %}
+        <ul class="list-group mb-3">
+          {% for doc in g.documentos %}
+          <li class="list-group-item d-flex justify-content-between align-items-center">
+            <div>
+              <a href="{{ url_for('gastos_documento_ver', gasto_id=g.id, doc_id=doc.id) }}" target="_blank">{{ doc.nombre_original }}</a>
+              <div class="text-muted small">{{ doc.tipo }}</div>
+            </div>
+            <div class="text-nowrap">
+              <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('gastos_documento_descargar', gasto_id=g.id, doc_id=doc.id) }}">Descargar</a>
+              <form method="post" action="{{ url_for('gastos_documento_eliminar', gasto_id=g.id, doc_id=doc.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar este documento?');">
+                <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+              </form>
+            </div>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-muted small">Sin documentos adjuntos todavía.</p>
+        {% endif %}
+        <form method="post" action="{{ url_for('gastos_documento_subir', gasto_id=g.id) }}" enctype="multipart/form-data" class="row g-2">
+          <div class="col-6">
+            <label class="form-label small">Tipo</label>
+            <select class="form-select form-select-sm" name="tipo">
+              {% for t in tipos_documento_gasto %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6">
+            <label class="form-label small">Archivo (PDF, Word, Excel o imagen)</label>
+            <input type="file" class="form-control form-control-sm" name="archivo" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png" required>
+          </div>
+          <div class="col-12"><button type="submit" class="btn btn-sm btn-brand">Subir documento</button></div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.buscar-catalogo').forEach(input => {
+  const parcialId = input.dataset.parcial;
+  const proveedorId = input.dataset.proveedor;
+  const resultados = document.querySelector(`.resultados-catalogo[data-parcial="${parcialId}"]`);
+  const modal = input.closest('.modal');
+  const campoProductoId = modal.querySelector('.campo-producto-id');
+  const campoCodigo = modal.querySelector('.campo-codigo');
+  const campoDescripcion = modal.querySelector('.campo-descripcion');
+  const campoPrecio = modal.querySelector('.campo-precio');
+
+  let debounce;
+  input.addEventListener('input', () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(async () => {
+      if (!input.value) { resultados.innerHTML = ''; return; }
+      const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(input.value)}`);
+      const productos = await resp.json();
+      resultados.innerHTML = '';
+      productos.slice(0, 15).forEach(p => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'list-group-item list-group-item-action py-1 small';
+        item.textContent = `${p.codigo} — ${p.descripcion}`;
+        item.addEventListener('click', () => {
+          campoProductoId.value = p.id;
+          campoCodigo.value = p.codigo;
+          campoDescripcion.value = p.descripcion;
+          campoPrecio.value = p.precio_unitario;
+          resultados.innerHTML = '';
+          input.value = '';
+        });
+        resultados.appendChild(item);
+      });
+    }, 300);
+  });
+});
+
+function actualizarContadorParcial(parcialId) {
+  const n = document.querySelectorAll(`.check-linea-parcial[data-parcial="${parcialId}"]:checked`).length;
+  const el = document.querySelector(`.contador-sel[data-parcial="${parcialId}"]`);
+  if (el) el.textContent = n + (n === 1 ? ' seleccionada' : ' seleccionadas');
+}
+
+document.querySelectorAll('.check-linea-parcial').forEach(cb => {
+  cb.addEventListener('change', () => actualizarContadorParcial(cb.dataset.parcial));
+});
+
+document.querySelectorAll('.btn-seleccionar-todas').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const parcialId = btn.dataset.parcial;
+    const boxes = document.querySelectorAll(`.check-linea-parcial[data-parcial="${parcialId}"]`);
+    const marcar = ![...boxes].every(b => b.checked);
+    boxes.forEach(b => b.checked = marcar);
+    actualizarContadorParcial(parcialId);
+  });
+});
+
+document.querySelectorAll('.campo-moneda-gasto').forEach(sel => {
+  const modal = sel.closest('.modal');
+  const campoTc = modal.querySelector('.campo-tc-gasto');
+  function actualizar() {
+    campoTc.style.display = (sel.value === 'CLP') ? 'none' : '';
+  }
+  sel.addEventListener('change', actualizar);
+  actualizar();
+});
+
+// Items de factura (Flete/Seguro/Handling Fee/Otros): el campo "Unid. por
+// 1 USD" solo aplica si la moneda del item no es USD (si es USD, monto ya
+// esta en USD, no hay que convertir).
+document.querySelectorAll('.campo-moneda-cargo').forEach(sel => {
+  const modal = sel.closest('.modal');
+  const campoTc = modal.querySelector('.campo-tc-cargo');
+  function actualizar() {
+    campoTc.style.display = (sel.value === 'USD') ? 'none' : '';
+  }
+  sel.addEventListener('change', actualizar);
+  actualizar();
+});
+
+// Editar importacion: elegir el mes de la operacion autocompleta el T/C
+// aduanero y la paridad desde Configuracion, pero los campos siguen
+// editables despues (punto 4, 2026-09-01).
+(function() {
+  const selMes = document.getElementById('selMesOperacionEditar');
+  if (!selMes) return;
+  const campoAduanero = document.getElementById('campoTcAduaneroEditar');
+  const campoParidad = document.getElementById('campoTcMonedaEditar');
+  selMes.addEventListener('change', () => {
+    const opt = selMes.selectedOptions[0];
+    if (!opt || !opt.value) return;
+    if (opt.dataset.aduanero) campoAduanero.value = opt.dataset.aduanero;
+    if (opt.dataset.paridad) campoParidad.value = opt.dataset.paridad;
+  });
+})();
+
+document.querySelectorAll('.form-mover-parcial').forEach(form => {
+  form.addEventListener('submit', (e) => {
+    const parcialId = form.dataset.parcial;
+    form.querySelectorAll('input[name="linea_ids"]').forEach(el => el.remove());
+    const seleccionadas = document.querySelectorAll(`.check-linea-parcial[data-parcial="${parcialId}"]:checked`);
+    if (seleccionadas.length === 0) {
+      alert('Selecciona al menos un producto de este parcial antes de moverlo.');
+      e.preventDefault();
+      return;
+    }
+    seleccionadas.forEach(b => {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'linea_ids';
+      input.value = b.value;
+      form.appendChild(input);
+    });
+  });
+});
+
+// Ordenar la tabla de productos costeados al hacer clic en un encabezado
+// (ronda G, punto 5). Cada tabla de parcial se ordena de forma
+// independiente; el orden es solo visual (no cambia los subtotales, que
+// son agregados y no dependen del orden de las filas).
+document.querySelectorAll('.tabla-costeo').forEach(table => {
+  const thead = table.querySelector('thead');
+  const tbody = table.querySelector('tbody');
+  if (!thead || !tbody) return;
+  thead.querySelectorAll('th[data-sort]').forEach(th => {
+    th.addEventListener('click', () => {
+      const idx = Array.prototype.indexOf.call(th.parentNode.children, th);
+      const tipo = th.dataset.sort;
+      const dirNueva = th.classList.contains('sort-asc') ? 'desc' : 'asc';
+      thead.querySelectorAll('th[data-sort]').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+      th.classList.add(dirNueva === 'asc' ? 'sort-asc' : 'sort-desc');
+      const filas = Array.from(tbody.querySelectorAll('tr')).filter(tr => tr.children.length > 1);
+      filas.sort((a, b) => {
+        const ta = a.children[idx] ? a.children[idx].textContent.trim() : '';
+        const tb = b.children[idx] ? b.children[idx].textContent.trim() : '';
+        let va, vb;
+        if (tipo === 'num') {
+          va = parseFloat(ta.replace(/\./g, '').replace(',', '.')) || 0;
+          vb = parseFloat(tb.replace(/\./g, '').replace(',', '.')) || 0;
+        } else {
+          va = ta.toLowerCase();
+          vb = tb.toLowerCase();
+        }
+        if (va < vb) return dirNueva === 'asc' ? -1 : 1;
+        if (va > vb) return dirNueva === 'asc' ? 1 : -1;
+        return 0;
+      });
+      filas.forEach(tr => tbody.appendChild(tr));
+    });
+  });
+});
+
+// Menu de engranaje UNICO por panel (ronda I, 2026-09-01), en vez de uno
+// por fila (ronda H): las opciones del engranaje ("Editar", "Eliminar", y
+// en Gastos tambien "Adjuntar > Concepto") activan una columna de
+// checkboxes que esta oculta por defecto. En modo "Editar" (o "Concepto"
+// en Gastos) basta marcar UNA fila para que se abra directo el modal
+// correspondiente (no hace falta un boton de confirmar aparte). En modo
+// "Eliminar" se puede marcar mas de una fila y aparece un boton "Eliminar
+// seleccionados" que junta los ids marcados en un form oculto y lo envia.
+function crearPanelSeleccion(opts) {
+  const tabla = document.querySelector(opts.tabla);
+  if (!tabla) return;
+  const barra = document.getElementById(opts.barraId);
+  const texto = document.getElementById(opts.textoId);
+  const btnEliminar = opts.btnEliminarId ? document.getElementById(opts.btnEliminarId) : null;
+  const btnCancelar = document.getElementById(opts.btnCancelarId);
+  let modo = null;
+
+  function checks() { return tabla.querySelectorAll(opts.checkSelector); }
+  function cols() { return tabla.querySelectorAll(opts.colSelector); }
+
+  function salir() {
+    modo = null;
+    cols().forEach(c => { c.style.display = 'none'; });
+    checks().forEach(c => { c.checked = false; });
+    barra.classList.add('d-none');
+    if (btnEliminar) btnEliminar.classList.add('d-none');
+  }
+
+  function entrar(m) {
+    modo = m;
+    cols().forEach(c => { c.style.display = ''; });
+    checks().forEach(c => { c.checked = false; });
+    barra.classList.remove('d-none');
+    texto.textContent = opts.textos[m] || '';
+    if (btnEliminar) btnEliminar.classList.toggle('d-none', m !== 'eliminar');
+  }
+
+  (opts.triggers || []).forEach(t => {
+    document.querySelectorAll(t.selector).forEach(btn => {
+      btn.addEventListener('click', () => entrar(t.modo));
+    });
+  });
+
+  if (btnCancelar) btnCancelar.addEventListener('click', salir);
+
+  tabla.addEventListener('change', (e) => {
+    const chk = e.target.closest(opts.checkSelector);
+    if (!chk || !chk.checked) return;
+    if (modo === 'eliminar') return; // multi-seleccion, no hace nada hasta el boton
+    const attr = opts.modoAttrMap[modo];
+    const destino = attr ? chk.dataset[attr] : null;
+    if (destino) {
+      const modalEl = document.querySelector(destino);
+      if (modalEl && window.bootstrap) new bootstrap.Modal(modalEl).show();
+    }
+    salir();
+  });
+
+  if (btnEliminar) {
+    btnEliminar.addEventListener('click', () => {
+      const ids = Array.from(checks()).filter(c => c.checked).map(c => c.value);
+      if (ids.length === 0) { alert('Selecciona al menos un elemento.'); return; }
+      if (!confirm(opts.confirmEliminar(ids.length))) return;
+      const form = document.getElementById(opts.eliminarFormId);
+      form.querySelectorAll(`input[name="${opts.eliminarFieldName}"]`).forEach(el => el.remove());
+      ids.forEach(id => {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = opts.eliminarFieldName;
+        input.value = id;
+        form.appendChild(input);
+      });
+      form.submit();
+    });
+  }
+}
+
+crearPanelSeleccion({
+  tabla: '#tablaCargos',
+  checkSelector: '.check-cargo',
+  colSelector: '.col-check-cargo',
+  barraId: 'barraModoCargo',
+  textoId: 'textoModoCargo',
+  btnEliminarId: 'btnEliminarSeleccionCargo',
+  btnCancelarId: 'btnCancelarModoCargo',
+  triggers: [
+    { selector: '[data-modo-cargo="editar"]', modo: 'editar' },
+    { selector: '[data-modo-cargo="eliminar"]', modo: 'eliminar' },
+  ],
+  modoAttrMap: { editar: 'editar' },
+  textos: {
+    editar: 'Marca el ítem que quieres editar.',
+    eliminar: 'Marca uno o más ítems y elimínalos.',
+  },
+  eliminarFormId: 'formEliminarCargosMultiple',
+  eliminarFieldName: 'cargo_ids',
+  confirmEliminar: (n) => `¿Eliminar ${n} ítem(s) seleccionados?`,
+});
+
+crearPanelSeleccion({
+  tabla: '#tablaGastos',
+  checkSelector: '.check-gasto',
+  colSelector: '.col-check-gasto',
+  barraId: 'barraModoGasto',
+  textoId: 'textoModoGasto',
+  btnEliminarId: 'btnEliminarSeleccionGasto',
+  btnCancelarId: 'btnCancelarModoGasto',
+  triggers: [
+    { selector: '[data-modo-gasto="editar"]', modo: 'editar' },
+    { selector: '[data-modo-gasto="eliminar"]', modo: 'eliminar' },
+    { selector: '[data-modo-gasto="concepto"]', modo: 'concepto' },
+  ],
+  modoAttrMap: { editar: 'editar', concepto: 'docs' },
+  textos: {
+    editar: 'Marca el gasto que quieres editar.',
+    eliminar: 'Marca uno o más gastos y elimínalos.',
+    concepto: 'Marca el gasto al que quieres adjuntar un documento.',
+  },
+  eliminarFormId: 'formEliminarGastosMultiple',
+  eliminarFieldName: 'gasto_ids',
+  confirmEliminar: (n) => `¿Eliminar ${n} gasto(s) seleccionados?`,
+});
+
+// Ronda J, punto 1: al enviar cualquier formulario de esta página la
+// pantalla recarga desde arriba, cortando la continuidad de lo que se
+// estaba haciendo más abajo (editar/eliminar en los paneles). Guardamos la
+// posición del scroll justo antes de enviar y la restauramos al volver a
+// cargar la página, mientras se siga en la misma URL (pathname).
+(function () {
+  const clave = 'scrollPos:' + window.location.pathname;
+  document.addEventListener('submit', function (e) {
+    if (e.defaultPrevented) return; // ej. un confirm() cancelado
+    try { sessionStorage.setItem(clave, String(window.scrollY)); } catch (err) {}
+  });
+  try {
+    const guardada = sessionStorage.getItem(clave);
+    if (guardada !== null) {
+      sessionStorage.removeItem(clave);
+      requestAnimationFrame(function () {
+        window.scrollTo(0, parseInt(guardada, 10) || 0);
+      });
+    }
+  } catch (err) {}
+})();
+
+// Ronda J, punto 2: filas de lotes dinámicas en el modal "Editar producto"
+// (botón + para agregar, x para quitar) con validación suave (no bloquea
+// el guardado) comparando la suma de unidades por lote contra el total.
+function actualizarSumaLotes(modalContent) {
+  if (!modalContent) return;
+  const campoTotal = modalContent.querySelector('.campo-cantidad-total');
+  const camposLote = modalContent.querySelectorAll('.campo-cantidad-lote');
+  const texto = modalContent.querySelector('.texto-suma-lotes');
+  if (!texto || !camposLote.length) { if (texto) texto.textContent = ''; return; }
+  const total = parseFloat((campoTotal && campoTotal.value) || '0') || 0;
+  let suma = 0;
+  camposLote.forEach(inp => { suma += parseFloat(inp.value || '0') || 0; });
+  texto.textContent = `Suma de lotes: ${suma} de ${total} unidades en total`;
+  texto.classList.toggle('text-danger', suma !== total);
+  texto.classList.toggle('text-success', suma === total);
+}
+
+document.addEventListener('click', function (e) {
+  const btnAgregar = e.target.closest('.btn-agregar-lote');
+  if (btnAgregar) {
+    const modalContent = btnAgregar.closest('.modal-content');
+    const contenedor = modalContent.querySelector('.filas-lotes');
+    const filaModelo = contenedor.querySelector('.fila-lote');
+    if (filaModelo) {
+      const nueva = filaModelo.cloneNode(true);
+      nueva.querySelectorAll('input').forEach(inp => { inp.value = ''; });
+      contenedor.appendChild(nueva);
+      actualizarSumaLotes(modalContent);
+    }
+    return;
+  }
+  const btnQuitar = e.target.closest('.btn-quitar-lote');
+  if (btnQuitar) {
+    const modalContent = btnQuitar.closest('.modal-content');
+    const contenedor = modalContent.querySelector('.filas-lotes');
+    const filas = contenedor.querySelectorAll('.fila-lote');
+    const fila = btnQuitar.closest('.fila-lote');
+    if (filas.length > 1) {
+      fila.remove();
+    } else {
+      fila.querySelectorAll('input').forEach(inp => { inp.value = ''; });
+    }
+    actualizarSumaLotes(modalContent);
+  }
+});
+
+document.addEventListener('input', function (e) {
+  if (e.target.classList.contains('campo-cantidad-lote') || e.target.classList.contains('campo-cantidad-total')) {
+    actualizarSumaLotes(e.target.closest('.modal-content'));
+  }
+});
+
+document.addEventListener('shown.bs.modal', function (e) {
+  actualizarSumaLotes(e.target.querySelector('.modal-content'));
+});
+</script>
+{% endblock %}

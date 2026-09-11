@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Reiniciar datos · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-3">Reiniciar datos de prueba</h3>
+
+<div class="alert alert-warning">
+  <i class="bi bi-exclamation-triangle me-1"></i>
+  <strong>Esto borra datos de forma permanente.</strong> Úsalo solo mientras estás probando el sistema, no en
+  producción con datos reales que necesites conservar.
+</div>
+
+<div class="card p-4" style="max-width: 640px;">
+  <form method="post" action="{{ url_for('admin_reset_ejecutar') }}" onsubmit="return confirm('¿Confirmas que quieres borrar los datos marcados? Esta acción no se puede deshacer.');">
+    <div class="form-check mb-2">
+      <input class="form-check-input" type="checkbox" name="categorias" value="proveedores" id="chkProveedores">
+      <label class="form-check-label" for="chkProveedores">
+        <strong>Proveedores</strong> ({{ resumen.proveedores }} proveedor(es), {{ resumen.productos }} producto(s) de catálogo)
+        <div class="text-muted small">Al borrar Proveedores también se borran Órdenes, Despachos y Costeos, porque dependen de los proveedores. El catálogo se vuelve a cargar automáticamente desde el Excel maestro.</div>
+      </label>
+    </div>
+    <div class="form-check mb-2">
+      <input class="form-check-input" type="checkbox" name="categorias" value="ordenes" id="chkOrdenes">
+      <label class="form-check-label" for="chkOrdenes">
+        <strong>Órdenes</strong> ({{ resumen.ordenes }} orden(es) de compra, {{ resumen.despachos }} despacho(s))
+        <div class="text-muted small">Incluye sus documentos adjuntos. Los Despachos se borran junto con las Órdenes, ya que están enlazados.</div>
+      </label>
+    </div>
+    <div class="form-check mb-3">
+      <input class="form-check-input" type="checkbox" name="categorias" value="costeos" id="chkCosteos">
+      <label class="form-check-label" for="chkCosteos">
+        <strong>Costeos</strong> ({{ resumen.importaciones }} importación(es), con sus parciales/productos/gastos)
+      </label>
+    </div>
+    <button type="submit" class="btn btn-danger">Borrar lo marcado</button>
+    <a href="{{ url_for('dashboard') }}" class="btn btn-outline-secondary">Cancelar</a>
+  </form>
+</div>
+
+{% endblock %}

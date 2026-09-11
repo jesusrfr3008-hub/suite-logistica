@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Nueva Importación · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-3">Nueva Importación (Costeo)</h3>
+
+<div class="card p-4" style="max-width: 720px;">
+  <form method="post">
+    <div class="row g-3">
+      <div class="col-md-6">
+        <label class="form-label">Proveedor *</label>
+        <select class="form-select" name="proveedor_id" required>
+          <option value="">Seleccione...</option>
+          {% for p in proveedores %}
+          <option value="{{ p.id }}">{{ p.nombre }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">N° Factura</label>
+        <input type="text" class="form-control" name="numero_factura">
+      </div>
+
+      <div class="col-md-6">
+        <label class="form-label">Fecha factura</label>
+        <input type="date" class="form-control" name="fecha_factura">
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Moneda de la factura (precios unitarios)</label>
+        <select class="form-select" name="moneda_factura" id="selMonedaFacturaForm">
+          <option value="EURO">EURO</option>
+          <option value="USD">USD</option>
+          <option value="CLP">CLP</option>
+        </select>
+      </div>
+
+      <div class="col-md-6">
+        <label class="form-label">Tipo de cambio aduanero (CLP por 1 USD) *</label>
+        <input type="number" step="0.01" class="form-control" name="tipo_cambio_aduanero" required
+               value="{{ tc_mes.tc_aduanero if tc_mes else '' }}">
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Tipo de cambio moneda factura por USD</label>
+        <input type="number" step="0.0001" class="form-control" name="tipo_cambio_moneda_usd"
+               value="{{ tc_mes.paridad_eur_usd if tc_mes else 1 }}"
+               placeholder="Ej: 0.8791 si la factura está en EUR">
+        <div class="form-text">Si la factura viene en USD, deja 1. Si viene en EUR, ingresa cuántos EUR equivalen a 1 USD.</div>
+      </div>
+
+      {% if tc_mes %}
+      <div class="col-12">
+        <div class="alert alert-light border py-2 mb-0 small">
+          <i class="bi bi-check-circle text-success me-1"></i>
+          Tipo de cambio precargado desde <a href="{{ url_for('tipo_cambio_list') }}">Configuración · {{ tc_mes.nombre_mes }} {{ tc_mes.anio }}</a> — igual puedes ajustarlo para este caso puntual.
+        </div>
+      </div>
+      {% else %}
+      <div class="col-12">
+        <div class="alert alert-light border py-2 mb-0 small">
+          <i class="bi bi-info-circle me-1"></i>
+          No hay un tipo de cambio cargado para este mes en <a href="{{ url_for('tipo_cambio_list') }}">Configuración</a> — cárgalo ahí para que se autocomplete la próxima vez.
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="col-md-6">
+        <label class="form-label">Condición de compra</label>
+        <select class="form-select" name="condicion_compra">
+          {% for c in condiciones %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+        </select>
+        <div class="form-text">Solo informativo — el Incoterm pactado con el proveedor.</div>
+      </div>
+      <div class="col-md-6"></div>
+
+      <div class="col-12">
+        <label class="form-label">Notas</label>
+        <textarea class="form-control" name="notas" rows="2"></textarea>
+      </div>
+    </div>
+
+    <div class="mt-4 d-flex gap-2">
+      <button type="submit" class="btn btn-brand">Crear importación</button>
+      <a href="{{ url_for('importaciones_list') }}" class="btn btn-outline-secondary">Cancelar</a>
+    </div>
+  </form>
+</div>
+
+<div class="alert alert-light border mt-3" style="max-width: 720px;">
+  <strong>Siguiente paso:</strong> una vez creada la importación, agregas uno o más
+  <em>parciales</em> (Declaraciones de Ingreso / DIN, según el régimen aduanero),
+  cargas los productos de cada parcial, el <strong>Flete/Seguro/Handling Fee</strong>
+  de la factura (cada uno como un ítem aparte, con su propia moneda si hace falta) y
+  los gastos compartidos del embarque (agencia, flete nacional, almacenaje, etc.).
+  El sistema calcula el costeo automáticamente.
+</div>
+
+{% endblock %}

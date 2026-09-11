@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Empresas compradoras · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h3 class="section-title mb-0">Empresas compradoras</h3>
+    <div class="text-muted small">Sus datos y logo aparecen como "Comprador" en la Orden de Compra en PDF. Cada empresa lleva su propio correlativo de N° de OC (PO-{{ hoy_anio if hoy_anio else '' }}-####), independiente de a qué proveedor le compre.</div>
+  </div>
+  <button class="btn btn-brand" data-bs-toggle="modal" data-bs-target="#modalNuevaEmpresa"><i class="bi bi-plus-lg"></i> Agregar empresa</button>
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Logo</th>
+          <th>Nombre</th>
+          <th>Dirección</th>
+          <th>RUT</th>
+          <th>Contacto</th>
+          <th class="text-end">OC asociadas</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in empresas %}
+        <tr>
+          <td>
+            {% if e.logo_nombre_archivo %}
+            <img src="{{ url_for('empresas_logo', empresa_id=e.id) }}" alt="Logo {{ e.nombre }}" style="max-height:36px; max-width:110px; object-fit:contain;">
+            {% else %}
+            <span class="text-muted small">Sin logo</span>
+            {% endif %}
+          </td>
+          <td class="fw-bold">{{ e.nombre }}</td>
+          <td>{{ e.direccion or '-' }}</td>
+          <td>{{ e.rut or '-' }}</td>
+          <td>{{ e.telefono or '' }}{% if e.telefono and e.email %} · {% endif %}{{ e.email or '' }}{% if not e.telefono and not e.email %}-{% endif %}</td>
+          <td class="text-end">{{ e.ordenes.count() }}</td>
+          <td class="text-end">
+            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarEmpresa{{ e.id }}">Editar</button>
+            <form method="post" action="{{ url_for('empresas_eliminar', empresa_id=e.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar la empresa {{ e.nombre }}?');">
+              <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-4">No hay empresas compradoras cargadas todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Modal: nueva -->
+<div class="modal fade" id="modalNuevaEmpresa" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('empresas_nueva') }}" enctype="multipart/form-data">
+        <div class="modal-header"><h5 class="modal-title">Agregar empresa compradora</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-12"><label class="form-label">Nombre *</label><input class="form-control" name="nombre" required></div>
+          <div class="col-12"><label class="form-label">Dirección</label><input class="form-control" name="direccion"></div>
+          <div class="col-6"><label class="form-label">RUT</label><input class="form-control" name="rut"></div>
+          <div class="col-6"><label class="form-label">Teléfono</label><input class="form-control" name="telefono"></div>
+          <div class="col-12"><label class="form-label">Correo</label><input type="email" class="form-control" name="email"></div>
+          <div class="col-12">
+            <label class="form-label">Logo (PNG, JPG o SVG)</label>
+            <input type="file" class="form-control" name="logo" accept=".png,.jpg,.jpeg,.svg">
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% for e in empresas %}
+<!-- Modal: editar -->
+<div class="modal fade" id="modalEditarEmpresa{{ e.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('empresas_editar', empresa_id=e.id) }}" enctype="multipart/form-data">
+        <div class="modal-header"><h5 class="modal-title">Editar {{ e.nombre }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-12"><label class="form-label">Nombre *</label><input class="form-control" name="nombre" value="{{ e.nombre }}" required></div>
+          <div class="col-12"><label class="form-label">Dirección</label><input class="form-control" name="direccion" value="{{ e.direccion or '' }}"></div>
+          <div class="col-6"><label class="form-label">RUT</label><input class="form-control" name="rut" value="{{ e.rut or '' }}"></div>
+          <div class="col-6"><label class="form-label">Teléfono</label><input class="form-control" name="telefono" value="{{ e.telefono or '' }}"></div>
+          <div class="col-12"><label class="form-label">Correo</label><input type="email" class="form-control" name="email" value="{{ e.email or '' }}"></div>
+          <div class="col-12">
+            <label class="form-label">Logo (PNG, JPG o SVG)</label>
+            {% if e.logo_nombre_archivo %}
+            <div class="mb-1"><img src="{{ url_for('empresas_logo', empresa_id=e.id) }}" alt="Logo actual" style="max-height:40px; max-width:140px; object-fit:contain;"></div>
+            {% endif %}
+            <input type="file" class="form-control" name="logo" accept=".png,.jpg,.jpeg,.svg">
+            <div class="form-text">Deja este campo vacío para conservar el logo actual.</div>
+          </div>
+          <div class="col-12"><hr class="my-1"></div>
+          <div class="col-12">
+            <label class="form-label mb-0">Plantilla de correo al proveedor</label>
+            <div class="form-text mb-2">
+              Se usa cuando envías la OC por Outlook (botón "Enviar al proveedor" en el detalle de la orden).
+              Déjala vacía para usar la plantilla general. Puedes usar estos marcadores y se reemplazan
+              automáticamente: <code>[PROVEEDOR]</code>, <code>[NUMERO_OC]</code>, <code>[EMPRESA]</code>,
+              <code>[FECHA_EMISION]</code>, <code>[MONEDA]</code>, <code>[TOTAL]</code> y <code>[NOTAS]</code>
+              (esto último toma lo que escribas en el campo "Notas" de cada orden).
+            </div>
+          </div>
+          <div class="col-12">
+            <label class="form-label">Asunto</label>
+            <input class="form-control" name="plantilla_asunto_correo" value="{{ e.plantilla_asunto_correo or '' }}" placeholder="{{ default_asunto_correo }}">
+          </div>
+          <div class="col-12">
+            <label class="form-label">Cuerpo del mensaje</label>
+            <textarea class="form-control" name="plantilla_cuerpo_correo" rows="6" placeholder="{{ default_cuerpo_correo }}">{{ e.plantilla_cuerpo_correo or '' }}</textarea>
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% endblock %}

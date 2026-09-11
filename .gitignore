@@ -1,0 +1,18 @@
+# Entorno Python
+__pycache__/
+*.pyc
+.env
+
+# Datos de ejecucion / runtime -- no se suben al repositorio porque son
+# datos reales (o generados en caliente) de la instancia que corre, no
+# parte del codigo. En Railway se recrean vacios en el primer arranque
+# (carpetas) o viven en la base de datos (Postgres), no en estos archivos.
+data/logistica.db
+data/documentos/
+data/documentos_gastos/
+data/documentos_legajo/
+data/pdf_oc/
+
+# Los logos de las empresas compradoras (data/logos_empresas/) SI se suben
+# a proposito -- son activos de marca que el seed de arranque necesita
+# encontrar en el primer despliegue, no datos generados en runtime.

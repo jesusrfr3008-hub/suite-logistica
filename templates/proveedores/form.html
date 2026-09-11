@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Editar' if proveedor else 'Nuevo' }} Proveedor · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-3">{{ 'Editar proveedor' if proveedor else 'Nuevo proveedor' }}</h3>
+
+<div class="card p-4" style="max-width: 720px;">
+  <form method="post">
+    <div class="row g-3">
+      <div class="col-md-8">
+        <label class="form-label">Nombre *</label>
+        <input type="text" class="form-control" name="nombre" required value="{{ proveedor.nombre if proveedor else '' }}">
+      </div>
+      <div class="col-md-4">
+        <label class="form-label">Tipo *</label>
+        <select class="form-select" name="tipo">
+          <option value="Extranjero" {% if proveedor and proveedor.tipo=='Extranjero' %}selected{% endif %}>Extranjero</option>
+          <option value="Nacional" {% if proveedor and proveedor.tipo=='Nacional' %}selected{% endif %}>Nacional</option>
+        </select>
+      </div>
+
+      <div class="col-md-6">
+        <label class="form-label">País</label>
+        <input type="text" class="form-control" name="pais" value="{{ proveedor.pais if proveedor else '' }}">
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Moneda por defecto</label>
+        <select class="form-select" name="moneda_default">
+          {% for m in ['USD', 'EURO', 'CLP'] %}
+          <option value="{{ m }}" {% if proveedor and proveedor.moneda_default==m %}selected{% endif %}>{{ m }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="col-md-6">
+        <label class="form-label">Nombre de contacto</label>
+        <input type="text" class="form-control" name="contacto_nombre" value="{{ proveedor.contacto_nombre if proveedor else '' }}">
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Teléfono de contacto</label>
+        <input type="text" class="form-control" name="contacto_telefono" value="{{ proveedor.contacto_telefono if proveedor else '' }}">
+      </div>
+
+      <div class="col-md-6">
+        <label class="form-label">Correo de contacto</label>
+        <input type="email" class="form-control" name="contacto_email" value="{{ proveedor.contacto_email if proveedor else '' }}">
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Dirección</label>
+        <input type="text" class="form-control" name="direccion" value="{{ proveedor.direccion if proveedor else '' }}">
+      </div>
+
+      <div class="col-12">
+        <label class="form-label">Notas</label>
+        <textarea class="form-control" name="notas" rows="3">{{ proveedor.notas if proveedor else '' }}</textarea>
+      </div>
+    </div>
+
+    <div class="mt-4 d-flex gap-2">
+      <button type="submit" class="btn btn-brand">Guardar</button>
+      <a href="{{ url_for('proveedores_list') }}" class="btn btn-outline-secondary">Cancelar</a>
+    </div>
+  </form>
+</div>
+
+{% endblock %}
