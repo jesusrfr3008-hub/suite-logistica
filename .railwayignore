@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+.git/
+data/logistica.db
+data/documentos/
+data/documentos_gastos/
+data/documentos_legajo/
+data/pdf_oc/
