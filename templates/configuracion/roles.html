@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Perfiles · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h3 class="section-title mb-0">Perfiles</h3>
+    <div class="text-muted small">Cada perfil agrupa los permisos que tendrán los usuarios asignados a él. Un perfil "Administrador" tiene automáticamente todos los permisos.</div>
+  </div>
+  <button class="btn btn-brand" data-bs-toggle="modal" data-bs-target="#modalNuevoRol"><i class="bi bi-plus-lg"></i> Agregar perfil</button>
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Nombre</th>
+          <th>Permisos</th>
+          <th class="text-end">Usuarios</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in roles %}
+        <tr>
+          <td class="fw-bold">
+            {{ r.nombre }}
+            {% if r.es_administrador %}<span class="badge text-bg-dark ms-1">Administrador</span>{% endif %}
+          </td>
+          <td>
+            {% if r.es_administrador %}
+            <span class="text-muted small">Todos (superusuario)</span>
+            {% else %}
+              {% for nombre in r.permisos_activos %}
+              <span class="badge text-bg-light border me-1 mb-1">{{ nombre }}</span>
+              {% else %}
+              <span class="text-muted small">Sin permisos asignados</span>
+              {% endfor %}
+            {% endif %}
+          </td>
+          <td class="text-end">{{ r.usuarios.count() }}</td>
+          <td class="text-end">
+            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarRol{{ r.id }}">Editar</button>
+            <form method="post" action="{{ url_for('roles_eliminar', rol_id=r.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar el perfil {{ r.nombre }}?');">
+              <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-center text-muted py-4">No hay perfiles cargados todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Modal: nuevo -->
+<div class="modal fade" id="modalNuevoRol" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('roles_nuevo') }}">
+        <div class="modal-header"><h5 class="modal-title">Agregar perfil</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-12"><label class="form-label">Nombre *</label><input class="form-control" name="nombre" required></div>
+          <div class="col-12">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="es_administrador" id="nuevoEsAdmin">
+              <label class="form-check-label fw-bold" for="nuevoEsAdmin">Administrador (superusuario — todos los permisos)</label>
+            </div>
+          </div>
+          <div class="col-12"><hr class="my-2"></div>
+          {% for codigo, nombre in permisos %}
+          <div class="col-md-6">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="permiso_{{ codigo }}" id="nuevoPerm{{ codigo }}">
+              <label class="form-check-label" for="nuevoPerm{{ codigo }}">{{ nombre }}</label>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% for r in roles %}
+<!-- Modal: editar -->
+<div class="modal fade" id="modalEditarRol{{ r.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('roles_editar', rol_id=r.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar {{ r.nombre }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-12"><label class="form-label">Nombre *</label><input class="form-control" name="nombre" value="{{ r.nombre }}" required></div>
+          <div class="col-12">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="es_administrador" id="editEsAdmin{{ r.id }}" {% if r.es_administrador %}checked{% endif %}>
+              <label class="form-check-label fw-bold" for="editEsAdmin{{ r.id }}">Administrador (superusuario — todos los permisos)</label>
+            </div>
+          </div>
+          <div class="col-12"><hr class="my-2"></div>
+          {% for codigo, nombre in permisos %}
+          <div class="col-md-6">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="permiso_{{ codigo }}" id="editPerm{{ codigo }}{{ r.id }}" {% if r['permiso_' ~ codigo] %}checked{% endif %}>
+              <label class="form-check-label" for="editPerm{{ codigo }}{{ r.id }}">{{ nombre }}</label>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% endblock %}

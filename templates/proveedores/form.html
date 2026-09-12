@@ -50,6 +50,13 @@
         <input type="text" class="form-control" name="direccion" value="{{ proveedor.direccion if proveedor else '' }}">
       </div>
 
+      <div class="col-md-6">
+        <label class="form-label">Código del proveedor en el sistema de Inventarios</label>
+        <input type="text" class="form-control" name="codigo_sistema_inventario" value="{{ proveedor.codigo_sistema_inventario if proveedor else '' }}">
+        <div class="form-text">Opcional — el ID interno con el que este proveedor está cargado en el otro sistema (Inventarios). Se usa solo en la planilla "Descargar planilla Inventario" de Costeo; se completa una vez y queda guardado.</div>
+      </div>
+      <div class="col-md-6"></div>
+
       <div class="col-12">
         <label class="form-label">Notas</label>
         <textarea class="form-control" name="notas" rows="3">{{ proveedor.notas if proveedor else '' }}</textarea>

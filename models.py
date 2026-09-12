@@ -6,8 +6,110 @@ de etapas por línea de producto y documentos adjuntos por orden.
 from datetime import datetime
 from urllib.parse import quote
 from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
+from werkzeug.security import generate_password_hash, check_password_hash
 
 db = SQLAlchemy()
+
+# Permisos operativos disponibles (ronda R, 2026-09-12) -- cada Rol marca
+# cuales de estos tiene. "es_administrador" (ver Rol abajo) es un permiso
+# aparte, mas amplio: implica TODOS estos automaticamente ademas de poder
+# administrar usuarios/roles/contraseñas -- ver Rol.tiene() abajo.
+PERMISOS_DISPONIBLES = [
+    ("crear_orden", "Creación de Orden"),
+    ("aprobar_orden", "Aprobación de Orden"),
+    ("actualizar_despacho", "Actualizar despacho"),
+    ("generar_costeo", "Generar Costeo"),
+    ("orden_simple", "Creación de Orden Simple (sin ver precios de proveedor)"),
+    ("inventarios", "Inventarios"),
+    ("reportes", "Acceso a Reportes"),
+    ("seguimiento", "Seguimiento de despachos (solo ver estado/tracking)"),
+    # Ronda V (2026-09-12): perfil amplio, pensado para colaboradores que NO
+    # necesitan crear/aprobar ordenes ni ver costeos -- solo consultar cuanto
+    # stock hay de cada producto. Deliberadamente separado del permiso
+    # "inventarios" de arriba (ese es para quien administra/genera el costeo
+    # de importaciones); este es de solo consulta de saldos de existencias.
+    ("consultar_stock", "Consulta de Stock (saldos de existencias)"),
+]
+
+
+class Rol(db.Model):
+    """Perfil de acceso (ronda R, 2026-09-12): un conjunto de permisos
+    operativos que se asigna a uno o mas Usuarios. "es_administrador" es un
+    interruptor aparte -- un Rol administrador tiene TODOS los permisos
+    automaticamente (ver tiene() abajo) ademas de poder entrar a
+    Configuración > Usuarios y Perfiles para administrar cuentas, sin
+    necesidad de tildar cada permiso individual por separado."""
+
+    __tablename__ = "roles"
+
+    id = db.Column(db.Integer, primary_key=True)
+    nombre = db.Column(db.String(80), unique=True, nullable=False)
+    es_administrador = db.Column(db.Boolean, default=False)
+    permiso_crear_orden = db.Column(db.Boolean, default=False)
+    permiso_aprobar_orden = db.Column(db.Boolean, default=False)
+    permiso_actualizar_despacho = db.Column(db.Boolean, default=False)
+    permiso_generar_costeo = db.Column(db.Boolean, default=False)
+    permiso_orden_simple = db.Column(db.Boolean, default=False)
+    permiso_inventarios = db.Column(db.Boolean, default=False)
+    permiso_reportes = db.Column(db.Boolean, default=False)
+    permiso_seguimiento = db.Column(db.Boolean, default=False)
+    # Ronda V (2026-09-12): consulta de saldos de Stock -- ver PERMISOS_
+    # DISPONIBLES arriba.
+    permiso_consultar_stock = db.Column(db.Boolean, default=False)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    usuarios = db.relationship("Usuario", backref="rol", lazy="dynamic")
+
+    def tiene(self, permiso):
+        """True si este Rol puede ejercer `permiso` (uno de los codigos de
+        PERMISOS_DISPONIBLES) -- un Rol administrador siempre da True."""
+        if self.es_administrador:
+            return True
+        return bool(getattr(self, f"permiso_{permiso}", False))
+
+    @property
+    def permisos_activos(self):
+        return [nombre for codigo, nombre in PERMISOS_DISPONIBLES if self.tiene(codigo)]
+
+    def __repr__(self):
+        return f"<Rol {self.nombre}>"
+
+
+class Usuario(UserMixin, db.Model):
+    """Cuenta de acceso a la app (ronda R, 2026-09-12). El login se hace con
+    email + contraseña (hash, nunca en texto plano); cada usuario tiene UN
+    Rol que determina que puede hacer (ver Rol.tiene() arriba)."""
+
+    __tablename__ = "usuarios"
+
+    id = db.Column(db.Integer, primary_key=True)
+    nombre_completo = db.Column(db.String(120), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    rol_id = db.Column(db.Integer, db.ForeignKey("roles.id"), nullable=False)
+    activo = db.Column(db.Boolean, default=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    ultimo_acceso = db.Column(db.DateTime, nullable=True)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return bool(self.password_hash) and check_password_hash(self.password_hash, password)
+
+    def tiene_permiso(self, permiso):
+        return bool(self.rol and self.rol.tiene(permiso))
+
+    @property
+    def is_active(self):
+        # Sobrescribe el default de UserMixin (siempre True) -- una cuenta
+        # desactivada desde Configuración > Usuarios no puede loguearse ni
+        # mantener una sesion ya abierta.
+        return self.activo
+
+    def __repr__(self):
+        return f"<Usuario {self.email}>"
 
 
 class Empresa(db.Model):
@@ -59,6 +161,13 @@ class Proveedor(db.Model):
     notas = db.Column(db.Text)
     activo = db.Column(db.Boolean, default=True)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    # Codigo/numero que identifica a este proveedor DENTRO del sistema de
+    # Inventarios del usuario (ronda O, 2026-09-12) -- no es su RUT real, es
+    # un ID interno de ese otro sistema que el usuario asocia manualmente una
+    # vez y que despues se reutiliza solo en la planilla de exportacion
+    # "Inventario" (columna "RUT" de la cabecera, ver _construir_excel_inventario
+    # en app.py). Queda en blanco hasta que el usuario lo completa.
+    codigo_sistema_inventario = db.Column(db.String(50))
 
     productos = db.relationship(
         "Producto", backref="proveedor", cascade="all, delete-orphan", lazy="dynamic"
@@ -83,6 +192,19 @@ class Producto(db.Model):
     precio_caja = db.Column(db.Float, default=0)
     precio_unitario = db.Column(db.Float, default=0)
     activo = db.Column(db.Boolean, default=True)
+
+    # Ronda V (2026-09-12): codigo interno con el que este producto se
+    # identifica en el OTRO sistema de la empresa (ventas/inventario,
+    # "Ergopyme") -- se homologa una vez (ver seed_homologacion_y_stock_
+    # inicial en app.py, a partir de "Inventarios y codigos interno sistema
+    # Inventarios.xlsx") y de ahi en adelante permite: 1) relacionar cada
+    # carga nueva del reporte de stock con nuestro catalogo sin volver a
+    # pedir el cruce completo, y 2) completar la columna CODIGO de la
+    # planilla de descarga del Costeo (ver _construir_excel_inventario)
+    # cuando el checkbox "Código Proveedor" esta SIN marcar -- antes esa
+    # columna quedaba siempre en blanco porque este codigo era desconocido.
+    # Nunca se muestra en pantallas de Ordenes de Compra.
+    codigo_interno_inventario = db.Column(db.String(40))
 
     # Nota: el Excel origen trae codigos repetidos para variantes/paquetes de
     # un mismo proveedor (ej. distintas configuraciones bajo el mismo codigo
@@ -115,10 +237,85 @@ class ProductoVariante(db.Model):
     codigo = db.Column(db.String(120), nullable=False)
     descripcion = db.Column(db.String(500), nullable=False)
 
+    # Ronda V (2026-09-12): mismo proposito que Producto.codigo_interno_
+    # inventario, pero a nivel de variante -- en el sistema de Inventarios
+    # cada dioptria/variante especifica es su propio codigo interno (el
+    # producto "padre" de nuestro catalogo no es una unidad fisica real).
+    codigo_interno_inventario = db.Column(db.String(40))
+
     producto = db.relationship("Producto", backref=db.backref("variantes", lazy="dynamic"))
 
     def __repr__(self):
         return f"<ProductoVariante {self.codigo}>"
+
+
+class HomologacionStock(db.Model):
+    """Ronda V (2026-09-12): tabla de homologacion -- una fila por cada
+    codigo interno del sistema de Inventarios ('Ergopyme'), con la
+    clasificacion que se le dio la primera vez que se vio (ver
+    seed_homologacion_y_stock_inicial en app.py). Una vez clasificado, cada
+    carga NUEVA del reporte de stock (que YA NO trae columnas de codigo de
+    proveedor, solo el formato original) usa esta tabla para saber que
+    hacer con cada codigo, sin tener que volver a pedir el cruce completo:
+    - 'vinculado': esta ligado a un Producto (o a una ProductoVariante,
+      cuando el producto es de una familia con variantes) de nuestro
+      catalogo -- ver producto_id/variante_id.
+    - 'sin_marca': se carga en el Stock para consulta, pero NO se crea ni
+      se liga a ningun Producto del catalogo de proveedores (a pedido
+      explicito del usuario -- son productos sin marca/generico).
+    - 'excluido': se descarta siempre, no se carga ni al Stock (ronda U:
+      equivalente a los codigos marcados "NO INCLUIR" en el cruce inicial).
+    - 'pendiente': codigo nuevo que aparecio en una carga posterior y que
+      todavia no se sabe a que producto/proveedor corresponde -- igual se
+      carga al Stock (sin producto/variante asociado) para no perder el
+      dato, y queda listado en /stock/homologacion para resolverlo a mano.
+    """
+    __tablename__ = "homologaciones_stock"
+
+    id = db.Column(db.Integer, primary_key=True)
+    codigo_interno = db.Column(db.String(40), unique=True, nullable=False)
+    estado = db.Column(db.String(20), nullable=False, default="pendiente")
+    producto_id = db.Column(db.Integer, db.ForeignKey("productos.id"), nullable=True)
+    variante_id = db.Column(db.Integer, db.ForeignKey("producto_variantes.id"), nullable=True)
+    # Ultima descripcion vista para este codigo en el reporte de stock -- útil
+    # para mostrarla en /stock/homologacion cuando no hay Producto asociado.
+    descripcion_referencia = db.Column(db.String(300))
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    producto = db.relationship("Producto")
+    variante = db.relationship("ProductoVariante")
+
+    def __repr__(self):
+        return f"<HomologacionStock {self.codigo_interno} ({self.estado})>"
+
+
+class StockExistencia(db.Model):
+    """Ronda V (2026-09-12): saldo de existencias por empresa, tal como se
+    ve en el sistema de Inventarios ('Ergopyme') -- una fila por cada
+    combinacion producto/variante + lote + empresa que trae el reporte. Se
+    recarga POR COMPLETO cada vez que alguien sube un reporte nuevo (ver
+    stock_cargar en app.py): se borran todas las filas anteriores y se
+    insertan las del archivo nuevo, para que el saldo mostrado sea siempre
+    el de la ultima foto real, sin arrastrar datos viejos ni duplicarlos."""
+    __tablename__ = "stock_existencias"
+
+    id = db.Column(db.Integer, primary_key=True)
+    empresa_id = db.Column(db.Integer, db.ForeignKey("empresas.id"), nullable=False)
+    producto_id = db.Column(db.Integer, db.ForeignKey("productos.id"), nullable=True)
+    variante_id = db.Column(db.Integer, db.ForeignKey("producto_variantes.id"), nullable=True)
+    codigo_interno = db.Column(db.String(40), nullable=False)
+    descripcion = db.Column(db.String(300))
+    codigo_lote = db.Column(db.String(80))
+    fecha_vencimiento = db.Column(db.Date, nullable=True)
+    stock_fisico = db.Column(db.Integer, default=0)
+    cargado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    empresa = db.relationship("Empresa")
+    producto = db.relationship("Producto")
+    variante = db.relationship("ProductoVariante")
+
+    def __repr__(self):
+        return f"<StockExistencia {self.codigo_interno} x{self.stock_fisico}>"
 
 
 # Etapas por las que avanza cada LINEA de producto de una orden, hasta la
@@ -134,6 +331,20 @@ ETAPAS_LINEA = [
 
 ESTADOS_OC = ETAPAS_LINEA + ["En proceso (mixto)", "Cancelada", "Anulada"]
 
+# Puerta de aprobacion de la orden COMPLETA (ronda T, 2026-09-12), separada
+# de 'estado'/'etapa' (que rastrean el avance linea por linea DESPUES de
+# aprobada). Toda orden NUEVA (cualquiera sea el perfil que la cree) nace en
+# "Por Aprobar" y no es todavia una Orden de Compra definitiva: no aparece en
+# el listado general de Compras/Ordenes ("los registros"), solo en la vista
+# de "Mis ordenes"/"Por Aprobar" de quien la creo. Alguien con permiso de
+# Aprobacion la pasa a "Aprobada" (desde ahi sigue el mismo flujo de siempre
+# por etapas de linea) o la "devuelve", dejandola en "Sin Emitir" -- visible
+# SOLO para quien la creo, quien puede editarla y reenviarla (vuelve a "Por
+# Aprobar"). Las ordenes que ya existian antes de esta ronda quedan
+# "Aprobada" por defecto via la migracion (ver ensure_schema_migrations en
+# app.py), para no ocultar de golpe ningun dato ya en curso.
+ESTADOS_APROBACION_OC = ["Por Aprobar", "Aprobada", "Sin Emitir"]
+
 # Una vez que una linea llega a "Orden Despachada" (o mas adelante), el
 # usuario ya no quiere poder anularla, editarla ni retrocederla -- lo
 # unico que se puede hacer es seguir avanzando de etapa (o subir/gestionar
@@ -142,6 +353,8 @@ ESTADOS_OC = ETAPAS_LINEA + ["En proceso (mixto)", "Cancelada", "Anulada"]
 ETAPAS_LINEA_BLOQUEADA = {"Orden Despachada", "Internación Aduanas", "Recibido"}
 
 TIPOS_DOCUMENTO_ORDEN = [
+    "Cotización",
+    "Orden de Compra (proveedor)",
     "Invoice",
     "Guía de Despacho",
     "Certificado de Origen",
@@ -186,6 +399,17 @@ class OrdenCompra(db.Model):
     # despacho puede agrupar VARIAS ordenes (despacho consolidado).
     despacho_id = db.Column(db.Integer, db.ForeignKey("despachos.id"), nullable=True)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    # Autoria (ronda S, 2026-09-12): quien creo la orden -- nullable porque
+    # las ordenes creadas ANTES de esta ronda no tienen usuario asociado (el
+    # sistema de login no existia). Se usa para que un usuario con el perfil
+    # "Creación de Orden Simple" solo pueda ver/editar/anular SUS PROPIAS
+    # ordenes (ver ordenes_simple_* en app.py), nunca las de otro usuario.
+    creado_por_usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    creado_por = db.relationship("Usuario", foreign_keys=[creado_por_usuario_id])
+    # Puerta de aprobacion de la orden completa (ronda T, 2026-09-12): ver
+    # ESTADOS_APROBACION_OC mas arriba. Default "Aprobada" para que la
+    # migracion automatica no oculte ninguna orden ya existente.
+    estado_aprobacion = db.Column(db.String(20), default="Aprobada")
 
     lineas = db.relationship(
         "OrdenCompraLinea", backref="orden", cascade="all, delete-orphan", lazy="dynamic"
@@ -278,6 +502,26 @@ class OrdenCompraLinea(db.Model):
     # nunca uno propio de la variante.
     variante_codigo = db.Column(db.String(120))
     variante_descripcion = db.Column(db.String(500))
+
+    # Ronda S (2026-09-12): True cuando esta linea la agrego un usuario con
+    # el perfil "Creación de Orden Simple" reutilizando un producto QUE YA
+    # EXISTIA en el catálogo del proveedor -- ese precio es el que ya tenia
+    # cargado el catálogo (no el que tecleo ese usuario, que se descarta), y
+    # por eso debe seguir oculto para el aun cuando el vea el detalle de SU
+    # PROPIA orden (ver ordenes/simple_detalle.html). Si en cambio el
+    # producto era nuevo, el precio es el que el mismo tecleo -- no hace
+    # falta ocultarselo a si mismo, asi que queda en False.
+    precio_catalogo_oculto = db.Column(db.Boolean, default=False)
+
+    # Ronda U (2026-09-12): True cuando esta linea fue la que dio de alta un
+    # producto NUEVO en el catálogo del proveedor (perfil "Creación de Orden
+    # Simple", código que no existía todavía) -- ese producto nace inactivo
+    # (Producto.activo=False, ver ordenes_simple_nueva/ordenes_simple_linea_
+    # nueva en app.py) para no ensuciar el catálogo con datos sin confirmar
+    # mientras la orden esté 'Por Aprobar'/'Sin Emitir'. Al aprobar la orden
+    # (ver ordenes_aprobar) se activa automáticamente. Si la línea reutilizó
+    # un producto que YA existía, queda en False -- no hay nada que activar.
+    producto_creado_por_esta_orden = db.Column(db.Boolean, default=False)
 
     producto = db.relationship("Producto")
 
@@ -533,6 +777,19 @@ class Importacion(db.Model):
     # de origen y a sus documentos (Invoice, Guia de despacho, etc.) ya
     # cargados, sin duplicarlos.
     despacho_id = db.Column(db.Integer, db.ForeignKey("despachos.id"), nullable=True)
+    # Empresa compradora de esta importacion (Accuvision/Accumedical, ronda O
+    # 2026-09-12) -- se usa para imprimir el nombre de la empresa y para
+    # calcular el correlativo de importacion del sistema de Inventarios (ver
+    # numero_correlativo_inventario abajo y siguiente_correlativo_inventario
+    # en app.py), igual patron que OrdenCompra.empresa_id (ronda K).
+    empresa_id = db.Column(db.Integer, db.ForeignKey("empresas.id"), nullable=True)
+    # Correlativo de esta importacion DENTRO del sistema de Inventarios,
+    # unico por empresa compradora (ronda O, 2026-09-12) -- es un numero que
+    # vive en ese otro sistema, no en este, asi que no se genera solo: el
+    # usuario entrega el numero de partida la primera vez y desde ahi
+    # siguiente_correlativo_inventario() en app.py sugiere el siguiente
+    # (maximo ya usado por esa empresa + 1), siempre editable a mano.
+    numero_correlativo_inventario = db.Column(db.Integer, nullable=True)
     numero_factura = db.Column(db.String(80))
     fecha_factura = db.Column(db.Date, nullable=True)
     moneda_factura = db.Column(db.String(10), default="EURO")  # moneda en que vienen los Valor Unitario de las lineas
@@ -564,6 +821,7 @@ class Importacion(db.Model):
 
     proveedor = db.relationship("Proveedor")
     despacho = db.relationship("Despacho", backref="importaciones_generadas")
+    empresa = db.relationship("Empresa", backref="importaciones")
     parciales = db.relationship(
         "Parcial", backref="importacion", cascade="all, delete-orphan", lazy="dynamic",
         order_by="Parcial.id",

@@ -44,7 +44,9 @@
 <p class="text-muted small">
   <i class="bi bi-info-circle me-1"></i>
   Las órdenes ya despachadas se gestionan desde el módulo <a href="{{ url_for('despachos_list') }}">Despachos</a>
-  (courier, tracking, aduana, recibido) y por eso no aparecen aquí por defecto.
+  (courier, tracking, aduana, recibido) y por eso no aparecen aquí por defecto. Las órdenes nuevas
+  que todavía no fueron aprobadas tampoco aparecen aquí -- se gestionan en
+  <a href="{{ url_for('ordenes_por_aprobar') }}">Por Aprobar</a>.
 </p>
 
 <div class="card p-3">

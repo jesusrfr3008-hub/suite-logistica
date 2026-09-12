@@ -56,11 +56,44 @@
       · Fecha factura: {{ imp.fecha_factura or '-' }} · Moneda factura: {{ imp.moneda_factura }}
     </div>
   </div>
-  <div class="d-flex gap-2">
+  <div class="d-flex gap-2 flex-wrap">
+    <form method="get" action="{{ url_for('importaciones_exportar_inventario', importacion_id=imp.id) }}" class="d-flex align-items-center gap-2 border rounded px-2">
+      <div class="form-check form-check-inline mb-0">
+        <input class="form-check-input" type="checkbox" name="codigo_proveedor" value="1" id="chkCodigoProveedor">
+        <label class="form-check-label small mb-0" for="chkCodigoProveedor" title="Si se marca, la columna B lleva el código del proveedor y la columna C solo la descripción (sin concatenar).">Código Proveedor</label>
+      </div>
+      <button type="submit" class="btn btn-outline-secondary">
+        <i class="bi bi-download me-1"></i>Descargar planilla Inventario
+      </button>
+    </form>
+    <button class="btn btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#modalCargaLotesImportacion">Carga Lotes</button>
     <button class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarImportacion">Editar datos</button>
     <form method="post" action="{{ url_for('importaciones_eliminar', importacion_id=imp.id) }}" onsubmit="return confirm('¿Eliminar esta importación y todo su costeo?');">
       <button class="btn btn-outline-danger">Eliminar</button>
     </form>
+  </div>
+</div>
+
+<!-- Modal: carga masiva de lotes para TODO el costeo (ronda N, 2026-09-12) -->
+<div class="modal fade" id="modalCargaLotesImportacion" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('importacion_lotes_cargar', importacion_id=imp.id) }}" enctype="multipart/form-data">
+        <div class="modal-header"><h5 class="modal-title">Carga de Lotes — todo el costeo</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+          <p class="small text-muted">
+            Sube un solo archivo .xlsx o .csv con los productos de TODO el embarque, sin importar el orden ni en qué
+            parcial esté cada uno — el sistema busca cada producto (por <strong>Descripción</strong>, o por
+            <strong>Código</strong> si el archivo lo trae) entre todos los parciales de este costeo y le carga los
+            lotes al que corresponda. Columnas esperadas: <strong>Descripción</strong> (o Código), <strong>Cod. de
+            Lote</strong>, <strong>Vencimiento</strong> y, si la tienes, <strong>Cantidad</strong> (si no viene esta
+            columna, se asume una fila por cada unidad física).
+          </p>
+          <input type="file" class="form-control" name="archivo_lotes" accept=".xlsx,.xls,.csv" required>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Cargar</button></div>
+      </form>
+    </div>
   </div>
 </div>
 
@@ -172,7 +205,6 @@
         <div class="d-flex gap-1">
           <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarParcial{{ parcial.id }}">Editar</button>
           <button class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#modalNuevaLinea{{ parcial.id }}">+ Producto</button>
-          <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#modalCargaLotes{{ parcial.id }}">Carga Lotes</button>
           <form method="post" action="{{ url_for('parciales_eliminar', parcial_id=parcial.id) }}" onsubmit="return confirm('¿Eliminar este parcial y sus líneas?');">
             <button class="btn btn-sm btn-outline-danger">Eliminar</button>
           </form>
@@ -489,6 +521,20 @@
       <form method="post" action="{{ url_for('importaciones_editar', importacion_id=imp.id) }}">
         <div class="modal-header"><h5 class="modal-title">Editar importación</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
         <div class="modal-body row g-2">
+          <div class="col-6">
+            <label class="form-label">Empresa compradora</label>
+            <select class="form-select" name="empresa_id">
+              <option value="">Sin asignar</option>
+              {% for e in empresas %}<option value="{{ e.id }}" {% if imp.empresa_id==e.id %}selected{% endif %}>{{ e.nombre }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-6">
+            <label class="form-label">Correlativo Inventario</label>
+            <input type="number" class="form-control" name="numero_correlativo_inventario"
+                   value="{{ imp.numero_correlativo_inventario if imp.numero_correlativo_inventario is not none else '' }}"
+                   placeholder="{{ sugerido_correlativo_inventario if sugerido_correlativo_inventario else 'ej: 579' }}">
+            <div class="form-text">Correlativo de esta importación en el sistema de Inventarios, único por empresa — ingresa el número de partida la primera vez para esta empresa; luego se sugiere el siguiente solo.</div>
+          </div>
           <div class="col-6"><label class="form-label">N° Factura</label><input class="form-control" name="numero_factura" value="{{ imp.numero_factura or '' }}"></div>
           <div class="col-6"><label class="form-label">Fecha factura</label><input type="date" class="form-control" name="fecha_factura" value="{{ imp.fecha_factura or '' }}"></div>
           <div class="col-6"><label class="form-label">Moneda factura</label>
@@ -768,22 +814,6 @@
           </div>
         </div>
         <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
-      </form>
-    </div>
-  </div>
-</div>
-
-<!-- Modal: carga masiva de lotes -->
-<div class="modal fade" id="modalCargaLotes{{ parcial.id }}" tabindex="-1">
-  <div class="modal-dialog">
-    <div class="modal-content">
-      <form method="post" action="{{ url_for('parcial_lotes_cargar', parcial_id=parcial.id) }}" enctype="multipart/form-data">
-        <div class="modal-header"><h5 class="modal-title">Carga de Lotes — {{ parcial.referencia or parcial.numero_parcial or parcial.id }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-        <div class="modal-body">
-          <p class="small text-muted">Sube un archivo .xlsx o .csv con las columnas <strong>Código de Producto</strong>, <strong>Lote</strong> y <strong>Fecha vencimiento</strong> — una fila por cada unidad física. Las cantidades de cada lote se calculan agrupando esas filas, para que siempre cuadren con el total de unidades.</p>
-          <input type="file" class="form-control" name="archivo_lotes" accept=".xlsx,.xls,.csv" required>
-        </div>
-        <div class="modal-footer"><button type="submit" class="btn btn-brand">Cargar</button></div>
       </form>
     </div>
   </div>

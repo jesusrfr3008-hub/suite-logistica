@@ -22,6 +22,19 @@
       </div>
 
       <div class="col-md-6">
+        <label class="form-label">Empresa compradora</label>
+        <select class="form-select" name="empresa_id">
+          <option value="">Sin asignar</option>
+          {% for e in empresas %}<option value="{{ e.id }}">{{ e.nombre }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Correlativo Inventario (opcional)</label>
+        <input type="number" class="form-control" name="numero_correlativo_inventario" placeholder="ej: 579">
+        <div class="form-text">Correlativo en el sistema de Inventarios para esa empresa — se puede completar después desde "Editar datos".</div>
+      </div>
+
+      <div class="col-md-6">
         <label class="form-label">Fecha factura</label>
         <input type="date" class="form-control" name="fecha_factura">
       </div>

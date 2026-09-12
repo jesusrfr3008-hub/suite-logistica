@@ -180,10 +180,15 @@ async function cargarCatalogo(q) {
     // (ej. dos dioptrias distintas del mismo lente); la duplicidad real se
     // valida al elegir la variante especifica.
     const yaAgregado = !p.tiene_variantes && !!lineasAgregadas[claveLinea(p.id, null)];
+    // Ronda U (2026-09-12, punto 4): un producto inactivo ahora SI aparece
+    // en la búsqueda (antes quedaba oculto), pero sombreado y con aviso --
+    // si se elige, se pide confirmar antes de agregarlo (el backend lo
+    // reactiva al guardar la línea).
     const tr = document.createElement('tr');
     if (yaAgregado) tr.className = 'text-muted';
+    else if (!p.activo) tr.className = 'table-secondary';
     tr.innerHTML = `
-      <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}</td>
+      <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}${!p.activo ? ' <span class="badge bg-secondary">Inactivo</span>' : ''}</td>
       <td style="max-width:380px;">${p.descripcion}</td>
       <td>${p.empaque}</td>
       <td class="text-end">${fmt(p.precio_caja)}</td>
@@ -192,6 +197,9 @@ async function cargarCatalogo(q) {
         : '<button type="button" class="btn btn-sm btn-outline-primary btn-agregar">Agregar</button>'}</td>
     `;
     if (!yaAgregado) tr.querySelector('.btn-agregar').addEventListener('click', () => {
+      if (!p.activo && !confirm(`'${p.codigo}' está desactivado en el catálogo. ¿Deseas activarlo y agregarlo a esta orden?`)) {
+        return;
+      }
       if (p.tiene_variantes) {
         abrirModalVariante(p);
       } else {

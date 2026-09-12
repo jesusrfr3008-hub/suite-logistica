@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Nueva Orden Simple · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-1">Nueva Orden (creación simple)</h3>
+<div class="text-muted small mb-3">
+  Este formulario no muestra el catálogo de precios de ningún proveedor. Escribe el código y la descripción
+  del producto y el precio que te cotizaron para esta compra puntual. Si el código ya existe en el catálogo
+  del proveedor, se usará el producto y precio que ya está cargado (el precio que escribas aquí se descarta).
+  Si es un producto nuevo, se guardará en el catálogo del proveedor con el precio indicado.
+</div>
+
+<div class="card p-4" style="max-width: 900px;">
+  <form method="post" id="formOrdenSimple" enctype="multipart/form-data">
+    <div class="row g-3 mb-3">
+      <div class="col-md-6">
+        <label class="form-label">Proveedor *</label>
+        <select class="form-select" name="proveedor_id" required>
+          <option value="">Seleccione...</option>
+          {% for p in proveedores %}
+          <option value="{{ p.id }}">{{ p.nombre }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Empresa compradora *</label>
+        <select class="form-select" name="empresa_id" required>
+          <option value="">Seleccione...</option>
+          {% for e in empresas %}<option value="{{ e.id }}">{{ e.nombre }}</option>{% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <div class="table-responsive">
+      <table class="table align-middle" id="tablaLineas">
+        <thead>
+          <tr>
+            <th style="width: 16%;">Código *</th>
+            <th>Descripción</th>
+            <th style="width: 10%;">Cantidad *</th>
+            <th style="width: 14%;">Precio cotizado</th>
+            <th style="width: 16%;">Fecha estimada despacho</th>
+            <th style="width: 4%;"></th>
+          </tr>
+        </thead>
+        <tbody id="cuerpoLineas">
+          <tr>
+            <td><input type="text" class="form-control" name="codigo"></td>
+            <td><input type="text" class="form-control" name="descripcion"></td>
+            <td><input type="number" min="1" class="form-control" name="cantidad_cajas"></td>
+            <td><input type="number" step="0.01" min="0" class="form-control" name="precio_cotizado" placeholder="0.00"></td>
+            <td><input type="date" class="form-control" name="fecha_estimada_despacho"></td>
+            <td class="text-center"><button type="button" class="btn btn-sm btn-outline-danger btnQuitarLinea"><i class="bi bi-x-lg"></i></button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <button type="button" class="btn btn-sm btn-outline-secondary mb-3" id="btnAgregarLinea"><i class="bi bi-plus-lg"></i> Agregar línea</button>
+
+    <div class="form-text mb-3">
+      El precio cotizado que escribas aquí solo se usa si el código es un producto nuevo para ese proveedor —
+      si el código ya existe en su catálogo, se ignora y se usa el precio ya cargado.
+    </div>
+
+    <hr class="my-3">
+    <h6 class="mb-2">Documentos de respaldo (opcional)</h6>
+    <div class="text-muted small mb-2">
+      Así quien aprueba puede corroborar por qué se está pidiendo esta orden de compra.
+    </div>
+    <div class="row g-3 mb-3">
+      <div class="col-md-6">
+        <label class="form-label">Cotización</label>
+        <input type="file" class="form-control" name="archivo_cotizacion" accept=".pdf,.jpg,.jpeg,.png">
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Orden de Compra del proveedor</label>
+        <input type="file" class="form-control" name="archivo_orden_compra" accept=".pdf,.jpg,.jpeg,.png">
+      </div>
+    </div>
+
+    <div class="mb-3">
+      <label class="form-label">Notas (opcional)</label>
+      <textarea class="form-control" name="notas" rows="2" placeholder="Cualquier contexto adicional para quien va a revisar esta orden..."></textarea>
+    </div>
+
+    <div class="d-flex gap-2">
+      <button type="submit" class="btn btn-brand">Crear orden</button>
+      <a href="{{ url_for('ordenes_simple_list') }}" class="btn btn-outline-secondary">Mis órdenes</a>
+    </div>
+  </form>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('btnAgregarLinea').addEventListener('click', function () {
+  var cuerpo = document.getElementById('cuerpoLineas');
+  var fila = cuerpo.rows[0].cloneNode(true);
+  fila.querySelectorAll('input').forEach(function (input) { input.value = ''; });
+  cuerpo.appendChild(fila);
+});
+
+document.getElementById('cuerpoLineas').addEventListener('click', function (ev) {
+  var btn = ev.target.closest('.btnQuitarLinea');
+  if (!btn) return;
+  var cuerpo = document.getElementById('cuerpoLineas');
+  if (cuerpo.rows.length > 1) {
+    btn.closest('tr').remove();
+  }
+});
+</script>
+{% endblock %}

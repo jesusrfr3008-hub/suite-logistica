@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}Stock · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+  <div>
+    <h3 class="section-title mb-0">Consulta de Stock</h3>
+    <div class="text-muted small">
+      Saldos de existencias del sistema de Inventarios (Accuvision y Accumedical juntas -- filtra por empresa abajo).
+      {% if ultima_carga %}Última actualización: {{ ultima_carga.strftime('%d-%m-%Y %H:%M') }}.{% else %}Todavía no se ha cargado ningún reporte de Stock.{% endif %}
+    </div>
+  </div>
+  {% if current_user.tiene_permiso('inventarios') %}
+  <button class="btn btn-brand" data-bs-toggle="modal" data-bs-target="#modalCargarStock">
+    <i class="bi bi-upload"></i> Cargar reporte de Stock
+  </button>
+  {% endif %}
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-auto">
+    <select class="form-select" name="empresa_id">
+      <option value="">Todas las empresas</option>
+      {% for e in empresas %}
+      <option value="{{ e.id }}" {% if empresa_sel|string == e.id|string %}selected{% endif %}>{{ e.nombre }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <input type="text" class="form-control" name="q" value="{{ q }}" placeholder="Buscar código o descripción...">
+  </div>
+  <div class="col-auto">
+    <button class="btn btn-outline-secondary" type="submit">Buscar</button>
+  </div>
+</form>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Empresa</th>
+          <th>Proveedor</th>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th class="text-end">Stock total</th>
+          <th>Próximo vencimiento</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for g in grupos %}
+        <tr class="{% if not g.homologado %}text-muted{% endif %}">
+          <td>{{ g.empresa.nombre if g.empresa else '' }}</td>
+          <td>{{ g.proveedor_nombre or '(sin homologar)' }}</td>
+          <td>{{ g.codigo }}</td>
+          <td style="max-width: 420px;">{{ g.descripcion }}</td>
+          <td class="text-end fw-semibold">{{ g.stock_total }}</td>
+          <td>{{ g.proximo_vencimiento.strftime('%d-%m-%Y') if g.proximo_vencimiento else '-' }}</td>
+          <td class="text-end">
+            {% if g.lotes|length > 1 %}
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#lotes{{ loop.index }}">
+              Ver {{ g.lotes|length }} lotes
+            </button>
+            {% endif %}
+          </td>
+        </tr>
+        {% if g.lotes|length > 1 %}
+        <tr class="collapse" id="lotes{{ loop.index }}">
+          <td></td>
+          <td colspan="6">
+            <table class="table table-sm table-borderless mb-0">
+              <thead><tr class="text-muted small"><th>Lote</th><th>Vencimiento</th><th class="text-end">Stock</th></tr></thead>
+              <tbody>
+                {% for lote in g.lotes %}
+                <tr><td>{{ lote.codigo_lote or '-' }}</td><td>{{ lote.fecha_vencimiento.strftime('%d-%m-%Y') if lote.fecha_vencimiento else '-' }}</td><td class="text-end">{{ lote.stock_fisico }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </td>
+        </tr>
+        {% endif %}
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-4">Sin resultados.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if current_user.tiene_permiso('inventarios') %}
+<div class="modal fade" id="modalCargarStock" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('stock_cargar') }}" enctype="multipart/form-data">
+        <div class="modal-header">
+          <h5 class="modal-title">Cargar reporte de Stock</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">
+            Sube el archivo .xlsx original del sistema de Inventarios ("Reporte Stock ... Existencias").
+            Esto <strong>reemplaza por completo</strong> el Stock cargado antes -- siempre queda la última foto real.
+          </p>
+          <input type="file" class="form-control" name="archivo" accept=".xlsx,.xls" required>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-brand">Cargar y reemplazar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

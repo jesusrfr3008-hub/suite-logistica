@@ -2,6 +2,60 @@
 {% block title %}{{ orden.numero_po }} · Suite Logística{% endblock %}
 {% block content %}
 
+{% set puede_crear = current_user.tiene_permiso('crear_orden') %}
+{% set puede_aprobar = current_user.tiene_permiso('aprobar_orden') %}
+{% set orden_aprobada = orden.estado_aprobacion in (none, 'Aprobada') %}
+
+{% if orden.estado_aprobacion == 'Por Aprobar' %}
+<div class="alert alert-warning d-flex justify-content-between align-items-center flex-wrap gap-2">
+  <div>
+    <i class="bi bi-hourglass-split me-1"></i>
+    <strong>Por Aprobar</strong> -- esta orden todavía no es una Orden de Compra definitiva: no
+    aparece en el listado general de Compras/Órdenes hasta que se apruebe.
+  </div>
+  {% if puede_aprobar %}
+  <div class="d-flex gap-2">
+    <form method="post" action="{{ url_for('ordenes_aprobar', orden_id=orden.id) }}" onsubmit="return confirm('¿Aprobar esta orden? Pasará a ser una Orden de Compra definitiva.');">
+      <button type="submit" class="btn btn-success btn-sm"><i class="bi bi-check-lg me-1"></i>Aprobar orden</button>
+    </form>
+    <button type="button" class="btn btn-outline-danger btn-sm" data-bs-toggle="modal" data-bs-target="#modalDevolverOrden">
+      <i class="bi bi-arrow-return-left me-1"></i>Devolver
+    </button>
+  </div>
+  {% endif %}
+</div>
+{% if puede_aprobar %}
+<div class="modal fade" id="modalDevolverOrden" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('ordenes_devolver_aprobacion', orden_id=orden.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Devolver orden {{ orden.numero_po }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+          <p class="text-muted small">Quedará 'Sin Emitir', visible solo para quien la creó, para que la corrija y la reenvíe.</p>
+          <label class="form-label">Motivo (opcional)</label>
+          <textarea class="form-control" name="motivo" rows="2"></textarea>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-danger">Devolver</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% elif orden.estado_aprobacion == 'Sin Emitir' %}
+<div class="alert alert-danger d-flex justify-content-between align-items-center flex-wrap gap-2">
+  <div>
+    <i class="bi bi-x-octagon me-1"></i>
+    <strong>Sin Emitir</strong> -- fue devuelta por quien aprueba. Corrígela y reenvíala para que
+    vuelva a quedar 'Por Aprobar'.
+  </div>
+  {% if puede_crear %}
+  <form method="post" action="{{ url_for('ordenes_reenviar_aprobacion', orden_id=orden.id) }}">
+    <button type="submit" class="btn btn-brand btn-sm"><i class="bi bi-send me-1"></i>Reenviar a aprobación</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
 <div class="d-flex justify-content-between align-items-start mb-3">
   <div>
     <h3 class="section-title mb-0">{{ orden.numero_po }}</h3>
@@ -17,11 +71,16 @@
       · Despacho: <a href="{{ url_for('despachos_detalle', despacho_id=orden.despacho.id) }}">{{ orden.despacho.numero_tracking or ('#' ~ orden.despacho.id) }}</a>
       <span class="badge bg-info text-dark">{{ orden.despacho.status }}</span>
       {% endif %}
+      {% if puede_crear %}
       <button class="btn btn-sm btn-link p-0 ms-1" data-bs-toggle="modal" data-bs-target="#modalEditarOrden">Editar</button>
+      {% endif %}
     </div>
   </div>
   <div class="d-flex gap-2">
+    {% if puede_crear or puede_aprobar %}
     <a href="{{ url_for('ordenes_imprimir', orden_id=orden.id) }}" target="_blank" class="btn btn-outline-secondary"><i class="bi bi-printer"></i> Imprimir / PDF</a>
+    {% endif %}
+    {% if puede_crear %}
     <div class="btn-group">
       <button type="button" class="btn btn-outline-primary dropdown-toggle" data-bs-toggle="dropdown">
         <i class="bi bi-envelope"></i> Enviar al proveedor
@@ -51,9 +110,11 @@
       <button class="btn btn-outline-danger">Cancelar orden</button>
     </form>
     {% endif %}
+    {% endif %}
   </div>
 </div>
 
+{% if puede_crear %}
 <!-- Modal: editar cabecera de la orden (ronda K: empresa compradora, N° de PO, moneda, notas) -->
 <div class="modal fade" id="modalEditarOrden" tabindex="-1">
   <div class="modal-dialog">
@@ -92,6 +153,7 @@
     </div>
   </div>
 </div>
+{% endif %}
 
 <div class="row g-3 mb-4">
   <div class="col-md-5">
@@ -147,7 +209,17 @@
 </div>
 
 {% if orden.notas %}
-<div class="alert alert-light border">{{ orden.notas }}</div>
+<div class="alert alert-light border" style="white-space: pre-line;">{{ orden.notas }}</div>
+{% endif %}
+
+{% if not puede_crear %}
+<div class="card p-3 mb-3">
+  <h6 class="mb-2">Agregar una nota</h6>
+  <form method="post" action="{{ url_for('ordenes_nota_agregar', orden_id=orden.id) }}" class="row g-2">
+    <div class="col-12"><textarea class="form-control" name="texto" rows="2" placeholder="Por ejemplo, el motivo de una aprobación o anulación..." required></textarea></div>
+    <div class="col-12"><button type="submit" class="btn btn-sm btn-outline-secondary">Agregar nota</button></div>
+  </form>
+</div>
 {% endif %}
 
 {% if otras_partes %}
@@ -170,7 +242,7 @@
 <div class="card p-3 mb-3">
   <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
     <h5 class="section-title mb-0">Líneas de la orden</h5>
-    {% if orden.estado not in ('Cancelada', 'Anulada') %}
+    {% if puede_crear and orden.estado not in ('Cancelada', 'Anulada') %}
     <button type="button" class="btn btn-sm btn-brand no-print" data-bs-toggle="modal" data-bs-target="#modalAgregarProducto">
       <i class="bi bi-plus-lg"></i> Agregar producto
     </button>
@@ -183,11 +255,19 @@
         <i class="bi bi-list-check"></i> Acciones sobre seleccionadas
       </button>
       <ul class="dropdown-menu">
+        {% if puede_aprobar and orden_aprobada %}
         <li><button type="button" class="dropdown-item" data-bs-toggle="modal" data-bs-target="#modalAccionConfirmar"><i class="bi bi-check2-circle me-1"></i> Confirmado</button></li>
+        {% endif %}
+        {% if puede_crear %}
         <li><button type="button" class="dropdown-item" data-bs-toggle="modal" data-bs-target="#modalAccionFecha"><i class="bi bi-calendar-event me-1"></i> Fecha despacho</button></li>
-        <li><hr class="dropdown-divider"></li>
+        {% endif %}
+        {% if puede_aprobar and orden_aprobada and puede_crear %}<li><hr class="dropdown-divider"></li>{% endif %}
+        {% if puede_aprobar and orden_aprobada %}
         <li><button type="button" class="dropdown-item" id="btnAccionRetroceder"><i class="bi bi-arrow-counterclockwise me-1"></i> Cambiar estado (volver a etapa anterior)</button></li>
+        {% endif %}
+        {% if puede_crear %}
         <li><button type="button" class="dropdown-item text-danger" id="btnAccionAnular"><i class="bi bi-x-circle me-1"></i> Anular</button></li>
+        {% endif %}
       </ul>
     </div>
     <span class="text-muted small" id="contadorSeleccionadas">0 seleccionadas</span>
@@ -249,6 +329,7 @@
     </div>
   </div>
 
+  {% if puede_crear %}
   <!-- Modal: agregar producto nuevo a la orden ya creada -->
   <div class="modal fade" id="modalAgregarProducto" tabindex="-1">
     <div class="modal-dialog modal-lg">
@@ -291,6 +372,7 @@
       </div>
     </div>
   </div>
+  {% endif %}
 
   <div class="table-responsive">
     <table class="table table-sm align-middle">
@@ -327,39 +409,47 @@
           <td class="text-end no-print">
             <div class="d-flex gap-1 justify-content-end">
               {% if l.anulada %}
-              <form method="post" action="{{ url_for('ordenes_linea_reactivar', orden_id=orden.id, linea_id=l.id) }}">
-                <button class="btn btn-sm btn-outline-success">Reactivar</button>
-              </form>
+                {% if puede_crear %}
+                <form method="post" action="{{ url_for('ordenes_linea_reactivar', orden_id=orden.id, linea_id=l.id) }}">
+                  <button class="btn btn-sm btn-outline-success">Reactivar</button>
+                </form>
+                {% else %}
+                <span class="text-muted small">—</span>
+                {% endif %}
               {% elif l.bloqueada %}
               {# Ya despachada: a partir de aqui el lote avanza (aduana / recibido) y se
                  gestiona en bloque desde "Acciones sobre seleccionadas" arriba, no linea
                  por linea -- no hay ninguna accion individual que tenga sentido aqui. #}
               <span class="text-muted small">—</span>
-              {% else %}
+              {% elif puede_crear or puede_aprobar %}
               <div class="dropdown">
                 <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">
                   Acciones
                 </button>
                 <ul class="dropdown-menu dropdown-menu-end">
-                  {% if l.etapa == 'Emisión de Orden' %}
+                  {% if puede_aprobar and orden_aprobada and l.etapa == 'Emisión de Orden' %}
                   <li><button type="button" class="dropdown-item" data-bs-toggle="modal" data-bs-target="#modalConfirmar{{ l.id }}">Confirmar</button></li>
                   {% endif %}
-                  {% if l.etapa_anterior %}
+                  {% if puede_aprobar and orden_aprobada and l.etapa_anterior %}
                   <li>
                     <form method="post" action="{{ url_for('ordenes_linea_retroceder', orden_id=orden.id, linea_id=l.id) }}" onsubmit="return confirm('¿Devolver esta línea a la etapa anterior?');">
                       <button type="submit" class="dropdown-item">↩ Cambiar estado (etapa anterior)</button>
                     </form>
                   </li>
                   {% endif %}
+                  {% if puede_crear %}
                   <li><hr class="dropdown-divider"></li>
                   <li>
                     <form method="post" action="{{ url_for('ordenes_linea_anular', orden_id=orden.id, linea_id=l.id) }}" onsubmit="return confirm('¿Anular esta línea?');">
                       <button type="submit" class="dropdown-item text-danger">Anular</button>
                     </form>
                   </li>
+                  {% endif %}
                 </ul>
               </div>
+              {% if puede_crear %}
               <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalLinea{{ l.id }}">Editar</button>
+              {% endif %}
               {% endif %}
             </div>
           </td>
@@ -374,6 +464,7 @@
 
 <div class="card p-3">
   <h5 class="section-title mb-3">Documentos de la orden</h5>
+  {% if puede_crear %}
   <form method="post" action="{{ url_for('ordenes_documento_subir', orden_id=orden.id) }}" enctype="multipart/form-data" class="row g-2 align-items-end mb-3">
     <div class="col-auto">
       <label class="form-label small mb-0">Tipo de documento</label>
@@ -391,6 +482,7 @@
       <button type="submit" class="btn btn-sm btn-brand">Subir documento</button>
     </div>
   </form>
+  {% endif %}
 
   {% if documentos %}
   <div class="table-responsive">
@@ -414,9 +506,11 @@
           <td class="text-end">
             <a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline-secondary">Ver</a>
             <a href="{{ url_for('ordenes_documento_descargar', orden_id=orden.id, doc_id=d.id) }}" class="btn btn-sm btn-outline-primary">Descargar</a>
+            {% if puede_crear %}
             <form method="post" action="{{ url_for('ordenes_documento_eliminar', orden_id=orden.id, doc_id=d.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar este documento?');">
               <button class="btn btn-sm btn-outline-danger">Eliminar</button>
             </form>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}
@@ -655,9 +749,21 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
         const item = document.createElement('button');
         item.type = 'button';
         const duplicado = !p.tiene_variantes && productoYaEnOrden(p.id, null);
-        item.className = 'list-group-item list-group-item-action py-1 small' + (duplicado ? ' text-muted' : '');
-        item.textContent = duplicado ? `${p.codigo} — ${p.descripcion} (ya en la orden)` : `${p.codigo} — ${p.descripcion}`;
-        item.addEventListener('click', () => seleccionarProducto(p));
+        // Ronda U (2026-09-12, punto 4): un producto inactivo ahora SI
+        // aparece en la búsqueda (antes quedaba oculto), sombreado -- si se
+        // elige, se pide confirmar antes (el backend lo reactiva al
+        // guardar la línea).
+        item.className = 'list-group-item list-group-item-action py-1 small' + (duplicado || !p.activo ? ' text-muted' : '');
+        let etiqueta = `${p.codigo} — ${p.descripcion}`;
+        if (duplicado) etiqueta += ' (ya en la orden)';
+        else if (!p.activo) etiqueta += ' (inactivo)';
+        item.textContent = etiqueta;
+        item.addEventListener('click', () => {
+          if (!duplicado && !p.activo && !confirm(`'${p.codigo}' está desactivado en el catálogo. ¿Deseas activarlo y agregarlo a esta orden?`)) {
+            return;
+          }
+          seleccionarProducto(p);
+        });
         resultados.appendChild(item);
       });
     }, 300);

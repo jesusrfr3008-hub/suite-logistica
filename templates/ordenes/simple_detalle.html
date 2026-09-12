@@ -1,0 +1,238 @@
+{% extends "base.html" %}
+{% block title %}{{ orden.numero_po }} · Mis Órdenes · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="mb-2">
+  <a href="{{ url_for('ordenes_simple_list') }}" class="text-decoration-none small"><i class="bi bi-arrow-left"></i> Mis órdenes</a>
+</div>
+
+{% if orden.estado_aprobacion == 'Por Aprobar' %}
+<div class="alert alert-warning">
+  <i class="bi bi-hourglass-split me-1"></i>
+  <strong>Por Aprobar</strong> -- todavía no es una Orden de Compra definitiva. La revisará alguien
+  con permiso de Aprobación.
+</div>
+{% elif orden.estado_aprobacion == 'Sin Emitir' %}
+<div class="alert alert-danger d-flex justify-content-between align-items-center flex-wrap gap-2">
+  <div>
+    <i class="bi bi-x-octagon me-1"></i>
+    <strong>Sin Emitir</strong> -- fue devuelta por quien aprueba. Corrígela y reenvíala.
+  </div>
+  <form method="post" action="{{ url_for('ordenes_reenviar_aprobacion', orden_id=orden.id) }}">
+    <button type="submit" class="btn btn-brand btn-sm"><i class="bi bi-send me-1"></i>Reenviar a aprobación</button>
+  </form>
+</div>
+{% endif %}
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+  <div>
+    <h3 class="section-title mb-0">{{ orden.numero_po }}</h3>
+    <div class="text-muted">
+      {% if orden.empresa %}Empresa: <strong>{{ orden.empresa.nombre }}</strong> · {% endif %}
+      Proveedor: {{ orden.proveedor.nombre }} · Emitida: {{ orden.fecha_emision }} · Moneda: {{ orden.moneda }}
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    {% if orden.estado == 'Emisión de Orden' %}
+    <form method="post" action="{{ url_for('ordenes_simple_cancelar', orden_id=orden.id) }}" onsubmit="return confirm('¿Anular esta orden completa? Se eliminará del sistema junto con sus líneas y documentos.');">
+      <button class="btn btn-outline-danger">Anular orden</button>
+    </form>
+    {% else %}
+    <span class="text-muted small align-self-center">
+      Esta orden ya tiene líneas confirmadas — para anularla, pídele a un usuario con permiso de Aprobación o Creación de Orden.
+    </span>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-md-6">
+    <div class="card p-3 h-100">
+      <h6 class="text-muted">Estado</h6>
+      <span class="badge bg-primary fs-6">{{ orden.estado }}</span>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card p-3 h-100">
+      <h6 class="text-muted">Total visible</h6>
+      <div class="stat-value">{{ "%.2f"|format(total_visible) }} {{ orden.moneda }}</div>
+      {% if tiene_precios_ocultos %}
+      <div class="text-muted small mt-1"><i class="bi bi-lock-fill me-1"></i>No incluye producto(s) con precio de catálogo no visible para tu perfil.</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{% if orden.notas %}
+<div class="alert alert-light border" style="white-space: pre-line;">{{ orden.notas }}</div>
+{% endif %}
+
+<div class="card p-3 mb-3">
+  <h6 class="mb-2">Agregar una nota</h6>
+  <form method="post" action="{{ url_for('ordenes_nota_agregar', orden_id=orden.id) }}" class="row g-2">
+    <div class="col-12"><textarea class="form-control" name="texto" rows="2" placeholder="Escribe una nota para esta orden..." required></textarea></div>
+    <div class="col-12"><button type="submit" class="btn btn-sm btn-outline-secondary">Agregar nota</button></div>
+  </form>
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <h5 class="section-title mb-0">Líneas de la orden</h5>
+    {% if orden.estado not in ('Cancelada', 'Anulada') %}
+    <button type="button" class="btn btn-sm btn-brand" data-bs-toggle="modal" data-bs-target="#modalAgregarProductoSimple">
+      <i class="bi bi-plus-lg"></i> Agregar producto
+    </button>
+    {% endif %}
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th class="text-end">Cant. cajas</th>
+          <th class="text-end">Precio/caja</th>
+          <th class="text-end">Subtotal</th>
+          <th>Fecha est. despacho</th>
+          <th>Etapa</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for l in lineas %}
+        <tr class="{% if l.anulada %}table-secondary text-muted{% endif %}">
+          <td>{{ l.codigo_mostrar }}</td>
+          <td style="max-width:260px;">{{ l.descripcion_mostrar }}</td>
+          <td class="text-end">{{ l.cantidad_cajas }}</td>
+          {% if l.precio_catalogo_oculto %}
+          <td class="text-end"><i class="bi bi-lock-fill text-muted" title="Precio de catálogo — no visible para tu perfil"></i></td>
+          <td class="text-end"><span class="text-muted">—</span></td>
+          {% else %}
+          <td class="text-end">{{ "%.2f"|format(l.precio_unitario_pactado) }}</td>
+          <td class="text-end">{{ "%.2f"|format(l.subtotal) }}</td>
+          {% endif %}
+          <td>{{ l.fecha_estimada_despacho or '-' }}</td>
+          <td>
+            {% if l.anulada %}<span class="badge bg-dark">Anulada</span>
+            {% elif l.etapa == 'Emisión de Orden' %}<span class="badge bg-secondary">{{ l.etapa }}</span>
+            {% else %}<span class="badge bg-info text-dark">{{ l.etapa }}</span>{% endif %}
+          </td>
+          <td class="text-end">
+            {% if not l.anulada and not l.bloqueada and l.etapa == 'Emisión de Orden' %}
+            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarLineaSimple{{ l.id }}">Editar</button>
+            <form method="post" action="{{ url_for('ordenes_simple_linea_anular', orden_id=orden.id, linea_id=l.id) }}" class="d-inline" onsubmit="return confirm('¿Anular esta línea?');">
+              <button class="btn btn-sm btn-outline-danger">Anular</button>
+            </form>
+            {% else %}
+            <span class="text-muted small">—</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="text-center text-muted py-4">Esta orden no tiene líneas.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card p-3">
+  <h5 class="section-title mb-3">Documentos de la orden</h5>
+  <form method="post" action="{{ url_for('ordenes_documento_subir', orden_id=orden.id) }}" enctype="multipart/form-data" class="row g-2 align-items-end mb-3">
+    <div class="col-auto">
+      <label class="form-label small mb-0">Tipo de documento</label>
+      <select class="form-select form-select-sm" name="tipo">
+        {% for t in tipos_documento %}
+        <option value="{{ t }}">{{ t }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-auto">
+      <label class="form-label small mb-0">Archivo (PDF, JPG, PNG)</label>
+      <input type="file" class="form-control form-control-sm" name="archivo" accept=".pdf,.jpg,.jpeg,.png" required>
+    </div>
+    <div class="col-auto">
+      <button type="submit" class="btn btn-sm btn-brand">Subir documento</button>
+    </div>
+  </form>
+
+  {% if documentos %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th>Tipo</th>
+          <th>Archivo</th>
+          <th>Fecha subida</th>
+          <th class="text-end">Acciones</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in documentos %}
+        <tr>
+          <td><span class="badge bg-secondary">{{ d.tipo }}</span></td>
+          <td><a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener">{{ d.nombre_original }}</a></td>
+          <td>{{ d.fecha_subida.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td class="text-end">
+            <a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline-secondary">Ver</a>
+            <a href="{{ url_for('ordenes_documento_descargar', orden_id=orden.id, doc_id=d.id) }}" class="btn btn-sm btn-outline-primary">Descargar</a>
+            <form method="post" action="{{ url_for('ordenes_documento_eliminar', orden_id=orden.id, doc_id=d.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar este documento?');">
+              <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted mb-0">Aún no hay documentos cargados para esta orden (Cotización, Orden de Compra del proveedor, etc.).</p>
+  {% endif %}
+</div>
+
+<!-- Modal: agregar producto -->
+<div class="modal fade" id="modalAgregarProductoSimple" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('ordenes_simple_linea_nueva', orden_id=orden.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Agregar producto</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6"><label class="form-label">Código *</label><input class="form-control" name="codigo" required></div>
+          <div class="col-6"><label class="form-label">Cantidad de cajas *</label><input type="number" min="1" class="form-control" name="cantidad_cajas" required></div>
+          <div class="col-12"><label class="form-label">Descripción</label><input class="form-control" name="descripcion"></div>
+          <div class="col-6"><label class="form-label">Precio cotizado</label><input type="number" step="0.01" min="0" class="form-control" name="precio_cotizado" placeholder="0.00"></div>
+          <div class="col-6"><label class="form-label">Fecha est. despacho</label><input type="date" class="form-control" name="fecha_estimada_despacho"></div>
+          <div class="col-12 form-text">Si el código ya existe en el catálogo de {{ orden.proveedor.nombre }}, se usará el precio ya cargado (el que escribas aquí se descarta).</div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% for l in lineas %}
+{% if not l.anulada and not l.bloqueada and l.etapa == 'Emisión de Orden' %}
+<div class="modal fade" id="modalEditarLineaSimple{{ l.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('ordenes_simple_linea_actualizar', orden_id=orden.id, linea_id=l.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar {{ l.codigo_mostrar }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-6"><label class="form-label">Cantidad de cajas</label><input type="number" min="1" class="form-control" name="cantidad_cajas" value="{{ l.cantidad_cajas }}"></div>
+          <div class="col-6"><label class="form-label">Fecha est. despacho</label><input type="date" class="form-control" name="fecha_estimada_despacho" value="{{ l.fecha_estimada_despacho or '' }}"></div>
+          {% if not l.precio_catalogo_oculto %}
+          <div class="col-6"><label class="form-label">Precio cotizado</label><input type="number" step="0.01" min="0" class="form-control" name="precio_cotizado" value="{{ l.precio_unitario_pactado }}"></div>
+          {% else %}
+          <div class="col-12 form-text"><i class="bi bi-lock-fill me-1"></i>El precio de esta línea viene del catálogo del proveedor y no se puede editar desde este perfil.</div>
+          {% endif %}
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endfor %}
+
+{% endblock %}

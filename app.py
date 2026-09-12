@@ -5,12 +5,21 @@ import os
 import re
 import shutil
 import uuid
+from collections import defaultdict
 from datetime import datetime, date
+from functools import wraps
 from urllib.parse import quote
 
 import openpyxl
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as ExcelImage
 from flask import (
-    Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory, abort
+    Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory,
+    send_file, abort
+)
+from flask_login import (
+    LoginManager, UserMixin, login_user, logout_user, current_user,
 )
 
 from models import (
@@ -22,6 +31,8 @@ from models import (
     CONCEPTOS_ITEM_FACTURA, TIPOS_DOCUMENTO_GASTO,
     Despacho, ESTADOS_DESPACHO,
     CargoAdicionalImportacion, TipoCambioMensual,
+    Usuario, Rol, PERMISOS_DISPONIBLES,
+    HomologacionStock, StockExistencia,
 )
 from seed_data import seed_from_excel
 import costing
@@ -44,6 +55,13 @@ EMPRESAS_LOGOS_DIR = os.path.join(BASE_DIR, "data", "logos_empresas")
 # mapea cada "codigo padre" del catalogo (ej. "677ADY") a sus codigos de
 # dioptria/variante reales -- ver seed_variantes_lentes_medicontur() abajo.
 VARIANTES_LENTES_MEDICONTUR_EXCEL = os.path.join(BASE_DIR, "Listado codigos lentes medicontur.xlsx")
+# Ronda V (2026-09-12): archivo que el usuario preparo a mano para el cruce
+# UNA SOLA VEZ entre el codigo interno del sistema de Inventarios ("Ergopyme")
+# y nuestro catalogo -- hoja "INVENTARIO ACTUAL" (columnas I/J/K con el
+# cruce) y hoja "LENTES PHYSIOL" (mismo formato que los lentes MEDICONTUR:
+# codigo padre / codigo variante / descripcion). Ver
+# seed_variantes_lentes_physiol() y seed_homologacion_y_stock_inicial() abajo.
+INVENTARIOS_CODIGOS_INTERNOS_EXCEL = os.path.join(BASE_DIR, "Inventarios y codigos interno sistema Inventarios.xlsx")
 EXTENSIONES_LOGO_PERMITIDAS = {".png", ".jpg", ".jpeg", ".svg"}
 # PDF de la Orden de Compra generado en disco para poder adjuntarlo a un
 # correo (ronda L, punto 1, 2026-09-09) -- se sobrescribe cada vez que se
@@ -72,6 +90,156 @@ app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB por archivo subido
 app.secret_key = os.environ.get("SECRET_KEY", "suite-logistica-dev-key")  # cambiar en un despliegue real
 
 db.init_app(app)
+
+# Sistema de usuarios/login (ronda R, 2026-09-12) -- ver Usuario/Rol en
+# models.py. login_view redirige aca cuando alguien sin sesion intenta
+# entrar a una pagina protegida (ver _requerir_login mas abajo).
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"
+login_manager.login_message = "Inicia sesión para continuar."
+login_manager.login_message_category = "warning"
+
+
+@login_manager.user_loader
+def _cargar_usuario(user_id):
+    return Usuario.query.get(int(user_id))
+
+
+# Rutas que NO requieren sesion iniciada -- todo lo demas la exige (ronda R,
+# 2026-09-12): antes de esta ronda la app no tenia ningun control de acceso.
+_ENDPOINTS_PUBLICOS = {"login", "static"}
+
+
+@app.before_request
+def _requerir_login():
+    if request.endpoint is None or request.endpoint in _ENDPOINTS_PUBLICOS:
+        return None
+    if not current_user.is_authenticated:
+        return redirect(url_for("login", next=request.path))
+    return None
+
+
+@app.context_processor
+def _inyectar_ordenes_por_aprobar():
+    """Ronda T (2026-09-12): cantidad para el badge de la pestaña 'Por
+    Aprobar' en la barra de navegacion -- las ordenes que ese usuario puede
+    ver ahi mismo (ver ordenes_por_aprobar): todas las 'Por Aprobar' si
+    tiene permiso de Aprobacion, o solo las suyas si no."""
+    if not current_user.is_authenticated:
+        return {}
+    if not (current_user.tiene_permiso("crear_orden") or current_user.tiene_permiso("aprobar_orden")):
+        return {}
+    q = OrdenCompra.query.filter(OrdenCompra.estado_aprobacion == "Por Aprobar")
+    if not current_user.tiene_permiso("aprobar_orden"):
+        q = q.filter(OrdenCompra.creado_por_usuario_id == current_user.id)
+    return {"ordenes_por_aprobar_count": q.count()}
+
+
+def requiere_permiso(*permisos):
+    """Decorador para una ruta: exige que el usuario logueado sea
+    Administrador o tenga AL MENOS UNO de los `permisos` indicados (los
+    codigos de PERMISOS_DISPONIBLES en models.py). El login en si ya lo
+    exige _requerir_login() arriba para TODA la app -- este decorador solo
+    agrega el chequeo de permiso especifico de cada pantalla."""
+    def decorador(vista):
+        @wraps(vista)
+        def envoltura(*args, **kwargs):
+            if not any(current_user.tiene_permiso(p) for p in permisos):
+                flash("No tienes permiso para acceder a esta sección.", "danger")
+                return redirect(url_for("dashboard"))
+            return vista(*args, **kwargs)
+        return envoltura
+    return decorador
+
+
+def requiere_admin(vista):
+    """Como requiere_permiso, pero solo para el Administrador (gestion de
+    usuarios/roles y pantallas de Configuración)."""
+    @wraps(vista)
+    def envoltura(*args, **kwargs):
+        if not (current_user.is_authenticated and current_user.rol and current_user.rol.es_administrador):
+            flash("Solo un Administrador puede acceder a esta sección.", "danger")
+            return redirect(url_for("dashboard"))
+        return vista(*args, **kwargs)
+    return envoltura
+
+
+def _puede_gestionar_orden_simple(orden):
+    """Ronda S (2026-09-12): True si el usuario actual puede ver/gestionar
+    esta orden a traves de las acciones COMPARTIDAS entre el flujo completo
+    y el flujo 'Creación de Orden Simple' (documentos, notas) -- o bien
+    tiene acceso completo (crear_orden/aprobar_orden, que ven CUALQUIER
+    orden) o bien es SU PROPIA orden, creada con el perfil orden_simple."""
+    if current_user.tiene_permiso("crear_orden") or current_user.tiene_permiso("aprobar_orden"):
+        return True
+    return orden.creado_por_usuario_id == current_user.id
+
+
+def _orden_aprobada(orden):
+    """Ronda T (2026-09-12): True si la orden ya es una Orden de Compra
+    definitiva (estado_aprobacion 'Aprobada', o NULL en ordenes de antes de
+    esta ronda). Las acciones de aprobacion por linea (Confirmar, Cambiar
+    estado) solo tienen sentido una vez aprobada la orden completa."""
+    return orden.estado_aprobacion in (None, "Aprobada")
+
+
+def _destino_detalle_orden(orden):
+    """A donde volver despues de una accion compartida (documentos, notas):
+    quien tiene acceso completo vuelve al detalle normal, quien solo tiene
+    orden_simple vuelve a su propia vista simplificada."""
+    if current_user.tiene_permiso("crear_orden") or current_user.tiene_permiso("aprobar_orden"):
+        return url_for("ordenes_detalle", orden_id=orden.id)
+    return url_for("ordenes_simple_detalle", orden_id=orden.id)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        usuario = Usuario.query.filter(db.func.lower(Usuario.email) == email).first()
+        if usuario and usuario.check_password(password):
+            if not usuario.activo:
+                flash("Este usuario está desactivado. Contacta a un Administrador.", "danger")
+            else:
+                login_user(usuario)
+                usuario.ultimo_acceso = datetime.utcnow()
+                db.session.commit()
+                destino = request.args.get("next") or url_for("dashboard")
+                return redirect(destino)
+        else:
+            flash("Correo o contraseña incorrectos.", "danger")
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    logout_user()
+    flash("Sesión cerrada.", "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/mi-cuenta", methods=["GET", "POST"])
+def mi_cuenta():
+    if request.method == "POST":
+        actual = request.form.get("password_actual", "")
+        nueva = request.form.get("password_nueva", "")
+        confirmar = request.form.get("password_confirmar", "")
+        if not current_user.check_password(actual):
+            flash("La contraseña actual no es correcta.", "danger")
+        elif len(nueva) < 6:
+            flash("La nueva contraseña debe tener al menos 6 caracteres.", "warning")
+        elif nueva != confirmar:
+            flash("La confirmación no coincide con la nueva contraseña.", "warning")
+        else:
+            current_user.set_password(nueva)
+            db.session.commit()
+            flash("Contraseña actualizada correctamente.", "success")
+            return redirect(url_for("dashboard"))
+    return render_template("mi_cuenta.html")
 
 
 # Formato de numeros (2026-09-01, punto 5/7, a pedido del usuario): en Chile
@@ -141,16 +309,25 @@ def ensure_schema_migrations():
             ("anulada", "BOOLEAN DEFAULT 0"),
             ("variante_codigo", "VARCHAR(120)"),
             ("variante_descripcion", "VARCHAR(500)"),
+            ("precio_catalogo_oculto", "BOOLEAN DEFAULT 0"),
+            ("producto_creado_por_esta_orden", "BOOLEAN DEFAULT 0"),
         ],
         "ordenes_compra": [
             ("despacho_id", "INTEGER"),
             ("empresa_id", "INTEGER"),
+            ("creado_por_usuario_id", "INTEGER"),
+            ("estado_aprobacion", "VARCHAR(20) DEFAULT 'Aprobada'"),
         ],
         "importaciones": [
             ("despacho_id", "INTEGER"),
             ("condicion_compra", "VARCHAR(10) DEFAULT 'EXW'"),
             ("flete_total_moneda", "FLOAT DEFAULT 0"),
             ("seguro_total_moneda", "FLOAT DEFAULT 0"),
+            ("empresa_id", "INTEGER"),
+            ("numero_correlativo_inventario", "INTEGER"),
+        ],
+        "proveedores": [
+            ("codigo_sistema_inventario", "VARCHAR(50)"),
         ],
         "parcial_lineas": [
             ("orden_compra_linea_id", "INTEGER"),
@@ -173,6 +350,15 @@ def ensure_schema_migrations():
         "empresas": [
             ("plantilla_asunto_correo", "VARCHAR(200)"),
             ("plantilla_cuerpo_correo", "TEXT"),
+        ],
+        "productos": [
+            ("codigo_interno_inventario", "VARCHAR(40)"),
+        ],
+        "producto_variantes": [
+            ("codigo_interno_inventario", "VARCHAR(40)"),
+        ],
+        "roles": [
+            ("permiso_consultar_stock", "BOOLEAN DEFAULT 0"),
         ],
     }
 
@@ -400,6 +586,434 @@ def seed_variantes_lentes_medicontur():
     )
 
 
+def seed_variantes_lentes_physiol():
+    """Ronda V (2026-09-12): mismo mecanismo que seed_variantes_lentes_
+    medicontur de arriba, pero para los lentes BVI PHYSIOL -- lee la hoja
+    'LENTES PHYSIOL' de INVENTARIOS_CODIGOS_INTERNOS_EXCEL (mismas 3
+    columnas: codigo padre, Codigo Producto/variante, DESCRIPCION). El
+    archivo real trae varias filas repetidas para la misma variante (una
+    por lote visto en el reporte de stock de origen), asi que se deduplica
+    por (codigo padre, codigo variante) antes de crear cada ProductoVariante.
+    Gateado de forma INDEPENDIENTE del gate de seed_variantes_lentes_
+    medicontur (que en produccion ya tiene sus variantes cargadas de una
+    ronda anterior) -- revisa si ya existen variantes especificamente para
+    productos de BVI PHYSIOL, no el conteo global de la tabla."""
+    physiol = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "BVI PHYSIOL").first()
+    if not physiol:
+        print("[seed] No existe el proveedor BVI PHYSIOL todavía, se omite la carga de variantes de lentes Physiol.")
+        return
+    ya_existen = ProductoVariante.query.join(Producto).filter(Producto.proveedor_id == physiol.id).count() > 0
+    if ya_existen:
+        return
+    if not os.path.isfile(INVENTARIOS_CODIGOS_INTERNOS_EXCEL):
+        print(f"[seed] No se encontró {INVENTARIOS_CODIGOS_INTERNOS_EXCEL}, se omite la carga de variantes Physiol.")
+        return
+
+    import openpyxl
+    wb = openpyxl.load_workbook(INVENTARIOS_CODIGOS_INTERNOS_EXCEL, data_only=True)
+    if "LENTES PHYSIOL" not in wb.sheetnames:
+        print("[seed] La hoja 'LENTES PHYSIOL' no existe en el archivo de homologación, se omite.")
+        return
+    ws = wb["LENTES PHYSIOL"]
+
+    productos_padre = {
+        p.codigo.strip().upper(): p
+        for p in Producto.query.filter_by(proveedor_id=physiol.id).all()
+    }
+
+    fila_inicio = 2
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), start=1):
+        primera = str(row[0]).strip().lower() if row and row[0] else ""
+        if primera == "codigo padre":
+            fila_inicio = i + 1
+            break
+
+    creadas = 0
+    padres_no_encontrados = set()
+    vistos = set()
+    for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+        codigo_padre, codigo_variante, descripcion = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, None)
+        codigo_padre = str(codigo_padre).strip() if codigo_padre else ""
+        codigo_variante = str(codigo_variante).strip() if codigo_variante else ""
+        descripcion = str(descripcion).strip() if descripcion else ""
+        if not codigo_padre or not codigo_variante:
+            continue
+        clave = (codigo_padre.upper(), codigo_variante.upper())
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        producto = productos_padre.get(codigo_padre.upper())
+        if not producto:
+            padres_no_encontrados.add(codigo_padre)
+            continue
+        db.session.add(ProductoVariante(
+            producto_id=producto.id,
+            codigo=codigo_variante,
+            descripcion=descripcion or codigo_variante,
+        ))
+        creadas += 1
+    db.session.commit()
+    print(
+        f"[seed] Importadas {creadas} variantes de lentes PHYSIOL "
+        f"({len(padres_no_encontrados)} código(s) padre no encontrados en el catálogo: "
+        f"{sorted(padres_no_encontrados)})."
+    )
+
+
+def _normalizar_codigo_interno(valor):
+    """Ronda V (2026-09-12): limpia un codigo interno del sistema de
+    Inventarios tal como viene en el reporte original -- trae una comilla
+    simple (') adelante (para que el otro sistema no le borre los ceros a
+    la izquierda) y espacios de relleno al final."""
+    if valor is None:
+        return ""
+    s = str(valor).strip()
+    if s.startswith("'"):
+        s = s[1:]
+    s = s.strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def _empresa_por_nombre_reporte(nombre_reporte, cache):
+    """Ronda V (2026-09-12): el reporte de Stock trae el nombre de la
+    empresa como 'ACCUVISION SPA' / 'ACCUMEDICAL SPA' -- nuestras Empresa
+    ya cargadas se llaman 'Accuvision' / 'Accumedical' (sin el SPA). Se
+    normaliza sacando el sufijo ' SPA' y comparando sin distinguir
+    mayusculas/minusculas."""
+    if not nombre_reporte:
+        return None
+    clave = re.sub(r"\s+SPA$", "", nombre_reporte.strip(), flags=re.IGNORECASE).strip().upper()
+    if clave in cache:
+        return cache[clave]
+    empresa = Empresa.query.filter(db.func.upper(Empresa.nombre) == clave).first()
+    cache[clave] = empresa
+    return empresa
+
+
+def _leer_filas_reporte_stock(ws):
+    """Ronda V (2026-09-12): lee una hoja con el formato ORIGINAL del
+    reporte de Stock del sistema de Inventarios ('Ergopyme') -- columnas
+    A-H: Cód.Bod (se ignora), Cód.Producto, Denominacion, Uni, Cód.Lote,
+    Vencimiento, F.Compra (se ignora), Stock físico. El archivo trae el
+    stock de VARIAS empresas seguidas, cada bloque separado por una fila
+    con solo el nombre de la empresa en la columna A (ej. 'ACCUVISION
+    SPA'), seguida del titulo, la fecha de emision, una fila en blanco, el
+    encabezado de la tabla y una fila de guiones -- todo eso se reconoce y
+    se salta solo, sin asumir un numero de fila fijo (la cantidad de filas
+    de cada empresa cambia en cada carga segun compras/ventas)."""
+    filas = []
+    empresa_actual = None
+    for row in ws.iter_rows(min_row=1, values_only=True):
+        a = row[0] if len(row) > 0 else None
+        b = row[1] if len(row) > 1 else None
+        if a is None and b is None:
+            continue
+        if b is None:
+            texto = str(a).strip() if a is not None else ""
+            if not texto or texto.lower().startswith("fecha") or texto.lower() == "cód.bod" or set(texto) <= {"-"}:
+                continue
+            empresa_actual = texto
+            continue
+        if not (isinstance(b, str) and b.strip().startswith("'")):
+            continue
+        codigo_interno = _normalizar_codigo_interno(b)
+        if not codigo_interno:
+            continue
+        descripcion = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+        codigo_lote = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
+        fecha_venc = row[5] if len(row) > 5 else None
+        if isinstance(fecha_venc, datetime):
+            fecha_venc = fecha_venc.date()
+        stock = row[7] if len(row) > 7 else 0
+        try:
+            stock = int(stock) if stock is not None else 0
+        except (TypeError, ValueError):
+            stock = 0
+        filas.append({
+            "empresa_texto": empresa_actual,
+            "codigo_interno": codigo_interno,
+            "descripcion": descripcion,
+            "codigo_lote": codigo_lote,
+            "fecha_vencimiento": fecha_venc,
+            "stock_fisico": stock,
+        })
+    return filas
+
+
+def _clasificar_y_cargar_stock(filas):
+    """Ronda V (2026-09-12): convierte filas ya leidas (_leer_filas_reporte_
+    stock) en registros StockExistencia, usando la tabla HomologacionStock
+    para saber a que Producto/Variante ligar cada codigo interno (o si hay
+    que excluirlo / dejarlo sin marca). Un codigo interno que nunca se vio
+    antes queda 'pendiente' -- se carga igual al Stock (sin producto/
+    variante ligado, para no perder el dato) y aparece en /stock/
+    homologacion para resolverlo a mano. NO crea Productos nuevos aca (eso
+    solo ocurre en el cruce inicial, ver seed_homologacion_y_stock_inicial)
+    -- una carga de stock del dia a dia nunca inventa productos solos."""
+    resumen = {
+        "cargados": 0, "vinculados": 0, "sin_marca": 0, "excluidos": 0,
+        "pendientes_nuevos": 0, "empresas_no_encontradas": set(),
+    }
+    cache_empresas = {}
+    homologaciones = {h.codigo_interno: h for h in HomologacionStock.query.all()}
+    for fila in filas:
+        codigo = fila["codigo_interno"]
+        homolog = homologaciones.get(codigo)
+        if homolog is None:
+            homolog = HomologacionStock(
+                codigo_interno=codigo,
+                estado="pendiente",
+                descripcion_referencia=fila["descripcion"],
+            )
+            db.session.add(homolog)
+            homologaciones[codigo] = homolog
+            resumen["pendientes_nuevos"] += 1
+        elif fila["descripcion"] and not homolog.producto_id and not homolog.variante_id:
+            homolog.descripcion_referencia = fila["descripcion"]
+
+        if homolog.estado == "excluido":
+            resumen["excluidos"] += 1
+            continue
+
+        empresa = _empresa_por_nombre_reporte(fila["empresa_texto"], cache_empresas)
+        if not empresa:
+            resumen["empresas_no_encontradas"].add(fila["empresa_texto"] or "(sin identificar)")
+            continue
+
+        db.session.add(StockExistencia(
+            empresa_id=empresa.id,
+            producto_id=homolog.producto_id,
+            variante_id=homolog.variante_id,
+            codigo_interno=codigo,
+            descripcion=fila["descripcion"],
+            codigo_lote=fila["codigo_lote"],
+            fecha_vencimiento=fila["fecha_vencimiento"],
+            stock_fisico=fila["stock_fisico"],
+        ))
+        resumen["cargados"] += 1
+        if homolog.estado == "vinculado":
+            resumen["vinculados"] += 1
+        elif homolog.estado == "sin_marca":
+            resumen["sin_marca"] += 1
+    return resumen
+
+
+def seed_homologacion_y_stock_inicial():
+    """Ronda V (2026-09-12, punto 1): cruce UNA SOLA VEZ entre el codigo
+    interno del sistema de Inventarios y nuestro catalogo, a partir del
+    archivo que el usuario preparo a mano ('Inventarios y codigos interno
+    sistema Inventarios.xlsx', hoja 'INVENTARIO ACTUAL', columnas I/J/K).
+    Clasifica cada codigo interno distinto segun la columna K (PROVEEDOR):
+    - 'NO INCLUIR' (o vacio) -> queda 'excluido': nunca se carga al Stock.
+    - 'SIN MARCA' -> queda 'sin_marca': se carga al Stock para consulta,
+      pero no se crea ni se liga a ningun Producto del catalogo.
+    - cualquier otro proveedor -> se busca ese Producto (o esa
+      ProductoVariante, para familias con dioptrias como MEDICONTUR/BVI
+      PHYSIOL) por el codigo de la columna J; si no existe todavia en
+      nuestro catalogo, se CREA (a pedido explicito del usuario).
+    Gateado: si ya existe alguna fila en HomologacionStock, no hace nada
+    (para que el usuario pueda ajustar homologaciones a mano despues sin
+    que se pisen solas en cada arranque). Debe correr DESPUES de
+    seed_variantes_lentes_medicontur() y seed_variantes_lentes_physiol(),
+    para que las variantes de esas 2 familias ya existan al momento del
+    cruce."""
+    if HomologacionStock.query.count() > 0:
+        return
+    if not os.path.isfile(INVENTARIOS_CODIGOS_INTERNOS_EXCEL):
+        print(f"[seed] No se encontró {INVENTARIOS_CODIGOS_INTERNOS_EXCEL}, se omite la homologación inicial de Stock.")
+        return
+
+    import openpyxl
+    wb = openpyxl.load_workbook(INVENTARIOS_CODIGOS_INTERNOS_EXCEL, data_only=True)
+    if "INVENTARIO ACTUAL" not in wb.sheetnames:
+        print("[seed] La hoja 'INVENTARIO ACTUAL' no existe en el archivo de homologación, se omite.")
+        return
+    ws = wb["INVENTARIO ACTUAL"]
+
+    clasificacion = {}
+    filas_crudas = []
+    empresa_actual = None
+    for row in ws.iter_rows(min_row=1, values_only=True):
+        a = row[0] if len(row) > 0 else None
+        b = row[1] if len(row) > 1 else None
+        if a is None and b is None:
+            continue
+        if b is None:
+            texto = str(a).strip() if a is not None else ""
+            if not texto or texto.lower().startswith("fecha") or texto.lower() == "cód.bod" or set(texto) <= {"-"}:
+                continue
+            empresa_actual = texto
+            continue
+        if not (isinstance(b, str) and b.strip().startswith("'")):
+            continue
+        codigo_interno = _normalizar_codigo_interno(b)
+        if not codigo_interno:
+            continue
+        descripcion = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+        codigo_lote = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
+        fecha_venc = row[5] if len(row) > 5 else None
+        if isinstance(fecha_venc, datetime):
+            fecha_venc = fecha_venc.date()
+        stock = row[7] if len(row) > 7 else 0
+        try:
+            stock = int(stock) if stock is not None else 0
+        except (TypeError, ValueError):
+            stock = 0
+        filas_crudas.append({
+            "empresa_texto": empresa_actual, "codigo_interno": codigo_interno,
+            "descripcion": descripcion, "codigo_lote": codigo_lote,
+            "fecha_vencimiento": fecha_venc, "stock_fisico": stock,
+        })
+        if codigo_interno not in clasificacion:
+            j = row[9] if len(row) > 9 else None
+            k = row[10] if len(row) > 10 else None
+            clasificacion[codigo_interno] = {
+                "j": str(j).strip() if j is not None else "",
+                "k": str(k).strip() if k is not None else "",
+                "descripcion": descripcion,
+            }
+
+    proveedores_cache = {}
+    productos_creados = 0
+    variantes_ligadas = 0
+    productos_ligados = 0
+    sin_marca = 0
+    excluidos = 0
+    pendientes_manual = 0
+    proveedores_no_encontrados = set()
+
+    for codigo_interno, info in clasificacion.items():
+        k_upper = info["k"].strip().upper()
+        j_valor = info["j"].strip()
+        if not k_upper or k_upper == "NO INCLUIR":
+            db.session.add(HomologacionStock(
+                codigo_interno=codigo_interno, estado="excluido",
+                descripcion_referencia=info["descripcion"],
+            ))
+            excluidos += 1
+            continue
+        if k_upper == "SIN MARCA":
+            db.session.add(HomologacionStock(
+                codigo_interno=codigo_interno, estado="sin_marca",
+                descripcion_referencia=info["descripcion"],
+            ))
+            sin_marca += 1
+            continue
+
+        if k_upper not in proveedores_cache:
+            proveedores_cache[k_upper] = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == k_upper).first()
+        proveedor = proveedores_cache[k_upper]
+        if not proveedor or not j_valor:
+            if not proveedor:
+                proveedores_no_encontrados.add(info["k"])
+            db.session.add(HomologacionStock(
+                codigo_interno=codigo_interno, estado="pendiente",
+                descripcion_referencia=info["descripcion"],
+            ))
+            pendientes_manual += 1
+            continue
+
+        j_upper = j_valor.upper()
+        producto_match = Producto.query.filter(
+            Producto.proveedor_id == proveedor.id, db.func.upper(Producto.codigo) == j_upper
+        ).first()
+        if producto_match:
+            producto_match.codigo_interno_inventario = codigo_interno
+            db.session.add(HomologacionStock(
+                codigo_interno=codigo_interno, estado="vinculado",
+                producto_id=producto_match.id, descripcion_referencia=info["descripcion"],
+            ))
+            productos_ligados += 1
+            continue
+
+        variante_match = ProductoVariante.query.join(Producto).filter(
+            Producto.proveedor_id == proveedor.id, db.func.upper(ProductoVariante.codigo) == j_upper
+        ).first()
+        if variante_match:
+            variante_match.codigo_interno_inventario = codigo_interno
+            db.session.add(HomologacionStock(
+                codigo_interno=codigo_interno, estado="vinculado",
+                producto_id=variante_match.producto_id, variante_id=variante_match.id,
+                descripcion_referencia=info["descripcion"],
+            ))
+            variantes_ligadas += 1
+            continue
+
+        nuevo = Producto(
+            proveedor_id=proveedor.id,
+            codigo=j_valor,
+            descripcion=info["descripcion"] or j_valor,
+            empaque=1,
+            moneda=proveedor.moneda_default or "USD",
+            precio_caja=0,
+            precio_unitario=0,
+            activo=True,
+            codigo_interno_inventario=codigo_interno,
+        )
+        db.session.add(nuevo)
+        db.session.flush()
+        db.session.add(HomologacionStock(
+            codigo_interno=codigo_interno, estado="vinculado",
+            producto_id=nuevo.id, descripcion_referencia=info["descripcion"],
+        ))
+        productos_creados += 1
+
+    db.session.commit()
+    print(
+        f"[seed] Homologación inicial de Stock: {productos_ligados} código(s) ligados a producto ya existente, "
+        f"{variantes_ligadas} ligados a variante ya existente, {productos_creados} producto(s) NUEVOS creados en "
+        f"el catálogo, {sin_marca} sin marca, {excluidos} excluidos, {pendientes_manual} pendiente(s) por resolver "
+        f"a mano (proveedor no encontrado: {sorted(proveedores_no_encontrados)})."
+    )
+
+    resumen = _clasificar_y_cargar_stock(filas_crudas)
+    db.session.commit()
+    print(
+        f"[seed] Stock inicial cargado: {resumen['cargados']} fila(s) "
+        f"({resumen['vinculados']} vinculadas, {resumen['sin_marca']} sin marca), "
+        f"{resumen['pendientes_nuevos']} código(s) nuevos quedaron pendientes, "
+        f"empresas no encontradas: {sorted(resumen['empresas_no_encontradas'])}."
+    )
+
+
+# Contraseña temporal del Administrador inicial (ronda R, 2026-09-12) --
+# ver seed_administrador_inicial() abajo. Puramente informativa aca (el
+# usuario la cambia desde "Mi cuenta" apenas entra la primera vez); no es
+# un secreto de produccion real, es solo para no dejar la app sin forma de
+# entrar la primera vez que se activa el login.
+PASSWORD_TEMPORAL_ADMIN_INICIAL = "CambiaEsta123!"
+
+
+def seed_administrador_inicial():
+    """Crea el primer Rol Administrador + el primer Usuario la primera vez
+    que la app arranca con el sistema de login (ronda R, 2026-09-12) -- sin
+    esto, al activar el login nadie podria entrar nunca mas. Gateado: si ya
+    existe algun Usuario, no hace nada (para no resetear la contraseña de
+    nadie en arranques posteriores)."""
+    if Usuario.query.count() > 0:
+        return
+    rol_admin = Rol.query.filter_by(es_administrador=True).first()
+    if not rol_admin:
+        rol_admin = Rol(nombre="Administrador", es_administrador=True)
+        db.session.add(rol_admin)
+        db.session.flush()
+    usuario = Usuario(
+        nombre_completo="Jesus Rafael",
+        email="jesusrfr3008@gmail.com",
+        rol_id=rol_admin.id,
+        activo=True,
+    )
+    usuario.set_password(PASSWORD_TEMPORAL_ADMIN_INICIAL)
+    db.session.add(usuario)
+    db.session.commit()
+    print(
+        f"[seed] Usuario Administrador inicial creado ({usuario.email}) -- "
+        "cambiar la contraseña temporal desde 'Mi cuenta' cuanto antes."
+    )
+
+
 with app.app_context():
     os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
     os.makedirs(DOCUMENTOS_DIR, exist_ok=True)
@@ -410,6 +1024,9 @@ with app.app_context():
     seed_from_excel(app)
     seed_empresas_compradoras()
     seed_variantes_lentes_medicontur()
+    seed_variantes_lentes_physiol()
+    seed_homologacion_y_stock_inicial()
+    seed_administrador_inicial()
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +1075,23 @@ def siguiente_numero_po(empresa_id=None):
         except ValueError:
             continue
     return f"{prefijo}{max_correlativo + 1:04d}"
+
+
+def siguiente_correlativo_inventario(empresa_id):
+    """Sugiere el siguiente correlativo de importacion del sistema de
+    Inventarios para una empresa compradora (ronda O, 2026-09-12) -- ese
+    correlativo vive en el OTRO sistema, no en este, asi que no hay forma de
+    generarlo desde cero: se calcula como el maximo ya guardado en
+    Importacion.numero_correlativo_inventario para esa empresa + 1. Si
+    todavia no hay ninguno cargado para esa empresa, devuelve None (no se
+    inventa un numero de partida) -- el usuario debe indicar el primero a
+    mano, tal como avisó."""
+    if not empresa_id:
+        return None
+    maximo = db.session.query(db.func.max(Importacion.numero_correlativo_inventario)).filter(
+        Importacion.empresa_id == empresa_id
+    ).scalar()
+    return (maximo + 1) if maximo else None
 
 
 def recalcular_estado_orden(orden):
@@ -553,6 +1187,13 @@ def dividir_orden_si_corresponde(orden):
                 moneda=orden.moneda,
                 estado=lineas_cohorte[0].etapa,
                 notas=orden.notas,
+                # Ronda T (2026-09-12): la orden nueva hereda quien creo la
+                # original y su estado de aprobacion -- si no se copiaran, la
+                # parte separada quedaria "huerfana" (sin creado_por_usuario_id)
+                # y el usuario que la creo dejaria de poder verla como suya en
+                # "Mis ordenes"/"Por Aprobar".
+                creado_por_usuario_id=orden.creado_por_usuario_id,
+                estado_aprobacion=orden.estado_aprobacion,
             )
             db.session.add(destino)
             db.session.flush()
@@ -685,6 +1326,7 @@ def dashboard():
 # ---------------------------------------------------------------------------
 
 @app.route("/proveedores")
+@requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_list():
     q = request.args.get("q", "").strip()
     query = Proveedor.query
@@ -695,6 +1337,7 @@ def proveedores_list():
 
 
 @app.route("/proveedores/nuevo", methods=["GET", "POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_nuevo():
     if request.method == "POST":
         prov = Proveedor(
@@ -706,6 +1349,7 @@ def proveedores_nuevo():
             contacto_email=request.form.get("contacto_email", "").strip(),
             direccion=request.form.get("direccion", "").strip(),
             moneda_default=request.form.get("moneda_default", "USD"),
+            codigo_sistema_inventario=request.form.get("codigo_sistema_inventario", "").strip(),
             notas=request.form.get("notas", "").strip(),
             activo=True,
         )
@@ -717,6 +1361,7 @@ def proveedores_nuevo():
 
 
 @app.route("/proveedores/<int:proveedor_id>/editar", methods=["GET", "POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_editar(proveedor_id):
     prov = Proveedor.query.get_or_404(proveedor_id)
     if request.method == "POST":
@@ -728,6 +1373,7 @@ def proveedores_editar(proveedor_id):
         prov.contacto_email = request.form.get("contacto_email", "").strip()
         prov.direccion = request.form.get("direccion", "").strip()
         prov.moneda_default = request.form.get("moneda_default", "USD")
+        prov.codigo_sistema_inventario = request.form.get("codigo_sistema_inventario", "").strip()
         prov.notas = request.form.get("notas", "").strip()
         db.session.commit()
         flash(f"Proveedor '{prov.nombre}' actualizado.", "success")
@@ -736,6 +1382,7 @@ def proveedores_editar(proveedor_id):
 
 
 @app.route("/proveedores/<int:proveedor_id>/eliminar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_eliminar(proveedor_id):
     prov = Proveedor.query.get_or_404(proveedor_id)
     if prov.ordenes.count() > 0:
@@ -753,6 +1400,7 @@ def proveedores_eliminar(proveedor_id):
 
 
 @app.route("/proveedores/<int:proveedor_id>/reactivar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_reactivar(proveedor_id):
     prov = Proveedor.query.get_or_404(proveedor_id)
     prov.activo = True
@@ -762,6 +1410,7 @@ def proveedores_reactivar(proveedor_id):
 
 
 @app.route("/proveedores/<int:proveedor_id>")
+@requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_detalle(proveedor_id):
     prov = Proveedor.query.get_or_404(proveedor_id)
     q = request.args.get("q", "").strip()
@@ -780,6 +1429,7 @@ def proveedores_detalle(proveedor_id):
 # --- Productos (catalogo por proveedor) ---
 
 @app.route("/proveedores/<int:proveedor_id>/productos/nuevo", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
 def productos_nuevo(proveedor_id):
     prov = Proveedor.query.get_or_404(proveedor_id)
     producto = Producto(
@@ -799,6 +1449,7 @@ def productos_nuevo(proveedor_id):
 
 
 @app.route("/productos/<int:producto_id>/editar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
 def productos_editar(producto_id):
     producto = Producto.query.get_or_404(producto_id)
     producto.codigo = request.form["codigo"].strip()
@@ -814,12 +1465,34 @@ def productos_editar(producto_id):
 
 
 @app.route("/productos/<int:producto_id>/eliminar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
 def productos_eliminar(producto_id):
+    """Ronda U (2026-09-12, punto 2): elimina el producto DE VERDAD del
+    catálogo (antes esta ruta existía pero no estaba conectada a ningún
+    botón, y solo desactivaba). Solo se permite si el producto nunca se usó
+    en ninguna Orden de Compra ni en ningún Parcial de Costeo -- si tiene
+    historial, se desactiva en su lugar (igual que el checkbox 'Activo en
+    catálogo' del modal Editar) para no romper ningún dato ya guardado."""
     producto = Producto.query.get_or_404(producto_id)
     proveedor_id = producto.proveedor_id
-    producto.activo = False
-    db.session.commit()
-    flash("Producto desactivado del catalogo.", "success")
+    en_uso = (
+        OrdenCompraLinea.query.filter_by(producto_id=producto.id).count() > 0
+        or ParcialLinea.query.filter_by(producto_id=producto.id).count() > 0
+    )
+    if en_uso:
+        producto.activo = False
+        db.session.commit()
+        flash(
+            f"'{producto.codigo}' ya se usó en alguna orden o costeo: no se puede eliminar sin perder "
+            "ese historial, así que se desactivó en su lugar.",
+            "warning",
+        )
+    else:
+        ProductoVariante.query.filter_by(producto_id=producto.id).delete()
+        codigo = producto.codigo
+        db.session.delete(producto)
+        db.session.commit()
+        flash(f"Producto '{codigo}' eliminado del catálogo.", "success")
     return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
 
 
@@ -828,12 +1501,18 @@ def productos_eliminar(producto_id):
 # ---------------------------------------------------------------------------
 
 @app.route("/ordenes")
+@requiere_permiso("crear_orden", "aprobar_orden")
 def ordenes_list():
     estado = request.args.get("estado", "")
     proveedor_id = request.args.get("proveedor_id", "")
     empresa_id = request.args.get("empresa_id", "")
     mostrar_despachadas = request.args.get("mostrar_despachadas") == "1"
-    query = OrdenCompra.query
+    # Ronda T (2026-09-12): "los registros" (este listado) solo muestran
+    # ordenes ya Aprobadas -- las 'Por Aprobar' y 'Sin Emitir' se gestionan
+    # aparte, en /ordenes/por-aprobar (ver ordenes_por_aprobar).
+    query = OrdenCompra.query.filter(
+        db.or_(OrdenCompra.estado_aprobacion.is_(None), OrdenCompra.estado_aprobacion == "Aprobada")
+    )
     if empresa_id:
         if empresa_id == "sin-asignar":
             query = query.filter(OrdenCompra.empresa_id.is_(None))
@@ -877,7 +1556,99 @@ def ordenes_list():
     )
 
 
+@app.route("/ordenes/por-aprobar")
+@requiere_permiso("crear_orden", "aprobar_orden")
+def ordenes_por_aprobar():
+    """Ronda T (2026-09-12): bandeja de ordenes que todavia NO son una
+    Orden de Compra definitiva. Quien tiene permiso de Aprobacion ve TODAS
+    las 'Por Aprobar' (de cualquier creador) para poder actuar sobre ellas;
+    quien solo tiene Creacion de Orden (sin Aprobacion) ve unicamente las
+    SUYAS -- tanto 'Por Aprobar' (a la espera) como 'Sin Emitir'
+    (devueltas, para corregir y reenviar) -- funciona como su propio 'Mis
+    ordenes', igual que ya existia para el perfil Orden Simple."""
+    puede_aprobar = current_user.tiene_permiso("aprobar_orden")
+    if puede_aprobar:
+        query = OrdenCompra.query.filter(
+            db.or_(OrdenCompra.estado_aprobacion == "Por Aprobar", db.and_(
+                OrdenCompra.estado_aprobacion == "Sin Emitir",
+                OrdenCompra.creado_por_usuario_id == current_user.id,
+            ))
+        )
+    else:
+        query = OrdenCompra.query.filter(
+            OrdenCompra.estado_aprobacion.in_(["Por Aprobar", "Sin Emitir"]),
+            OrdenCompra.creado_por_usuario_id == current_user.id,
+        )
+    ordenes = query.order_by(OrdenCompra.id.desc()).all()
+    return render_template("ordenes/por_aprobar.html", ordenes=ordenes, puede_aprobar=puede_aprobar)
+
+
+@app.route("/ordenes/<int:orden_id>/aprobar", methods=["POST"])
+@requiere_permiso("aprobar_orden")
+def ordenes_aprobar(orden_id):
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.estado_aprobacion != "Por Aprobar":
+        flash("Esta orden ya no está 'Por Aprobar'.", "warning")
+        return redirect(url_for("ordenes_por_aprobar"))
+    orden.estado_aprobacion = "Aprobada"
+    # Ronda U (2026-09-12, punto 1): los productos nuevos que dio de alta
+    # esta orden (perfil "Creación de Orden Simple") nacieron inactivos para
+    # no ensuciar el catálogo con datos sin confirmar -- recien ahora, al
+    # aprobarse, se activan de verdad.
+    activados = 0
+    for linea in orden.lineas:
+        if linea.producto_creado_por_esta_orden and linea.producto and not linea.producto.activo:
+            linea.producto.activo = True
+            activados += 1
+    db.session.commit()
+    mensaje = f"Orden {orden.numero_po} aprobada -- ya es una Orden de Compra definitiva y aparece en Compras/Órdenes."
+    if activados:
+        mensaje += f" Se activaron {activados} producto(s) nuevo(s) en el catálogo del proveedor."
+    flash(mensaje, "success")
+    return redirect(url_for("ordenes_por_aprobar"))
+
+
+@app.route("/ordenes/<int:orden_id>/devolver-aprobacion", methods=["POST"])
+@requiere_permiso("aprobar_orden")
+def ordenes_devolver_aprobacion(orden_id):
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.estado_aprobacion != "Por Aprobar":
+        flash("Esta orden ya no está 'Por Aprobar'.", "warning")
+        return redirect(url_for("ordenes_por_aprobar"))
+    orden.estado_aprobacion = "Sin Emitir"
+    motivo = (request.form.get("motivo") or "").strip()
+    sello = f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} · {current_user.nombre_completo}]"
+    nota = f"{sello} Devolvió la orden (queda 'Sin Emitir')."
+    if motivo:
+        nota += f" Motivo: {motivo}"
+    orden.notas = f"{orden.notas}\n{nota}" if orden.notas else nota
+    db.session.commit()
+    flash(f"Orden {orden.numero_po} devuelta -- queda 'Sin Emitir', visible solo para quien la creó.", "info")
+    return redirect(url_for("ordenes_por_aprobar"))
+
+
+@app.route("/ordenes/<int:orden_id>/reenviar-aprobacion", methods=["POST"])
+@requiere_permiso("crear_orden", "orden_simple")
+def ordenes_reenviar_aprobacion(orden_id):
+    """Quien creó la orden la reenvía a aprobación despues de corregirla:
+    quien tiene acceso completo (crear_orden) puede reenviar cualquier
+    orden (mismo criterio que el resto del flujo completo); quien solo
+    tiene el perfil orden_simple unicamente puede reenviar la SUYA."""
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _puede_gestionar_orden_simple(orden):
+        flash("Solo puedes reenviar las órdenes que tú mismo creaste.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
+    if orden.estado_aprobacion != "Sin Emitir":
+        flash("Esta orden no está 'Sin Emitir'.", "warning")
+        return redirect(_destino_detalle_orden(orden))
+    orden.estado_aprobacion = "Por Aprobar"
+    db.session.commit()
+    flash(f"Orden {orden.numero_po} reenviada -- vuelve a quedar 'Por Aprobar'.", "success")
+    return redirect(_destino_detalle_orden(orden))
+
+
 @app.route("/ordenes/nueva", methods=["GET", "POST"])
+@requiere_permiso("crear_orden")
 def ordenes_nueva():
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     empresas = Empresa.query.filter_by(activo=True).order_by(Empresa.nombre).all()
@@ -886,8 +1657,13 @@ def ordenes_nueva():
         proveedor_id = int(request.form["proveedor_id"])
         prov = Proveedor.query.get_or_404(proveedor_id)
         empresa_id = request.form.get("empresa_id") or None
-        if empresa_id:
-            Empresa.query.get_or_404(int(empresa_id))
+        if not empresa_id:
+            # Ronda U (2026-09-12, punto 3): una orden no se puede crear sin
+            # Empresa compradora identificada (el <select> ya lo exige en el
+            # HTML, pero se valida tambien acá por si llega sin ese campo).
+            flash("Selecciona la Empresa compradora antes de crear la orden.", "danger")
+            return redirect(url_for("ordenes_nueva", proveedor_id=proveedor_id))
+        Empresa.query.get_or_404(int(empresa_id))
 
         orden = OrdenCompra(
             numero_po=siguiente_numero_po(int(empresa_id) if empresa_id else None),
@@ -897,6 +1673,8 @@ def ordenes_nueva():
             moneda=request.form.get("moneda", prov.moneda_default or "USD"),
             estado=ETAPAS_LINEA[0],
             notas=request.form.get("notas", "").strip(),
+            creado_por_usuario_id=current_user.id,
+            estado_aprobacion="Por Aprobar",
         )
         db.session.add(orden)
         db.session.flush()
@@ -936,8 +1714,21 @@ def ordenes_nueva():
             flash("Debes agregar al menos una linea con cantidad mayor a 0.", "danger")
             return redirect(url_for("ordenes_nueva", proveedor_id=proveedor_id))
 
+        db.session.flush()
+        # Ronda U (2026-09-12, punto 4): si se eligio del catalogo un
+        # producto inactivo (el front-end lo muestra sombreado y pide
+        # confirmar antes), se reactiva al quedar agregado a la orden.
+        reactivados = 0
+        for l in orden.lineas:
+            if l.producto and not l.producto.activo:
+                l.producto.activo = True
+                reactivados += 1
+
         db.session.commit()
-        flash(f"Orden {orden.numero_po} creada con {lineas_creadas} lineas.", "success")
+        mensaje = f"Orden {orden.numero_po} creada con {lineas_creadas} lineas. Queda 'Por Aprobar' -- no aparecera en el listado general hasta que alguien con permiso de Aprobacion la apruebe."
+        if reactivados:
+            mensaje += f" Se reactivaron {reactivados} producto(s) que estaban inactivos en el catálogo."
+        flash(mensaje, "success")
         return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
     proveedor_id = request.args.get("proveedor_id", type=int)
@@ -947,15 +1738,397 @@ def ordenes_nueva():
     )
 
 
+@app.route("/ordenes/simple/nueva", methods=["GET", "POST"])
+def ordenes_simple_nueva():
+    """Creación de Orden 'simple' (ronda R, 2026-09-12, permiso
+    orden_simple): pensada para un usuario que NO debe ver los precios ya
+    cargados en el catálogo de ningún proveedor -- por eso este formulario
+    nunca busca ni muestra el catálogo, solo pide escribir el código/
+    descripción/cantidad y el precio que el proveedor le cotizó a ÉL para
+    esta compra puntual. Si ese código YA existe en el catálogo de ese
+    proveedor, se usa el producto y precio YA cargados (el precio tecleado
+    acá se descarta sin mostrarlo) -- para no pisar el dato que mantiene
+    quien sí tiene acceso a Creación de Orden completa. Si no existe, se
+    crea un Producto nuevo en el catálogo de ese proveedor con el precio
+    indicado. Ronda T (2026-09-12): la orden resultante nace 'Por Aprobar'
+    (ver ESTADOS_APROBACION_OC en models.py) -- no aparece en el listado
+    general de Compras/Órdenes hasta que alguien con permiso de Aprobación
+    la apruebe desde la pestaña 'Por Aprobar'; si la devuelve, queda 'Sin
+    Emitir' y solo la ve quien la creó, en 'Mis órdenes', para corregirla y
+    reenviarla. Ronda S (2026-09-12, puntos 1 y 2): ahora puede adjuntar
+    Cotización/Orden de Compra del proveedor desde este mismo formulario, y
+    queda registrado como creador (creado_por_usuario_id) para que después
+    pueda ver/editar/anular ESTA orden puntual desde "Mis órdenes" -- ver
+    ordenes_simple_list/detalle mas abajo."""
+    if not (current_user.tiene_permiso("orden_simple") or current_user.tiene_permiso("crear_orden")):
+        flash("No tienes permiso para acceder a esta sección.", "danger")
+        return redirect(url_for("dashboard"))
+
+    proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
+    empresas = Empresa.query.filter_by(activo=True).order_by(Empresa.nombre).all()
+
+    if request.method == "POST":
+        proveedor_id = request.form.get("proveedor_id") or None
+        empresa_id = request.form.get("empresa_id") or None
+        if not proveedor_id:
+            flash("Selecciona un proveedor.", "warning")
+            return redirect(url_for("ordenes_simple_nueva"))
+        if not empresa_id:
+            # Ronda U (2026-09-12, punto 3): una orden no se puede crear sin
+            # Empresa compradora identificada.
+            flash("Selecciona la Empresa compradora antes de crear la orden.", "danger")
+            return redirect(url_for("ordenes_simple_nueva"))
+        prov = Proveedor.query.get_or_404(int(proveedor_id))
+
+        nota_sistema = (
+            f"Orden creada por {current_user.nombre_completo} con el perfil "
+            "'Creación de Orden Simple' (sin acceso al catálogo de precios)."
+        )
+        nota_usuario = request.form.get("notas", "").strip()
+        if nota_usuario:
+            nota_sistema += f"\nNota de {current_user.nombre_completo}: {nota_usuario}"
+
+        orden = OrdenCompra(
+            numero_po=siguiente_numero_po(int(empresa_id) if empresa_id else None),
+            proveedor_id=prov.id,
+            empresa_id=int(empresa_id) if empresa_id else None,
+            fecha_emision=date.today(),
+            moneda=prov.moneda_default or "USD",
+            estado=ETAPAS_LINEA[0],
+            notas=nota_sistema,
+            creado_por_usuario_id=current_user.id,
+            estado_aprobacion="Por Aprobar",
+        )
+        db.session.add(orden)
+        db.session.flush()
+
+        codigos = request.form.getlist("codigo")
+        descripciones = request.form.getlist("descripcion")
+        cantidades = request.form.getlist("cantidad_cajas")
+        precios = request.form.getlist("precio_cotizado")
+        fechas = request.form.getlist("fecha_estimada_despacho")
+
+        lineas_creadas = 0
+        productos_nuevos = 0
+        for codigo, descripcion, cant, precio, fecha in zip(codigos, descripciones, cantidades, precios, fechas):
+            codigo = (codigo or "").strip()
+            descripcion = (descripcion or "").strip()
+            cant_val = parse_int(cant, default=0)
+            if not codigo or cant_val <= 0:
+                continue
+
+            producto = Producto.query.filter(
+                Producto.proveedor_id == prov.id, db.func.lower(Producto.codigo) == codigo.lower()
+            ).first()
+            # Si el producto YA existia en el catalogo, el precio que se
+            # use es el que YA tenia cargado (el tecleado aca se descarta) y
+            # esta linea queda marcada para que su precio siga oculto para
+            # este mismo usuario mas adelante (ver precio_catalogo_oculto en
+            # models.py). Si es nuevo, el precio es el que el tecleo -- no
+            # hace falta ocultarselo a si mismo.
+            precio_venia_de_catalogo = producto is not None
+            producto_nuevo_esta_linea = not precio_venia_de_catalogo
+            if not producto:
+                precio_caja = float(precio) if precio else 0
+                producto = Producto(
+                    proveedor_id=prov.id,
+                    codigo=codigo,
+                    descripcion=descripcion or codigo,
+                    empaque=1,
+                    moneda=prov.moneda_default or "USD",
+                    precio_caja=precio_caja,
+                    precio_unitario=precio_caja,
+                    # Ronda U (2026-09-12, punto 1): nace INACTIVO -- recien
+                    # se activa (se suma de verdad al catalogo) si esta orden
+                    # llega a Aprobarse (ver ordenes_aprobar). Asi una orden
+                    # que nunca se aprueba no deja "basura" visible en el
+                    # catalogo del proveedor.
+                    activo=False,
+                )
+                db.session.add(producto)
+                db.session.flush()
+                productos_nuevos += 1
+
+            linea = OrdenCompraLinea(
+                orden_id=orden.id,
+                producto_id=producto.id,
+                cantidad_cajas=cant_val,
+                precio_unitario_pactado=producto.precio_caja,
+                fecha_estimada_despacho=parse_date(fecha),
+                etapa=ETAPAS_LINEA[0],
+                precio_catalogo_oculto=precio_venia_de_catalogo,
+                producto_creado_por_esta_orden=producto_nuevo_esta_linea,
+            )
+            db.session.add(linea)
+            lineas_creadas += 1
+
+        if lineas_creadas == 0:
+            db.session.rollback()
+            flash("Agrega al menos un producto con código y cantidad mayor a 0.", "danger")
+            return redirect(url_for("ordenes_simple_nueva"))
+
+        # Documentos opcionales adjuntados desde el mismo formulario (ronda
+        # S, 2026-09-12, punto 1) -- para que quien aprueba pueda corroborar
+        # por que se esta pidiendo esta compra.
+        docs_adjuntados = 0
+        for campo, tipo_doc in (
+            ("archivo_cotizacion", "Cotización"),
+            ("archivo_orden_compra", "Orden de Compra (proveedor)"),
+        ):
+            archivo = request.files.get(campo)
+            if archivo and archivo.filename:
+                if _extension_valida(archivo.filename):
+                    if _guardar_documento_orden(orden, archivo, tipo_doc):
+                        docs_adjuntados += 1
+                else:
+                    flash(f"'{archivo.filename}' no se adjuntó: solo se permiten PDF o imágenes (JPG, PNG).", "warning")
+
+        db.session.commit()
+        mensaje = (
+            f"Orden {orden.numero_po} creada para {prov.nombre} con {lineas_creadas} producto(s) "
+            f"({productos_nuevos} nuevo(s) en el catálogo)."
+        )
+        if docs_adjuntados:
+            mensaje += f" Se adjuntaron {docs_adjuntados} documento(s)."
+        mensaje += (
+            " Queda 'Por Aprobar': no aparecerá en el listado general hasta que alguien con permiso "
+            "de Aprobación la apruebe. Mientras tanto la puedes ver, editar o anular desde "
+            "'Mis órdenes'."
+        )
+        if productos_nuevos:
+            mensaje += (
+                f" Los {productos_nuevos} producto(s) nuevo(s) quedan INACTIVOS en el catálogo de "
+                f"{prov.nombre} hasta que la orden se apruebe -- así no se llena el catálogo con "
+                "datos sin confirmar."
+            )
+        flash(mensaje, "success")
+        return redirect(url_for("ordenes_simple_detalle", orden_id=orden.id))
+
+    return render_template(
+        "ordenes/simple_form.html", proveedores=proveedores, empresas=empresas,
+        tipos_documento=TIPOS_DOCUMENTO_ORDEN,
+    )
+
+
+def _resumen_precio_para_simple(orden):
+    """Ronda S (2026-09-12): total 'seguro' de mostrarle a quien tiene el
+    perfil orden_simple sobre SU PROPIA orden. Si se mostrara el total real
+    de la orden completa, alguien podria deducir el precio oculto de una
+    linea de catalogo restando el resto de subtotales (que si conoce,
+    porque el escribio cantidad y a veces precio) -- por eso el total que
+    se muestra excluye las lineas con precio oculto, y se avisa aparte."""
+    lineas_activas = [l for l in orden.lineas if not l.anulada]
+    tiene_ocultos = any(l.precio_catalogo_oculto for l in lineas_activas)
+    total_visible = sum(l.subtotal for l in lineas_activas if not l.precio_catalogo_oculto)
+    return total_visible, tiene_ocultos
+
+
+@app.route("/ordenes/simple")
+@requiere_permiso("orden_simple")
+def ordenes_simple_list():
+    """'Mis órdenes' (ronda S, 2026-09-12, punto 2): a diferencia del
+    listado completo de /ordenes (que requiere crear_orden/aprobar_orden),
+    este perfil solo ve las ordenes que EL MISMO creo -- nunca las de otro
+    usuario ni el listado global."""
+    ordenes = (
+        OrdenCompra.query.filter_by(creado_por_usuario_id=current_user.id)
+        .order_by(OrdenCompra.id.desc())
+        .all()
+    )
+    for o in ordenes:
+        o.total_visible, o.tiene_precios_ocultos = _resumen_precio_para_simple(o)
+    return render_template("ordenes/simple_list.html", ordenes=ordenes)
+
+
+@app.route("/ordenes/simple/<int:orden_id>")
+@requiere_permiso("orden_simple")
+def ordenes_simple_detalle(orden_id):
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.creado_por_usuario_id != current_user.id:
+        flash("Solo puedes ver las órdenes que tú mismo creaste con este perfil.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
+    lineas = orden.lineas.order_by(OrdenCompraLinea.id).all()
+    documentos = orden.documentos.order_by(OrdenDocumento.fecha_subida.desc()).all()
+    total_visible, tiene_precios_ocultos = _resumen_precio_para_simple(orden)
+    return render_template(
+        "ordenes/simple_detalle.html",
+        orden=orden, lineas=lineas, documentos=documentos, tipos_documento=TIPOS_DOCUMENTO_ORDEN,
+        total_visible=total_visible, tiene_precios_ocultos=tiene_precios_ocultos,
+    )
+
+
+@app.route("/ordenes/simple/<int:orden_id>/lineas/nueva", methods=["POST"])
+@requiere_permiso("orden_simple")
+def ordenes_simple_linea_nueva(orden_id):
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.creado_por_usuario_id != current_user.id:
+        flash("Solo puedes editar las órdenes que tú mismo creaste con este perfil.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
+    if orden.estado in ("Cancelada", "Anulada"):
+        flash("No se pueden agregar productos a una orden cancelada o anulada.", "warning")
+        return redirect(url_for("ordenes_simple_detalle", orden_id=orden.id))
+
+    codigo = (request.form.get("codigo") or "").strip()
+    descripcion = (request.form.get("descripcion") or "").strip()
+    cant_val = parse_int(request.form.get("cantidad_cajas"), default=0)
+    precio = request.form.get("precio_cotizado")
+    fecha = request.form.get("fecha_estimada_despacho")
+    if not codigo or cant_val <= 0:
+        flash("Ingresa un código y una cantidad mayor a 0.", "warning")
+        return redirect(url_for("ordenes_simple_detalle", orden_id=orden.id))
+
+    producto = Producto.query.filter(
+        Producto.proveedor_id == orden.proveedor_id, db.func.lower(Producto.codigo) == codigo.lower()
+    ).first()
+    precio_venia_de_catalogo = producto is not None
+    producto_nuevo_esta_linea = not precio_venia_de_catalogo
+    # Ronda U (2026-09-12, punto 1): si la orden todavia NO esta Aprobada, un
+    # producto nuevo nace inactivo hasta que se apruebe (ver ordenes_aprobar).
+    # Si la orden ya esta Aprobada (esta linea se agrega despues), no hay
+    # ningun paso de aprobacion pendiente que lo vaya a activar mas
+    # adelante -- nace activo directamente, igual que antes de esta ronda.
+    pendiente_aprobacion = orden.estado_aprobacion in ("Por Aprobar", "Sin Emitir")
+    if not producto:
+        precio_caja = float(precio) if precio else 0
+        producto = Producto(
+            proveedor_id=orden.proveedor_id,
+            codigo=codigo,
+            descripcion=descripcion or codigo,
+            empaque=1,
+            moneda=orden.proveedor.moneda_default or "USD",
+            precio_caja=precio_caja,
+            precio_unitario=precio_caja,
+            activo=not pendiente_aprobacion,
+        )
+        db.session.add(producto)
+        db.session.flush()
+
+    linea = OrdenCompraLinea(
+        orden_id=orden.id,
+        producto_id=producto.id,
+        cantidad_cajas=cant_val,
+        precio_unitario_pactado=producto.precio_caja,
+        fecha_estimada_despacho=parse_date(fecha),
+        etapa=ETAPAS_LINEA[0],
+        precio_catalogo_oculto=precio_venia_de_catalogo,
+        producto_creado_por_esta_orden=producto_nuevo_esta_linea and pendiente_aprobacion,
+    )
+    db.session.add(linea)
+    db.session.flush()
+    recalcular_estado_orden(orden)
+    db.session.commit()
+    mensaje = f"Producto agregado a la orden {orden.numero_po}."
+    if producto_nuevo_esta_linea and pendiente_aprobacion:
+        mensaje += " Queda INACTIVO en el catálogo hasta que la orden se apruebe."
+    flash(mensaje, "success")
+    return redirect(url_for("ordenes_simple_detalle", orden_id=orden.id))
+
+
+@app.route("/ordenes/simple/<int:orden_id>/lineas/<int:linea_id>/actualizar", methods=["POST"])
+@requiere_permiso("orden_simple")
+def ordenes_simple_linea_actualizar(orden_id, linea_id):
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.creado_por_usuario_id != current_user.id:
+        flash("Solo puedes editar las órdenes que tú mismo creaste con este perfil.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
+    linea = OrdenCompraLinea.query.get_or_404(linea_id)
+    if linea.orden_id != orden.id:
+        abort(404)
+    if linea.bloqueada:
+        flash("Esta línea ya fue despachada: no se puede editar.", "warning")
+        return redirect(url_for("ordenes_simple_detalle", orden_id=orden.id))
+
+    linea.cantidad_cajas = parse_int(request.form.get("cantidad_cajas"), default=linea.cantidad_cajas)
+    linea.fecha_estimada_despacho = (
+        parse_date(request.form.get("fecha_estimada_despacho")) or linea.fecha_estimada_despacho
+    )
+    # El precio solo se puede tocar si NO vino del catalogo -- si vino del
+    # catalogo (precio_catalogo_oculto=True) sigue oculto e intocable desde
+    # este perfil, ni siquiera para "corregirlo".
+    if not linea.precio_catalogo_oculto:
+        nuevo_precio = request.form.get("precio_cotizado")
+        if nuevo_precio:
+            nuevo_precio_val = float(nuevo_precio)
+            linea.precio_unitario_pactado = nuevo_precio_val
+            linea.producto.precio_caja = nuevo_precio_val
+            linea.producto.precio_unitario = nuevo_precio_val
+    db.session.commit()
+    flash("Línea actualizada.", "success")
+    return redirect(url_for("ordenes_simple_detalle", orden_id=orden.id))
+
+
+@app.route("/ordenes/simple/<int:orden_id>/lineas/<int:linea_id>/anular", methods=["POST"])
+@requiere_permiso("orden_simple")
+def ordenes_simple_linea_anular(orden_id, linea_id):
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.creado_por_usuario_id != current_user.id:
+        flash("Solo puedes editar las órdenes que tú mismo creaste con este perfil.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
+    linea = OrdenCompraLinea.query.get_or_404(linea_id)
+    if linea.orden_id != orden.id:
+        abort(404)
+    if linea.bloqueada:
+        flash("Esta línea ya fue despachada: no se puede anular.", "warning")
+    elif linea.etapa != ETAPAS_LINEA[0]:
+        flash(
+            "Esta línea ya fue confirmada por quien aprueba: pídele a un usuario con permiso de "
+            "Aprobación o Creación de Orden que la anule.",
+            "warning",
+        )
+    else:
+        linea.anulada = True
+        db.session.flush()
+        recalcular_estado_orden(orden)
+        db.session.commit()
+        flash("Línea anulada.", "success")
+    return redirect(url_for("ordenes_simple_detalle", orden_id=orden.id))
+
+
+@app.route("/ordenes/simple/<int:orden_id>/cancelar", methods=["POST"])
+@requiere_permiso("orden_simple")
+def ordenes_simple_cancelar(orden_id):
+    """Anular la orden completa (ronda S, 2026-09-12, punto 2) -- solo
+    mientras NADA se haya confirmado todavia (orden.estado sigue en
+    'Emisión de Orden'). Una vez que alguien con permiso de Aprobación
+    empezo a procesarla, este perfil ya no puede revertir esa decision por
+    su cuenta -- tiene que pedirselo a quien aprueba/crea ordenes."""
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.creado_por_usuario_id != current_user.id:
+        flash("Solo puedes anular las órdenes que tú mismo creaste con este perfil.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
+    if orden.estado != ETAPAS_LINEA[0]:
+        flash(
+            "Esta orden ya tiene líneas confirmadas: pídele a un usuario con permiso de Aprobación "
+            "o Creación de Orden que la anule.",
+            "warning",
+        )
+        return redirect(url_for("ordenes_simple_detalle", orden_id=orden.id))
+    numero_po = orden.numero_po
+    db.session.delete(orden)
+    db.session.commit()
+    _borrar_carpeta_documentos_orden(orden_id)
+    flash(f"Orden {numero_po} anulada.", "warning")
+    return redirect(url_for("ordenes_simple_list"))
+
+
 @app.route("/api/proveedores/<int:proveedor_id>/productos")
+@requiere_permiso("crear_orden", "generar_costeo")
 def api_productos_por_proveedor(proveedor_id):
+    """Ronda U (2026-09-12, punto 4): antes solo devolvía productos activos
+    -- uno inactivo simplemente no aparecía en la búsqueda del catálogo al
+    armar una orden. Ahora se incluyen también los inactivos (con
+    "activo": false) para que el front-end los muestre sombreados y pida
+    confirmación antes de agregarlos -- ver ordenes/form.html y
+    ordenes/detalle.html. Si se selecciona uno, el backend lo reactiva
+    automáticamente al agregar la línea (ver ordenes_nueva/
+    ordenes_linea_nueva)."""
     q = request.args.get("q", "").strip()
-    query = Producto.query.filter_by(proveedor_id=proveedor_id, activo=True)
+    query = Producto.query.filter_by(proveedor_id=proveedor_id)
     if q:
         query = query.filter(
             db.or_(Producto.codigo.ilike(f"%{q}%"), Producto.descripcion.ilike(f"%{q}%"))
         )
-    productos = query.order_by(Producto.codigo).limit(50).all()
+    productos = query.order_by(Producto.activo.desc(), Producto.codigo).limit(50).all()
     return jsonify(
         [
             {
@@ -970,6 +2143,7 @@ def api_productos_por_proveedor(proveedor_id):
                 # lentes MEDICONTUR), el front-end abre un modal para elegir
                 # cual en vez de agregar la linea directo con el codigo padre.
                 "tiene_variantes": p.variantes.count() > 0,
+                "activo": p.activo,
             }
             for p in productos
         ]
@@ -977,6 +2151,7 @@ def api_productos_por_proveedor(proveedor_id):
 
 
 @app.route("/api/productos/<int:producto_id>/variantes")
+@requiere_permiso("crear_orden", "generar_costeo")
 def api_producto_variantes(producto_id):
     """Variantes de un producto padre (ronda M, 2026-09-10, punto 1) --
     usado por el modal de "elegir variante" al agregar una linea a la
@@ -990,6 +2165,7 @@ def api_producto_variantes(producto_id):
 
 
 @app.route("/ordenes/<int:orden_id>")
+@requiere_permiso("crear_orden", "aprobar_orden")
 def ordenes_detalle(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     lineas = orden.lineas.all()
@@ -1026,6 +2202,7 @@ def ordenes_detalle(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/editar", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_editar(orden_id):
     """Edicion de los datos de cabecera de la orden -- ronda K (2026-09-07):
     nace de la necesidad de poder asignarle una Empresa compradora a
@@ -1042,8 +2219,33 @@ def ordenes_editar(orden_id):
     empresa_id = request.form.get("empresa_id") or None
     if empresa_id:
         Empresa.query.get_or_404(int(empresa_id))
+    nuevo_empresa_id = int(empresa_id) if empresa_id else None
+
+    # Ronda S (2026-09-12): el N° de PO tiene que ser unico POR EMPRESA
+    # compradora -- si no se valida esto, dos ordenes SIN relacion pueden
+    # terminar con el mismo numero (por coincidencia al tipearlo a mano) y
+    # el sistema las trata como si fueran partes de una misma division
+    # automatica (ver dividir_orden_si_corresponde), lo que confunde a
+    # quien aprueba. Solo se valida cuando el numero CAMBIA -- una orden ya
+    # dividida (que comparte numero de PO a proposito con sus hermanas) se
+    # puede volver a guardar sin tocar nada mas sin que esto la bloquee.
+    if nuevo_empresa_id is not None and nuevo_numero.lower() != (orden.numero_po or "").lower():
+        conflicto = OrdenCompra.query.filter(
+            OrdenCompra.id != orden.id,
+            OrdenCompra.empresa_id == nuevo_empresa_id,
+            db.func.lower(OrdenCompra.numero_po) == nuevo_numero.lower(),
+        ).first()
+        if conflicto:
+            flash(
+                f"Ya existe otra orden con el número '{nuevo_numero}' para esta empresa compradora "
+                f"(proveedor {conflicto.proveedor.nombre}, estado '{conflicto.estado}') -- el número de "
+                "PO no puede repetirse dentro de la misma empresa. Usa uno distinto.",
+                "danger",
+            )
+            return redirect(url_for("ordenes_detalle", orden_id=orden.id))
+
     orden.numero_po = nuevo_numero
-    orden.empresa_id = int(empresa_id) if empresa_id else None
+    orden.empresa_id = nuevo_empresa_id
     orden.fecha_emision = parse_date(request.form.get("fecha_emision")) or orden.fecha_emision
     orden.moneda = request.form.get("moneda", orden.moneda)
     orden.notas = request.form.get("notas", "").strip()
@@ -1053,6 +2255,7 @@ def ordenes_editar(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/cancelar", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_cancelar(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     numero_po = orden.numero_po
@@ -1077,6 +2280,7 @@ def ordenes_cancelar(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/reactivar", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_reactivar(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     orden.estado = "Emisión de Orden"  # se recalcula abajo segun las lineas
@@ -1087,6 +2291,7 @@ def ordenes_reactivar(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/lineas/nueva", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_linea_nueva(orden_id):
     """Agrega un producto nuevo a una orden YA CREADA -- antes solo se
     podian agregar productos al momento de crear la orden; una vez emitida
@@ -1145,17 +2350,29 @@ def ordenes_linea_nueva(orden_id):
     )
     db.session.add(linea)
     db.session.flush()
+    # Ronda U (2026-09-12, punto 4): el catálogo ahora tambien deja elegir un
+    # producto inactivo (el front-end lo muestra sombreado y pide
+    # confirmacion antes) -- si se confirmo y se llego hasta aca, se
+    # reactiva de una.
+    reactivado = False
+    if linea.producto and not linea.producto.activo:
+        linea.producto.activo = True
+        reactivado = True
     recalcular_estado_orden(orden)
     # Si la orden ya tenia lineas mas avanzadas (ej. despachada) esta linea
     # nueva en "Emision de Orden" quedaria mezclando cohortes -- se separa
     # igual que al confirmar/despachar.
     nuevas_ordenes = dividir_orden_si_corresponde(orden)
     db.session.commit()
-    flash(f"'{linea.codigo_mostrar}' agregado a la orden.{_mensaje_division(nuevas_ordenes)}", "success")
+    mensaje = f"'{linea.codigo_mostrar}' agregado a la orden.{_mensaje_division(nuevas_ordenes)}"
+    if reactivado:
+        mensaje += " Estaba inactivo en el catálogo -- se reactivó."
+    flash(mensaje, "success")
     return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
 
 @app.route("/ordenes/<int:orden_id>/linea/<int:linea_id>/actualizar", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_linea_actualizar(orden_id, linea_id):
     linea = OrdenCompraLinea.query.get_or_404(linea_id)
     if linea.bloqueada:
@@ -1183,6 +2400,7 @@ def ordenes_linea_actualizar(orden_id, linea_id):
 
 
 @app.route("/ordenes/<int:orden_id>/linea/<int:linea_id>/eliminar", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_linea_eliminar(orden_id, linea_id):
     linea = OrdenCompraLinea.query.get_or_404(linea_id)
     if linea.bloqueada:
@@ -1198,6 +2416,7 @@ def ordenes_linea_eliminar(orden_id, linea_id):
 
 
 @app.route("/ordenes/<int:orden_id>/lineas/fecha-masiva", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_lineas_fecha_masiva(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     linea_ids = request.form.getlist("linea_ids")
@@ -1229,9 +2448,13 @@ def ordenes_lineas_fecha_masiva(orden_id):
 # --- Etapas por linea ---
 
 @app.route("/ordenes/<int:orden_id>/linea/<int:linea_id>/confirmar", methods=["POST"])
+@requiere_permiso("aprobar_orden")
 def ordenes_linea_confirmar(orden_id, linea_id):
     linea = OrdenCompraLinea.query.get_or_404(linea_id)
     orden = linea.orden
+    if not _orden_aprobada(orden):
+        flash("Esta orden todavía no está Aprobada -- apruébala primero.", "warning")
+        return redirect(url_for("ordenes_detalle", orden_id=orden_id))
     if linea.anulada:
         flash("Esta linea esta anulada. Reactivala primero para poder confirmarla.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
@@ -1250,8 +2473,12 @@ def ordenes_linea_confirmar(orden_id, linea_id):
 
 
 @app.route("/ordenes/<int:orden_id>/lineas/confirmar-masivo", methods=["POST"])
+@requiere_permiso("aprobar_orden")
 def ordenes_lineas_confirmar_masivo(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _orden_aprobada(orden):
+        flash("Esta orden todavía no está Aprobada -- apruébala primero.", "warning")
+        return redirect(url_for("ordenes_detalle", orden_id=orden.id))
     linea_ids = request.form.getlist("linea_ids")
     fecha_desp_conf = parse_date(request.form.get("fecha_estimada_despacho_confirmada"))
 
@@ -1292,9 +2519,13 @@ def ordenes_lineas_confirmar_masivo(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/linea/<int:linea_id>/retroceder", methods=["POST"])
+@requiere_permiso("aprobar_orden")
 def ordenes_linea_retroceder(orden_id, linea_id):
     linea = OrdenCompraLinea.query.get_or_404(linea_id)
     orden = linea.orden
+    if not _orden_aprobada(orden):
+        flash("Esta orden todavía no está Aprobada.", "warning")
+        return redirect(url_for("ordenes_detalle", orden_id=orden_id))
     if linea.bloqueada:
         flash("Esta línea ya fue despachada: no se puede devolver a una etapa anterior.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
@@ -1331,8 +2562,12 @@ def _lineas_seleccionadas(orden):
 
 
 @app.route("/ordenes/<int:orden_id>/lineas/retroceder-masivo", methods=["POST"])
+@requiere_permiso("aprobar_orden")
 def ordenes_lineas_retroceder_masivo(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _orden_aprobada(orden):
+        flash("Esta orden todavía no está Aprobada.", "warning")
+        return redirect(url_for("ordenes_detalle", orden_id=orden.id))
     lineas = _lineas_seleccionadas(orden)
     if not lineas:
         flash("Selecciona al menos una linea para devolver a la etapa anterior.", "warning")
@@ -1361,6 +2596,7 @@ def ordenes_lineas_retroceder_masivo(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/lineas/anular-masivo", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_lineas_anular_masivo(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     lineas = _lineas_seleccionadas(orden)
@@ -1387,6 +2623,7 @@ def ordenes_lineas_anular_masivo(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/linea/<int:linea_id>/anular", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_linea_anular(orden_id, linea_id):
     linea = OrdenCompraLinea.query.get_or_404(linea_id)
     orden = linea.orden
@@ -1401,6 +2638,7 @@ def ordenes_linea_anular(orden_id, linea_id):
 
 
 @app.route("/ordenes/<int:orden_id>/linea/<int:linea_id>/reactivar-linea", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_linea_reactivar(orden_id, linea_id):
     linea = OrdenCompraLinea.query.get_or_404(linea_id)
     orden = linea.orden
@@ -1418,27 +2656,23 @@ def _extension_valida(nombre_archivo):
     return ext in EXTENSIONES_PERMITIDAS
 
 
-@app.route("/ordenes/<int:orden_id>/documentos/subir", methods=["POST"])
-def ordenes_documento_subir(orden_id):
-    orden = OrdenCompra.query.get_or_404(orden_id)
-    archivo = request.files.get("archivo")
-    tipo = request.form.get("tipo", "Otro")
-
-    if not archivo or archivo.filename == "":
-        flash("Selecciona un archivo para subir.", "danger")
-        return redirect(url_for("ordenes_detalle", orden_id=orden_id))
-
+def _guardar_documento_orden(orden, archivo, tipo):
+    """Guarda un archivo adjunto de una orden en disco + su fila
+    OrdenDocumento (sin hacer commit -- lo hace el caller). Devuelve None si
+    no hay archivo o la extension no es valida, para que el caller decida
+    que flash mostrar. Reutilizada por la subida manual (crear_orden/
+    orden_simple) y por la creacion de una orden 'simple' con Cotización/
+    Orden de Compra adjuntas desde el mismo formulario (ronda S,
+    2026-09-12)."""
+    if not archivo or not archivo.filename:
+        return None
     if not _extension_valida(archivo.filename):
-        flash("Solo se permiten archivos PDF o imagenes (JPG, PNG).", "danger")
-        return redirect(url_for("ordenes_detalle", orden_id=orden_id))
-
+        return None
     carpeta_orden = os.path.join(DOCUMENTOS_DIR, str(orden.id))
     os.makedirs(carpeta_orden, exist_ok=True)
-
     _, ext = os.path.splitext(archivo.filename)
     nombre_disco = f"{uuid.uuid4().hex}{ext.lower()}"
     archivo.save(os.path.join(carpeta_orden, nombre_disco))
-
     doc = OrdenDocumento(
         orden_id=orden.id,
         tipo=tipo if tipo in TIPOS_DOCUMENTO_ORDEN else "Otro",
@@ -1446,18 +2680,45 @@ def ordenes_documento_subir(orden_id):
         nombre_archivo=nombre_disco,
     )
     db.session.add(doc)
+    return doc
+
+
+@app.route("/ordenes/<int:orden_id>/documentos/subir", methods=["POST"])
+@requiere_permiso("crear_orden", "orden_simple")
+def ordenes_documento_subir(orden_id):
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _puede_gestionar_orden_simple(orden):
+        flash("Solo puedes subir documentos a las órdenes que tú mismo creaste.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
+    archivo = request.files.get("archivo")
+    tipo = request.form.get("tipo", "Otro")
+
+    if not archivo or archivo.filename == "":
+        flash("Selecciona un archivo para subir.", "danger")
+        return redirect(_destino_detalle_orden(orden))
+
+    if not _extension_valida(archivo.filename):
+        flash("Solo se permiten archivos PDF o imagenes (JPG, PNG).", "danger")
+        return redirect(_destino_detalle_orden(orden))
+
+    _guardar_documento_orden(orden, archivo, tipo)
     db.session.commit()
     flash(f"Documento '{archivo.filename}' subido correctamente.", "success")
-    return redirect(url_for("ordenes_detalle", orden_id=orden_id))
+    return redirect(_destino_detalle_orden(orden))
 
 
 @app.route("/ordenes/<int:orden_id>/documentos/<int:doc_id>/ver")
+@requiere_permiso("crear_orden", "aprobar_orden", "orden_simple")
 def ordenes_documento_ver(orden_id, doc_id):
     """Abre el documento en el navegador (PDF/imagen inline) en vez de forzar
     la descarga -- para que el usuario pueda visualizarlo con un clic."""
     doc = OrdenDocumento.query.get_or_404(doc_id)
     if doc.orden_id != orden_id:
         abort(404)
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _puede_gestionar_orden_simple(orden):
+        flash("No tienes acceso a los documentos de esta orden.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
     carpeta_orden = os.path.join(DOCUMENTOS_DIR, str(doc.orden_id))
     return send_from_directory(
         carpeta_orden, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=False
@@ -1465,10 +2726,15 @@ def ordenes_documento_ver(orden_id, doc_id):
 
 
 @app.route("/ordenes/<int:orden_id>/documentos/<int:doc_id>/descargar")
+@requiere_permiso("crear_orden", "aprobar_orden", "orden_simple")
 def ordenes_documento_descargar(orden_id, doc_id):
     doc = OrdenDocumento.query.get_or_404(doc_id)
     if doc.orden_id != orden_id:
         abort(404)
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _puede_gestionar_orden_simple(orden):
+        flash("No tienes acceso a los documentos de esta orden.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
     carpeta_orden = os.path.join(DOCUMENTOS_DIR, str(doc.orden_id))
     return send_from_directory(
         carpeta_orden, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=True
@@ -1476,10 +2742,15 @@ def ordenes_documento_descargar(orden_id, doc_id):
 
 
 @app.route("/ordenes/<int:orden_id>/documentos/<int:doc_id>/eliminar", methods=["POST"])
+@requiere_permiso("crear_orden", "orden_simple")
 def ordenes_documento_eliminar(orden_id, doc_id):
     doc = OrdenDocumento.query.get_or_404(doc_id)
     if doc.orden_id != orden_id:
         abort(404)
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _puede_gestionar_orden_simple(orden):
+        flash("Solo puedes eliminar documentos de las órdenes que tú mismo creaste.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
     carpeta_orden = os.path.join(DOCUMENTOS_DIR, str(doc.orden_id))
     ruta = os.path.join(carpeta_orden, doc.nombre_archivo)
     if os.path.exists(ruta):
@@ -1487,10 +2758,38 @@ def ordenes_documento_eliminar(orden_id, doc_id):
     db.session.delete(doc)
     db.session.commit()
     flash("Documento eliminado.", "success")
-    return redirect(url_for("ordenes_detalle", orden_id=orden_id))
+    return redirect(_destino_detalle_orden(orden))
+
+
+@app.route("/ordenes/<int:orden_id>/nota", methods=["POST"])
+@requiere_permiso("crear_orden", "aprobar_orden", "orden_simple")
+def ordenes_nota_agregar(orden_id):
+    """Nota rapida sobre una orden (ronda S, 2026-09-12) -- pensada sobre
+    todo para quien tiene el permiso de Aprobación de Orden: a diferencia
+    del modal "Editar" (que puede cambiar N° de PO/moneda/empresa y esta
+    reservado a crear_orden), esto solo AGREGA texto al final de las notas
+    existentes, con fecha y autor, sin tocar nada mas -- sirve para dejar
+    constancia de por que se aprobo o anulo algo. Tambien la puede usar
+    quien creo la orden con el perfil orden_simple, sobre sus propias
+    ordenes."""
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _puede_gestionar_orden_simple(orden):
+        flash("No tienes acceso a esta orden.", "danger")
+        return redirect(url_for("dashboard"))
+    texto = request.form.get("texto", "").strip()
+    if not texto:
+        flash("Escribe algo antes de agregar la nota.", "warning")
+    else:
+        sello = f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} · {current_user.nombre_completo}]"
+        linea_nueva = f"{sello} {texto}"
+        orden.notas = f"{orden.notas}\n{linea_nueva}" if orden.notas else linea_nueva
+        db.session.commit()
+        flash("Nota agregada.", "success")
+    return redirect(_destino_detalle_orden(orden))
 
 
 @app.route("/ordenes/<int:orden_id>/imprimir")
+@requiere_permiso("crear_orden", "aprobar_orden")
 def ordenes_imprimir(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     lineas = orden.lineas.all()
@@ -1592,6 +2891,7 @@ def generar_pdf_orden(orden):
 
 
 @app.route("/ordenes/<int:orden_id>/pdf")
+@requiere_permiso("crear_orden", "aprobar_orden")
 def ordenes_pdf(orden_id):
     """Descarga directa del PDF de la orden (ronda L, punto 1) -- sirve
     tanto como fin en si mismo (el usuario quiere el archivo) como
@@ -1615,6 +2915,7 @@ def ordenes_pdf(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/enviar-outlook", methods=["POST"])
+@requiere_permiso("crear_orden")
 def ordenes_enviar_outlook(orden_id):
     """Envío de la OC al proveedor directo desde Outlook de escritorio
     (ronda L, punto 1, 2026-09-09): genera el PDF de la orden y abre un
@@ -1689,6 +2990,7 @@ def ordenes_enviar_outlook(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/mailto")
+@requiere_permiso("crear_orden")
 def ordenes_mailto(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     prov = orden.proveedor
@@ -1751,6 +3053,7 @@ def _marcar_orden_despachada(orden):
 
 
 @app.route("/despachos")
+@requiere_permiso("actualizar_despacho", "seguimiento", "generar_costeo")
 def despachos_list():
     despachos = Despacho.query.order_by(Despacho.id.desc()).all()
     hay_candidatas = bool(_ordenes_listas_para_despachar())
@@ -1758,6 +3061,7 @@ def despachos_list():
 
 
 @app.route("/despachos/nuevo", methods=["GET", "POST"])
+@requiere_permiso("actualizar_despacho")
 def despachos_nuevo():
     candidatas = _ordenes_listas_para_despachar()
     if request.method == "POST":
@@ -1791,6 +3095,7 @@ def despachos_nuevo():
 
 
 @app.route("/despachos/<int:despacho_id>")
+@requiere_permiso("actualizar_despacho", "seguimiento", "generar_costeo")
 def despachos_detalle(despacho_id):
     despacho = Despacho.query.get_or_404(despacho_id)
     ordenes = despacho.ordenes.order_by(OrdenCompra.id).all()
@@ -1806,6 +3111,7 @@ def despachos_detalle(despacho_id):
 
 
 @app.route("/despachos/<int:despacho_id>/editar", methods=["POST"])
+@requiere_permiso("actualizar_despacho")
 def despachos_editar(despacho_id):
     despacho = Despacho.query.get_or_404(despacho_id)
     despacho.numero_tracking = request.form.get("numero_tracking", "").strip()
@@ -1821,6 +3127,7 @@ def despachos_editar(despacho_id):
 
 
 @app.route("/despachos/<int:despacho_id>/asociar", methods=["POST"])
+@requiere_permiso("actualizar_despacho")
 def despachos_asociar(despacho_id):
     despacho = Despacho.query.get_or_404(despacho_id)
     orden_ids = request.form.getlist("orden_ids")
@@ -1839,6 +3146,7 @@ def despachos_asociar(despacho_id):
 
 
 @app.route("/despachos/<int:despacho_id>/orden/<int:orden_id>/quitar", methods=["POST"])
+@requiere_permiso("actualizar_despacho")
 def despachos_quitar_orden(despacho_id, orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     if orden.despacho_id != despacho_id:
@@ -1880,6 +3188,7 @@ def _avanzar_lineas_despacho(despacho, etapa_desde, etapa_hasta, campo_fecha):
 
 
 @app.route("/despachos/<int:despacho_id>/aduana-masivo", methods=["POST"])
+@requiere_permiso("actualizar_despacho")
 def despachos_aduana_masivo(despacho_id):
     despacho = Despacho.query.get_or_404(despacho_id)
     marcadas = _avanzar_lineas_despacho(
@@ -1891,6 +3200,7 @@ def despachos_aduana_masivo(despacho_id):
 
 
 @app.route("/despachos/<int:despacho_id>/recibido-masivo", methods=["POST"])
+@requiere_permiso("actualizar_despacho")
 def despachos_recibido_masivo(despacho_id):
     despacho = Despacho.query.get_or_404(despacho_id)
     marcadas = _avanzar_lineas_despacho(
@@ -1902,6 +3212,7 @@ def despachos_recibido_masivo(despacho_id):
 
 
 @app.route("/despachos/<int:despacho_id>/eliminar", methods=["POST"])
+@requiere_permiso("actualizar_despacho")
 def despachos_eliminar(despacho_id):
     despacho = Despacho.query.get_or_404(despacho_id)
     for orden in despacho.ordenes.all():
@@ -1926,6 +3237,7 @@ def _despacho_completo_recibido(despacho):
 
 
 @app.route("/despachos/<int:despacho_id>/generar-importacion", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def despachos_generar_importacion(despacho_id):
     """Crea una Importacion (Costeo) precargada con los datos de este
     despacho: un Parcial nuevo con una ParcialLinea por cada linea
@@ -2045,6 +3357,7 @@ def _despachos_pendientes_de_costeo():
 
 
 @app.route("/importaciones")
+@requiere_permiso("generar_costeo", "reportes")
 def importaciones_list():
     proveedor_id = request.args.get("proveedor_id", "")
     query = Importacion.query
@@ -2065,6 +3378,7 @@ def importaciones_list():
 
 
 @app.route("/importaciones/comparativo")
+@requiere_permiso("generar_costeo", "reportes")
 def importaciones_comparativo():
     """Vista comparativa (punto 8, 2026-08-26): todas las importaciones
     valoradas en la misma moneda para poder compararlas entre si, sin
@@ -2116,11 +3430,16 @@ def _tipo_cambio_mes(anio, mes):
 
 
 @app.route("/importaciones/nueva", methods=["GET", "POST"])
+@requiere_permiso("generar_costeo")
 def importaciones_nueva():
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
+    empresas = Empresa.query.filter_by(activo=True).order_by(Empresa.nombre).all()
     if request.method == "POST":
+        empresa_id = request.form.get("empresa_id") or None
         imp = Importacion(
             proveedor_id=int(request.form["proveedor_id"]),
+            empresa_id=int(empresa_id) if empresa_id else None,
+            numero_correlativo_inventario=parse_int(request.form.get("numero_correlativo_inventario"), default=None),
             numero_factura=request.form.get("numero_factura", "").strip(),
             fecha_factura=parse_date(request.form.get("fecha_factura")),
             moneda_factura=request.form.get("moneda_factura", "EURO"),
@@ -2139,30 +3458,43 @@ def importaciones_nueva():
     hoy = date.today()
     tc_mes = _tipo_cambio_mes(hoy.year, hoy.month)
     return render_template(
-        "importaciones/form.html", proveedores=proveedores, condiciones=CONDICIONES_COMPRA,
-        tc_mes=tc_mes,
+        "importaciones/form.html", proveedores=proveedores, empresas=empresas,
+        condiciones=CONDICIONES_COMPRA, tc_mes=tc_mes,
     )
 
 
 @app.route("/importaciones/<int:importacion_id>")
+@requiere_permiso("generar_costeo")
 def importaciones_detalle(importacion_id):
     imp = Importacion.query.get_or_404(importacion_id)
     resultado = costing.calcular_costeo(imp)
     tipos_cambio = TipoCambioMensual.query.order_by(
         TipoCambioMensual.anio.desc(), TipoCambioMensual.mes.desc()
     ).all()
+    empresas = Empresa.query.filter_by(activo=True).order_by(Empresa.nombre).all()
+    # Sugerencia de correlativo de Inventario (ronda O) para la empresa YA
+    # asignada a esta importacion -- solo una sugerencia, nunca se aplica
+    # sola; si la importacion ya tiene uno guardado, ese es el que manda.
+    sugerido_correlativo_inventario = (
+        siguiente_correlativo_inventario(imp.empresa_id) if imp.empresa_id else None
+    )
     return render_template(
         "importaciones/detalle.html", imp=imp, resultado=resultado,
         regimenes=REGIMENES_PARCIAL, vias=VIAS_EMBARQUE,
         condiciones=CONDICIONES_COMPRA, conceptos_gasto=CONCEPTOS_GASTO,
         conceptos_item_factura=CONCEPTOS_ITEM_FACTURA, tipos_cambio=tipos_cambio,
-        tipos_documento_gasto=TIPOS_DOCUMENTO_GASTO,
+        tipos_documento_gasto=TIPOS_DOCUMENTO_GASTO, empresas=empresas,
+        sugerido_correlativo_inventario=sugerido_correlativo_inventario,
     )
 
 
 @app.route("/importaciones/<int:importacion_id>/editar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def importaciones_editar(importacion_id):
     imp = Importacion.query.get_or_404(importacion_id)
+    empresa_id = request.form.get("empresa_id") or None
+    imp.empresa_id = int(empresa_id) if empresa_id else None
+    imp.numero_correlativo_inventario = parse_int(request.form.get("numero_correlativo_inventario"), default=None)
     imp.numero_factura = request.form.get("numero_factura", "").strip()
     imp.fecha_factura = parse_date(request.form.get("fecha_factura"))
     imp.moneda_factura = request.form.get("moneda_factura", "EURO")
@@ -2176,6 +3508,7 @@ def importaciones_editar(importacion_id):
 
 
 @app.route("/importaciones/<int:importacion_id>/eliminar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def importaciones_eliminar(importacion_id):
     imp = Importacion.query.get_or_404(importacion_id)
     carpeta_legajo = os.path.join(DOCUMENTOS_LEGAJO_DIR, str(imp.id))
@@ -2190,6 +3523,7 @@ def importaciones_eliminar(importacion_id):
 # --- Parciales ---
 
 @app.route("/importaciones/<int:importacion_id>/parciales/nuevo", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def parciales_nuevo(importacion_id):
     imp = Importacion.query.get_or_404(importacion_id)
     parcial = Parcial(
@@ -2207,6 +3541,7 @@ def parciales_nuevo(importacion_id):
 
 
 @app.route("/parciales/<int:parcial_id>/editar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def parciales_editar(parcial_id):
     parcial = Parcial.query.get_or_404(parcial_id)
     parcial.numero_parcial = request.form.get("numero_parcial", "").strip()
@@ -2220,6 +3555,7 @@ def parciales_editar(parcial_id):
 
 
 @app.route("/parciales/<int:parcial_id>/eliminar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def parciales_eliminar(parcial_id):
     parcial = Parcial.query.get_or_404(parcial_id)
     importacion_id = parcial.importacion_id
@@ -2259,6 +3595,7 @@ def _guardar_lotes_linea(linea, form):
 
 
 @app.route("/parciales/<int:parcial_id>/lineas/nueva", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def parcial_lineas_nueva(parcial_id):
     parcial = Parcial.query.get_or_404(parcial_id)
     producto_id = request.form.get("producto_id") or None
@@ -2289,6 +3626,7 @@ def parcial_lineas_nueva(parcial_id):
 
 
 @app.route("/parcial_lineas/<int:linea_id>/editar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def parcial_lineas_editar(linea_id):
     linea = ParcialLinea.query.get_or_404(linea_id)
     linea.codigo = request.form.get("codigo", "").strip()
@@ -2302,6 +3640,7 @@ def parcial_lineas_editar(linea_id):
 
 
 @app.route("/parcial_lineas/<int:linea_id>/eliminar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def parcial_lineas_eliminar(linea_id):
     linea = ParcialLinea.query.get_or_404(linea_id)
     importacion_id = linea.parcial.importacion_id
@@ -2312,6 +3651,7 @@ def parcial_lineas_eliminar(linea_id):
 
 
 @app.route("/parcial_lineas/mover-masivo", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def parcial_lineas_mover_masivo():
     """Reasigna en bloque un grupo de productos a otro Parcial de la MISMA
     importacion -- util cuando un despacho se genero de una vez en un solo
@@ -2357,14 +3697,45 @@ def _parsear_fecha_archivo_lotes(valor):
     return None
 
 
+def _normalizar_desc(texto):
+    """Normaliza texto para comparar descripciones de producto sin que
+    espacios de más, espacios "duros" (\\xa0, comunes en descripciones
+    copiadas desde Excel) o mayúsculas/minúsculas generen un falso
+    'no encontrado' al cruzar el archivo de lotes contra el catálogo."""
+    if texto is None:
+        return ""
+    texto = str(texto).replace("\xa0", " ")
+    texto = re.sub(r"\s+", " ", texto).strip().lower()
+    return texto
+
+
+def _buscar_columna_prioridad(encabezado, *listas_claves):
+    """Busca una columna probando listas de claves en orden de prioridad
+    (todas las columnas contra la lista más específica antes de pasar a la
+    siguiente) -- evita que, por ejemplo, una columna 'Fecha Invoice' se
+    confunda con la columna de vencimiento solo porque ambas contienen la
+    palabra genérica 'fecha'."""
+    for claves in listas_claves:
+        for i, nombre_col in enumerate(encabezado):
+            for clave in claves:
+                if clave in nombre_col:
+                    return i
+    return None
+
+
 def _leer_filas_archivo_lotes(file_storage):
-    """Lee un archivo .xlsx/.xls o .csv de carga de lotes. Espera columnas
-    con encabezados flexibles (Código de Producto / Código, Lote, Fecha
-    vencimiento) y UNA FILA POR CADA UNIDAD FISICA (sin columna de
-    cantidad) -- se agrupan despues por (código, lote, fecha) para obtener
-    la cantidad de cada lote, de forma que siempre "cuadre" con el total
-    de unidades. Devuelve una lista de tuplas (codigo_producto, lote,
-    fecha_o_None), o None si no se reconocieron los encabezados."""
+    """Lee un archivo .xlsx/.xls o .csv de carga masiva de lotes para TODO
+    el costeo (ronda N, 2026-09-12 -- reemplaza la versión por parcial de
+    la ronda J). Encabezados flexibles: identifica el producto por
+    'Descripción' (formato real que usa el usuario, ver 'Carga de Lotes
+    Costeo.xlsx') o por 'Código' si está presente; 'Cod. de Lote'/'Lote';
+    'Vencmto'/'Fecha vencimiento'; y opcionalmente 'Cantidad' (si el
+    archivo ya trae la cantidad de cada lote directamente, como en el
+    formato real del usuario) -- si no hay columna de cantidad, sigue
+    soportando el formato viejo de UNA FILA POR UNIDAD (se cuenta 1 por
+    fila y se agrupan). Devuelve una lista de dicts
+    {codigo, descripcion, lote, fecha, cantidad}, o None si no se
+    reconocieron los encabezados mínimos (falta el producto o el lote)."""
     nombre = (file_storage.filename or "").lower()
     if nombre.endswith(".csv"):
         contenido = file_storage.read().decode("utf-8-sig", errors="ignore")
@@ -2379,97 +3750,504 @@ def _leer_filas_archivo_lotes(file_storage):
 
     encabezado = [str(c or "").strip().lower() for c in filas_crudas[0]]
 
-    def _buscar_columna(*claves):
-        for i, nombre_col in enumerate(encabezado):
-            for clave in claves:
-                if clave in nombre_col:
-                    return i
+    idx_codigo = _buscar_columna_prioridad(
+        encabezado, ["codigo de producto", "código de producto"], ["codigo", "código"]
+    )
+    idx_descripcion = _buscar_columna_prioridad(encabezado, ["descripcion", "descripción"])
+    idx_lote = _buscar_columna_prioridad(
+        encabezado, ["cod.de lote", "cod. de lote", "codigo de lote", "código de lote"], ["lote"]
+    )
+    idx_fecha = _buscar_columna_prioridad(
+        encabezado,
+        ["vencmto", "fecha vencimiento", "fecha de vencimiento"],
+        ["vencimiento"],
+        ["fecha"],
+    )
+    idx_cantidad = _buscar_columna_prioridad(encabezado, ["cantidad"], ["unidades"])
+
+    if idx_lote is None or (idx_codigo is None and idx_descripcion is None):
         return None
 
-    idx_codigo = _buscar_columna("codigo de producto", "código de producto", "codigo", "código")
-    idx_lote = _buscar_columna("lote")
-    idx_fecha = _buscar_columna("fecha vencimiento", "fecha de vencimiento", "vencimiento", "fecha")
-
-    if idx_codigo is None or idx_lote is None:
-        return None
+    def _valor_lote(crudo):
+        if crudo is None:
+            return ""
+        if isinstance(crudo, float) and crudo.is_integer():
+            return str(int(crudo))
+        return str(crudo).strip()
 
     filas = []
     for fila in filas_crudas[1:]:
-        if idx_codigo >= len(fila):
+        codigo = ""
+        if idx_codigo is not None and idx_codigo < len(fila):
+            codigo = str(fila[idx_codigo] or "").strip()
+        descripcion = ""
+        if idx_descripcion is not None and idx_descripcion < len(fila):
+            descripcion = str(fila[idx_descripcion] or "").strip()
+        if not codigo and not descripcion:
             continue
-        codigo = str(fila[idx_codigo] or "").strip()
-        if not codigo:
-            continue
-        lote = str(fila[idx_lote] or "").strip() if idx_lote < len(fila) else ""
+        lote = _valor_lote(fila[idx_lote]) if idx_lote < len(fila) else ""
         fecha_cruda = fila[idx_fecha] if (idx_fecha is not None and idx_fecha < len(fila)) else None
-        filas.append((codigo, lote, _parsear_fecha_archivo_lotes(fecha_cruda)))
+        cantidad = None
+        if idx_cantidad is not None and idx_cantidad < len(fila):
+            crudo_cantidad = fila[idx_cantidad]
+            if crudo_cantidad not in (None, ""):
+                try:
+                    cantidad = int(float(crudo_cantidad))
+                except (TypeError, ValueError):
+                    cantidad = None
+        filas.append({
+            "codigo": codigo,
+            "descripcion": descripcion,
+            "lote": lote,
+            "fecha": _parsear_fecha_archivo_lotes(fecha_cruda),
+            "cantidad": cantidad,
+        })
     return filas
 
 
-@app.route("/parciales/<int:parcial_id>/lotes/cargar", methods=["POST"])
-def parcial_lotes_cargar(parcial_id):
-    """Ronda J, punto 3: carga masiva de lotes desde un archivo con Código
-    de Producto / Lote / Fecha vencimiento (una fila por unidad). Reemplaza
-    el desglose de lotes de cada producto encontrado en el archivo; los
-    productos del parcial que no aparecen en el archivo no se tocan."""
-    parcial = Parcial.query.get_or_404(parcial_id)
+def _indexar_lineas_importacion(importacion):
+    """Arma diccionarios (por código normalizado y por descripción
+    normalizada) que apuntan a la ParcialLinea correspondiente, buscando en
+    TODOS los parciales de la importación -- para la carga masiva de lotes
+    a nivel de todo el costeo (un mismo producto no se repite entre
+    parciales distintos del mismo costeo, confirmado por el usuario). Si
+    una clave aparece en más de una línea (dato real inesperado), se marca
+    como ambigua y se excluye de los diccionarios en vez de adivinar a
+    cuál asignarla."""
+    por_codigo, por_descripcion = {}, {}
+    vistos_codigo, vistos_descripcion = set(), set()
+    ambiguos_codigo, ambiguos_descripcion = set(), set()
+    for parcial in importacion.parciales:
+        for linea in parcial.lineas:
+            clave_cod = (linea.codigo or "").strip().lower()
+            if clave_cod:
+                if clave_cod in vistos_codigo:
+                    ambiguos_codigo.add(clave_cod)
+                vistos_codigo.add(clave_cod)
+                por_codigo[clave_cod] = linea
+            clave_desc = _normalizar_desc(linea.descripcion)
+            if clave_desc:
+                if clave_desc in vistos_descripcion:
+                    ambiguos_descripcion.add(clave_desc)
+                vistos_descripcion.add(clave_desc)
+                por_descripcion[clave_desc] = linea
+    for clave in ambiguos_codigo:
+        por_codigo.pop(clave, None)
+    for clave in ambiguos_descripcion:
+        por_descripcion.pop(clave, None)
+    return por_codigo, por_descripcion, ambiguos_codigo, ambiguos_descripcion
+
+
+@app.route("/importaciones/<int:importacion_id>/lotes/cargar", methods=["POST"])
+@requiere_permiso("generar_costeo")
+def importacion_lotes_cargar(importacion_id):
+    """Carga masiva de lotes para TODO el costeo de una sola vez (ronda N,
+    2026-09-12, a pedido del usuario -- reemplaza la carga por parcial de
+    la ronda J). Se sube un solo archivo con los productos del embarque
+    completo, sin importar el orden de las filas ni en qué parcial esté
+    cada uno: el sistema busca cada producto (por Código si el archivo lo
+    trae, si no por Descripción) entre TODAS las líneas de TODOS los
+    parciales de esta importación y le carga los lotes al que corresponda,
+    ya que un mismo producto no se repite en dos parciales del mismo
+    costeo."""
+    imp = Importacion.query.get_or_404(importacion_id)
     archivo = request.files.get("archivo_lotes")
     if not archivo or not archivo.filename:
         flash("Selecciona un archivo para cargar los lotes.", "warning")
-        return redirect(url_for("importaciones_detalle", importacion_id=parcial.importacion_id))
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
     extension = os.path.splitext(archivo.filename)[1].lower()
     if extension not in (".xlsx", ".xls", ".csv"):
         flash("Formato no soportado. Sube un archivo .xlsx o .csv.", "danger")
-        return redirect(url_for("importaciones_detalle", importacion_id=parcial.importacion_id))
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
     try:
         filas = _leer_filas_archivo_lotes(archivo)
     except Exception:
         flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
-        return redirect(url_for("importaciones_detalle", importacion_id=parcial.importacion_id))
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
     if filas is None:
-        flash("No se reconocieron las columnas del archivo. Debe incluir 'Código de Producto', 'Lote' y 'Fecha vencimiento'.", "danger")
-        return redirect(url_for("importaciones_detalle", importacion_id=parcial.importacion_id))
+        flash("No se reconocieron las columnas del archivo. Debe incluir 'Descripción' (o 'Código') y 'Lote'.", "danger")
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
     if not filas:
         flash("El archivo no tiene filas para cargar.", "warning")
-        return redirect(url_for("importaciones_detalle", importacion_id=parcial.importacion_id))
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
-    lineas_por_codigo = {}
-    for linea in parcial.lineas:
-        lineas_por_codigo.setdefault((linea.codigo or "").strip().lower(), linea)
+    por_codigo, por_descripcion, ambiguos_codigo, ambiguos_descripcion = _indexar_lineas_importacion(imp)
 
-    conteo = {}
-    for codigo, lote, fecha in filas:
-        grupo = (codigo.strip().lower(), lote, fecha)
-        conteo[grupo] = conteo.get(grupo, 0) + 1
+    conteo_por_linea = defaultdict(lambda: defaultdict(int))
+    no_encontrados = set()
+    ambiguos_encontrados = set()
 
-    nuevos_por_linea = {}
-    codigos_no_encontrados = set()
-    for (codigo_key, lote, fecha), cantidad in conteo.items():
-        linea = lineas_por_codigo.get(codigo_key)
-        if not linea:
-            codigos_no_encontrados.add(codigo_key)
+    for fila in filas:
+        codigo_key = fila["codigo"].strip().lower() if fila["codigo"] else ""
+        desc_key = _normalizar_desc(fila["descripcion"]) if fila["descripcion"] else ""
+        linea = None
+        if codigo_key:
+            linea = por_codigo.get(codigo_key)
+            if linea is None and codigo_key in ambiguos_codigo:
+                ambiguos_encontrados.add(fila["codigo"])
+        if linea is None and desc_key:
+            linea = por_descripcion.get(desc_key)
+            if linea is None and desc_key in ambiguos_descripcion:
+                ambiguos_encontrados.add(fila["descripcion"])
+        if linea is None:
+            if not (codigo_key and codigo_key in ambiguos_codigo) and not (desc_key and desc_key in ambiguos_descripcion):
+                no_encontrados.add(fila["codigo"] or fila["descripcion"])
             continue
-        nuevos_por_linea.setdefault(linea.id, []).append(
-            ParcialLineaLote(codigo_lote=lote, fecha_vencimiento=fecha, cantidad_unidades=cantidad)
-        )
+        cantidad = fila["cantidad"] if fila["cantidad"] is not None else 1
+        clave_lote = (fila["lote"], fila["fecha"])
+        conteo_por_linea[linea.id][clave_lote] += cantidad
 
-    for linea_id, nuevos in nuevos_por_linea.items():
+    lineas_por_parcial = {}
+    for linea_id, grupos in conteo_por_linea.items():
         linea = ParcialLinea.query.get(linea_id)
+        nuevos = [
+            ParcialLineaLote(codigo_lote=lote, fecha_vencimiento=fecha, cantidad_unidades=cantidad)
+            for (lote, fecha), cantidad in grupos.items()
+        ]
         linea.lotes = nuevos
         primero = min(nuevos, key=lambda lo: (lo.fecha_vencimiento is None, lo.fecha_vencimiento or date.max))
         linea.codigo_lote = ", ".join(sorted({lo.codigo_lote for lo in nuevos if lo.codigo_lote}))
         linea.fecha_vencimiento = primero.fecha_vencimiento
+        nombre_parcial = linea.parcial.referencia or linea.parcial.numero_parcial or f"Parcial {linea.parcial.id}"
+        lineas_por_parcial[nombre_parcial] = lineas_por_parcial.get(nombre_parcial, 0) + 1
 
     db.session.commit()
 
-    mensaje = f"Lotes cargados para {len(nuevos_por_linea)} producto(s)."
-    if codigos_no_encontrados:
-        mensaje += f" {len(codigos_no_encontrados)} código(s) del archivo no se encontraron en este parcial y se ignoraron."
-    flash(mensaje, "success" if nuevos_por_linea else "warning")
-    return redirect(url_for("importaciones_detalle", importacion_id=parcial.importacion_id))
+    if lineas_por_parcial:
+        detalle = ", ".join(f"{n} en {parcial}" for parcial, n in lineas_por_parcial.items())
+        mensaje = f"Lotes cargados para {sum(lineas_por_parcial.values())} producto(s) ({detalle})."
+    else:
+        mensaje = "No se encontró ningún producto del archivo en este costeo."
+    if no_encontrados:
+        mensaje += f" {len(no_encontrados)} producto(s) del archivo no se encontraron en ningún parcial y se ignoraron."
+    if ambiguos_encontrados:
+        mensaje += (
+            f" {len(ambiguos_encontrados)} producto(s) aparecen repetidos en más de un parcial "
+            "(mismo código o descripción) y no se pudieron asignar automáticamente -- revísalos a mano."
+        )
+    flash(mensaje, "success" if lineas_por_parcial else "warning")
+    return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
+
+
+# --- Exportar planilla para el sistema de Inventarios (ronda N, 2026-09-12) ---
+
+ENCABEZADOS_INVENTARIO = [
+    "CODIGO", "DESCRIPCION", "DD-MM-AAAA FECHA INVOICE", "CODIGO DE BARRA ESCANEADO",
+    "COD.DE LOTE", "VENCMTO AAMMDD", "UBICACIÓN", "NUL", "valor Unitario EU", "Unidades",
+    "Total Ivoice EU", "TOTAL INVOICE US$", "VALOR FLETE", "US $ SEGURO", "C.I.F.",
+    "TOTAL C.I.F. $", "DERECHO ADUANA $", "OTROS GASTOS $", "TOTAL COSTO $", "COSTO UNITARIO $",
+]
+_ANCHOS_INVENTARIO = [20, 42, 16, 16, 16, 14, 10, 6, 12, 10, 12, 14, 12, 12, 12, 16, 16, 14, 14, 16]
+# La tabla de 20 columnas empieza en la columna B (no en A) -- ronda O,
+# punto 2: la columna A queda siempre en blanco y angosta, igual que en la
+# planilla real del sistema de Inventarios (columnas B a U).
+_COL_INVENTARIO_OFFSET = 1
+_RELLENO_AMARILLO = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+# Formato "Contabilidad" estandar de Excel (2 decimales, separador de miles,
+# negativos entre parentesis, guion para el cero) -- ronda Q, punto 2: se
+# aplica a todas las columnas de valores (J a U) EXCEPTO "Unidades" (K), que
+# es una cantidad, no un monto.
+_FORMATO_CONTABILIDAD = '_-* #,##0.00_-;-* #,##0.00_-;_-* "-"??_-;_-@_-'
+# Indices (1-based, dentro de ENCABEZADOS_INVENTARIO) de las columnas de
+# valores a las que se les aplica el formato de contabilidad (ronda Q, punto
+# 2): de "valor Unitario EU" (9) a "COSTO UNITARIO $" (20), salteando
+# "Unidades" (10), que es una cantidad, no un monto.
+_COLS_VALORES_INVENTARIO = [i for i in range(9, 21) if i != 10]
+# Columnas que llevan fila de subtotal (ronda Q, punto 3): "desde la columna
+# J en adelante" -- a diferencia del formato de contabilidad, aca SI se
+# incluye "Unidades" (J es la primera de este rango, columna 10 de la hoja).
+_COLS_SUBTOTAL_INVENTARIO = list(range(9, 21))
+# Fila donde empieza la tabla de 20 columnas (encabezados) -- deja espacio
+# arriba para el bloque de cabecera (empresa/correlativo/proveedor/etc.,
+# ver _escribir_cabecera_inventario) tal como en la planilla real.
+_FILA_TABLA_INVENTARIO = 13
+
+
+def _fecha_larga_es(d):
+    """Formatea una fecha como '14 de julio de 2026', igual que la celda
+    'FECHA FACTURA' de la planilla real del sistema de Inventarios."""
+    if not d:
+        return None
+    mes = TipoCambioMensual.MESES_NOMBRE[d.month - 1].lower()
+    return f"{d.day} de {mes} de {d.year}"
+
+
+def _escribir_cabecera_inventario(ws, imp, proveedor):
+    """Replica el bloque de cabecera de la planilla real del sistema de
+    Inventarios (ver capturas del usuario, ronda O 2026-09-12), en las
+    mismas celdas que usa esa planilla: B1/B2 título y empresa, C1 el
+    nombre de la empresa otra vez (ronda Q, punto 1) y su logo en el área
+    E1:F3, B3:C10 los datos de la importación (uno por fila), y M1/M2:N2
+    el bloque de mes/fecha de carga. Solo C3 (correlativo), C5 (código del
+    proveedor en el otro sistema) y N2 (fecha de carga) quedan resaltados
+    en amarillo -- son, según el usuario, los únicos campos de esta
+    cabecera que ese sistema exige para poder cargar el archivo."""
+    ws["B1"] = "PLANTILLA DE COSTEO"
+    ws["B1"].font = Font(bold=True)
+    ws["C1"] = imp.empresa.nombre if imp.empresa else None
+    ws["C1"].font = Font(bold=True)
+    ws["B2"] = imp.empresa.nombre if imp.empresa else None
+
+    # Logo de la empresa compradora, en el area E1:F3 (ronda Q, punto 1) --
+    # si la empresa no tiene logo cargado (o el archivo no existe en disco),
+    # simplemente no se agrega ninguna imagen, sin romper la exportacion.
+    if imp.empresa and imp.empresa.logo_nombre_archivo:
+        ruta_logo = os.path.join(EMPRESAS_LOGOS_DIR, imp.empresa.logo_nombre_archivo)
+        if os.path.isfile(ruta_logo):
+            try:
+                img = ExcelImage(ruta_logo)
+                ancho_max, alto_max = 200, 58  # aprox. el area E1:F3
+                escala = min(ancho_max / img.width, alto_max / img.height, 1)
+                img.width = int(img.width * escala)
+                img.height = int(img.height * escala)
+                ws.merge_cells("E1:F3")
+                img.anchor = "E1"
+                ws.add_image(img)
+            except Exception:
+                pass
+
+    ws["B3"] = "NRO. IMPORTACION"
+    ws["C3"] = imp.numero_correlativo_inventario
+    ws["C3"].fill = _RELLENO_AMARILLO
+
+    ws["B4"] = "NUMERO FACTURA"
+    ws["C4"] = imp.numero_factura
+
+    ws["B5"] = "RUT"
+    ws["C5"] = proveedor.codigo_sistema_inventario if proveedor else None
+    ws["C5"].fill = _RELLENO_AMARILLO
+
+    ws["B6"] = "PROVEEDOR"
+    ws["C6"] = proveedor.nombre if proveedor else None
+
+    ws["B7"] = "FECHA FACTURA"
+    ws["C7"] = _fecha_larga_es(imp.fecha_factura)
+
+    ws["B8"] = "TIPO CAMBIO"
+    ws["C8"] = imp.tipo_cambio_aduanero
+
+    ws["B9"] = "DÓLAR ADUANERO"
+    ws["C9"] = imp.tipo_cambio_aduanero
+
+    ws["B10"] = "NUMERO DE DESPACHO"
+    ws["C10"] = imp.despacho.numero_tracking if (imp.despacho_id and imp.despacho) else None
+
+    for fila in range(3, 11):
+        ws.cell(row=fila, column=2).font = Font(bold=True)
+
+    ws["M1"] = "PLANILLA DE COSTEO"
+    ws["M1"].font = Font(bold=True)
+    ws["M2"] = "MES/AÑO :"
+    ws["M2"].font = Font(bold=True)
+    ws["N2"] = date.today().strftime("%d-%m-%Y")
+    ws["N2"].fill = _RELLENO_AMARILLO
+
+    # Ancho de B/C (y del resto de la tabla) lo fija _construir_excel_inventario
+    # a partir de _ANCHOS_INVENTARIO, ya que son las mismas columnas que usa
+    # la tabla de 20 encabezados (CODIGO=B, DESCRIPCION=C, ...) -- acá solo
+    # se deja A en blanco y angosto.
+    ws.column_dimensions["A"].width = 3
+
+
+def _codigo_interno_homologado(parcial_linea):
+    """Ronda V (2026-09-12, punto 1): devuelve el codigo interno del sistema
+    de Inventarios (Ergopyme) ya homologado para esta linea de Costeo, o
+    None si todavia no se conoce (nunca rompe nada -- la planilla
+    simplemente deja esa celda en blanco, igual que antes de esta ronda).
+    `parcial_linea.codigo` es "codigo_mostrar" de la linea de OC original
+    (ver parciales_generar): el codigo padre para un producto simple, o el
+    codigo de la variante especifica elegida (ej. una dioptria) cuando el
+    producto es de una familia con variantes -- por eso primero se busca en
+    ProductoVariante antes de asumir que es el codigo del Producto padre."""
+    producto = parcial_linea.producto
+    if not producto:
+        return None
+    codigo_mostrado = (parcial_linea.codigo or "").strip()
+    if codigo_mostrado and codigo_mostrado.upper() != (producto.codigo or "").strip().upper():
+        variante = ProductoVariante.query.filter(
+            ProductoVariante.producto_id == producto.id,
+            db.func.upper(ProductoVariante.codigo) == codigo_mostrado.upper(),
+        ).first()
+        if variante and variante.codigo_interno_inventario:
+            return variante.codigo_interno_inventario
+    return producto.codigo_interno_inventario
+
+
+def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
+    """Arma el Excel de carga al sistema de Inventarios: mismos encabezados
+    y misma cadena de conversión de moneda (factura -> USD -> CLP) que la
+    planilla de referencia del usuario ('Muestra planilla de costeo
+    Importacion.xlsx'), reutilizando los montos YA CALCULADOS por
+    costing.py línea por línea -- para no volver a calcular nada aparte y
+    evitar un descuadre entre esta planilla y lo que se ve en pantalla.
+    Una fila por LOTE físico (no por producto): si un producto tiene 2
+    lotes, cada lote recibe su porción proporcional de FOB/Flete/Seguro/
+    CIF/Gastos según su cantidad de unidades sobre el total de la línea.
+    Si un producto todavía no tiene lotes cargados, se exporta como un
+    único "lote" con el total de la línea (usando codigo_lote/
+    fecha_vencimiento "resumen" de siempre), para que la planilla nunca
+    salga incompleta aunque falte hacer la carga masiva de lotes.
+    Un sheet por parcial, en el mismo orden en que se muestran las
+    pestañas en pantalla. La columna A queda en blanco (la tabla empieza
+    en B, ronda O). CODIGO DE BARRA ESCANEADO queda en blanco a propósito
+    -- es el código interno del sistema de Inventarios, que este sistema
+    no conoce (se completa/relaciona del otro lado).
+
+    Columnas CODIGO (B) y DESCRIPCION (C) segun el checkbox "Código
+    Proveedor" (ronda T, 2026-09-12; CODIGO homologado agregado en ronda V):
+    - Sin marcar (default): CODIGO lleva el código INTERNO del sistema de
+      Inventarios ya homologado (ver _codigo_interno_homologado, ronda V) --
+      queda en blanco solo si ese producto/variante todavía no se homologó.
+      DESCRIPCION lleva el código propio de Suite Logística concatenado con
+      la descripción, igual que siempre desde ronda O.
+    - Marcado: CODIGO lleva el código del proveedor (el propio de Suite
+      Logística) y DESCRIPCION queda solo con la descripción, sin
+      concatenar."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    nombres_usados = set()
+    proveedor = imp.proveedor
+    for idx, pr in enumerate(resultado["parciales"], start=1):
+        parcial = pr["parcial"]
+        base = parcial.referencia or parcial.numero_parcial or f"Parcial {idx}"
+        base = re.sub(r'[\\/*?:\[\]]', "-", str(base)).strip()[:28] or f"Parcial {idx}"
+        nombre_hoja = base
+        sufijo = 2
+        while nombre_hoja in nombres_usados:
+            nombre_hoja = f"{base} ({sufijo})"
+            sufijo += 1
+        nombres_usados.add(nombre_hoja)
+
+        ws = wb.create_sheet(title=nombre_hoja)
+        _escribir_cabecera_inventario(ws, imp, proveedor)
+
+        fila_encabezado = _FILA_TABLA_INVENTARIO
+        for i, titulo in enumerate(ENCABEZADOS_INVENTARIO):
+            celda = ws.cell(row=fila_encabezado, column=i + 1 + _COL_INVENTARIO_OFFSET, value=titulo)
+            celda.font = Font(bold=True)
+        for ancho, col in zip(_ANCHOS_INVENTARIO, range(1, len(_ANCHOS_INVENTARIO) + 1)):
+            ws.column_dimensions[get_column_letter(col + _COL_INVENTARIO_OFFSET)].width = ancho
+
+        fila_actual = fila_encabezado
+        for info in pr["lineas"]:
+            linea = info["linea"]
+            codigo_limpio = (linea.codigo or "").strip()
+            descripcion_limpia = (linea.descripcion or "").strip()
+            if codigo_proveedor:
+                # Checkbox marcado (ronda T): CODIGO (B) = código del proveedor
+                # (el propio de Suite Logística), DESCRIPCION (C) = solo la
+                # descripción, sin concatenar.
+                valor_codigo_col_b = codigo_limpio
+                valor_descripcion_col_c = descripcion_limpia
+            else:
+                # Ronda V (2026-09-12, punto 1): CODIGO (B) ahora lleva el
+                # código interno homologado del sistema de Inventarios,
+                # cuando ya se conoce (antes quedaba siempre en blanco).
+                # DESCRIPCION (C) sigue igual que siempre: "código
+                # descripción" concatenados con el código propio de Suite
+                # Logística (no el interno).
+                valor_codigo_col_b = _codigo_interno_homologado(linea)
+                valor_descripcion_col_c = f"{codigo_limpio} {descripcion_limpia}".strip()
+            total_unidades = linea.cantidad_unidades or 0
+            lotes = list(linea.lotes) or [None]
+            for lote in lotes:
+                if lote is not None:
+                    cantidad_lote = lote.cantidad_unidades or 0
+                    codigo_lote = lote.codigo_lote or ""
+                    fecha_venc = lote.fecha_vencimiento
+                else:
+                    cantidad_lote = total_unidades
+                    codigo_lote = linea.codigo_lote or ""
+                    fecha_venc = linea.fecha_vencimiento
+                share = (cantidad_lote / total_unidades) if total_unidades else 0
+                costo_total_lote = info["costo_total_clp"] * share
+                fila_actual += 1
+                valores = [
+                    valor_codigo_col_b,
+                    valor_descripcion_col_c,
+                    imp.fecha_factura,
+                    None,
+                    codigo_lote,
+                    fecha_venc,
+                    None,
+                    None,
+                    linea.valor_unitario_moneda,
+                    cantidad_lote,
+                    (linea.valor_unitario_moneda or 0) * cantidad_lote,
+                    info["valor_usd"] * share,
+                    info["flete_usd"] * share,
+                    info["seguro_usd"] * share,
+                    info["cif_usd"] * share,
+                    info["cif_clp"] * share,
+                    info["derechos_clp"] * share,
+                    (info["gastos_clp"] - info["derechos_clp"]) * share,
+                    costo_total_lote,
+                    (costo_total_lote / cantidad_lote) if cantidad_lote else 0,
+                ]
+                for i, valor in enumerate(valores):
+                    ws.cell(row=fila_actual, column=i + 1 + _COL_INVENTARIO_OFFSET, value=valor)
+                ws.cell(row=fila_actual, column=3 + _COL_INVENTARIO_OFFSET).number_format = "DD-MM-YYYY"
+                if fecha_venc is not None:
+                    ws.cell(row=fila_actual, column=6 + _COL_INVENTARIO_OFFSET).number_format = "YYMMDD"
+                # Formato "Contabilidad" en las columnas de valores (ronda Q,
+                # punto 2) -- "Unidades" (columna K) queda fuera a propósito.
+                for col_pos in _COLS_VALORES_INVENTARIO:
+                    ws.cell(row=fila_actual, column=col_pos + _COL_INVENTARIO_OFFSET).number_format = _FORMATO_CONTABILIDAD
+
+        # Fila de subtotales, filtro en el encabezado y sin cuadricula (ronda
+        # Q, puntos 3, 4 y 5) -- una vez procesadas todas las lineas/lotes de
+        # este parcial.
+        ws.sheet_view.showGridLines = False
+        if fila_actual > fila_encabezado:
+            fila_subtotal = fila_actual + 1
+            ws.cell(row=fila_subtotal, column=2 + _COL_INVENTARIO_OFFSET, value="SUBTOTAL").font = Font(bold=True)
+            for col_pos in _COLS_SUBTOTAL_INVENTARIO:
+                col_letra = get_column_letter(col_pos + _COL_INVENTARIO_OFFSET)
+                celda = ws.cell(row=fila_subtotal, column=col_pos + _COL_INVENTARIO_OFFSET)
+                celda.value = f"=SUM({col_letra}{fila_encabezado + 1}:{col_letra}{fila_actual})"
+                celda.font = Font(bold=True)
+                if col_pos != 10:  # 10 = "Unidades", sin formato de contabilidad
+                    celda.number_format = _FORMATO_CONTABILIDAD
+        ws.auto_filter.ref = (
+            f"B{fila_encabezado}:U{fila_actual}" if fila_actual > fila_encabezado
+            else f"B{fila_encabezado}:U{fila_encabezado}"
+        )
+    if not wb.worksheets:
+        ws = wb.create_sheet(title="Sin datos")
+        _escribir_cabecera_inventario(ws, imp, proveedor)
+        for i, titulo in enumerate(ENCABEZADOS_INVENTARIO):
+            ws.cell(row=_FILA_TABLA_INVENTARIO, column=i + 1 + _COL_INVENTARIO_OFFSET, value=titulo).font = Font(bold=True)
+        ws.sheet_view.showGridLines = False
+        ws.auto_filter.ref = f"B{_FILA_TABLA_INVENTARIO}:U{_FILA_TABLA_INVENTARIO}"
+    return wb
+
+
+@app.route("/importaciones/<int:importacion_id>/exportar-inventario")
+@requiere_permiso("generar_costeo", "inventarios")
+def importaciones_exportar_inventario(importacion_id):
+    """Descarga la planilla de carga al sistema de Inventarios (un sheet
+    por parcial, un lote físico por fila) -- ver _construir_excel_inventario.
+    Ronda T (2026-09-12): checkbox opcional "Código Proveedor" -- si se
+    marca, la columna CODIGO (B) lleva el código propio de Suite Logística
+    (el mismo que identifica al producto en el catálogo de ese proveedor) y
+    la columna DESCRIPCION (C) queda con la descripción sola, sin
+    concatenar; si no se marca, se mantiene el comportamiento de siempre
+    (CODIGO en blanco, DESCRIPCION con "código descripción" concatenados)."""
+    imp = Importacion.query.get_or_404(importacion_id)
+    codigo_proveedor = request.args.get("codigo_proveedor") == "1"
+    resultado = costing.calcular_costeo(imp)
+    wb = _construir_excel_inventario(imp, resultado, codigo_proveedor=codigo_proveedor)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    nombre_archivo = f"Inventario_{(imp.numero_factura or imp.id)}.xlsx".replace("/", "-").replace(" ", "_")
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre_archivo,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 # --- Gastos compartidos ---
@@ -2488,6 +4266,7 @@ def _monto_clp_gasto(request_form):
 
 
 @app.route("/importaciones/<int:importacion_id>/gastos/nuevo", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def gastos_nuevo(importacion_id):
     imp = Importacion.query.get_or_404(importacion_id)
     moneda, tipo_cambio, monto_original, monto_clp = _monto_clp_gasto(request.form)
@@ -2510,6 +4289,7 @@ def gastos_nuevo(importacion_id):
 
 
 @app.route("/gastos/<int:gasto_id>/editar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def gastos_editar(gasto_id):
     gasto = GastoImportacion.query.get_or_404(gasto_id)
     moneda, tipo_cambio, monto_original, monto_clp = _monto_clp_gasto(request.form)
@@ -2529,6 +4309,7 @@ def gastos_editar(gasto_id):
 
 
 @app.route("/gastos/<int:gasto_id>/eliminar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def gastos_eliminar(gasto_id):
     gasto = GastoImportacion.query.get_or_404(gasto_id)
     importacion_id = gasto.importacion_id
@@ -2542,6 +4323,7 @@ def gastos_eliminar(gasto_id):
 
 
 @app.route("/importaciones/<int:importacion_id>/gastos/eliminar-multiple", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def gastos_eliminar_multiple(importacion_id):
     """Eliminacion masiva de Gastos compartidos -- ronda I, 2026-09-01,
     mismo patron que cargos_eliminar_multiple. Borra tambien la carpeta de
@@ -2573,6 +4355,7 @@ def _extension_valida_gasto(nombre_archivo):
 
 
 @app.route("/gastos/<int:gasto_id>/documentos/subir", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def gastos_documento_subir(gasto_id):
     gasto = GastoImportacion.query.get_or_404(gasto_id)
     archivo = request.files.get("archivo")
@@ -2606,6 +4389,7 @@ def gastos_documento_subir(gasto_id):
 
 
 @app.route("/gastos/<int:gasto_id>/documentos/<int:doc_id>/ver")
+@requiere_permiso("generar_costeo")
 def gastos_documento_ver(gasto_id, doc_id):
     doc = GastoDocumento.query.get_or_404(doc_id)
     if doc.gasto_id != gasto_id:
@@ -2617,6 +4401,7 @@ def gastos_documento_ver(gasto_id, doc_id):
 
 
 @app.route("/gastos/<int:gasto_id>/documentos/<int:doc_id>/descargar")
+@requiere_permiso("generar_costeo")
 def gastos_documento_descargar(gasto_id, doc_id):
     doc = GastoDocumento.query.get_or_404(doc_id)
     if doc.gasto_id != gasto_id:
@@ -2628,6 +4413,7 @@ def gastos_documento_descargar(gasto_id, doc_id):
 
 
 @app.route("/gastos/<int:gasto_id>/documentos/<int:doc_id>/eliminar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def gastos_documento_eliminar(gasto_id, doc_id):
     doc = GastoDocumento.query.get_or_404(doc_id)
     if doc.gasto_id != gasto_id:
@@ -2655,6 +4441,7 @@ def _extension_valida_legajo(nombre_archivo):
 
 
 @app.route("/importaciones/<int:importacion_id>/legajo/subir", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def importacion_legajo_subir(importacion_id):
     imp = Importacion.query.get_or_404(importacion_id)
     archivo = request.files.get("archivo")
@@ -2688,6 +4475,7 @@ def importacion_legajo_subir(importacion_id):
 
 
 @app.route("/importaciones/<int:importacion_id>/legajo/<int:doc_id>/ver")
+@requiere_permiso("generar_costeo")
 def importacion_legajo_ver(importacion_id, doc_id):
     doc = ImportacionDocumento.query.get_or_404(doc_id)
     if doc.importacion_id != importacion_id:
@@ -2699,6 +4487,7 @@ def importacion_legajo_ver(importacion_id, doc_id):
 
 
 @app.route("/importaciones/<int:importacion_id>/legajo/<int:doc_id>/descargar")
+@requiere_permiso("generar_costeo")
 def importacion_legajo_descargar(importacion_id, doc_id):
     doc = ImportacionDocumento.query.get_or_404(doc_id)
     if doc.importacion_id != importacion_id:
@@ -2710,6 +4499,7 @@ def importacion_legajo_descargar(importacion_id, doc_id):
 
 
 @app.route("/importaciones/<int:importacion_id>/legajo/<int:doc_id>/eliminar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def importacion_legajo_eliminar(importacion_id, doc_id):
     doc = ImportacionDocumento.query.get_or_404(doc_id)
     if doc.importacion_id != importacion_id:
@@ -2734,6 +4524,7 @@ def importacion_legajo_eliminar(importacion_id, doc_id):
 # factura, pero se puede cargar en otra si el proveedor lo factura distinto.
 
 @app.route("/importaciones/<int:importacion_id>/cargos/nuevo", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def cargos_nuevo(importacion_id):
     imp = Importacion.query.get_or_404(importacion_id)
     moneda = request.form.get("moneda", "").strip() or imp.moneda_factura
@@ -2752,6 +4543,7 @@ def cargos_nuevo(importacion_id):
 
 
 @app.route("/cargos/<int:cargo_id>/editar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def cargos_editar(cargo_id):
     cargo = CargoAdicionalImportacion.query.get_or_404(cargo_id)
     moneda = request.form.get("moneda", "").strip() or cargo.importacion.moneda_factura
@@ -2766,6 +4558,7 @@ def cargos_editar(cargo_id):
 
 
 @app.route("/cargos/<int:cargo_id>/eliminar", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def cargos_eliminar(cargo_id):
     cargo = CargoAdicionalImportacion.query.get_or_404(cargo_id)
     importacion_id = cargo.importacion_id
@@ -2776,6 +4569,7 @@ def cargos_eliminar(cargo_id):
 
 
 @app.route("/importaciones/<int:importacion_id>/cargos/eliminar-multiple", methods=["POST"])
+@requiere_permiso("generar_costeo")
 def cargos_eliminar_multiple(importacion_id):
     """Eliminacion masiva de items de factura (Flete/Seguro/Handling Fee/
     Otros) -- ronda I, 2026-09-01: el engranaje unico del panel activa
@@ -2799,6 +4593,7 @@ def cargos_eliminar_multiple(importacion_id):
 # ---------------------------------------------------------------------------
 
 @app.route("/configuracion/empresas")
+@requiere_admin
 def empresas_list():
     empresas = Empresa.query.order_by(Empresa.nombre).all()
     return render_template(
@@ -2826,6 +4621,7 @@ def _guardar_logo_empresa(file_storage, empresa_id):
 
 
 @app.route("/configuracion/empresas/nueva", methods=["POST"])
+@requiere_admin
 def empresas_nueva():
     nombre = request.form.get("nombre", "").strip()
     if not nombre:
@@ -2852,6 +4648,7 @@ def empresas_nueva():
 
 
 @app.route("/configuracion/empresas/<int:empresa_id>/editar", methods=["POST"])
+@requiere_admin
 def empresas_editar(empresa_id):
     empresa = Empresa.query.get_or_404(empresa_id)
     nombre = request.form.get("nombre", "").strip()
@@ -2874,6 +4671,7 @@ def empresas_editar(empresa_id):
 
 
 @app.route("/configuracion/empresas/<int:empresa_id>/eliminar", methods=["POST"])
+@requiere_admin
 def empresas_eliminar(empresa_id):
     empresa = Empresa.query.get_or_404(empresa_id)
     total_ordenes = empresa.ordenes.count()
@@ -2904,10 +4702,422 @@ def empresas_logo(empresa_id):
 
 
 # ---------------------------------------------------------------------------
+# Modulo: Configuracion -- Perfiles (Roles) y Usuarios (ronda R, 2026-09-12)
+# ---------------------------------------------------------------------------
+
+@app.route("/configuracion/perfiles")
+@requiere_admin
+def roles_list():
+    roles = Rol.query.order_by(Rol.nombre).all()
+    return render_template("configuracion/roles.html", roles=roles, permisos=PERMISOS_DISPONIBLES)
+
+
+def _guardar_permisos_rol(rol, form):
+    rol.es_administrador = form.get("es_administrador") == "on"
+    for codigo, _nombre in PERMISOS_DISPONIBLES:
+        setattr(rol, f"permiso_{codigo}", form.get(f"permiso_{codigo}") == "on")
+
+
+@app.route("/configuracion/perfiles/nuevo", methods=["POST"])
+@requiere_admin
+def roles_nuevo():
+    nombre = request.form.get("nombre", "").strip()
+    if not nombre:
+        flash("El perfil necesita un nombre.", "warning")
+        return redirect(url_for("roles_list"))
+    if Rol.query.filter(db.func.lower(Rol.nombre) == nombre.lower()).first():
+        flash(f"Ya existe un perfil llamado '{nombre}'.", "warning")
+        return redirect(url_for("roles_list"))
+    rol = Rol(nombre=nombre)
+    _guardar_permisos_rol(rol, request.form)
+    db.session.add(rol)
+    db.session.commit()
+    flash(f"Perfil '{rol.nombre}' creado.", "success")
+    return redirect(url_for("roles_list"))
+
+
+@app.route("/configuracion/perfiles/<int:rol_id>/editar", methods=["POST"])
+@requiere_admin
+def roles_editar(rol_id):
+    rol = Rol.query.get_or_404(rol_id)
+    nombre = request.form.get("nombre", "").strip()
+    if not nombre:
+        flash("El perfil necesita un nombre.", "warning")
+        return redirect(url_for("roles_list"))
+    if Rol.query.filter(db.func.lower(Rol.nombre) == nombre.lower(), Rol.id != rol.id).first():
+        flash(f"Ya existe otro perfil llamado '{nombre}'.", "warning")
+        return redirect(url_for("roles_list"))
+    # Misma salvaguarda que en usuarios_editar: si a ESTE perfil se le quita
+    # "es_administrador" y tiene usuarios activos asignados, hay que
+    # asegurarse de que quede al menos otro administrador activo en algun
+    # otro perfil -- si no, nadie podria volver a administrar usuarios/roles.
+    dejara_de_ser_admin = rol.es_administrador and request.form.get("es_administrador") != "on"
+    if dejara_de_ser_admin and rol.usuarios.filter_by(activo=True).count() > 0:
+        otros_admins_activos = Usuario.query.join(Rol).filter(
+            Rol.es_administrador.is_(True), Usuario.activo.is_(True), Rol.id != rol.id
+        ).count()
+        if otros_admins_activos == 0:
+            flash("No puedes quitarle 'Administrador' a este perfil: quedaría sin ningún administrador activo en el sistema.", "danger")
+            return redirect(url_for("roles_list"))
+    rol.nombre = nombre
+    _guardar_permisos_rol(rol, request.form)
+    db.session.commit()
+    flash(f"Perfil '{rol.nombre}' actualizado.", "success")
+    return redirect(url_for("roles_list"))
+
+
+@app.route("/configuracion/perfiles/<int:rol_id>/eliminar", methods=["POST"])
+@requiere_admin
+def roles_eliminar(rol_id):
+    rol = Rol.query.get_or_404(rol_id)
+    if rol.usuarios.count() > 0:
+        flash(f"'{rol.nombre}' tiene usuarios asignados: reasígnalos a otro perfil antes de eliminarlo.", "warning")
+        return redirect(url_for("roles_list"))
+    db.session.delete(rol)
+    db.session.commit()
+    flash("Perfil eliminado.", "success")
+    return redirect(url_for("roles_list"))
+
+
+@app.route("/configuracion/usuarios")
+@requiere_admin
+def usuarios_list():
+    usuarios = Usuario.query.order_by(Usuario.nombre_completo).all()
+    roles = Rol.query.order_by(Rol.nombre).all()
+    return render_template("configuracion/usuarios.html", usuarios=usuarios, roles=roles)
+
+
+@app.route("/configuracion/usuarios/nuevo", methods=["POST"])
+@requiere_admin
+def usuarios_nuevo():
+    email = request.form.get("email", "").strip().lower()
+    nombre_completo = request.form.get("nombre_completo", "").strip()
+    rol_id = request.form.get("rol_id") or None
+    password = request.form.get("password", "")
+    if not (email and nombre_completo and rol_id and password):
+        flash("Nombre, correo, perfil y contraseña son obligatorios.", "warning")
+        return redirect(url_for("usuarios_list"))
+    if len(password) < 6:
+        flash("La contraseña debe tener al menos 6 caracteres.", "warning")
+        return redirect(url_for("usuarios_list"))
+    if Usuario.query.filter(db.func.lower(Usuario.email) == email).first():
+        flash(f"Ya existe un usuario con el correo '{email}'.", "warning")
+        return redirect(url_for("usuarios_list"))
+    usuario = Usuario(nombre_completo=nombre_completo, email=email, rol_id=int(rol_id), activo=True)
+    usuario.set_password(password)
+    db.session.add(usuario)
+    db.session.commit()
+    flash(f"Usuario '{usuario.nombre_completo}' creado.", "success")
+    return redirect(url_for("usuarios_list"))
+
+
+@app.route("/configuracion/usuarios/<int:usuario_id>/editar", methods=["POST"])
+@requiere_admin
+def usuarios_editar(usuario_id):
+    usuario = Usuario.query.get_or_404(usuario_id)
+    email = request.form.get("email", "").strip().lower()
+    nombre_completo = request.form.get("nombre_completo", "").strip()
+    rol_id = request.form.get("rol_id") or None
+    if not (email and nombre_completo and rol_id):
+        flash("Nombre, correo y perfil son obligatorios.", "warning")
+        return redirect(url_for("usuarios_list"))
+    if Usuario.query.filter(db.func.lower(Usuario.email) == email, Usuario.id != usuario.id).first():
+        flash(f"Ya existe otro usuario con el correo '{email}'.", "warning")
+        return redirect(url_for("usuarios_list"))
+    # Salvaguardas para no dejar la app sin ningun Administrador activo
+    # (ronda R, 2026-09-12) -- sin esto un error de carga (o el checkbox
+    # "Usuario activo" deshabilitado en el propio formulario, que un
+    # navegador simplemente no envia al hacer submit) podria desactivar o
+    # quitarle el perfil de Administrador al unico usuario que puede
+    # administrar usuarios, dejando la app inaccesible para siempre.
+    nuevo_rol = Rol.query.get(int(rol_id))
+    era_admin = bool(usuario.rol and usuario.rol.es_administrador)
+    sera_admin = bool(nuevo_rol and nuevo_rol.es_administrador)
+    if era_admin and not sera_admin:
+        otros_admins_activos = Usuario.query.join(Rol).filter(
+            Rol.es_administrador.is_(True), Usuario.activo.is_(True), Usuario.id != usuario.id
+        ).count()
+        if otros_admins_activos == 0:
+            flash("No puedes quitarle el perfil de Administrador: es el único administrador activo.", "danger")
+            return redirect(url_for("usuarios_list"))
+    if usuario.id == current_user.id:
+        nueva_activa = True  # nunca te desactivas a ti mismo
+    else:
+        nueva_activa = request.form.get("activo") == "on"
+        if era_admin and sera_admin and not nueva_activa:
+            otros_admins_activos = Usuario.query.join(Rol).filter(
+                Rol.es_administrador.is_(True), Usuario.activo.is_(True), Usuario.id != usuario.id
+            ).count()
+            if otros_admins_activos == 0:
+                flash("No puedes desactivar al único administrador activo.", "danger")
+                return redirect(url_for("usuarios_list"))
+    usuario.email = email
+    usuario.nombre_completo = nombre_completo
+    usuario.rol_id = int(rol_id)
+    usuario.activo = nueva_activa
+    nueva_password = request.form.get("password", "")
+    if nueva_password:
+        if len(nueva_password) < 6:
+            flash("La nueva contraseña debe tener al menos 6 caracteres -- no se cambió.", "warning")
+        else:
+            usuario.set_password(nueva_password)
+    db.session.commit()
+    flash(f"Usuario '{usuario.nombre_completo}' actualizado.", "success")
+    return redirect(url_for("usuarios_list"))
+
+
+@app.route("/configuracion/usuarios/<int:usuario_id>/eliminar", methods=["POST"])
+@requiere_admin
+def usuarios_eliminar(usuario_id):
+    usuario = Usuario.query.get_or_404(usuario_id)
+    if usuario.id == current_user.id:
+        flash("No puedes eliminar tu propio usuario mientras tienes la sesión abierta.", "warning")
+        return redirect(url_for("usuarios_list"))
+    nombre = usuario.nombre_completo
+    db.session.delete(usuario)
+    db.session.commit()
+    flash(f"Usuario '{nombre}' eliminado.", "success")
+    return redirect(url_for("usuarios_list"))
+
+
+# ---------------------------------------------------------------------------
+# Modulo: Stock (saldos de existencias) -- ronda V, 2026-09-12
+# ---------------------------------------------------------------------------
+# Consulta de stock por empresa (Accuvision/Accumedical juntas, se filtra en
+# pantalla), pensada para colaboradores que solo necesitan ver saldos, sin
+# tocar Compras/Costeo. Los datos vienen del reporte del sistema de
+# Inventarios ("Ergopyme"), que no es parte de esta Suite -- alguien con
+# permiso "inventarios" lo sube manualmente cuando hace falta actualizarlo
+# (reemplaza TODO el stock cargado antes, ver _clasificar_y_cargar_stock).
+
+@app.route("/stock")
+@requiere_permiso("consultar_stock", "inventarios")
+def stock_list():
+    empresa_id = request.args.get("empresa_id", "")
+    q = request.args.get("q", "").strip()
+
+    query = StockExistencia.query
+    if empresa_id:
+        query = query.filter_by(empresa_id=empresa_id)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(db.or_(
+            StockExistencia.descripcion.ilike(like),
+            StockExistencia.codigo_interno.ilike(like),
+            StockExistencia.producto.has(Producto.codigo.ilike(like)),
+            StockExistencia.variante.has(ProductoVariante.codigo.ilike(like)),
+        ))
+    filas = query.all()
+
+    # Ronda V: stock "Desglosado por variante exacta" -- se agrupa por
+    # (empresa, producto, variante) sumando todos los lotes de esa
+    # combinacion, mostrando el stock total y el proximo vencimiento (el
+    # detalle de cada lote individual se ve expandiendo la fila). Un
+    # producto/variante sin match (sin_marca o pendiente) se agrupa por su
+    # propio codigo_interno, ya que no hay Producto al que sumarle.
+    grupos = {}
+    for fila in filas:
+        if fila.variante_id:
+            clave = ("variante", fila.variante_id, fila.empresa_id)
+        elif fila.producto_id:
+            clave = ("producto", fila.producto_id, fila.empresa_id)
+        else:
+            clave = ("codigo", fila.codigo_interno, fila.empresa_id)
+        grupo = grupos.get(clave)
+        if grupo is None:
+            proveedor_nombre = None
+            codigo_mostrar = fila.codigo_interno
+            descripcion = fila.descripcion
+            if fila.variante:
+                codigo_mostrar = fila.variante.codigo
+                descripcion = fila.variante.descripcion or fila.descripcion
+                proveedor_nombre = fila.variante.producto.proveedor.nombre
+            elif fila.producto:
+                codigo_mostrar = fila.producto.codigo
+                descripcion = fila.producto.descripcion
+                proveedor_nombre = fila.producto.proveedor.nombre
+            grupo = {
+                "empresa": fila.empresa,
+                "proveedor_nombre": proveedor_nombre,
+                "codigo": codigo_mostrar,
+                "codigo_interno": fila.codigo_interno,
+                "descripcion": descripcion,
+                "stock_total": 0,
+                "proximo_vencimiento": None,
+                "lotes": [],
+                "homologado": bool(fila.producto_id or fila.variante_id),
+            }
+            grupos[clave] = grupo
+        grupo["stock_total"] += fila.stock_fisico or 0
+        if fila.fecha_vencimiento and (
+            grupo["proximo_vencimiento"] is None or fila.fecha_vencimiento < grupo["proximo_vencimiento"]
+        ):
+            grupo["proximo_vencimiento"] = fila.fecha_vencimiento
+        grupo["lotes"].append(fila)
+
+    resultado = sorted(grupos.values(), key=lambda g: (g["proveedor_nombre"] or "", g["descripcion"] or ""))
+    empresas = Empresa.query.order_by(Empresa.nombre).all()
+    ultima_carga = db.session.query(db.func.max(StockExistencia.cargado_en)).scalar()
+    return render_template(
+        "stock/list.html", grupos=resultado, empresas=empresas,
+        empresa_sel=empresa_id, q=q, ultima_carga=ultima_carga,
+    )
+
+
+@app.route("/stock/cargar", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_cargar():
+    """Sube un reporte nuevo del sistema de Inventarios ("Ergopyme", formato
+    original: columnas A-H, sin cruce) y REEMPLAZA por completo el Stock
+    cargado antes -- para que siempre refleje la ultima foto real, sin
+    arrastrar ni duplicar datos viejos (confirmado con el usuario, ronda
+    V)."""
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona el archivo de Stock para cargar.", "warning")
+        return redirect(url_for("stock_list"))
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls"):
+        flash("Formato no soportado. Sube el archivo .xlsx del reporte de Stock.", "danger")
+        return redirect(url_for("stock_list"))
+    try:
+        wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
+        ws = wb.active
+        filas = _leer_filas_reporte_stock(ws)
+    except Exception:
+        flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
+        return redirect(url_for("stock_list"))
+
+    if not filas:
+        flash("El archivo no tiene filas de stock reconocibles -- no se cambió nada.", "warning")
+        return redirect(url_for("stock_list"))
+
+    StockExistencia.query.delete()
+    resumen = _clasificar_y_cargar_stock(filas)
+    db.session.commit()
+
+    mensaje = (
+        f"Stock actualizado: {resumen['cargados']} producto(s)/lote(s) cargados "
+        f"({resumen['vinculados']} ligados al catálogo, {resumen['sin_marca']} sin marca)."
+    )
+    if resumen["pendientes_nuevos"]:
+        mensaje += (
+            f" {resumen['pendientes_nuevos']} código(s) nuevo(s) todavía no están homologados -- "
+            f"revísalos en 'Homologación de Stock'."
+        )
+    if resumen["empresas_no_encontradas"]:
+        mensaje += f" No se pudo identificar la empresa para: {', '.join(sorted(resumen['empresas_no_encontradas']))}."
+    flash(mensaje, "success" if not resumen["pendientes_nuevos"] and not resumen["empresas_no_encontradas"] else "warning")
+    return redirect(url_for("stock_list"))
+
+
+@app.route("/api/stock/productos")
+@requiere_permiso("inventarios")
+def api_stock_buscar_productos():
+    """Busqueda de productos (con sus variantes, si tiene) para el
+    selector de 'Homologación de Stock' -- separada de /api/proveedores/
+    <id>/productos porque esa exige permiso de Creación de Orden/Costeo, y
+    quien homologa Stock puede no tenerlo."""
+    proveedor_id = request.args.get("proveedor_id") or None
+    q = request.args.get("q", "").strip()
+    query = Producto.query
+    if proveedor_id:
+        query = query.filter_by(proveedor_id=proveedor_id)
+    if q:
+        query = query.filter(db.or_(Producto.codigo.ilike(f"%{q}%"), Producto.descripcion.ilike(f"%{q}%")))
+    productos = query.order_by(Producto.codigo).limit(50).all()
+    return jsonify([
+        {
+            "id": p.id,
+            "codigo": p.codigo,
+            "descripcion": p.descripcion,
+            "proveedor": p.proveedor.nombre,
+            "variantes": [{"id": v.id, "codigo": v.codigo, "descripcion": v.descripcion} for v in p.variantes],
+        }
+        for p in productos
+    ])
+
+
+@app.route("/stock/homologacion")
+@requiere_permiso("inventarios")
+def stock_homologacion():
+    """Códigos internos del sistema de Inventarios que aparecieron en una
+    carga de Stock pero todavía no se sabe a qué producto/proveedor
+    corresponden (ver estado 'pendiente' en HomologacionStock) -- desde acá
+    se resuelven a mano, uno por uno."""
+    pendientes = HomologacionStock.query.filter_by(estado="pendiente").order_by(
+        HomologacionStock.codigo_interno
+    ).all()
+    proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
+    return render_template("stock/homologacion.html", pendientes=pendientes, proveedores=proveedores)
+
+
+@app.route("/stock/homologacion/<int:homolog_id>/resolver", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_homologacion_resolver(homolog_id):
+    homolog = HomologacionStock.query.get_or_404(homolog_id)
+    accion = request.form.get("accion")
+
+    if accion == "sin_marca":
+        homolog.estado = "sin_marca"
+        homolog.producto_id = None
+        homolog.variante_id = None
+    elif accion == "excluido":
+        homolog.estado = "excluido"
+        homolog.producto_id = None
+        homolog.variante_id = None
+        StockExistencia.query.filter_by(codigo_interno=homolog.codigo_interno).delete()
+    elif accion == "vincular_existente":
+        producto_id = request.form.get("producto_id") or None
+        variante_id = request.form.get("variante_id") or None
+        if not producto_id:
+            flash("Selecciona un producto del catálogo para vincular.", "warning")
+            return redirect(url_for("stock_homologacion"))
+        producto = Producto.query.get_or_404(producto_id)
+        variante = ProductoVariante.query.get(variante_id) if variante_id else None
+        homolog.estado = "vinculado"
+        homolog.producto_id = producto.id
+        homolog.variante_id = variante.id if variante else None
+        if variante:
+            variante.codigo_interno_inventario = homolog.codigo_interno
+        else:
+            producto.codigo_interno_inventario = homolog.codigo_interno
+        StockExistencia.query.filter_by(codigo_interno=homolog.codigo_interno).update({
+            "producto_id": producto.id, "variante_id": variante.id if variante else None,
+        })
+    elif accion == "crear_producto":
+        proveedor_id = request.form.get("proveedor_id_nuevo")
+        codigo_nuevo = (request.form.get("codigo_nuevo") or "").strip()
+        if not proveedor_id or not codigo_nuevo:
+            flash("Indica proveedor y código para crear el producto nuevo.", "warning")
+            return redirect(url_for("stock_homologacion"))
+        nuevo = Producto(
+            proveedor_id=proveedor_id,
+            codigo=codigo_nuevo,
+            descripcion=homolog.descripcion_referencia or codigo_nuevo,
+            empaque=1, precio_caja=0, precio_unitario=0, activo=True,
+            codigo_interno_inventario=homolog.codigo_interno,
+        )
+        db.session.add(nuevo)
+        db.session.flush()
+        homolog.estado = "vinculado"
+        homolog.producto_id = nuevo.id
+        StockExistencia.query.filter_by(codigo_interno=homolog.codigo_interno).update({"producto_id": nuevo.id})
+    else:
+        flash("Acción no reconocida.", "danger")
+        return redirect(url_for("stock_homologacion"))
+
+    db.session.commit()
+    flash(f"Código interno '{homolog.codigo_interno}' resuelto.", "success")
+    return redirect(url_for("stock_homologacion"))
+
+
+# ---------------------------------------------------------------------------
 # Modulo: Configuracion -- Tipo de cambio mensual (2026-08-27, punto 6)
 # ---------------------------------------------------------------------------
 
 @app.route("/configuracion/tipo-cambio")
+@requiere_admin
 def tipo_cambio_list():
     tipos = TipoCambioMensual.query.order_by(
         TipoCambioMensual.anio.desc(), TipoCambioMensual.mes.desc()
@@ -2916,6 +5126,7 @@ def tipo_cambio_list():
 
 
 @app.route("/configuracion/tipo-cambio/nuevo", methods=["POST"])
+@requiere_admin
 def tipo_cambio_nuevo():
     anio = parse_int(request.form.get("anio"), default=date.today().year)
     mes = parse_int(request.form.get("mes"), default=date.today().month)
@@ -2939,6 +5150,7 @@ def tipo_cambio_nuevo():
 
 
 @app.route("/configuracion/tipo-cambio/<int:tc_id>/editar", methods=["POST"])
+@requiere_admin
 def tipo_cambio_editar(tc_id):
     tc = TipoCambioMensual.query.get_or_404(tc_id)
     tc.tc_aduanero = float(request.form.get("tc_aduanero") or 0)
@@ -2950,6 +5162,7 @@ def tipo_cambio_editar(tc_id):
 
 
 @app.route("/configuracion/tipo-cambio/<int:tc_id>/eliminar", methods=["POST"])
+@requiere_admin
 def tipo_cambio_eliminar(tc_id):
     tc = TipoCambioMensual.query.get_or_404(tc_id)
     db.session.delete(tc)
@@ -3024,11 +5237,13 @@ def _ejecutar_reset(categorias):
 
 
 @app.route("/configuracion/reset")
+@requiere_admin
 def admin_reset():
     return render_template("configuracion/reset.html", resumen=_resumen_datos_reset())
 
 
 @app.route("/configuracion/reset/ejecutar", methods=["POST"])
+@requiere_admin
 def admin_reset_ejecutar():
     categorias = set(request.form.getlist("categorias"))
     categorias &= {"proveedores", "ordenes", "costeos"}

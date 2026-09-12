@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}Homologación de Stock · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-1">Homologación de Stock</h3>
+<div class="text-muted small mb-3">
+  Códigos internos del sistema de Inventarios que aparecieron en una carga de Stock y todavía no
+  están ligados a ningún producto de nuestro catálogo. Resuélvelos abajo: vincúlalos a un producto
+  ya existente, créalo si es nuevo, márcalo "sin marca" (se sigue mostrando en Stock, pero sin
+  producto asociado) o "excluido" (se descarta siempre, no vuelve a aparecer).
+</div>
+
+{% if not pendientes %}
+<div class="alert alert-success">No hay códigos pendientes por resolver.</div>
+{% endif %}
+
+{% for h in pendientes %}
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-start mb-2">
+    <div>
+      <div class="fw-semibold">{{ h.codigo_interno }}</div>
+      <div class="text-muted small">{{ h.descripcion_referencia or '(sin descripción)' }}</div>
+    </div>
+    <div class="d-flex gap-2">
+      <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}">
+        <input type="hidden" name="accion" value="sin_marca">
+        <button type="submit" class="btn btn-sm btn-outline-secondary">Marcar "sin marca"</button>
+      </form>
+      <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}" onsubmit="return confirm('¿Excluir este código? No volverá a aparecer en el Stock.');">
+        <input type="hidden" name="accion" value="excluido">
+        <button type="submit" class="btn btn-sm btn-outline-danger">Excluir</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="row g-3">
+    <div class="col-md-6">
+      <div class="border rounded p-2 h-100">
+        <div class="small fw-semibold mb-2">Vincular a producto/variante ya existente</div>
+        <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}" class="row g-2">
+          <input type="hidden" name="accion" value="vincular_existente">
+          <div class="col-12">
+            <input type="text" class="form-control form-control-sm buscador-producto" placeholder="Buscar código o descripción..." data-target="{{ h.id }}">
+          </div>
+          <div class="col-12">
+            <select class="form-select form-select-sm" name="producto_id" id="select-producto-{{ h.id }}" required>
+              <option value="">Selecciona un producto...</option>
+            </select>
+          </div>
+          <div class="col-12">
+            <select class="form-select form-select-sm" name="variante_id" id="select-variante-{{ h.id }}">
+              <option value="">(sin variante -- producto simple)</option>
+            </select>
+          </div>
+          <div class="col-12">
+            <button type="submit" class="btn btn-sm btn-brand">Vincular</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="border rounded p-2 h-100">
+        <div class="small fw-semibold mb-2">Crear producto nuevo</div>
+        <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}" class="row g-2">
+          <input type="hidden" name="accion" value="crear_producto">
+          <div class="col-12">
+            <select class="form-select form-select-sm" name="proveedor_id_nuevo" required>
+              <option value="">Proveedor...</option>
+              {% for p in proveedores %}
+              <option value="{{ p.id }}">{{ p.nombre }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-12">
+            <input type="text" class="form-control form-control-sm" name="codigo_nuevo" placeholder="Código del producto" required>
+          </div>
+          <div class="col-12">
+            <button type="submit" class="btn btn-sm btn-outline-primary">Crear y vincular</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+<script>
+document.querySelectorAll('.buscador-producto').forEach(function (input) {
+  const homologId = input.dataset.target;
+  const selectProducto = document.getElementById('select-producto-' + homologId);
+  const selectVariante = document.getElementById('select-variante-' + homologId);
+  let productosCache = [];
+  let timeoutId = null;
+
+  input.addEventListener('input', function () {
+    clearTimeout(timeoutId);
+    const q = input.value.trim();
+    if (q.length < 2) return;
+    timeoutId = setTimeout(function () {
+      fetch('{{ url_for("api_stock_buscar_productos") }}?q=' + encodeURIComponent(q))
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          productosCache = data;
+          selectProducto.innerHTML = '<option value="">Selecciona un producto...</option>';
+          data.forEach(function (p) {
+            const opt = document.createElement('option');
+            opt.value = p.id;
+            opt.textContent = p.proveedor + ' -- ' + p.codigo + ' (' + p.descripcion + ')';
+            selectProducto.appendChild(opt);
+          });
+        });
+    }, 300);
+  });
+
+  selectProducto.addEventListener('change', function () {
+    const producto = productosCache.find(function (p) { return String(p.id) === selectProducto.value; });
+    selectVariante.innerHTML = '<option value="">(sin variante -- producto simple)</option>';
+    if (producto && producto.variantes && producto.variantes.length) {
+      producto.variantes.forEach(function (v) {
+        const opt = document.createElement('option');
+        opt.value = v.id;
+        opt.textContent = v.codigo + ' -- ' + v.descripcion;
+        selectVariante.appendChild(opt);
+      });
+    }
+  });
+});
+</script>
+
+{% endblock %}

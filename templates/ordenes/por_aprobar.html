@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Por Aprobar · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h3 class="section-title mb-0">Por Aprobar</h3>
+    <div class="text-muted small">
+      {% if puede_aprobar %}
+      Órdenes nuevas que todavía no son una Orden de Compra definitiva (de cualquier usuario), más
+      las que devolviste y siguen "Sin Emitir" mientras las corrigen.
+      {% else %}
+      Tus propias órdenes que todavía no son una Orden de Compra definitiva, o que fueron devueltas
+      ("Sin Emitir") para que las corrijas y reenvíes.
+      {% endif %}
+    </div>
+  </div>
+  <a href="{{ url_for('ordenes_list') }}" class="btn btn-outline-secondary btn-sm">Ver Compras / Órdenes</a>
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>N° PO</th>
+          <th>Empresa</th>
+          <th>Proveedor</th>
+          <th>Creado por</th>
+          <th>Fecha emisión</th>
+          <th>Aprobación</th>
+          <th class="text-end">Total</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in ordenes %}
+        <tr>
+          <td>{{ o.numero_po }}</td>
+          <td>{% if o.empresa %}{{ o.empresa.nombre }}{% else %}<span class="badge bg-warning text-dark">Sin asignar</span>{% endif %}</td>
+          <td>{{ o.proveedor.nombre }}</td>
+          <td>{{ o.creado_por.nombre_completo if o.creado_por else '-' }}</td>
+          <td>{{ o.fecha_emision }}</td>
+          <td>
+            {% if o.estado_aprobacion == 'Por Aprobar' %}
+              <span class="badge bg-warning text-dark">Por Aprobar</span>
+            {% else %}
+              <span class="badge bg-danger">Sin Emitir</span>
+            {% endif %}
+          </td>
+          <td class="text-end">{{ "%.2f"|format(o.total) }} {{ o.moneda }}</td>
+          <td class="text-end">
+            <div class="d-flex gap-1 justify-content-end flex-wrap">
+              <a href="{{ url_for('ordenes_detalle', orden_id=o.id) }}" class="btn btn-sm btn-outline-primary">Ver</a>
+              {% if puede_aprobar and o.estado_aprobacion == 'Por Aprobar' %}
+              <form method="post" action="{{ url_for('ordenes_aprobar', orden_id=o.id) }}" onsubmit="return confirm('¿Aprobar esta orden?');">
+                <button type="submit" class="btn btn-sm btn-success">Aprobar</button>
+              </form>
+              <button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#modalDevolver{{ o.id }}">Devolver</button>
+              {% elif o.estado_aprobacion == 'Sin Emitir' and o.creado_por_usuario_id == current_user.id %}
+              <form method="post" action="{{ url_for('ordenes_reenviar_aprobacion', orden_id=o.id) }}">
+                <button type="submit" class="btn btn-sm btn-brand">Reenviar</button>
+              </form>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="text-center text-muted py-4">No hay órdenes por aprobar.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% for o in ordenes %}
+{% if puede_aprobar and o.estado_aprobacion == 'Por Aprobar' %}
+<div class="modal fade" id="modalDevolver{{ o.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('ordenes_devolver_aprobacion', orden_id=o.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Devolver orden {{ o.numero_po }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+          <p class="text-muted small">Quedará 'Sin Emitir', visible solo para quien la creó, para que la corrija y la reenvíe.</p>
+          <label class="form-label">Motivo (opcional)</label>
+          <textarea class="form-control" name="motivo" rows="2"></textarea>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-danger">Devolver</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endfor %}
+
+{% endblock %}

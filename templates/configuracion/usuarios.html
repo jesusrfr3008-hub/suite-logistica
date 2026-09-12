@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}Usuarios · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h3 class="section-title mb-0">Usuarios</h3>
+    <div class="text-muted small">Cada usuario tiene un único perfil, que define a qué secciones puede acceder.</div>
+  </div>
+  {% if roles %}
+  <button class="btn btn-brand" data-bs-toggle="modal" data-bs-target="#modalNuevoUsuario"><i class="bi bi-plus-lg"></i> Agregar usuario</button>
+  {% endif %}
+</div>
+
+{% if not roles %}
+<div class="alert alert-warning">Primero crea al menos un <a href="{{ url_for('roles_list') }}">perfil</a> antes de agregar usuarios.</div>
+{% endif %}
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Nombre</th>
+          <th>Correo</th>
+          <th>Perfil</th>
+          <th>Estado</th>
+          <th>Último acceso</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in usuarios %}
+        <tr>
+          <td class="fw-bold">{{ u.nombre_completo }}{% if u.id == current_user.id %} <span class="badge text-bg-light border">tú</span>{% endif %}</td>
+          <td>{{ u.email }}</td>
+          <td>
+            {{ u.rol.nombre if u.rol else '-' }}
+            {% if u.rol and u.rol.es_administrador %}<span class="badge text-bg-dark ms-1">Admin</span>{% endif %}
+          </td>
+          <td>
+            {% if u.activo %}<span class="badge text-bg-success">Activo</span>{% else %}<span class="badge text-bg-secondary">Desactivado</span>{% endif %}
+          </td>
+          <td class="text-muted small">{{ u.ultimo_acceso.strftime('%d-%m-%Y %H:%M') if u.ultimo_acceso else 'Nunca' }}</td>
+          <td class="text-end">
+            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarUsuario{{ u.id }}">Editar</button>
+            {% if u.id != current_user.id %}
+            <form method="post" action="{{ url_for('usuarios_eliminar', usuario_id=u.id) }}" class="d-inline" onsubmit="return confirm('¿Eliminar el usuario {{ u.nombre_completo }}?');">
+              <button class="btn btn-sm btn-outline-danger">Eliminar</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted py-4">No hay usuarios cargados todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Modal: nuevo -->
+<div class="modal fade" id="modalNuevoUsuario" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('usuarios_nuevo') }}">
+        <div class="modal-header"><h5 class="modal-title">Agregar usuario</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-12"><label class="form-label">Nombre completo *</label><input class="form-control" name="nombre_completo" required></div>
+          <div class="col-12"><label class="form-label">Correo *</label><input type="email" class="form-control" name="email" required></div>
+          <div class="col-12">
+            <label class="form-label">Perfil *</label>
+            <select class="form-select" name="rol_id" required>
+              <option value="">Seleccione...</option>
+              {% for r in roles %}<option value="{{ r.id }}">{{ r.nombre }}{% if r.es_administrador %} (Administrador){% endif %}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-12">
+            <label class="form-label">Contraseña *</label>
+            <input type="password" class="form-control" name="password" required minlength="6">
+            <div class="form-text">Al menos 6 caracteres. El usuario podrá cambiarla luego desde "Mi cuenta".</div>
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% for u in usuarios %}
+<!-- Modal: editar -->
+<div class="modal fade" id="modalEditarUsuario{{ u.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('usuarios_editar', usuario_id=u.id) }}">
+        <div class="modal-header"><h5 class="modal-title">Editar {{ u.nombre_completo }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-2">
+          <div class="col-12"><label class="form-label">Nombre completo *</label><input class="form-control" name="nombre_completo" value="{{ u.nombre_completo }}" required></div>
+          <div class="col-12"><label class="form-label">Correo *</label><input type="email" class="form-control" name="email" value="{{ u.email }}" required></div>
+          <div class="col-12">
+            <label class="form-label">Perfil *</label>
+            <select class="form-select" name="rol_id" required>
+              {% for r in roles %}<option value="{{ r.id }}" {% if u.rol_id == r.id %}selected{% endif %}>{{ r.nombre }}{% if r.es_administrador %} (Administrador){% endif %}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="col-12">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="activo" id="editActivo{{ u.id }}" {% if u.activo %}checked{% endif %} {% if u.id == current_user.id %}disabled{% endif %}>
+              <label class="form-check-label" for="editActivo{{ u.id }}">Usuario activo</label>
+              {% if u.id == current_user.id %}<div class="form-text">No puedes desactivar tu propio usuario.</div>{% endif %}
+            </div>
+          </div>
+          <div class="col-12">
+            <label class="form-label">Nueva contraseña</label>
+            <input type="password" class="form-control" name="password" minlength="6">
+            <div class="form-text">Déjala vacía para conservar la contraseña actual.</div>
+          </div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+{% endblock %}

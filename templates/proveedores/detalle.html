@@ -123,9 +123,13 @@
             <label class="form-check-label" for="activo{{ p.id }}">Activo en catálogo</label>
           </div>
         </div>
-        <div class="modal-footer">
+        <div class="modal-footer d-flex justify-content-between">
+          <button type="submit" form="formEliminarProducto{{ p.id }}" class="btn btn-outline-danger">Eliminar</button>
           <button type="submit" class="btn btn-brand">Guardar</button>
         </div>
+      </form>
+      <form method="post" id="formEliminarProducto{{ p.id }}" action="{{ url_for('productos_eliminar', producto_id=p.id) }}"
+            onsubmit="return confirm('¿Eliminar \'{{ p.codigo }}\' del catálogo de {{ proveedor.nombre }}? Si ya se usó en alguna Orden de Compra o Costeo, no se puede eliminar sin perder ese historial -- en ese caso quedará desactivado en su lugar.');">
       </form>
     </div>
   </div>

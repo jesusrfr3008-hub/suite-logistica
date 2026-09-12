@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Mis Órdenes · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h3 class="section-title mb-0">Mis Órdenes</h3>
+    <div class="text-muted small">Solo se muestran las órdenes que tú mismo creaste con el perfil "Creación de Orden Simple".</div>
+  </div>
+  <a href="{{ url_for('ordenes_simple_nueva') }}" class="btn btn-brand"><i class="bi bi-plus-lg"></i> Nueva orden</a>
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>N° PO</th>
+          <th>Proveedor</th>
+          <th>Fecha emisión</th>
+          <th>Aprobación</th>
+          <th>Estado</th>
+          <th class="text-end">Total (visible)</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in ordenes %}
+        <tr>
+          <td>{{ o.numero_po }}</td>
+          <td>{{ o.proveedor.nombre }}</td>
+          <td>{{ o.fecha_emision }}</td>
+          <td>
+            {% if o.estado_aprobacion == 'Por Aprobar' %}
+              <span class="badge bg-warning text-dark">Por Aprobar</span>
+            {% elif o.estado_aprobacion == 'Sin Emitir' %}
+              <span class="badge bg-danger">Sin Emitir</span>
+            {% else %}
+              <span class="badge bg-success">Aprobada</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if o.estado == 'Cancelada' or o.estado == 'Anulada' %}
+              <span class="badge bg-dark">{{ o.estado }}</span>
+            {% elif o.estado == 'En proceso (mixto)' %}
+              <span class="badge bg-warning text-dark">En proceso (mixto)</span>
+            {% else %}
+              <span class="badge bg-primary">{{ o.estado }}</span>
+            {% endif %}
+          </td>
+          <td class="text-end">
+            {{ "%.2f"|format(o.total_visible) }} {{ o.moneda }}
+            {% if o.tiene_precios_ocultos %}<i class="bi bi-lock-fill text-muted ms-1" title="Esta orden tiene productos con precio de catálogo no visible"></i>{% endif %}
+          </td>
+          <td class="text-end"><a href="{{ url_for('ordenes_simple_detalle', orden_id=o.id) }}" class="btn btn-sm btn-outline-primary">Ver</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-4">Todavía no has creado ninguna orden con este perfil.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
