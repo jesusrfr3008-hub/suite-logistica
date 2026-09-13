@@ -2,6 +2,16 @@
 {% block title %}Stock · Suite Logística{% endblock %}
 {% block content %}
 
+<style>
+  th.ordenable { cursor: pointer; user-select: none; white-space: nowrap; }
+  th.ordenable:hover { background-color: rgba(0,0,0,0.03); }
+  .icono-orden { font-size: 0.7em; color: #adb5bd; margin-left: 2px; }
+  .icono-orden.orden-activo { color: var(--brand); font-weight: bold; }
+  .btn-autofiltro { color: #adb5bd; text-decoration: none; vertical-align: baseline; }
+  .btn-autofiltro.filtro-activo { color: var(--brand); }
+  .btn-autofiltro:hover { color: var(--brand); }
+</style>
+
 <div class="d-flex justify-content-between align-items-start mb-3">
   <div>
     <h3 class="section-title mb-0">Consulta de Stock</h3>
@@ -49,19 +59,29 @@
 </form>
 
 <div class="card p-3">
+  <div id="contadorFilasStock" class="text-muted small mb-2"></div>
   <div class="table-responsive">
-    <table class="table table-sm table-hover align-middle mb-0">
+    <table class="table table-sm table-hover align-middle mb-0" id="tablaStock">
       <thead>
         <tr>
-          <th>Empresa</th>
-          <th>Proveedor</th>
-          <th>Código</th>
-          <th>Descripción</th>
-          <th class="text-end">Stock actual</th>
-          <th class="text-end">Tránsito</th>
-          <th class="text-end">Pedido</th>
-          <th class="text-end">Stock total</th>
-          <th>Próximo vencimiento</th>
+          <th class="ordenable" data-col="empresa" data-tipo="text">Empresa <span class="icono-orden">⇅</span></th>
+          <th class="ordenable" data-col="proveedor" data-tipo="text">Proveedor <span class="icono-orden">⇅</span></th>
+          <th class="ordenable" data-col="codigo" data-tipo="text">Código <span class="icono-orden">⇅</span></th>
+          <th class="ordenable" data-col="descripcion" data-tipo="text">Descripción <span class="icono-orden">⇅</span></th>
+          <th class="text-end ordenable" data-col="stock_actual" data-tipo="num">
+            Stock actual <span class="icono-orden">⇅</span>
+            <button type="button" class="btn btn-sm btn-link p-0 ms-1 btn-autofiltro" data-filter-col="stock_actual" data-bs-toggle="tooltip" title="Ocultar los que tienen 0"><i class="bi bi-funnel"></i></button>
+          </th>
+          <th class="text-end ordenable" data-col="transito" data-tipo="num">
+            Tránsito <span class="icono-orden">⇅</span>
+            <button type="button" class="btn btn-sm btn-link p-0 ms-1 btn-autofiltro" data-filter-col="transito" data-bs-toggle="tooltip" title="Ocultar los que tienen 0"><i class="bi bi-funnel"></i></button>
+          </th>
+          <th class="text-end ordenable" data-col="pedido" data-tipo="num">
+            Pedido <span class="icono-orden">⇅</span>
+            <button type="button" class="btn btn-sm btn-link p-0 ms-1 btn-autofiltro" data-filter-col="pedido" data-bs-toggle="tooltip" title="Ocultar los que tienen 0"><i class="bi bi-funnel"></i></button>
+          </th>
+          <th class="text-end ordenable" data-col="stock_total" data-tipo="num">Stock total <span class="icono-orden">⇅</span></th>
+          <th class="ordenable" data-col="vencimiento" data-tipo="text">Próximo vencimiento <span class="icono-orden">⇅</span></th>
           <th class="text-end">Cantidad Licitación</th>
           <th></th>
         </tr>
@@ -69,19 +89,19 @@
       <tbody>
         {% for g in grupos %}
         <tr class="{% if not g.homologado %}text-muted{% endif %}">
-          <td>{{ g.empresa.nombre if g.empresa else '' }}</td>
-          <td>{{ g.proveedor_nombre or '(sin homologar)' }}</td>
-          <td>{{ g.codigo or '-' }}</td>
-          <td style="max-width: 380px;">{{ g.descripcion }}</td>
-          <td class="text-end">{{ g.stock_actual }}</td>
-          <td class="text-end">
+          <td data-col="empresa" data-value="{{ (g.empresa.nombre if g.empresa else '')|lower }}">{{ g.empresa.nombre if g.empresa else '' }}</td>
+          <td data-col="proveedor" data-value="{{ (g.proveedor_nombre or '')|lower }}">{{ g.proveedor_nombre or '(sin homologar)' }}</td>
+          <td data-col="codigo" data-value="{{ (g.codigo or '')|lower }}">{{ g.codigo or '-' }}</td>
+          <td data-col="descripcion" data-value="{{ (g.descripcion or '')|lower }}" style="max-width: 380px;">{{ g.descripcion }}</td>
+          <td class="text-end" data-col="stock_actual" data-value="{{ g.stock_actual }}">{{ g.stock_actual }}</td>
+          <td class="text-end" data-col="transito" data-value="{{ g.transito }}">
             {% if g.transito %}
             <span data-bs-toggle="tooltip" data-bs-html="true" title="{{ g.transito_detalle | safe }}" style="cursor: help; border-bottom: 1px dotted;">{{ g.transito }}</span>
             {% else %}0{% endif %}
           </td>
-          <td class="text-end">{{ g.pedido }}</td>
-          <td class="text-end fw-semibold">{{ g.stock_total_proyectado }}</td>
-          <td>{{ g.proximo_vencimiento.strftime('%d-%m-%Y') if g.proximo_vencimiento else '-' }}</td>
+          <td class="text-end" data-col="pedido" data-value="{{ g.pedido }}">{{ g.pedido }}</td>
+          <td class="text-end fw-semibold" data-col="stock_total" data-value="{{ g.stock_total_proyectado }}">{{ g.stock_total_proyectado }}</td>
+          <td data-col="vencimiento" data-value="{{ g.proximo_vencimiento.strftime('%Y-%m-%d') if g.proximo_vencimiento else '' }}">{{ g.proximo_vencimiento.strftime('%d-%m-%Y') if g.proximo_vencimiento else '-' }}</td>
           <td class="text-end text-muted" title="Próximamente">-</td>
           <td class="text-end">
             {% if g.lotes|length > 1 %}
@@ -92,7 +112,7 @@
           </td>
         </tr>
         {% if g.lotes|length > 1 %}
-        <tr class="collapse" id="lotes{{ loop.index }}">
+        <tr class="collapse fila-detalle" id="lotes{{ loop.index }}">
           <td></td>
           <td colspan="9">
             <table class="table table-sm table-borderless mb-0">
@@ -107,7 +127,7 @@
         </tr>
         {% endif %}
         {% else %}
-        <tr><td colspan="11" class="text-center text-muted py-4">Sin resultados.</td></tr>
+        <tr class="fila-vacia"><td colspan="11" class="text-center text-muted py-4">Sin resultados.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -168,8 +188,123 @@
 
 {% block scripts %}
 <script>
-document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
-  new bootstrap.Tooltip(el);
-});
+(function () {
+  var tabla = document.getElementById('tablaStock');
+  if (!tabla) return;
+  var tbody = tabla.querySelector('tbody');
+  var contador = document.getElementById('contadorFilasStock');
+
+  // Cada "grupo" es la fila principal de un producto mas, si existe, su
+  // fila de detalle de lotes (la <tr class="collapse fila-detalle">
+  // inmediatamente siguiente) -- se mueven y se muestran/ocultan siempre
+  // juntas para no separar un producto de sus lotes.
+  function obtenerGrupos() {
+    var filas = Array.prototype.slice.call(tbody.children);
+    var grupos = [];
+    for (var i = 0; i < filas.length; i++) {
+      var fila = filas[i];
+      if (fila.classList.contains('fila-detalle')) continue;
+      if (fila.classList.contains('fila-vacia')) { grupos.push({ principal: fila, detalle: null, vacia: true }); continue; }
+      var siguiente = filas[i + 1];
+      var detalle = (siguiente && siguiente.classList.contains('fila-detalle')) ? siguiente : null;
+      grupos.push({ principal: fila, detalle: detalle, vacia: false });
+    }
+    return grupos;
+  }
+
+  var filtrosActivos = { stock_actual: false, transito: false, pedido: false };
+
+  function aplicarFiltros() {
+    var visibles = 0;
+    var totalReal = 0;
+    obtenerGrupos().forEach(function (g) {
+      if (g.vacia) return;
+      totalReal++;
+      var visible = true;
+      Object.keys(filtrosActivos).forEach(function (col) {
+        if (!filtrosActivos[col]) return;
+        var celda = g.principal.querySelector('[data-col="' + col + '"]');
+        if (celda && parseFloat(celda.dataset.value || '0') === 0) visible = false;
+      });
+      g.principal.style.display = visible ? '' : 'none';
+      if (g.detalle) {
+        // Si el grupo se oculta por el filtro, se fuerza a ocultar tambien
+        // su detalle de lotes (si estaba abierto). Si vuelve a ser visible,
+        // se quita ese forzado y el detalle vuelve a depender solo del
+        // colapso de Bootstrap (abierto/cerrado segun el boton "Ver lotes").
+        g.detalle.style.display = visible ? '' : 'none';
+      }
+      if (visible) visibles++;
+    });
+    if (contador) {
+      var hayFiltro = Object.keys(filtrosActivos).some(function (c) { return filtrosActivos[c]; });
+      contador.textContent = (totalReal > 0 && hayFiltro) ? ('Mostrando ' + visibles + ' de ' + totalReal + ' productos.') : '';
+    }
+  }
+
+  document.querySelectorAll('.btn-autofiltro').forEach(function (btn) {
+    btn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var col = btn.dataset.filterCol;
+      filtrosActivos[col] = !filtrosActivos[col];
+      btn.classList.toggle('filtro-activo', filtrosActivos[col]);
+      var icono = btn.querySelector('i');
+      icono.className = filtrosActivos[col] ? 'bi bi-funnel-fill' : 'bi bi-funnel';
+      aplicarFiltros();
+    });
+  });
+
+  var ordenActual = { col: null, asc: true };
+  document.querySelectorAll('th.ordenable').forEach(function (th) {
+    th.addEventListener('click', function (ev) {
+      if (ev.target.closest('.btn-autofiltro')) return;
+      var col = th.dataset.col;
+      var tipo = th.dataset.tipo;
+      var asc = (ordenActual.col === col) ? !ordenActual.asc : true;
+      ordenActual = { col: col, asc: asc };
+
+      var grupos = obtenerGrupos().filter(function (g) { return !g.vacia; });
+      grupos.sort(function (a, b) {
+        var celdaA = a.principal.querySelector('[data-col="' + col + '"]');
+        var celdaB = b.principal.querySelector('[data-col="' + col + '"]');
+        var va = celdaA ? (celdaA.dataset.value || '') : '';
+        var vb = celdaB ? (celdaB.dataset.value || '') : '';
+        var cmp;
+        if (tipo === 'num') {
+          cmp = (parseFloat(va) || 0) - (parseFloat(vb) || 0);
+        } else {
+          cmp = va.localeCompare(vb, 'es', { sensitivity: 'base' });
+          if (va === '' && vb !== '') cmp = 1;
+          if (vb === '' && va !== '') cmp = -1;
+        }
+        return asc ? cmp : -cmp;
+      });
+      grupos.forEach(function (g) {
+        tbody.appendChild(g.principal);
+        if (g.detalle) tbody.appendChild(g.detalle);
+      });
+
+      document.querySelectorAll('th.ordenable .icono-orden').forEach(function (ic) {
+        ic.textContent = '⇅';
+        ic.classList.remove('orden-activo');
+      });
+      var iconoActual = th.querySelector('.icono-orden');
+      iconoActual.textContent = asc ? '▲' : '▼';
+      iconoActual.classList.add('orden-activo');
+    });
+  });
+})();
+
+// Tooltips de Bootstrap (fecha estimada de llegada en Tránsito, ayuda de
+// los filtros) -- en try/catch y despues de lo anterior para que un
+// problema cargando el bundle de Bootstrap nunca deje sin funcionar el
+// ordenamiento/autofiltro de la tabla, que no depende de Bootstrap.
+try {
+  document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+    new bootstrap.Tooltip(el);
+  });
+} catch (e) {
+  console.warn('No se pudieron inicializar los tooltips de Stock:', e);
+}
 </script>
 {% endblock %}

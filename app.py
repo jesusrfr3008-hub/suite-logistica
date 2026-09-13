@@ -1703,7 +1703,19 @@ def dashboard():
     ordenes_pendientes = OrdenCompra.query.filter(
         OrdenCompra.estado.notin_(["Recibido", "Cancelada"])
     ).count()
-    ultimas_ordenes = OrdenCompra.query.order_by(OrdenCompra.id.desc()).limit(6).all()
+    # Ronda Y (2026-09-13): la tabla "Ultimas ordenes de compra" muestra
+    # proveedor y montos -- los mismos datos sensibles que protege el
+    # acceso a /ordenes (ver ordenes_list, y el mismo permiso que la
+    # navegacion usa para mostrar el menu "Compras / Ordenes"). Antes se
+    # calculaba y mostraba a CUALQUIER usuario logueado sin chequear
+    # permiso, por lo que un perfil de solo Consulta de Stock (ej. Felipe
+    # Bravo, perfil COMERCIALES) la veia igual aunque no pueda entrar a
+    # Ordenes. Se calcula solo si corresponde.
+    puede_ver_ordenes = current_user.tiene_permiso("crear_orden") or current_user.tiene_permiso("aprobar_orden")
+    ultimas_ordenes = (
+        OrdenCompra.query.order_by(OrdenCompra.id.desc()).limit(6).all()
+        if puede_ver_ordenes else []
+    )
     return render_template(
         "dashboard.html",
         total_proveedores=total_proveedores,
@@ -1711,6 +1723,7 @@ def dashboard():
         total_ordenes=total_ordenes,
         ordenes_pendientes=ordenes_pendientes,
         ultimas_ordenes=ultimas_ordenes,
+        puede_ver_ordenes=puede_ver_ordenes,
     )
 
 
