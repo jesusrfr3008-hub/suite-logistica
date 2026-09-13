@@ -117,4 +117,30 @@
 </div>
 {% endfor %}
 
+<script>
+(function () {
+  // "Inventarios" implica "Consulta de Stock" (el servidor lo fuerza igual al guardar);
+  // aquí solo lo reflejamos en la UI para que no sea sorpresa.
+  function wire(invId, stockId) {
+    var inv = document.getElementById(invId);
+    var stock = document.getElementById(stockId);
+    if (!inv || !stock) return;
+    function sync() {
+      if (inv.checked) {
+        stock.checked = true;
+        stock.disabled = true;
+      } else {
+        stock.disabled = false;
+      }
+    }
+    inv.addEventListener('change', sync);
+    sync();
+  }
+  wire('nuevoPerminventarios', 'nuevoPermconsultar_stock');
+  {% for r in roles %}
+  wire('editPerminventarios{{ r.id }}', 'editPermconsultar_stock{{ r.id }}');
+  {% endfor %}
+})();
+</script>
+
 {% endblock %}

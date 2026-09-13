@@ -439,6 +439,27 @@ def ensure_schema_migrations():
                         },
                     )
 
+    # Reparacion de datos (ronda W, 2026-09-13, punto 5): todo perfil que ya
+    # tenia el permiso "Inventarios" marcado, pero no "Consultar Stock"
+    # (creado antes de que existiera este ultimo, ronda V), pasa a tener los
+    # 2 -- a pedido explicito del usuario, para no dejar a nadie que ya
+    # gestionaba Inventarios sin poder ver la pantalla de Consulta de Stock
+    # nueva. De aca en mas _guardar_permisos_rol ya los mantiene alineados
+    # solo (ver ese comentario), asi que esto no vuelve a hacer falta salvo
+    # para perfiles de antes de esta ronda.
+    if "roles" in tablas:
+        columnas_roles = {c["name"] for c in inspector.get_columns("roles")}
+        if "permiso_inventarios" in columnas_roles and "permiso_consultar_stock" in columnas_roles:
+            with db.engine.begin() as conn:
+                conn.execute(db.text(
+                    "UPDATE roles SET permiso_consultar_stock = "
+                    + ("1" if es_sqlite else "TRUE")
+                    + " WHERE permiso_inventarios = "
+                    + ("1" if es_sqlite else "TRUE")
+                    + " AND (permiso_consultar_stock IS NULL OR permiso_consultar_stock = "
+                    + ("0" if es_sqlite else "FALSE") + ")"
+                ))
+
     # Quitar la restriccion UNIQUE de numero_po: desde que las ordenes se
     # pueden dividir automaticamente al confirmar solo una parte de los
     # productos, dos ordenes distintas pueden compartir el mismo numero de
@@ -629,7 +650,7 @@ def seed_variantes_lentes_physiol():
             break
 
     creadas = 0
-    padres_no_encontrados = set()
+    padres_creados = set()
     vistos = set()
     for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
         codigo_padre, codigo_variante, descripcion = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, None)
@@ -644,8 +665,35 @@ def seed_variantes_lentes_physiol():
         vistos.add(clave)
         producto = productos_padre.get(codigo_padre.upper())
         if not producto:
-            padres_no_encontrados.add(codigo_padre)
-            continue
+            # Ronda W (2026-09-13): antes esto se reportaba como "código
+            # padre no encontrado" y se descartaba la fila entera -- el
+            # usuario confirmó (con "Serenity Toric PODS49P" y "Podeye
+            # Toric") que esos códigos padre SÍ deberían existir, solo que
+            # el catálogo (importado del listado de precios) nunca tuvo esa
+            # familia como Producto propio. Se crea el Producto padre nuevo
+            # bajo BVI PHYSIOL -- si el nombre es la version " Toric" de una
+            # familia que ya existe (ej. "Podeye Toric" -> "Podeye"), se le
+            # copia el precio/moneda/empaque como punto de partida (a
+            # verificar por el usuario); si no hay una familia "hermana"
+            # reconocible, nace en 0 igual que cualquier producto nuevo de
+            # la homologación.
+            candidato_hermano = re.sub(r"\btoric\b", "", codigo_padre, flags=re.IGNORECASE)
+            candidato_hermano = re.sub(r"\s+", " ", candidato_hermano).strip()
+            hermano = productos_padre.get(candidato_hermano.upper()) if candidato_hermano else None
+            producto = Producto(
+                proveedor_id=physiol.id,
+                codigo=codigo_padre,
+                descripcion=codigo_padre,
+                empaque=(hermano.empaque if hermano else 1),
+                moneda=(hermano.moneda if hermano else (physiol.moneda_default or "USD")),
+                precio_caja=(hermano.precio_caja if hermano else 0),
+                precio_unitario=(hermano.precio_unitario if hermano else 0),
+                activo=True,
+            )
+            db.session.add(producto)
+            db.session.flush()
+            productos_padre[codigo_padre.upper()] = producto
+            padres_creados.add((codigo_padre, hermano.codigo if hermano else None))
         db.session.add(ProductoVariante(
             producto_id=producto.id,
             codigo=codigo_variante,
@@ -655,8 +703,8 @@ def seed_variantes_lentes_physiol():
     db.session.commit()
     print(
         f"[seed] Importadas {creadas} variantes de lentes PHYSIOL "
-        f"({len(padres_no_encontrados)} código(s) padre no encontrados en el catálogo: "
-        f"{sorted(padres_no_encontrados)})."
+        f"({len(padres_creados)} código(s) padre nuevo(s) creados en el catálogo -- "
+        f"verificar precio: {sorted(padres_creados)})."
     )
 
 
@@ -877,12 +925,13 @@ def seed_homologacion_y_stock_inicial():
 
     proveedores_cache = {}
     productos_creados = 0
+    proveedores_creados = set()
     variantes_ligadas = 0
+    variantes_ligadas_por_descripcion = 0
     productos_ligados = 0
     sin_marca = 0
     excluidos = 0
     pendientes_manual = 0
-    proveedores_no_encontrados = set()
 
     for codigo_interno, info in clasificacion.items():
         k_upper = info["k"].strip().upper()
@@ -905,9 +954,22 @@ def seed_homologacion_y_stock_inicial():
         if k_upper not in proveedores_cache:
             proveedores_cache[k_upper] = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == k_upper).first()
         proveedor = proveedores_cache[k_upper]
+        if not proveedor and j_valor:
+            # Ronda W (2026-09-13, punto 3): antes un proveedor no
+            # reconocido (nombre en la columna K que no calzaba con ningun
+            # Proveedor ya cargado) dejaba el codigo "pendiente" para
+            # resolverlo a mano -- a pedido explicito del usuario, ahora se
+            # CREA el proveedor que falte (algunos venian con un "*" al
+            # final en el archivo, se saca por no ser parte del nombre
+            # real) para poder seguir e ingresar sus productos igual que
+            # con cualquier otro proveedor ya conocido.
+            nombre_nuevo = info["k"].strip().rstrip("*").strip() or info["k"].strip()
+            proveedor = Proveedor(nombre=nombre_nuevo, tipo="Extranjero", moneda_default="USD", activo=True)
+            db.session.add(proveedor)
+            db.session.flush()
+            proveedores_cache[k_upper] = proveedor
+            proveedores_creados.add(nombre_nuevo)
         if not proveedor or not j_valor:
-            if not proveedor:
-                proveedores_no_encontrados.add(info["k"])
             db.session.add(HomologacionStock(
                 codigo_interno=codigo_interno, estado="pendiente",
                 descripcion_referencia=info["descripcion"],
@@ -941,6 +1003,36 @@ def seed_homologacion_y_stock_inicial():
             variantes_ligadas += 1
             continue
 
+        # Ronda W (2026-09-13, punto 1): a veces el código de la columna J
+        # (escrito a mano por el usuario al armar el cruce) no coincide
+        # exactamente con ningún código de variante ya cargado, pero la
+        # Denominación (columna C, la descripción real del producto en el
+        # reporte de origen) SÍ coincide -- ej. "MICROPURE 07.00D" en J vs.
+        # la variante ya cargada "MICROPURE 07.0D", cuya propia
+        # descripción es justamente "MICROPURE 07.0D". Antes de crear un
+        # Producto nuevo (y terminar con un duplicado sombra a precio 0),
+        # se intenta este último cruce por descripción dentro del mismo
+        # proveedor.
+        descripcion_upper = (info["descripcion"] or "").strip().upper()
+        variante_por_desc = None
+        if descripcion_upper:
+            variante_por_desc = ProductoVariante.query.join(Producto).filter(
+                Producto.proveedor_id == proveedor.id,
+                db.or_(
+                    db.func.upper(ProductoVariante.codigo) == descripcion_upper,
+                    db.func.upper(ProductoVariante.descripcion) == descripcion_upper,
+                ),
+            ).first()
+        if variante_por_desc:
+            variante_por_desc.codigo_interno_inventario = codigo_interno
+            db.session.add(HomologacionStock(
+                codigo_interno=codigo_interno, estado="vinculado",
+                producto_id=variante_por_desc.producto_id, variante_id=variante_por_desc.id,
+                descripcion_referencia=info["descripcion"],
+            ))
+            variantes_ligadas_por_descripcion += 1
+            continue
+
         nuevo = Producto(
             proveedor_id=proveedor.id,
             codigo=j_valor,
@@ -963,9 +1055,10 @@ def seed_homologacion_y_stock_inicial():
     db.session.commit()
     print(
         f"[seed] Homologación inicial de Stock: {productos_ligados} código(s) ligados a producto ya existente, "
-        f"{variantes_ligadas} ligados a variante ya existente, {productos_creados} producto(s) NUEVOS creados en "
-        f"el catálogo, {sin_marca} sin marca, {excluidos} excluidos, {pendientes_manual} pendiente(s) por resolver "
-        f"a mano (proveedor no encontrado: {sorted(proveedores_no_encontrados)})."
+        f"{variantes_ligadas} ligados a variante ya existente ({variantes_ligadas_por_descripcion} de ellos por "
+        f"descripción, no por código), {productos_creados} producto(s) NUEVOS creados en el catálogo, "
+        f"{len(proveedores_creados)} proveedor(es) NUEVO(s) creados ({sorted(proveedores_creados)}), "
+        f"{sin_marca} sin marca, {excluidos} excluidos, {pendientes_manual} pendiente(s) por resolver a mano."
     )
 
     resumen = _clasificar_y_cargar_stock(filas_crudas)
@@ -4716,6 +4809,15 @@ def _guardar_permisos_rol(rol, form):
     rol.es_administrador = form.get("es_administrador") == "on"
     for codigo, _nombre in PERMISOS_DISPONIBLES:
         setattr(rol, f"permiso_{codigo}", form.get(f"permiso_{codigo}") == "on")
+    # Ronda W (2026-09-13, punto 5): a pedido explicito del usuario, "Inventarios"
+    # y "Consultar Stock" no deben quedar como conceptos separados que se
+    # puedan desalinear -- todo perfil con permiso Inventarios lleva SIEMPRE
+    # tambien Consultar Stock (la consulta de saldos es un subconjunto de lo
+    # que ya puede hacer alguien de Inventarios). No es reciproco: alguien
+    # puede tener SOLO Consultar Stock sin Inventarios (el colaborador que
+    # solo necesita ver saldos).
+    if rol.permiso_inventarios:
+        rol.permiso_consultar_stock = True
 
 
 @app.route("/configuracion/perfiles/nuevo", methods=["POST"])

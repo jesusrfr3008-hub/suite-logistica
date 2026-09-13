@@ -66,27 +66,29 @@
           </li>
           {% endif %}
           {% if current_user.tiene_permiso('consultar_stock') or current_user.tiene_permiso('inventarios') %}
-          <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if request.endpoint and request.endpoint.startswith('stock') %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Stock</a>
-            <ul class="dropdown-menu">
-              <li><a class="dropdown-item" href="{{ url_for('stock_list') }}">Consultar Stock</a></li>
-              {% if current_user.tiene_permiso('inventarios') %}
-              <li><a class="dropdown-item" href="{{ url_for('stock_homologacion') }}">Homologación de Stock</a></li>
-              {% endif %}
-            </ul>
+          <li class="nav-item">
+            <a class="nav-link {% if request.endpoint == 'stock_list' %}active{% endif %}" href="{{ url_for('stock_list') }}">Consulta de Stock</a>
           </li>
           {% endif %}
-          {% if es_admin %}
+          {% if es_admin or current_user.tiene_permiso('inventarios') %}
           <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if 'tipo_cambio' in request.endpoint or 'admin_reset' in request.endpoint or 'empresas' in request.endpoint or 'roles' in request.endpoint or 'usuarios' in request.endpoint %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Configuración</a>
+            <a class="nav-link dropdown-toggle {% if 'tipo_cambio' in request.endpoint or 'admin_reset' in request.endpoint or 'empresas' in request.endpoint or 'roles' in request.endpoint or 'usuarios' in request.endpoint or request.endpoint == 'stock_homologacion' %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Configuración</a>
             <ul class="dropdown-menu">
+              {% if es_admin %}
               <li><a class="dropdown-item" href="{{ url_for('empresas_list') }}">Empresas compradoras</a></li>
               <li><a class="dropdown-item" href="{{ url_for('tipo_cambio_list') }}">Tipo de cambio mensual</a></li>
               <li><hr class="dropdown-divider"></li>
               <li><a class="dropdown-item" href="{{ url_for('roles_list') }}">Perfiles</a></li>
               <li><a class="dropdown-item" href="{{ url_for('usuarios_list') }}">Usuarios</a></li>
               <li><hr class="dropdown-divider"></li>
+              {% endif %}
+              {% if current_user.tiene_permiso('inventarios') %}
+              <li><a class="dropdown-item" href="{{ url_for('stock_homologacion') }}">Homologación de Stock</a></li>
+              {% endif %}
+              {% if es_admin %}
+              <li><hr class="dropdown-divider"></li>
               <li><a class="dropdown-item" href="{{ url_for('admin_reset') }}">Reiniciar datos</a></li>
+              {% endif %}
             </ul>
           </li>
           {% endif %}
