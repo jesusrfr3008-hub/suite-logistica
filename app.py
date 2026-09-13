@@ -1071,6 +1071,296 @@ def seed_homologacion_y_stock_inicial():
     )
 
 
+def reparar_datos_ronda_w():
+    """Ronda W (2026-09-13): repara datos que YA quedaron mal creados en una
+    base real donde seed_homologacion_y_stock_inicial() y seed_variantes_
+    lentes_physiol() ya habian corrido (con la logica vieja, antes de los
+    arreglos de esta ronda) -- en ese caso los gates de esas dos funciones
+    (que solo corren "si la tabla esta vacia") quedan cerrados para siempre
+    y las correcciones de Ronda W nunca llegan a aplicarse solas. Esta
+    funcion SI puede correr en cada arranque sin problema: no depende de
+    ninguna bandera, revisa el estado real de los datos cada vez y no hace
+    nada si ya no encuentra nada por reparar (idempotente).
+
+    Hace 3 cosas, siempre migrando las referencias ya guardadas
+    (HomologacionStock y StockExistencia) al lugar correcto antes de borrar
+    cualquier producto "placeholder" que haya quedado mal creado, igual que
+    ya hace a mano /stock/homologacion/<id>/resolver:
+
+    A) Familias de lentes PHYSIOL (Serenity Toric PODS49P, Podeye Toric):
+       las variantes que quedaron creadas como Producto suelto (uno por
+       dioptria, a precio 0) se migran a ser ProductoVariante bajo su
+       cuenta padre real, creando esa cuenta padre si todavia no existe (y
+       reconociendo -- ver ALIAS_PADRES_PHYSIOL más abajo -- si el usuario
+       ya la habia creado el mismo a mano con un nombre levemente distinto
+       mientras esperaba esta correccion, para reusar ESE producto en vez
+       de crear una cuenta padre duplicada).
+    B) Cualquier producto (de cualquier proveedor) que haya quedado creado
+       como placeholder a precio 0 pero que en realidad corresponde a una
+       variante ya existente segun su propia Denominacion (mismo mecanismo
+       que el cruce por descripcion agregado en seed_homologacion_y_stock_
+       inicial, aplicado aqui retroactivamente).
+    C) Codigos internos que hayan quedado "pendiente" (proveedor no
+       reconocido en su momento): crea el proveedor que falte y liga/crea
+       su producto, igual que ya hace seed_homologacion_y_stock_inicial()
+       para una base nueva."""
+    if not os.path.isfile(INVENTARIOS_CODIGOS_INTERNOS_EXCEL):
+        return
+
+    import openpyxl
+
+    resumen = {
+        "variantes_migradas": 0, "padres_reparados": set(),
+        "denominacion_migradas": 0, "proveedores_creados": set(),
+        "pendientes_resueltos": 0,
+    }
+
+    # ---- Parte A: familias PHYSIOL sueltas -> bajo su cuenta padre ----
+    physiol = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "BVI PHYSIOL").first()
+    if physiol and os.path.isfile(INVENTARIOS_CODIGOS_INTERNOS_EXCEL):
+        wb = openpyxl.load_workbook(INVENTARIOS_CODIGOS_INTERNOS_EXCEL, data_only=True)
+        if "LENTES PHYSIOL" in wb.sheetnames:
+            ws = wb["LENTES PHYSIOL"]
+            fila_inicio = 2
+            for i, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), start=1):
+                primera = str(row[0]).strip().lower() if row and row[0] else ""
+                if primera == "codigo padre":
+                    fila_inicio = i + 1
+                    break
+
+            # Nombres alternativos bajo los que el usuario ya habia creado a
+            # mano una cuenta padre (mientras esperaba esta correccion),
+            # levemente distintos del nombre oficial de este archivo -- si
+            # se encuentra uno, se reusa ese Producto (conservando su id y
+            # su precio, que suele ser mas confiable que el "precio copiado
+            # de la familia hermana" que se usa como respaldo) y solo se le
+            # corrige el nombre al oficial.
+            ALIAS_PADRES_PHYSIOL = {
+                "SERENITY TORIC PODS49P": "SERENITY TORIC PODST49P",
+            }
+
+            productos_por_codigo = {
+                p.codigo.strip().upper(): p
+                for p in Producto.query.filter_by(proveedor_id=physiol.id).all()
+            }
+            variantes_por_clave = {
+                (v.producto_id, v.codigo.strip().upper())
+                for v in ProductoVariante.query.join(Producto).filter(Producto.proveedor_id == physiol.id).all()
+            }
+
+            def obtener_o_crear_padre(codigo_padre):
+                clave = codigo_padre.upper()
+                padre = productos_por_codigo.get(clave)
+                if not padre:
+                    alias = ALIAS_PADRES_PHYSIOL.get(clave)
+                    if alias and alias in productos_por_codigo:
+                        padre = productos_por_codigo.pop(alias)
+                        padre.codigo = codigo_padre
+                        padre.descripcion = codigo_padre
+                        productos_por_codigo[clave] = padre
+                if not padre:
+                    hermano_codigo = re.sub(r"\btoric\b", "", codigo_padre, flags=re.IGNORECASE)
+                    hermano_codigo = re.sub(r"\s+", " ", hermano_codigo).strip()
+                    hermano = productos_por_codigo.get(hermano_codigo.upper())
+                    padre = Producto(
+                        proveedor_id=physiol.id, codigo=codigo_padre, descripcion=codigo_padre,
+                        empaque=(hermano.empaque if hermano else 1),
+                        moneda=(hermano.moneda if hermano else (physiol.moneda_default or "USD")),
+                        precio_caja=(hermano.precio_caja if hermano else 0),
+                        precio_unitario=(hermano.precio_unitario if hermano else 0),
+                        activo=True,
+                    )
+                    db.session.add(padre)
+                    db.session.flush()
+                    productos_por_codigo[clave] = padre
+                    resumen["padres_reparados"].add(codigo_padre)
+                return padre
+
+            vistos = set()
+            for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+                codigo_padre, codigo_variante, descripcion = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, None)
+                codigo_padre = str(codigo_padre).strip() if codigo_padre else ""
+                codigo_variante = str(codigo_variante).strip() if codigo_variante else ""
+                descripcion = str(descripcion).strip() if descripcion else ""
+                if not codigo_padre or not codigo_variante:
+                    continue
+                clave_vista = (codigo_padre.upper(), codigo_variante.upper())
+                if clave_vista in vistos:
+                    continue
+                vistos.add(clave_vista)
+
+                placeholder = productos_por_codigo.get(codigo_variante.upper())
+                if not placeholder:
+                    continue  # nunca quedo mal creado, o ya se reparo antes
+
+                padre = obtener_o_crear_padre(codigo_padre)
+                if placeholder.id == padre.id:
+                    continue
+
+                clave_variante = (padre.id, codigo_variante.upper())
+                if clave_variante in variantes_por_clave:
+                    variante_final = ProductoVariante.query.filter_by(producto_id=padre.id, codigo=codigo_variante).first()
+                else:
+                    variante_final = ProductoVariante(producto_id=padre.id, codigo=codigo_variante, descripcion=descripcion or codigo_variante)
+                    db.session.add(variante_final)
+                    db.session.flush()
+                    variantes_por_clave.add(clave_variante)
+
+                codigo_interno = placeholder.codigo_interno_inventario
+                if codigo_interno:
+                    variante_final.codigo_interno_inventario = codigo_interno
+                    HomologacionStock.query.filter_by(producto_id=placeholder.id).update({
+                        "producto_id": padre.id, "variante_id": variante_final.id,
+                    })
+                    StockExistencia.query.filter_by(producto_id=placeholder.id).update({
+                        "producto_id": padre.id, "variante_id": variante_final.id,
+                    })
+                db.session.delete(placeholder)
+                del productos_por_codigo[codigo_variante.upper()]
+                resumen["variantes_migradas"] += 1
+
+            db.session.commit()
+
+    # ---- Parte B: cruce por Denominacion para placeholders ya creados ----
+    candidatos = Producto.query.filter(
+        Producto.codigo_interno_inventario.isnot(None),
+        Producto.precio_unitario == 0, Producto.precio_caja == 0,
+    ).all()
+    for placeholder in candidatos:
+        homolog = HomologacionStock.query.filter_by(producto_id=placeholder.id, variante_id=None).first()
+        if not homolog or not homolog.descripcion_referencia:
+            continue
+        descripcion_upper = homolog.descripcion_referencia.strip().upper()
+        variante_match = ProductoVariante.query.join(Producto).filter(
+            Producto.proveedor_id == placeholder.proveedor_id,
+            db.or_(
+                db.func.upper(ProductoVariante.codigo) == descripcion_upper,
+                db.func.upper(ProductoVariante.descripcion) == descripcion_upper,
+            ),
+        ).first()
+        if not variante_match:
+            continue
+        variante_match.codigo_interno_inventario = placeholder.codigo_interno_inventario
+        homolog.producto_id = variante_match.producto_id
+        homolog.variante_id = variante_match.id
+        StockExistencia.query.filter_by(producto_id=placeholder.id).update({
+            "producto_id": variante_match.producto_id, "variante_id": variante_match.id,
+        })
+        db.session.delete(placeholder)
+        resumen["denominacion_migradas"] += 1
+    db.session.commit()
+
+    # ---- Parte C: proveedores faltantes + codigos que quedaron pendientes ----
+    pendientes = HomologacionStock.query.filter_by(estado="pendiente").all()
+    if pendientes and os.path.isfile(INVENTARIOS_CODIGOS_INTERNOS_EXCEL):
+        wb2 = openpyxl.load_workbook(INVENTARIOS_CODIGOS_INTERNOS_EXCEL, data_only=True)
+        if "INVENTARIO ACTUAL" in wb2.sheetnames:
+            ws2 = wb2["INVENTARIO ACTUAL"]
+            clasificacion = {}
+            for row in ws2.iter_rows(min_row=1, values_only=True):
+                a = row[0] if len(row) > 0 else None
+                b = row[1] if len(row) > 1 else None
+                if a is None and b is None:
+                    continue
+                if b is None or not (isinstance(b, str) and b.strip().startswith("'")):
+                    continue
+                codigo_interno = _normalizar_codigo_interno(b)
+                if not codigo_interno or codigo_interno in clasificacion:
+                    continue
+                j = row[9] if len(row) > 9 else None
+                k = row[10] if len(row) > 10 else None
+                descripcion = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+                clasificacion[codigo_interno] = {
+                    "j": str(j).strip() if j is not None else "",
+                    "k": str(k).strip() if k is not None else "",
+                    "descripcion": descripcion,
+                }
+
+            proveedores_cache = {}
+            for homolog in pendientes:
+                info = clasificacion.get(homolog.codigo_interno)
+                if not info:
+                    continue
+                k_upper = info["k"].strip().upper()
+                j_valor = info["j"].strip()
+                if not k_upper or k_upper == "NO INCLUIR":
+                    homolog.estado = "excluido"
+                    StockExistencia.query.filter_by(codigo_interno=homolog.codigo_interno).delete()
+                    continue
+                if k_upper == "SIN MARCA":
+                    homolog.estado = "sin_marca"
+                    continue
+
+                if k_upper not in proveedores_cache:
+                    proveedores_cache[k_upper] = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == k_upper).first()
+                proveedor = proveedores_cache[k_upper]
+                if not proveedor and j_valor:
+                    nombre_nuevo = info["k"].strip().rstrip("*").strip() or info["k"].strip()
+                    proveedor = Proveedor(nombre=nombre_nuevo, tipo="Extranjero", moneda_default="USD", activo=True)
+                    db.session.add(proveedor)
+                    db.session.flush()
+                    proveedores_cache[k_upper] = proveedor
+                    resumen["proveedores_creados"].add(nombre_nuevo)
+                if not proveedor or not j_valor:
+                    continue  # sigue sin info suficiente, se deja pendiente
+
+                j_upper = j_valor.upper()
+                producto_match = Producto.query.filter(
+                    Producto.proveedor_id == proveedor.id, db.func.upper(Producto.codigo) == j_upper
+                ).first()
+                variante_match = None
+                if not producto_match:
+                    variante_match = ProductoVariante.query.join(Producto).filter(
+                        Producto.proveedor_id == proveedor.id, db.func.upper(ProductoVariante.codigo) == j_upper
+                    ).first()
+                if not producto_match and not variante_match:
+                    descripcion_upper = (info["descripcion"] or "").strip().upper()
+                    if descripcion_upper:
+                        variante_match = ProductoVariante.query.join(Producto).filter(
+                            Producto.proveedor_id == proveedor.id,
+                            db.or_(
+                                db.func.upper(ProductoVariante.codigo) == descripcion_upper,
+                                db.func.upper(ProductoVariante.descripcion) == descripcion_upper,
+                            ),
+                        ).first()
+
+                if producto_match:
+                    producto_match.codigo_interno_inventario = homolog.codigo_interno
+                    homolog.estado = "vinculado"
+                    homolog.producto_id = producto_match.id
+                    StockExistencia.query.filter_by(codigo_interno=homolog.codigo_interno).update({"producto_id": producto_match.id})
+                elif variante_match:
+                    variante_match.codigo_interno_inventario = homolog.codigo_interno
+                    homolog.estado = "vinculado"
+                    homolog.producto_id = variante_match.producto_id
+                    homolog.variante_id = variante_match.id
+                    StockExistencia.query.filter_by(codigo_interno=homolog.codigo_interno).update({
+                        "producto_id": variante_match.producto_id, "variante_id": variante_match.id,
+                    })
+                else:
+                    nuevo = Producto(
+                        proveedor_id=proveedor.id, codigo=j_valor, descripcion=info["descripcion"] or j_valor,
+                        empaque=1, moneda=proveedor.moneda_default or "USD", precio_caja=0, precio_unitario=0,
+                        activo=True, codigo_interno_inventario=homolog.codigo_interno,
+                    )
+                    db.session.add(nuevo)
+                    db.session.flush()
+                    homolog.estado = "vinculado"
+                    homolog.producto_id = nuevo.id
+                    StockExistencia.query.filter_by(codigo_interno=homolog.codigo_interno).update({"producto_id": nuevo.id})
+                resumen["pendientes_resueltos"] += 1
+            db.session.commit()
+
+    if any(resumen.values()):
+        print(
+            f"[reparación ronda W] {resumen['variantes_migradas']} variante(s) PHYSIOL migradas bajo su cuenta "
+            f"padre ({sorted(resumen['padres_reparados'])} cuenta(s) padre nueva(s) creada(s)), "
+            f"{resumen['denominacion_migradas']} producto(s) migrados por coincidencia de Denominación, "
+            f"{len(resumen['proveedores_creados'])} proveedor(es) nuevo(s) creados ({sorted(resumen['proveedores_creados'])}), "
+            f"{resumen['pendientes_resueltos']} código(s) pendiente(s) resueltos."
+        )
+
+
 # Contraseña temporal del Administrador inicial (ronda R, 2026-09-12) --
 # ver seed_administrador_inicial() abajo. Puramente informativa aca (el
 # usuario la cambia desde "Mi cuenta" apenas entra la primera vez); no es
@@ -1120,6 +1410,7 @@ with app.app_context():
     seed_variantes_lentes_physiol()
     seed_homologacion_y_stock_inicial()
     seed_administrador_inicial()
+    reparar_datos_ronda_w()
 
 
 # ---------------------------------------------------------------------------
