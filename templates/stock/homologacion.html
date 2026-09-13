@@ -4,28 +4,39 @@
 
 <h3 class="section-title mb-1">Homologación de Stock</h3>
 <div class="text-muted small mb-3">
-  Códigos internos del sistema de Inventarios que aparecieron en una carga de Stock y todavía no
-  están ligados a ningún producto de nuestro catálogo. Resuélvelos abajo: vincúlalos a un producto
-  ya existente, créalo si es nuevo, márcalo "sin marca" (se sigue mostrando en Stock, pero sin
+  Códigos internos del sistema de Inventarios que todavía no están ligados a ningún producto de
+  nuestro catálogo -- incluye tanto los recién aparecidos ("Pendiente") como los que ya se
+  clasificaron como "Sin Marca" (genéricos, sin proveedor asignado) por si en algún momento quieres
+  editarlos y asignarlos a un proveedor real. Resuélvelos abajo: vincúlalos a un producto ya
+  existente, créalo si es nuevo, márcalo "sin marca" (se sigue mostrando en Stock, pero sin
   producto asociado) o "excluido" (se descarta siempre, no vuelve a aparecer).
 </div>
 
 {% if not pendientes %}
-<div class="alert alert-success">No hay códigos pendientes por resolver.</div>
+<div class="alert alert-success">No hay códigos pendientes ni "Sin Marca" por resolver.</div>
 {% endif %}
 
 {% for h in pendientes %}
 <div class="card p-3 mb-3">
   <div class="d-flex justify-content-between align-items-start mb-2">
     <div>
-      <div class="fw-semibold">{{ h.codigo_interno }}</div>
+      <div class="d-flex align-items-center gap-2">
+        <span class="fw-semibold">{{ h.codigo_interno }}</span>
+        {% if h.estado == 'sin_marca' %}
+        <span class="badge bg-secondary">Sin Marca</span>
+        {% else %}
+        <span class="badge bg-warning text-dark">Pendiente</span>
+        {% endif %}
+      </div>
       <div class="text-muted small">{{ h.descripcion_referencia or '(sin descripción)' }}</div>
     </div>
     <div class="d-flex gap-2">
+      {% if h.estado != 'sin_marca' %}
       <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}">
         <input type="hidden" name="accion" value="sin_marca">
         <button type="submit" class="btn btn-sm btn-outline-secondary">Marcar "sin marca"</button>
       </form>
+      {% endif %}
       <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}" onsubmit="return confirm('¿Excluir este código? No volverá a aparecer en el Stock.');">
         <input type="hidden" name="accion" value="excluido">
         <button type="submit" class="btn btn-sm btn-outline-danger">Excluir</button>

@@ -5365,6 +5365,16 @@ def _pedido_por_codigo():
     return resultado
 
 
+def _estados_homologacion_por_codigo():
+    """Ronda Z (2026-09-13): estado de HomologacionStock por codigo_interno
+    -- usado en Consulta de Stock para distinguir, entre los codigos SIN
+    producto/variante ligado, los que se clasificaron a proposito como
+    'sin_marca' (se muestran como proveedor "Sin Marca") de los que
+    todavia estan 'pendiente' de resolver (siguen mostrando
+    "(sin homologar)")."""
+    return {h.codigo_interno: h.estado for h in HomologacionStock.query.all()}
+
+
 @app.route("/stock")
 @requiere_permiso("consultar_stock", "inventarios")
 def stock_list():
@@ -5384,6 +5394,12 @@ def stock_list():
             StockExistencia.variante.has(ProductoVariante.codigo.ilike(like)),
         ))
     filas = query.all()
+
+    # Ronda Z (2026-09-13): para los codigos SIN producto/variante ligado,
+    # distinguir "sin_marca" (clasificacion explicita, a pedido del
+    # usuario, para que a futuro se pueda editar/asignar a un proveedor
+    # real) de "pendiente" (todavia sin resolver).
+    estados_homologacion = _estados_homologacion_por_codigo()
 
     # Ronda V: stock "Desglosado por variante exacta" -- se agrupa por
     # (empresa, producto, variante) sumando todos los lotes de esa
@@ -5425,6 +5441,14 @@ def stock_list():
                 proveedor_nombre = fila.producto.proveedor.nombre
                 proveedor_id_grupo = fila.producto.proveedor_id
                 producto_id_grupo = fila.producto_id
+            elif estados_homologacion.get(fila.codigo_interno) == "sin_marca":
+                # Ronda Z (2026-09-13): clasificado a proposito como "Sin
+                # Marca" (ej. lentes genericos como ABBOTT LIO ACRILICO) --
+                # se muestra en la columna/filtro de Proveedor con esa
+                # etiqueta, en vez de "(sin homologar)", y queda disponible
+                # en /stock/homologacion para asignarlo a un proveedor real
+                # y darle mantenimiento a su codigo mas adelante.
+                proveedor_nombre = "Sin Marca"
             grupo = {
                 "empresa": fila.empresa,
                 "proveedor_id": proveedor_id_grupo,
@@ -5447,7 +5471,9 @@ def stock_list():
             grupo["proximo_vencimiento"] = fila.fecha_vencimiento
         grupo["lotes"].append(fila)
 
-    if proveedor_id:
+    if proveedor_id == "sin_marca":
+        grupos = {k: g for k, g in grupos.items() if g["proveedor_nombre"] == "Sin Marca"}
+    elif proveedor_id:
         grupos = {k: g for k, g in grupos.items() if str(g["proveedor_id"] or "") == str(proveedor_id)}
 
     # Ronda X (2026-09-13, punto 3): columnas Stock actual (A) / Tránsito
@@ -5661,13 +5687,18 @@ def api_stock_buscar_productos():
 @app.route("/stock/homologacion")
 @requiere_permiso("inventarios")
 def stock_homologacion():
-    """Códigos internos del sistema de Inventarios que aparecieron en una
-    carga de Stock pero todavía no se sabe a qué producto/proveedor
-    corresponden (ver estado 'pendiente' en HomologacionStock) -- desde acá
-    se resuelven a mano, uno por uno."""
-    pendientes = HomologacionStock.query.filter_by(estado="pendiente").order_by(
-        HomologacionStock.codigo_interno
-    ).all()
+    """Códigos internos del sistema de Inventarios que todavía no están
+    ligados a ningún producto de nuestro catálogo -- ver estado 'pendiente'
+    en HomologacionStock -- y códigos ya clasificados como 'sin_marca' (a
+    pedido explícito del usuario, ej. lentes genéricos como ABBOTT LIO
+    ACRILICO). Ronda Z (2026-09-13): antes esta pantalla solo mostraba los
+    'pendiente', asi que un codigo marcado 'sin_marca' quedaba sin ninguna
+    forma de editarlo despues; ahora tambien aparece aca, para poder
+    asignarlo mas adelante a un proveedor real y darle mantenimiento a su
+    código -- desde acá se resuelven a mano, uno por uno."""
+    pendientes = HomologacionStock.query.filter(
+        HomologacionStock.estado.in_(["pendiente", "sin_marca"])
+    ).order_by(HomologacionStock.estado, HomologacionStock.codigo_interno).all()
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     return render_template("stock/homologacion.html", pendientes=pendientes, proveedores=proveedores)
 

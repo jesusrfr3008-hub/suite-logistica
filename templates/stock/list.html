@@ -45,6 +45,7 @@
   <div class="col-auto">
     <select class="form-select" name="proveedor_id">
       <option value="">Todos los proveedores</option>
+      <option value="sin_marca" {% if proveedor_sel == 'sin_marca' %}selected{% endif %}>Sin Marca</option>
       {% for p in proveedores %}
       <option value="{{ p.id }}" {% if proveedor_sel|string == p.id|string %}selected{% endif %}>{{ p.nombre }}</option>
       {% endfor %}
