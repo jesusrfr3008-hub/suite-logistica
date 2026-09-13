@@ -6,14 +6,20 @@
   <div>
     <h3 class="section-title mb-0">Consulta de Stock</h3>
     <div class="text-muted small">
-      Saldos de existencias del sistema de Inventarios (Accuvision y Accumedical juntas -- filtra por empresa abajo).
-      {% if ultima_carga %}Última actualización: {{ ultima_carga.strftime('%d-%m-%Y %H:%M') }}.{% else %}Todavía no se ha cargado ningún reporte de Stock.{% endif %}
+      Saldos de existencias del sistema de Inventarios (Accuvision y Accumedical juntas -- filtra por empresa o proveedor abajo).
+      {% if ultima_carga %}Última actualización de Stock: {{ ultima_carga.strftime('%d-%m-%Y %H:%M') }}.{% else %}Todavía no se ha cargado ningún reporte de Stock.{% endif %}
+      {% if ultima_carga_pedidos %}Última actualización de Notas de pedido: {{ ultima_carga_pedidos.strftime('%d-%m-%Y %H:%M') }}.{% endif %}
     </div>
   </div>
   {% if current_user.tiene_permiso('inventarios') %}
-  <button class="btn btn-brand" data-bs-toggle="modal" data-bs-target="#modalCargarStock">
-    <i class="bi bi-upload"></i> Cargar reporte de Stock
-  </button>
+  <div class="d-flex gap-2">
+    <button class="btn btn-outline-brand" data-bs-toggle="modal" data-bs-target="#modalCargarPedidos">
+      <i class="bi bi-upload"></i> Cargar Notas de pedido
+    </button>
+    <button class="btn btn-brand" data-bs-toggle="modal" data-bs-target="#modalCargarStock">
+      <i class="bi bi-upload"></i> Cargar reporte de Stock
+    </button>
+  </div>
   {% endif %}
 </div>
 
@@ -23,6 +29,14 @@
       <option value="">Todas las empresas</option>
       {% for e in empresas %}
       <option value="{{ e.id }}" {% if empresa_sel|string == e.id|string %}selected{% endif %}>{{ e.nombre }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <select class="form-select" name="proveedor_id">
+      <option value="">Todos los proveedores</option>
+      {% for p in proveedores %}
+      <option value="{{ p.id }}" {% if proveedor_sel|string == p.id|string %}selected{% endif %}>{{ p.nombre }}</option>
       {% endfor %}
     </select>
   </div>
@@ -43,8 +57,12 @@
           <th>Proveedor</th>
           <th>Código</th>
           <th>Descripción</th>
+          <th class="text-end">Stock actual</th>
+          <th class="text-end">Tránsito</th>
+          <th class="text-end">Pedido</th>
           <th class="text-end">Stock total</th>
           <th>Próximo vencimiento</th>
+          <th class="text-end">Cantidad Licitación</th>
           <th></th>
         </tr>
       </thead>
@@ -53,10 +71,18 @@
         <tr class="{% if not g.homologado %}text-muted{% endif %}">
           <td>{{ g.empresa.nombre if g.empresa else '' }}</td>
           <td>{{ g.proveedor_nombre or '(sin homologar)' }}</td>
-          <td>{{ g.codigo }}</td>
-          <td style="max-width: 420px;">{{ g.descripcion }}</td>
-          <td class="text-end fw-semibold">{{ g.stock_total }}</td>
+          <td>{{ g.codigo or '-' }}</td>
+          <td style="max-width: 380px;">{{ g.descripcion }}</td>
+          <td class="text-end">{{ g.stock_actual }}</td>
+          <td class="text-end">
+            {% if g.transito %}
+            <span data-bs-toggle="tooltip" data-bs-html="true" title="{{ g.transito_detalle | safe }}" style="cursor: help; border-bottom: 1px dotted;">{{ g.transito }}</span>
+            {% else %}0{% endif %}
+          </td>
+          <td class="text-end">{{ g.pedido }}</td>
+          <td class="text-end fw-semibold">{{ g.stock_total_proyectado }}</td>
           <td>{{ g.proximo_vencimiento.strftime('%d-%m-%Y') if g.proximo_vencimiento else '-' }}</td>
+          <td class="text-end text-muted" title="Próximamente">-</td>
           <td class="text-end">
             {% if g.lotes|length > 1 %}
             <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#lotes{{ loop.index }}">
@@ -68,7 +94,7 @@
         {% if g.lotes|length > 1 %}
         <tr class="collapse" id="lotes{{ loop.index }}">
           <td></td>
-          <td colspan="6">
+          <td colspan="9">
             <table class="table table-sm table-borderless mb-0">
               <thead><tr class="text-muted small"><th>Lote</th><th>Vencimiento</th><th class="text-end">Stock</th></tr></thead>
               <tbody>
@@ -81,7 +107,7 @@
         </tr>
         {% endif %}
         {% else %}
-        <tr><td colspan="7" class="text-center text-muted py-4">Sin resultados.</td></tr>
+        <tr><td colspan="11" class="text-center text-muted py-4">Sin resultados.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -111,6 +137,39 @@
     </div>
   </div>
 </div>
+
+<div class="modal fade" id="modalCargarPedidos" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('stock_pedidos_cargar') }}" enctype="multipart/form-data">
+        <div class="modal-header">
+          <h5 class="modal-title">Cargar Notas de pedido</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">
+            Sube el archivo .xlsx del reporte "Balance de Productos" (Notas de pedido) del sistema de
+            Inventarios. Trae las unidades ya comprometidas con clientes, usadas para la columna "Pedido".
+            El archivo es de UNA empresa a la vez (lo indica en su primera fila) -- esto
+            <strong>reemplaza solo los pedidos de esa empresa</strong>, sin tocar los de la otra.
+          </p>
+          <input type="file" class="form-control" name="archivo" accept=".xlsx,.xls" required>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-brand">Cargar y reemplazar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
 {% endif %}
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+  new bootstrap.Tooltip(el);
+});
+</script>
 {% endblock %}

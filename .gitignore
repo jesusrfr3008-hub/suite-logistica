@@ -12,6 +12,7 @@ data/documentos/
 data/documentos_gastos/
 data/documentos_legajo/
 data/pdf_oc/
+data/reportes/
 
 # Los logos de las empresas compradoras (data/logos_empresas/) SI se suben
 # a proposito -- son activos de marca que el seed de arranque necesita

@@ -318,6 +318,35 @@ class StockExistencia(db.Model):
         return f"<StockExistencia {self.codigo_interno} x{self.stock_fisico}>"
 
 
+class PedidoComprometido(db.Model):
+    """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
+    clientes (OC de clientes, no de nosotros a los proveedores), tal como
+    vienen en el reporte "Notas de pedido" del sistema de Inventarios --
+    una fila por cada linea de pedido de cliente todavia con saldo
+    pendiente de despacho. Se recarga POR EMPRESA cada vez que se sube un
+    archivo nuevo (ver stock_pedidos_cargar en app.py): se borran solo las
+    filas de la empresa que trae ESE archivo (identificada por el
+    encabezado del reporte, igual que el reporte de Stock) y se insertan
+    las nuevas -- si mas adelante se sube el equivalente de la otra
+    empresa, no se pisan entre si."""
+    __tablename__ = "pedidos_comprometidos"
+
+    id = db.Column(db.Integer, primary_key=True)
+    empresa_id = db.Column(db.Integer, db.ForeignKey("empresas.id"), nullable=False)
+    codigo_interno = db.Column(db.String(40), nullable=False)
+    descripcion = db.Column(db.String(300))
+    nro_pedido = db.Column(db.String(40))
+    fecha_pedido = db.Column(db.Date, nullable=True)
+    cliente_nombre = db.Column(db.String(300))
+    cantidad = db.Column(db.Integer, default=0)
+    cargado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    empresa = db.relationship("Empresa")
+
+    def __repr__(self):
+        return f"<PedidoComprometido {self.codigo_interno} x{self.cantidad}>"
+
+
 # Etapas por las que avanza cada LINEA de producto de una orden, hasta la
 # llegada a bodega. El estado de la orden se calcula automaticamente a
 # partir de las etapas de sus lineas (ver OrdenCompra.estado_calculado).

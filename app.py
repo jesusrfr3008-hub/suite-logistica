@@ -21,6 +21,7 @@ from flask import (
 from flask_login import (
     LoginManager, UserMixin, login_user, logout_user, current_user,
 )
+from markupsafe import escape
 
 from models import (
     db, Empresa, Proveedor, Producto, ProductoVariante, OrdenCompra, OrdenCompraLinea, OrdenDocumento,
@@ -32,7 +33,7 @@ from models import (
     Despacho, ESTADOS_DESPACHO,
     CargoAdicionalImportacion, TipoCambioMensual,
     Usuario, Rol, PERMISOS_DISPONIBLES,
-    HomologacionStock, StockExistencia,
+    HomologacionStock, StockExistencia, PedidoComprometido,
 )
 from seed_data import seed_from_excel
 import costing
@@ -67,6 +68,13 @@ EXTENSIONES_LOGO_PERMITIDAS = {".png", ".jpg", ".jpeg", ".svg"}
 # correo (ronda L, punto 1, 2026-09-09) -- se sobrescribe cada vez que se
 # genera, no se acumulan versiones viejas.
 PDF_OC_DIR = os.path.join(BASE_DIR, "data", "pdf_oc")
+# Reportes cargados para consulta posterior (ronda X, 2026-09-13, punto 3C):
+# el archivo original "Notas de pedido" que el usuario sube en Consulta de
+# Stock se guarda aca, uno por empresa (se sobrescribe solo el de esa
+# empresa cada vez que se sube uno nuevo) -- asi queda disponible para
+# volver a consultarlo despues, sin depender de que el usuario guarde su
+# propia copia.
+REPORTES_DIR = os.path.join(BASE_DIR, "data", "reportes")
 
 app = Flask(__name__)
 # Soporte Postgres (ronda M, 2026-09-10): si existe la variable de entorno
@@ -1402,6 +1410,7 @@ with app.app_context():
     os.makedirs(DOCUMENTOS_DIR, exist_ok=True)
     os.makedirs(EMPRESAS_LOGOS_DIR, exist_ok=True)
     os.makedirs(PDF_OC_DIR, exist_ok=True)
+    os.makedirs(REPORTES_DIR, exist_ok=True)
     db.create_all()
     ensure_schema_migrations()
     seed_from_excel(app)
@@ -5283,10 +5292,71 @@ def usuarios_eliminar(usuario_id):
 # permiso "inventarios" lo sube manualmente cuando hace falta actualizarlo
 # (reemplaza TODO el stock cargado antes, ver _clasificar_y_cargar_stock).
 
+def _transito_por_linea():
+    """Ronda X (2026-09-13, punto 3B): unidades "en tránsito" por (producto,
+    variante) -- lineas de ordenes YA APROBADAS que el proveedor ya
+    despachó pero que todavía no llegan a bodega (etapa 'Orden Despachada'
+    o 'Internación Aduanas'; una vez 'Recibido' ya deberían reflejarse en
+    el Stock real y dejan de contar aquí). Devuelve un diccionario
+    {(producto_id, variante_codigo_en_mayuscula_o_None): {"cantidad": int,
+    "detalle": [str, ...]}} -- 'detalle' es una lista de textos para el
+    tooltip (cantidad + fecha estimada de llegada, sin numero de PO) SIN
+    exponer nada mas de la orden: quien solo tiene 'Consulta de Stock' (sin
+    'seguimiento' ni permisos de Compras) nunca ve ni navega a la orden en
+    si, solo este resumen agregado (ronda X, punto 5)."""
+    ETAPAS_EN_TRANSITO = ("Orden Despachada", "Internación Aduanas")
+    lineas = (
+        OrdenCompraLinea.query
+        .join(OrdenCompra)
+        .filter(
+            OrdenCompraLinea.anulada == False,  # noqa: E712
+            OrdenCompraLinea.etapa.in_(ETAPAS_EN_TRANSITO),
+            OrdenCompra.estado_aprobacion == "Aprobada",
+        )
+        .all()
+    )
+    resultado = {}
+    for linea in lineas:
+        cantidad = linea.cantidad_unidades
+        if cantidad <= 0:
+            continue
+        clave = (linea.producto_id, (linea.variante_codigo or "").strip().upper() or None)
+        info = resultado.setdefault(clave, {"cantidad": 0, "detalle": []})
+        info["cantidad"] += cantidad
+        despacho = linea.orden.despacho
+        fecha_estimada = None
+        if despacho and despacho.fecha_estimada_llegada:
+            fecha_estimada = despacho.fecha_estimada_llegada
+        elif linea.fecha_estimada_despacho_confirmada:
+            fecha_estimada = linea.fecha_estimada_despacho_confirmada
+        elif linea.fecha_estimada_despacho:
+            fecha_estimada = linea.fecha_estimada_despacho
+        fecha_texto = fecha_estimada.strftime("%d-%m-%Y") if fecha_estimada else "sin fecha estimada"
+        # Ronda X (2026-09-13, punto 5): el tooltip NO menciona el numero de
+        # PO ni ningun otro dato de la orden -- solo la cantidad y la fecha
+        # estimada, para que "Consulta de Stock" (sin permiso de
+        # Seguimiento) no tenga forma de identificar ni rastrear la orden.
+        info["detalle"].append(f"{cantidad} un. (llegada estimada {fecha_texto})")
+    return resultado
+
+
+def _pedido_por_codigo():
+    """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
+    clientes (columna 'Pedido'), sumadas por (empresa_id, codigo_interno) a
+    partir de PedidoComprometido -- puede haber varias filas para el mismo
+    código (un pedido de cliente distinto cada una)."""
+    resultado = {}
+    for p in PedidoComprometido.query.all():
+        clave = (p.empresa_id, p.codigo_interno)
+        resultado[clave] = resultado.get(clave, 0) + (p.cantidad or 0)
+    return resultado
+
+
 @app.route("/stock")
 @requiere_permiso("consultar_stock", "inventarios")
 def stock_list():
     empresa_id = request.args.get("empresa_id", "")
+    proveedor_id = request.args.get("proveedor_id", "")
     q = request.args.get("q", "").strip()
 
     query = StockExistencia.query
@@ -5319,18 +5389,32 @@ def stock_list():
         grupo = grupos.get(clave)
         if grupo is None:
             proveedor_nombre = None
-            codigo_mostrar = fila.codigo_interno
+            proveedor_id_grupo = None
+            producto_id_grupo = None
+            variante_codigo_grupo = None
+            # Ronda X (2026-09-13, punto 2): un codigo todavia sin
+            # homologar (sin marca / pendiente) ya NO muestra el codigo
+            # crudo de Ergopyme en pantalla -- queda en blanco (se sigue
+            # viendo la descripcion, y se lo puede seguir buscando por su
+            # codigo interno desde el buscador de arriba).
+            codigo_mostrar = None
             descripcion = fila.descripcion
             if fila.variante:
                 codigo_mostrar = fila.variante.codigo
                 descripcion = fila.variante.descripcion or fila.descripcion
                 proveedor_nombre = fila.variante.producto.proveedor.nombre
+                proveedor_id_grupo = fila.variante.producto.proveedor_id
+                producto_id_grupo = fila.variante.producto_id
+                variante_codigo_grupo = fila.variante.codigo.strip().upper()
             elif fila.producto:
                 codigo_mostrar = fila.producto.codigo
                 descripcion = fila.producto.descripcion
                 proveedor_nombre = fila.producto.proveedor.nombre
+                proveedor_id_grupo = fila.producto.proveedor_id
+                producto_id_grupo = fila.producto_id
             grupo = {
                 "empresa": fila.empresa,
+                "proveedor_id": proveedor_id_grupo,
                 "proveedor_nombre": proveedor_nombre,
                 "codigo": codigo_mostrar,
                 "codigo_interno": fila.codigo_interno,
@@ -5339,6 +5423,8 @@ def stock_list():
                 "proximo_vencimiento": None,
                 "lotes": [],
                 "homologado": bool(fila.producto_id or fila.variante_id),
+                "_producto_id": producto_id_grupo,
+                "_variante_codigo": variante_codigo_grupo,
             }
             grupos[clave] = grupo
         grupo["stock_total"] += fila.stock_fisico or 0
@@ -5348,12 +5434,33 @@ def stock_list():
             grupo["proximo_vencimiento"] = fila.fecha_vencimiento
         grupo["lotes"].append(fila)
 
+    if proveedor_id:
+        grupos = {k: g for k, g in grupos.items() if str(g["proveedor_id"] or "") == str(proveedor_id)}
+
+    # Ronda X (2026-09-13, punto 3): columnas Stock actual (A) / Tránsito
+    # (B) / Pedido (C) / Stock total (D = A+B-C), agregadas sobre cada
+    # grupo ya armado arriba.
+    transito_por_linea = _transito_por_linea()
+    pedido_por_codigo = _pedido_por_codigo()
+    for grupo in grupos.values():
+        transito_info = transito_por_linea.get((grupo["_producto_id"], grupo["_variante_codigo"]), None)
+        grupo["stock_actual"] = grupo["stock_total"]
+        grupo["transito"] = transito_info["cantidad"] if transito_info else 0
+        grupo["transito_detalle"] = (
+            "<br>".join(str(escape(linea)) for linea in transito_info["detalle"]) if transito_info else ""
+        )
+        grupo["pedido"] = pedido_por_codigo.get((grupo["empresa"].id if grupo["empresa"] else None, grupo["codigo_interno"]), 0)
+        grupo["stock_total_proyectado"] = grupo["stock_actual"] + grupo["transito"] - grupo["pedido"]
+
     resultado = sorted(grupos.values(), key=lambda g: (g["proveedor_nombre"] or "", g["descripcion"] or ""))
     empresas = Empresa.query.order_by(Empresa.nombre).all()
+    proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     ultima_carga = db.session.query(db.func.max(StockExistencia.cargado_en)).scalar()
+    ultima_carga_pedidos = db.session.query(db.func.max(PedidoComprometido.cargado_en)).scalar()
     return render_template(
-        "stock/list.html", grupos=resultado, empresas=empresas,
-        empresa_sel=empresa_id, q=q, ultima_carga=ultima_carga,
+        "stock/list.html", grupos=resultado, empresas=empresas, proveedores=proveedores,
+        empresa_sel=empresa_id, proveedor_sel=proveedor_id, q=q,
+        ultima_carga=ultima_carga, ultima_carga_pedidos=ultima_carga_pedidos,
     )
 
 
@@ -5401,6 +5508,113 @@ def stock_cargar():
     if resumen["empresas_no_encontradas"]:
         mensaje += f" No se pudo identificar la empresa para: {', '.join(sorted(resumen['empresas_no_encontradas']))}."
     flash(mensaje, "success" if not resumen["pendientes_nuevos"] and not resumen["empresas_no_encontradas"] else "warning")
+    return redirect(url_for("stock_list"))
+
+
+@app.route("/stock/pedidos/cargar", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_pedidos_cargar():
+    """Ronda X (2026-09-13, punto 3C): sube el reporte 'Notas de pedido'
+    (Balance de Productos) del sistema de Inventarios -- fila 1 trae el
+    nombre de la empresa (igual que el reporte de Stock), encabezado en la
+    fila con 'Cód.Producto' en la columna A y los datos desde la fila
+    siguiente: A=código interno, C=Denominación, G=N° de pedido,
+    I=fecha de pedido, K=cliente, L=cantidad comprometida (Despacho
+    Comprometido). REEMPLAZA solo los registros de la empresa que trae ESE
+    archivo (confirmado con el usuario) -- si mas adelante sube el
+    equivalente de la otra empresa, no se pisan entre si. El archivo
+    original queda guardado en data/reportes/ (uno por empresa, se
+    sobrescribe) para poder volver a consultarlo despues."""
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona el archivo de Notas de pedido para cargar.", "warning")
+        return redirect(url_for("stock_list"))
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls"):
+        flash("Formato no soportado. Sube el archivo .xlsx del reporte de Notas de pedido.", "danger")
+        return redirect(url_for("stock_list"))
+
+    try:
+        wb = openpyxl.load_workbook(archivo, data_only=True)
+        ws = wb.active
+        filas_excel = list(ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True))
+    except Exception:
+        flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
+        return redirect(url_for("stock_list"))
+
+    if not filas_excel:
+        flash("El archivo está vacío -- no se cambió nada.", "warning")
+        return redirect(url_for("stock_list"))
+
+    nombre_empresa_reporte = str(filas_excel[0][0]).strip() if filas_excel[0] and filas_excel[0][0] else ""
+    empresa = _empresa_por_nombre_reporte(nombre_empresa_reporte, {})
+    if not empresa:
+        flash(
+            f"No se pudo identificar a qué empresa pertenece este archivo (fila 1 dice "
+            f"'{nombre_empresa_reporte or '(vacío)'}') -- no se cambió nada.", "danger",
+        )
+        return redirect(url_for("stock_list"))
+
+    fila_inicio = None
+    for i, row in enumerate(filas_excel[:10], start=1):
+        primera = str(row[0]).strip().lower() if row and row[0] else ""
+        if primera.replace("ó", "o") == "cód.producto".replace("ó", "o"):
+            fila_inicio = i + 1
+            break
+    if fila_inicio is None:
+        flash("No se encontró el encabezado 'Cód.Producto' en el archivo -- no se cambió nada.", "danger")
+        return redirect(url_for("stock_list"))
+
+    nuevas_filas = []
+    for row in filas_excel[fila_inicio - 1:]:
+        codigo_crudo = row[0] if len(row) > 0 else None
+        if not codigo_crudo:
+            continue
+        codigo_interno = _normalizar_codigo_interno(codigo_crudo)
+        if not codigo_interno:
+            continue
+        descripcion = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+        nro_pedido = str(row[6]).strip() if len(row) > 6 and row[6] is not None else ""
+        fecha_pedido = row[8] if len(row) > 8 else None
+        if isinstance(fecha_pedido, datetime):
+            fecha_pedido = fecha_pedido.date()
+        else:
+            fecha_pedido = None
+        cliente_nombre = str(row[10]).strip() if len(row) > 10 and row[10] is not None else ""
+        cantidad = row[11] if len(row) > 11 else 0
+        try:
+            cantidad = int(cantidad) if cantidad is not None else 0
+        except (TypeError, ValueError):
+            cantidad = 0
+        if cantidad <= 0:
+            continue
+        nuevas_filas.append(PedidoComprometido(
+            empresa_id=empresa.id, codigo_interno=codigo_interno, descripcion=descripcion,
+            nro_pedido=nro_pedido, fecha_pedido=fecha_pedido, cliente_nombre=cliente_nombre,
+            cantidad=cantidad,
+        ))
+
+    if not nuevas_filas:
+        flash("El archivo no tiene filas de pedidos comprometidos reconocibles -- no se cambió nada.", "warning")
+        return redirect(url_for("stock_list"))
+
+    PedidoComprometido.query.filter_by(empresa_id=empresa.id).delete()
+    db.session.add_all(nuevas_filas)
+    db.session.commit()
+
+    # Guarda el archivo original para poder volver a consultarlo despues
+    # (un archivo por empresa, se reemplaza cada vez).
+    os.makedirs(REPORTES_DIR, exist_ok=True)
+    nombre_archivo = f"notas_pedido_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
+    archivo.stream.seek(0)
+    archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
+
+    total_unidades = sum(f.cantidad for f in nuevas_filas)
+    flash(
+        f"Notas de pedido de {empresa.nombre} actualizadas: {len(nuevas_filas)} línea(s), "
+        f"{total_unidades} unidad(es) comprometidas en total. Verifica que este total coincida con el "
+        f"archivo que subiste antes de confiar en la columna 'Pedido'.", "success",
+    )
     return redirect(url_for("stock_list"))
 
 
