@@ -347,6 +347,82 @@ class PedidoComprometido(db.Model):
         return f"<PedidoComprometido {self.codigo_interno} x{self.cantidad}>"
 
 
+class CodigoErgopyme(db.Model):
+    """Ronda AA (2026-09-13): tabla maestra de homologación Proveedor +
+    Código Proveedor + Descripción para cada "código interno" del sistema
+    de Inventarios (Ergopyme), cargada una vez desde el archivo "2da
+    Revisión códigos ergopyme" que mantiene el usuario. Es MÁS COMPLETA
+    que HomologacionStock (ronda V-Z, que solo cubre los códigos que
+    aparecieron alguna vez en una carga del reporte de Stock) -- se usa
+    ÚNICAMENTE para homologar el histórico de compras/importaciones del
+    reporte "Compras Proveedor" (ver seed_codigos_ergopyme y
+    reportes_compras_proveedor en app.py). No reemplaza ni modifica
+    HomologacionStock, que sigue siendo la fuente de verdad para Consulta
+    de Stock."""
+    __tablename__ = "codigos_ergopyme"
+
+    id = db.Column(db.Integer, primary_key=True)
+    codigo_interno = db.Column(db.String(40), unique=True, nullable=False, index=True)
+    proveedor_nombre = db.Column(db.String(120))
+    codigo_proveedor = db.Column(db.String(120))
+    descripcion = db.Column(db.String(500))
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<CodigoErgopyme {self.codigo_interno} -> {self.proveedor_nombre}>"
+
+
+class CompraHistorica(db.Model):
+    """Ronda AA (2026-09-13): histórico "congelado" de compras/importaciones
+    a proveedores anteriores a este sistema, cargado UNA SOLA VEZ desde el
+    archivo "Data Histórica Compra proveedores, costo fletes y gastos
+    Importación" -- una fila por cada línea de producto de cada factura
+    (6.135 filas reales al 2026-09-13, de 2023-11 a 2026-08). Se homologa
+    al cargarse contra CodigoErgopyme (arriba) para saber el proveedor
+    "real" (mismo nombre que usa el catálogo de Proveedor de este sistema)
+    y el código de ese proveedor -- homologado=False cuando el código no
+    se encontró en CodigoErgopyme (queda igual con el proveedor tal como
+    venía en el archivo). El reporte "Compras Proveedor" (ver app.py)
+    combina estas filas con las compras hechas DESDE la plataforma
+    (calculadas en vivo a partir de Importacion/Parcial/ParcialLinea), así
+    que de acá en adelante cada Orden de Compra/Costeo que se haga en el
+    sistema se va sumando solo al mismo reporte, sin tener que recargar
+    nada."""
+    __tablename__ = "compras_historicas"
+
+    id = db.Column(db.Integer, primary_key=True)
+    fecha_factura = db.Column(db.Date, nullable=True)
+    mes_anio = db.Column(db.String(20))
+    proveedor_original = db.Column(db.String(120))
+    proveedor_homologado = db.Column(db.String(120))
+    factura = db.Column(db.String(120))
+    tipo_cambio = db.Column(db.Float, default=0)      # CLP por 1 USD (Dólar Aduanero)
+    paridad_eur = db.Column(db.Float, default=0)      # unidades de la moneda de factura por 1 USD
+    transporte = db.Column(db.String(80))
+    codigo_interno = db.Column(db.String(40), index=True)
+    codigo_proveedor = db.Column(db.String(120))
+    descripcion = db.Column(db.String(500))
+    tipo_flete = db.Column(db.String(40))
+    unidades = db.Column(db.Float, default=0)
+    total_invoice = db.Column(db.Float, default=0)    # en la moneda original de la factura
+    total_usd = db.Column(db.Float, default=0)
+    flete_usd = db.Column(db.Float, default=0)
+    seguro_usd = db.Column(db.Float, default=0)
+    cif_usd = db.Column(db.Float, default=0)
+    cif_clp = db.Column(db.Float, default=0)
+    derechos_clp = db.Column(db.Float, default=0)
+    otros_gastos_clp = db.Column(db.Float, default=0)
+    costo_total_clp = db.Column(db.Float, default=0)
+    costo_unitario_clp = db.Column(db.Float, default=0)
+    categoria = db.Column(db.String(80))              # columna "PRODUCTO" del archivo (INSTRUMENTALES/INSUMOS/...)
+    otros_costos_usd = db.Column(db.Float, default=0)
+    empresa_compradora = db.Column(db.String(80))     # ACCUVISION / ACCUMEDICAL, tal como viene en el archivo
+    homologado = db.Column(db.Boolean, default=False)
+
+    def __repr__(self):
+        return f"<CompraHistorica {self.codigo_interno} {self.factura}>"
+
+
 # Etapas por las que avanza cada LINEA de producto de una orden, hasta la
 # llegada a bodega. El estado de la orden se calcula automaticamente a
 # partir de las etapas de sus lineas (ver OrdenCompra.estado_calculado).

@@ -89,9 +89,15 @@
       </thead>
       <tbody>
         {% for g in grupos %}
-        <tr class="{% if not g.homologado %}text-muted{% endif %}">
+        <tr class="{% if not g.homologado %}text-muted{% endif %} {% if g.sin_stock_cargado %}table-warning{% endif %}">
           <td data-col="empresa" data-value="{{ (g.empresa.nombre if g.empresa else '')|lower }}">{{ g.empresa.nombre if g.empresa else '' }}</td>
-          <td data-col="proveedor" data-value="{{ (g.proveedor_nombre or '')|lower }}">{{ g.proveedor_nombre or '(sin homologar)' }}</td>
+          <td data-col="proveedor" data-value="{{ (g.proveedor_nombre or '')|lower }}">
+            {% if g.sin_stock_cargado %}
+            <span data-bs-toggle="tooltip" title="Este código tiene unidades pendientes en Notas de pedido, pero nunca apareció en el último reporte de Stock cargado.">(pedido sin stock cargado)</span>
+            {% else %}
+            {{ g.proveedor_nombre or '(sin homologar)' }}
+            {% endif %}
+          </td>
           <td data-col="codigo" data-value="{{ (g.codigo or '')|lower }}">{{ g.codigo or '-' }}</td>
           <td data-col="descripcion" data-value="{{ (g.descripcion or '')|lower }}" style="max-width: 380px;">{{ g.descripcion }}</td>
           <td class="text-end" data-col="stock_actual" data-value="{{ g.stock_actual }}">{{ g.stock_actual }}</td>

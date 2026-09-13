@@ -92,12 +92,14 @@
             </ul>
           </li>
           {% endif %}
+          {% if current_user.tiene_permiso('reportes') %}
           <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle text-white-50" href="#" role="button" data-bs-toggle="dropdown">Próximamente</a>
+            <a class="nav-link dropdown-toggle {% if request.endpoint and 'reportes' in request.endpoint %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Reportes</a>
             <ul class="dropdown-menu">
-              <li><span class="dropdown-item-text text-muted small">Ventas y rotación</span></li>
+              <li><a class="dropdown-item" href="{{ url_for('reportes_compras_proveedor') }}">Compras Proveedor</a></li>
             </ul>
           </li>
+          {% endif %}
           {% endif %}
         </ul>
         {% if current_user.is_authenticated %}

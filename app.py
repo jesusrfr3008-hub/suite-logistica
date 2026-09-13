@@ -34,6 +34,7 @@ from models import (
     CargoAdicionalImportacion, TipoCambioMensual,
     Usuario, Rol, PERMISOS_DISPONIBLES,
     HomologacionStock, StockExistencia, PedidoComprometido,
+    CodigoErgopyme, CompraHistorica,
 )
 from seed_data import seed_from_excel
 import costing
@@ -75,6 +76,16 @@ PDF_OC_DIR = os.path.join(BASE_DIR, "data", "pdf_oc")
 # volver a consultarlo despues, sin depender de que el usuario guarde su
 # propia copia.
 REPORTES_DIR = os.path.join(BASE_DIR, "data", "reportes")
+# Ronda AA (2026-09-13): archivos para el reporte "Compras Proveedor" (menu
+# Reportes) -- ver seed_codigos_ergopyme() y seed_compras_historicas() abajo.
+# 1) mapeo maestro Proveedor + Codigo Proveedor + Descripcion para cada
+#    "codigo interno" del sistema de Inventarios (Ergopyme), mas completo
+#    que HomologacionStock (esa solo cubre codigos vistos en Stock).
+CODIGOS_ERGOPYME_EXCEL = os.path.join(BASE_DIR, "codigos_ergopyme_homologacion.xlsx")
+# 2) historico de compras/importaciones a proveedores anterior a este
+#    sistema (una fila por linea de producto de cada factura, 2023-2026),
+#    homologado contra (1) al cargarse.
+HISTORICO_COMPRAS_EXCEL = os.path.join(BASE_DIR, "historico_compras_proveedores.xlsx")
 
 app = Flask(__name__)
 # Soporte Postgres (ronda M, 2026-09-10): si existe la variable de entorno
@@ -1369,6 +1380,208 @@ def reparar_datos_ronda_w():
         )
 
 
+def _normalizar_codigo_ergopyme(valor):
+    """Ronda AA (2026-09-13): normaliza un código interno del sistema de
+    Inventarios (Ergopyme) tal como viene en los archivos de Reportes --
+    ahí llegan como número (int o float, sin comilla ni ceros a la
+    izquierda que preservar), a diferencia de _normalizar_codigo_interno
+    (usado para Stock/Notas de pedido, que sí trae la comilla delante)."""
+    if valor is None:
+        return ""
+    if isinstance(valor, float):
+        valor = int(valor) if valor.is_integer() else valor
+    s = str(valor).strip()
+    if s.startswith("'"):
+        s = s[1:].strip()
+    if s.endswith(".0") and s[:-2].replace("-", "").isdigit():
+        s = s[:-2]
+    return s
+
+
+def seed_codigos_ergopyme():
+    """Ronda AA (2026-09-13): carga UNA VEZ el mapeo maestro Proveedor +
+    Código Proveedor + Descripción para cada código interno de Ergopyme,
+    desde 'codigos_ergopyme_homologacion.xlsx' ("2da Revisión códigos
+    ergopyme" que mantiene el usuario) -- se usa para homologar el
+    histórico de compras (ver seed_compras_historicas abajo). Gateado:
+    si ya existe algún CodigoErgopyme, no hace nada."""
+    if CodigoErgopyme.query.count() > 0:
+        return
+    if not os.path.isfile(CODIGOS_ERGOPYME_EXCEL):
+        print(f"[seed] No se encontró {CODIGOS_ERGOPYME_EXCEL}, se omite la carga de códigos Ergopyme.")
+        return
+
+    wb = openpyxl.load_workbook(CODIGOS_ERGOPYME_EXCEL, data_only=True)
+    ws = wb.worksheets[0]
+    fila_inicio = None
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True), start=1):
+        primera = str(row[0]).strip().upper() if row and row[0] is not None else ""
+        if primera == "CODIGO ITEM":
+            fila_inicio = i + 1
+            break
+    if fila_inicio is None:
+        print("[seed] No se encontró el encabezado 'CODIGO ITEM' en codigos_ergopyme_homologacion.xlsx, se omite.")
+        return
+
+    creados = 0
+    vistos = set()
+    for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+        if not row or row[0] is None:
+            continue
+        codigo = _normalizar_codigo_ergopyme(row[0])
+        if not codigo or codigo in vistos:
+            continue
+        vistos.add(codigo)
+        proveedor = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+        codigo_proveedor = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+        descripcion = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
+        db.session.add(CodigoErgopyme(
+            codigo_interno=codigo, proveedor_nombre=proveedor,
+            codigo_proveedor=codigo_proveedor, descripcion=descripcion,
+        ))
+        creados += 1
+    db.session.commit()
+    print(f"[seed] Importados {creados} código(s) Ergopyme para el reporte Compras Proveedor.")
+
+
+def seed_compras_historicas():
+    """Ronda AA (2026-09-13): carga UNA VEZ el histórico de compras/
+    importaciones a proveedores anterior a este sistema, desde
+    'historico_compras_proveedores.xlsx' ("Data Histórica Compra
+    proveedores, costo fletes y gastos Importación"), homologando cada
+    fila contra CodigoErgopyme para saber el proveedor "real" (mismo
+    nombre que usa el catálogo de Proveedor de este sistema). El reporte
+    Compras Proveedor (ver app.py) combina estas filas "congeladas" con
+    las compras hechas DESDE la plataforma (calculadas en vivo a partir
+    de Importacion/Parcial/ParcialLinea) -- gateado igual que los demás
+    seeds, si ya hay datos no hace nada."""
+    if CompraHistorica.query.count() > 0:
+        return
+    if not os.path.isfile(HISTORICO_COMPRAS_EXCEL):
+        print(f"[seed] No se encontró {HISTORICO_COMPRAS_EXCEL}, se omite la carga de compras históricas.")
+        return
+
+    seed_codigos_ergopyme()
+    mapeo = {c.codigo_interno: c for c in CodigoErgopyme.query.all()}
+
+    wb = openpyxl.load_workbook(HISTORICO_COMPRAS_EXCEL, data_only=True)
+    ws = wb.worksheets[0]
+
+    # Detecta la fila de encabezado buscando "CODIGO" y "UNIDADES" (en vez
+    # de asumir una fila fija) -- el archivo real trae una fila en blanco
+    # antes del encabezado. La columna "Compradora" (ACCUVISION/
+    # ACCUMEDICAL) no trae texto de encabezado -- viene justo despues de
+    # la ultima columna con nombre ("COSTO"), se ubica por posicion
+    # relativa en vez de un numero de columna fijo.
+    fila_inicio = None
+    columnas = {}
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), start=1):
+        nombres = [str(v).strip().upper() if v is not None else "" for v in row]
+        if "CODIGO" in nombres and "UNIDADES" in nombres:
+            fila_inicio = i + 1
+            for idx, nombre in enumerate(nombres):
+                if nombre:
+                    columnas[nombre] = idx
+            break
+    if fila_inicio is None:
+        print("[seed] No se encontró el encabezado esperado en historico_compras_proveedores.xlsx, se omite.")
+        return
+
+    def col(nombre, row):
+        idx = columnas.get(nombre)
+        return row[idx] if idx is not None and idx < len(row) else None
+
+    idx_costo = columnas.get("COSTO")
+    idx_compradora = (idx_costo + 1) if idx_costo is not None else None
+
+    creados = 0
+    homologados = 0
+    codigos_sin_homologar = set()
+    filas_sin_codigo = 0
+
+    for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+        if not row or all(v is None for v in row):
+            continue
+        codigo_crudo = col("CODIGO", row)
+        if codigo_crudo is None:
+            filas_sin_codigo += 1
+            continue
+        codigo = _normalizar_codigo_ergopyme(codigo_crudo)
+        if not codigo:
+            filas_sin_codigo += 1
+            continue
+
+        fecha_factura = col("FECHA", row)
+        fecha_factura = fecha_factura.date() if isinstance(fecha_factura, datetime) else None
+
+        homolog = mapeo.get(codigo)
+        proveedor_valor = col("PROVEEDOR", row)
+        proveedor_original = str(proveedor_valor).strip() if proveedor_valor is not None else ""
+        # El archivo de mapeo trae 59 códigos con Proveedor "#N/A" (una
+        # fórmula de búsqueda sin resolver en el Excel original) -- eso NO
+        # cuenta como una homologación real: se usa el proveedor tal como
+        # viene en el propio histórico (más confiable que "#N/A").
+        proveedor_mapeo = (homolog.proveedor_nombre or "").strip() if homolog else ""
+        if homolog and proveedor_mapeo and proveedor_mapeo.upper() != "#N/A":
+            proveedor_homologado = proveedor_mapeo
+            codigo_proveedor = homolog.codigo_proveedor or ""
+            homologados += 1
+        else:
+            proveedor_homologado = proveedor_original
+            codigo_proveedor = (homolog.codigo_proveedor or "") if homolog else ""
+            codigos_sin_homologar.add(codigo)
+
+        def num(nombre):
+            v = col(nombre, row)
+            try:
+                return float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        compradora_valor = row[idx_compradora] if idx_compradora is not None and idx_compradora < len(row) else None
+
+        db.session.add(CompraHistorica(
+            fecha_factura=fecha_factura,
+            mes_anio=str(col("MES AÑO", row) or "").strip(),
+            proveedor_original=proveedor_original,
+            proveedor_homologado=proveedor_homologado,
+            factura=str(col("FACTURA", row) or "").strip(),
+            tipo_cambio=num("USD TIPO CAMBIO"),
+            paridad_eur=num("PARIDAD EUR"),
+            transporte=str(col("TRANSPORTE", row) or "").strip(),
+            codigo_interno=codigo,
+            codigo_proveedor=codigo_proveedor,
+            descripcion=str(col("DESCRIPCION", row) or "").strip(),
+            tipo_flete=str(col("TIPO FLETE", row) or "").strip(),
+            unidades=num("UNIDADES"),
+            total_invoice=num("TOTAL IVOICE EU"),
+            total_usd=num("US$"),
+            flete_usd=num("FLETE"),
+            seguro_usd=num("SEGURO"),
+            cif_usd=num("C.I.F."),
+            cif_clp=num("C.I.F. $"),
+            derechos_clp=num("DERECHOS  $"),
+            otros_gastos_clp=num("OTROS GASTOS $"),
+            costo_total_clp=num("TOTAL COSTO $"),
+            costo_unitario_clp=num("COSTO UNITARIO $"),
+            categoria=str(col("LINEA", row) or "").strip(),
+            otros_costos_usd=num("OTROS COSTOS USD$"),
+            empresa_compradora=str(compradora_valor or "").strip(),
+            homologado=bool(homolog and proveedor_mapeo and proveedor_mapeo.upper() != "#N/A"),
+        ))
+        creados += 1
+
+    db.session.commit()
+    print(
+        f"[seed] Importadas {creados} línea(s) de compras históricas "
+        f"({homologados} homologadas contra el mapeo Ergopyme, "
+        f"{len(codigos_sin_homologar)} código(s) distintos sin homologar, "
+        f"{filas_sin_codigo} fila(s) sin código omitidas)."
+    )
+    if codigos_sin_homologar:
+        print(f"[seed] Códigos históricos sin homologar: {sorted(codigos_sin_homologar)}")
+
+
 # Contraseña temporal del Administrador inicial (ronda R, 2026-09-12) --
 # ver seed_administrador_inicial() abajo. Puramente informativa aca (el
 # usuario la cambia desde "Mi cuenta" apenas entra la primera vez); no es
@@ -1420,6 +1633,8 @@ with app.app_context():
     seed_homologacion_y_stock_inicial()
     seed_administrador_inicial()
     reparar_datos_ronda_w()
+    seed_codigos_ergopyme()
+    seed_compras_historicas()
 
 
 # ---------------------------------------------------------------------------
@@ -5357,12 +5572,20 @@ def _pedido_por_codigo():
     """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
     clientes (columna 'Pedido'), sumadas por (empresa_id, codigo_interno) a
     partir de PedidoComprometido -- puede haber varias filas para el mismo
-    código (un pedido de cliente distinto cada una)."""
+    código (un pedido de cliente distinto cada una).
+
+    Ronda AA (2026-09-13): tambien devuelve la descripcion de cada codigo
+    (la primera que encuentre) -- se usa en stock_list para poder armar una
+    fila aunque ese codigo nunca haya aparecido en un reporte de Stock (ver
+    "codigos con Pedido pero sin Stock cargado" abajo)."""
     resultado = {}
+    descripciones = {}
     for p in PedidoComprometido.query.all():
         clave = (p.empresa_id, p.codigo_interno)
         resultado[clave] = resultado.get(clave, 0) + (p.cantidad or 0)
-    return resultado
+        if p.descripcion and clave not in descripciones:
+            descripciones[clave] = p.descripcion
+    return resultado, descripciones
 
 
 def _estados_homologacion_por_codigo():
@@ -5480,7 +5703,7 @@ def stock_list():
     # (B) / Pedido (C) / Stock total (D = A+B-C), agregadas sobre cada
     # grupo ya armado arriba.
     transito_por_linea = _transito_por_linea()
-    pedido_por_codigo = _pedido_por_codigo()
+    pedido_por_codigo, descripcion_pedido_por_codigo = _pedido_por_codigo()
     for grupo in grupos.values():
         transito_info = transito_por_linea.get((grupo["_producto_id"], grupo["_variante_codigo"]), None)
         grupo["stock_actual"] = grupo["stock_total"]
@@ -5490,6 +5713,51 @@ def stock_list():
         )
         grupo["pedido"] = pedido_por_codigo.get((grupo["empresa"].id if grupo["empresa"] else None, grupo["codigo_interno"]), 0)
         grupo["stock_total_proyectado"] = grupo["stock_actual"] + grupo["transito"] - grupo["pedido"]
+
+    # Ronda AA (2026-09-13): un codigo puede tener unidades comprometidas en
+    # "Notas de pedido" sin tener NINGUNA fila en el ultimo reporte de Stock
+    # cargado (ej. se agoto y se cayo del reporte de Inventarios, o es un
+    # codigo nuevo que todavia no aparecio en Stock) -- sin esto, esas
+    # unidades quedaban invisibles en Consulta de Stock (no habia ningun
+    # grupo al que sumarselas, ver validacion real hecha contra "Notas de
+    # pedidos.xlsx": 26 de las 154 unidades del archivo, en 7 codigos
+    # distintos, no aparecian en ningun lado de la pantalla). Se arma una
+    # fila "sintetica" (Stock actual = 0, Transito = 0) solo para poder
+    # mostrar el Pedido pendiente -- se omite si hay un filtro de Proveedor
+    # activo (estos codigos no tienen proveedor conocido) y respeta los
+    # filtros de Empresa/busqueda ya aplicados.
+    if not proveedor_id:
+        codigos_cubiertos = {(f.empresa_id, f.codigo_interno) for f in filas}
+        empresas_por_id = {e.id: e for e in Empresa.query.all()}
+        q_lower = q.lower() if q else ""
+        for (emp_id, codigo), cantidad_pedido in pedido_por_codigo.items():
+            if not cantidad_pedido or (emp_id, codigo) in codigos_cubiertos:
+                continue
+            if empresa_id and str(emp_id) != str(empresa_id):
+                continue
+            descripcion_pend = descripcion_pedido_por_codigo.get((emp_id, codigo), "")
+            if q_lower and q_lower not in (descripcion_pend or "").lower() and q_lower not in (codigo or "").lower():
+                continue
+            grupos[("pedido_sin_stock", codigo, emp_id)] = {
+                "empresa": empresas_por_id.get(emp_id),
+                "proveedor_id": None,
+                "proveedor_nombre": None,
+                "codigo": None,
+                "codigo_interno": codigo,
+                "descripcion": descripcion_pend,
+                "stock_total": 0,
+                "proximo_vencimiento": None,
+                "lotes": [],
+                "homologado": False,
+                "sin_stock_cargado": True,
+                "_producto_id": None,
+                "_variante_codigo": None,
+                "stock_actual": 0,
+                "transito": 0,
+                "transito_detalle": "",
+                "pedido": cantidad_pedido,
+                "stock_total_proyectado": 0 + 0 - cantidad_pedido,
+            }
 
     resultado = sorted(grupos.values(), key=lambda g: (g["proveedor_nombre"] or "", g["descripcion"] or ""))
     empresas = Empresa.query.order_by(Empresa.nombre).all()
@@ -5904,6 +6172,173 @@ def admin_reset_ejecutar():
     partes = _ejecutar_reset(categorias)
     flash("Borrado: " + "; ".join(partes) + ".", "success")
     return redirect(url_for("dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# Reportes (ronda AA, 2026-09-13)
+# ---------------------------------------------------------------------------
+
+def _proveedores_reporte_compras():
+    """Lista de proveedores para el filtro del reporte Compras Proveedor:
+    los del catálogo activo + los que aparecen ya homologados en el
+    histórico cargado -- para no dejar fuera un proveedor antiguo que ya
+    no está en el catálogo (ej. una relación comercial discontinuada)."""
+    nombres = {p.nombre for p in Proveedor.query.filter_by(activo=True).all()}
+    nombres |= {
+        r[0] for r in db.session.query(CompraHistorica.proveedor_homologado)
+        .filter(
+            CompraHistorica.proveedor_homologado.isnot(None),
+            CompraHistorica.proveedor_homologado != "",
+            db.func.upper(CompraHistorica.proveedor_homologado) != "#N/A",
+        ).distinct()
+    }
+    return sorted(nombres)
+
+
+def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
+    """Ronda AA (2026-09-13): compras hechas DESDE la plataforma
+    (Importacion/Parcial/ParcialLinea, vía costing.py), transformadas a
+    filas con la MISMA forma que CompraHistorica -- así el reporte
+    "Compras Proveedor" combina ambas fuentes sin duplicar nada. De acá en
+    adelante, cada Costeo que se genere en el sistema alimenta este mismo
+    reporte automáticamente, sin tener que recargar ni recapturar nada."""
+    query = Importacion.query
+    if proveedor:
+        query = query.join(Proveedor).filter(db.func.upper(Proveedor.nombre) == proveedor.upper())
+    if fecha_desde:
+        query = query.filter(Importacion.fecha_factura >= fecha_desde)
+    if fecha_hasta:
+        query = query.filter(Importacion.fecha_factura <= fecha_hasta)
+
+    filas = []
+    for importacion in query.all():
+        if importacion.parciales.count() == 0:
+            continue
+        try:
+            costeo = costing.calcular_costeo(importacion)
+        except Exception:
+            continue
+        proveedor_nombre = importacion.proveedor.nombre if importacion.proveedor else ""
+        empresa_nombre = importacion.empresa.nombre.upper() if importacion.empresa else "SIN ASIGNAR"
+        for info in costeo["lineas"]:
+            linea = info["linea"]
+            codigo = _codigo_interno_homologado(linea) or (linea.codigo or "")
+            filas.append({
+                "origen": "Sistema",
+                "fecha_factura": importacion.fecha_factura,
+                "proveedor": proveedor_nombre,
+                "factura": importacion.numero_factura,
+                "codigo_interno": codigo,
+                "descripcion": linea.descripcion,
+                "unidades": linea.cantidad_unidades or 0,
+                "total_invoice": linea.valor_total_moneda,
+                "total_usd": info["valor_usd"],
+                "costo_total_clp": info["costo_total_clp"],
+                "costo_unitario_clp": info["costo_unitario_clp"],
+                "empresa_compradora": empresa_nombre,
+                "categoria": "",
+                "tipo_flete": "",
+                "homologado": None,
+            })
+    return filas
+
+
+@app.route("/reportes")
+@requiere_permiso("reportes")
+def reportes_index():
+    return redirect(url_for("reportes_compras_proveedor"))
+
+
+@app.route("/reportes/compras-proveedor")
+@requiere_permiso("reportes")
+def reportes_compras_proveedor():
+    """Ronda AA (2026-09-13): primer reporte del menú "Reportes" -- combina
+    el histórico de compras a proveedores (cargado una vez desde el Excel
+    de referencia del usuario, homologado por código Ergopyme) con las
+    compras hechas DESDE la plataforma (calculadas en vivo desde Costeo de
+    Importaciones), filtrable por Proveedor / Empresa compradora / rango
+    de fechas de factura."""
+    proveedor = request.args.get("proveedor", "").strip()
+    empresa = request.args.get("empresa", "").strip()
+    fecha_desde_txt = request.args.get("fecha_desde", "")
+    fecha_hasta_txt = request.args.get("fecha_hasta", "")
+    fecha_desde = parse_date(fecha_desde_txt)
+    fecha_hasta = parse_date(fecha_hasta_txt)
+
+    query = CompraHistorica.query
+    if proveedor:
+        query = query.filter(db.func.upper(CompraHistorica.proveedor_homologado) == proveedor.upper())
+    if empresa:
+        query = query.filter(db.func.upper(CompraHistorica.empresa_compradora) == empresa.upper())
+    if fecha_desde:
+        query = query.filter(CompraHistorica.fecha_factura >= fecha_desde)
+    if fecha_hasta:
+        query = query.filter(CompraHistorica.fecha_factura <= fecha_hasta)
+
+    filas = [
+        {
+            "origen": "Histórico",
+            "fecha_factura": c.fecha_factura,
+            "proveedor": c.proveedor_homologado or c.proveedor_original,
+            "factura": c.factura,
+            "codigo_interno": c.codigo_interno,
+            "descripcion": c.descripcion,
+            "unidades": c.unidades or 0,
+            "total_invoice": c.total_invoice,
+            "total_usd": c.total_usd,
+            "costo_total_clp": c.costo_total_clp,
+            "costo_unitario_clp": c.costo_unitario_clp,
+            "empresa_compradora": c.empresa_compradora,
+            "categoria": c.categoria,
+            "tipo_flete": c.tipo_flete,
+            "homologado": c.homologado,
+        }
+        for c in query.all()
+    ]
+    filas += _compras_sistema(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
+    if empresa:
+        filas = [f for f in filas if (f["empresa_compradora"] or "").upper() == empresa.upper()]
+
+    resumen_proveedor = defaultdict(lambda: {"unidades": 0, "costo_total_clp": 0, "facturas": set(), "lineas": 0})
+    for f in filas:
+        r = resumen_proveedor[f["proveedor"] or "(sin proveedor)"]
+        r["unidades"] += f["unidades"] or 0
+        r["costo_total_clp"] += f["costo_total_clp"] or 0
+        if f["factura"]:
+            r["facturas"].add(f["factura"])
+        r["lineas"] += 1
+
+    resumen = sorted(
+        (
+            {
+                "proveedor": p, "unidades": v["unidades"], "costo_total_clp": v["costo_total_clp"],
+                "facturas": len(v["facturas"]), "lineas": v["lineas"],
+            }
+            for p, v in resumen_proveedor.items()
+        ),
+        key=lambda r: -r["costo_total_clp"],
+    )
+
+    totales = {
+        "unidades": sum(f["unidades"] or 0 for f in filas),
+        "costo_total_clp": sum(f["costo_total_clp"] or 0 for f in filas),
+        "facturas": len({f["factura"] for f in filas if f["factura"]}),
+        "lineas": len(filas),
+    }
+    sin_homologar = sum(1 for f in filas if f.get("homologado") is False)
+
+    detalle_completo = sorted(filas, key=lambda f: (f["fecha_factura"] or date.min), reverse=True)
+    LIMITE_DETALLE = 500
+    detalle = detalle_completo[:LIMITE_DETALLE]
+
+    return render_template(
+        "reportes/compras_proveedor.html",
+        resumen=resumen, totales=totales, detalle=detalle,
+        proveedores=_proveedores_reporte_compras(), empresas=Empresa.query.order_by(Empresa.nombre).all(),
+        proveedor_sel=proveedor, empresa_sel=empresa,
+        fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
+        sin_homologar=sin_homologar, total_filas=len(filas), limite_detalle=LIMITE_DETALLE,
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,193 @@
+{% extends "base.html" %}
+{% block title %}Compras Proveedor · Suite Logística{% endblock %}
+{% block content %}
+
+<style>
+  .badge-origen-sistema {
+    background-color: var(--brand);
+    color: #fff;
+  }
+</style>
+
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-0">Reportes · Compras Proveedor</h3>
+    <div class="text-muted small">
+      Histórico de compras/importaciones a proveedores (desde 2023) combinado con las compras hechas
+      desde esta plataforma -- a medida que generes nuevas Órdenes de Compra y Costeos, se suman solas acá.
+    </div>
+  </div>
+</div>
+
+{% if sin_homologar %}
+<div class="alert alert-warning small">
+  <i class="bi bi-exclamation-triangle me-1"></i>
+  {{ sin_homologar }} línea(s) del histórico no se pudieron homologar contra el mapeo de códigos Ergopyme
+  (el proveedor se muestra tal como venía en el archivo original de todas formas, así no falta ningún dato).
+</div>
+{% endif %}
+
+<form class="row g-2 mb-3 align-items-end">
+  <div class="col-auto">
+    <label class="form-label small mb-0">Proveedor</label>
+    <select class="form-select" name="proveedor" onchange="this.form.submit()">
+      <option value="">Todos</option>
+      {% for p in proveedores %}
+      <option value="{{ p }}" {% if proveedor_sel == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Empresa compradora</label>
+    <select class="form-select" name="empresa" onchange="this.form.submit()">
+      <option value="">Todas</option>
+      {% for e in empresas %}
+      <option value="{{ e.nombre }}" {% if empresa_sel|upper == e.nombre|upper %}selected{% endif %}>{{ e.nombre }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Fecha factura desde</label>
+    <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}" onchange="this.form.submit()">
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Fecha factura hasta</label>
+    <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}" onchange="this.form.submit()">
+  </div>
+  {% if proveedor_sel or empresa_sel or fecha_desde or fecha_hasta %}
+  <div class="col-auto">
+    <a href="{{ url_for('reportes_compras_proveedor') }}" class="btn btn-outline-secondary">Quitar filtros</a>
+  </div>
+  {% endif %}
+</form>
+
+<div class="row g-3 mb-3">
+  <div class="col-md-3">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Unidades compradas</div>
+      <div class="stat-value fs-4">{{ totales.unidades | numero_flex }}</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Costo total (CLP)</div>
+      <div class="stat-value fs-4">{{ totales.costo_total_clp | clp }}</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">N° de facturas</div>
+      <div class="stat-value fs-4">{{ totales.facturas }}</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">N° de líneas</div>
+      <div class="stat-value fs-4">{{ totales.lineas }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="fw-semibold mb-2">Resumen por proveedor</div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Proveedor</th>
+          <th class="text-end">Unidades</th>
+          <th class="text-end">N° facturas</th>
+          <th class="text-end">N° líneas</th>
+          <th class="text-end">Costo total (CLP)</th>
+          <th class="text-end">% del total</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in resumen %}
+        <tr>
+          <td>
+            <a href="{{ url_for('reportes_compras_proveedor', proveedor=r.proveedor, empresa=empresa_sel, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}">
+              {{ r.proveedor }}
+            </a>
+          </td>
+          <td class="text-end">{{ r.unidades | numero_flex }}</td>
+          <td class="text-end">{{ r.facturas }}</td>
+          <td class="text-end">{{ r.lineas }}</td>
+          <td class="text-end fw-semibold">{{ r.costo_total_clp | clp }}</td>
+          <td class="text-end text-muted">
+            {{ ((r.costo_total_clp / totales.costo_total_clp * 100) if totales.costo_total_clp else 0) | round(1) }}%
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted py-4">No hay compras que coincidan con los filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card p-3">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <div class="fw-semibold">Detalle de líneas</div>
+    {% if total_filas > limite_detalle %}
+    <div class="text-muted small">Mostrando las {{ limite_detalle }} más recientes de {{ total_filas }} -- usa los filtros de arriba para acotar.</div>
+    {% endif %}
+  </div>
+  <div class="table-responsive" style="max-height: 520px; overflow-y: auto;">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead class="table-dark">
+        <tr>
+          <th>Origen</th>
+          <th>Fecha factura</th>
+          <th>Proveedor</th>
+          <th>N° Factura</th>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th class="text-end">Unidades</th>
+          <th class="text-end">Costo unitario (CLP)</th>
+          <th class="text-end">Costo total (CLP)</th>
+          <th>Empresa</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in detalle %}
+        <tr class="{% if f.homologado == false %}text-muted{% endif %}">
+          <td>
+            {% if f.origen == 'Sistema' %}
+            <span class="badge badge-origen-sistema">Sistema</span>
+            {% else %}
+            <span class="badge bg-secondary">Histórico</span>
+            {% endif %}
+          </td>
+          <td>{{ f.fecha_factura.strftime('%d-%m-%Y') if f.fecha_factura else '-' }}</td>
+          <td>
+            {{ f.proveedor or '-' }}
+            {% if f.homologado == false %}
+            <i class="bi bi-question-circle text-warning ms-1" data-bs-toggle="tooltip" title="No se pudo homologar contra el mapeo de códigos Ergopyme."></i>
+            {% endif %}
+          </td>
+          <td>{{ f.factura or '-' }}</td>
+          <td>{{ f.codigo_interno or '-' }}</td>
+          <td style="max-width: 320px;">{{ f.descripcion }}</td>
+          <td class="text-end">{{ f.unidades | numero_flex }}</td>
+          <td class="text-end">{{ f.costo_unitario_clp | clp }}</td>
+          <td class="text-end fw-semibold">{{ f.costo_total_clp | clp }}</td>
+          <td>{{ f.empresa_compradora or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="10" class="text-center text-muted py-4">Sin resultados.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+  try { new bootstrap.Tooltip(el); } catch (e) {}
+});
+</script>
+{% endblock %}
