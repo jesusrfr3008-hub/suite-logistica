@@ -86,6 +86,12 @@ CODIGOS_ERGOPYME_EXCEL = os.path.join(BASE_DIR, "codigos_ergopyme_homologacion.x
 #    sistema (una fila por linea de producto de cada factura, 2023-2026),
 #    homologado contra (1) al cargarse.
 HISTORICO_COMPRAS_EXCEL = os.path.join(BASE_DIR, "historico_compras_proveedores.xlsx")
+# 3) Ronda AC (2026-09-14): planilla de referencia que mantiene el usuario
+#    con la moneda HABITUAL de cada proveedor extranjero (USD/EURO) -- se
+#    usa solo como DESEMPATE al elegir en qué moneda expresar un resumen
+#    (ver _moneda_dominante), nunca como fuente principal: la moneda de
+#    cada línea/factura se sigue determinando por su propia paridad.
+MONEDA_PROVEEDOR_EXCEL = os.path.join(BASE_DIR, "moneda_proveedor.xlsx")
 
 app = Flask(__name__)
 # Soporte Postgres (ronda M, 2026-09-10): si existe la variable de entorno
@@ -4802,6 +4808,183 @@ def _derecho_u_otro_costo_en_moneda(valor_clp, tipo_cambio, paridad):
     return valor_usd, valor_moneda
 
 
+def _paridad_efectiva_historica(c):
+    """Ronda AC (2026-09-14): corrige un bug real detectado por el usuario
+    -- 54 líneas del histórico traen la columna "Paridad EUR" en 0 (dato
+    faltante en el Excel original, no una operación en USD), y el código
+    anterior interpretaba ese 0 como "paridad 1 = USD", mostrando como
+    dólar una compra que en realidad era en euros (ej. DORC, código
+    8310.25G12_01, facturas CD100058713/CD100059451: TODAS sus líneas
+    tienen paridad 0, pero el proveedor jamás compra en USD).
+
+    Fuente principal: la paridad tal como viene en el archivo (así lo pidió
+    el usuario: "para definir la moneda tiene que ver ese campo de
+    paridad"). Solo cuando esa paridad viene en 0/vacía, se reconstruye
+    dividiendo Total Invoice (columna R, moneda de factura) por el propio
+    Total USD (columna S) -- validado contra los datos reales: para TODA
+    fila con paridad ya informada, ese cociente reproduce la paridad
+    original casi exacto (la propia planilla del usuario calculó la
+    columna S dividiendo R por la paridad real, aunque la columna F haya
+    quedado en blanco para esa fila en particular)."""
+    paridad = c.paridad_eur
+    if paridad:
+        return paridad
+    if c.total_usd:
+        try:
+            return c.total_invoice / c.total_usd
+        except (TypeError, ZeroDivisionError):
+            return 1.0
+    return 1.0
+
+
+def _normalizar_nombre_proveedor_moneda(nombre):
+    """Normaliza un nombre de proveedor para poder cruzarlo contra
+    moneda_proveedor.xlsx tolerando las variantes que conviven en este
+    sistema (ej. catálogo "BVI BEAVER" vs histórico "BEAVER", catálogo
+    "CUSTOM SURGICAL" vs archivo "CUSTOMS SURGICAL", "BAUSCH" vs
+    "BAUSCH + LOMB")."""
+    n = (nombre or "").strip().upper()
+    n = n.replace("+", " ")
+    n = re.sub(r"[^A-Z0-9 ]", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    if n.startswith("BVI "):
+        n = n[4:]
+    # Quita un plural simple palabra por palabra (CUSTOMS -> CUSTOM) para
+    # tolerar esa variante puntual sin tener que hardcodear un alias.
+    palabras = [p[:-1] if len(p) > 4 and p.endswith("S") else p for p in n.split(" ")]
+    return " ".join(palabras)
+
+
+def _moneda_recurrente_proveedores():
+    """Ronda AC (2026-09-14): lee moneda_proveedor.xlsx (planilla que
+    mantiene el usuario con la moneda HABITUAL de cada proveedor
+    extranjero) -- se usa únicamente como desempate en _moneda_dominante,
+    nunca como fuente principal."""
+    resultado = {}
+    if not os.path.isfile(MONEDA_PROVEEDOR_EXCEL):
+        return resultado
+    wb = openpyxl.load_workbook(MONEDA_PROVEEDOR_EXCEL, data_only=True)
+    ws = wb.worksheets[0]
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or row[0] is None:
+            continue
+        nombre = str(row[0]).strip()
+        moneda_valor = str(row[1]).strip().upper() if len(row) > 1 and row[1] is not None else ""
+        moneda = "EUR" if moneda_valor.startswith("EUR") else ("USD" if moneda_valor.startswith("USD") else None)
+        if nombre and moneda:
+            resultado[_normalizar_nombre_proveedor_moneda(nombre)] = moneda
+    return resultado
+
+
+def _moneda_recurrente(nombre, mapa=None):
+    """Moneda habitual del proveedor `nombre` según moneda_proveedor.xlsx,
+    o None si no aparece ahí (tolera variantes de nombre, ver
+    _normalizar_nombre_proveedor_moneda)."""
+    if not nombre:
+        return None
+    mapa = mapa if mapa is not None else _moneda_recurrente_proveedores()
+    clave = _normalizar_nombre_proveedor_moneda(nombre)
+    if clave in mapa:
+        return mapa[clave]
+    for clave_archivo, moneda in mapa.items():
+        if clave == clave_archivo:
+            return moneda
+        if clave.startswith(clave_archivo + " ") or clave_archivo.startswith(clave + " "):
+            return moneda
+        if clave in clave_archivo or clave_archivo in clave:
+            return moneda
+    return None
+
+
+def _moneda_dominante(filas, proveedor_nombre=None, mapa_recurrente=None):
+    """Ronda AC (2026-09-14): determina en qué moneda expresar los totales
+    de un conjunto de filas de UN mismo proveedor (ya filtradas por fecha)
+    -- regla exacta del usuario: se cuenta en cuántas FACTURAS distintas
+    predominó cada moneda (nunca líneas sueltas -- una factura completa es
+    en una sola moneda) y gana la que más se repite en el rango. Empate ->
+    la moneda "habitual" de ese proveedor (moneda_proveedor.xlsx). Sin
+    datos de ningún tipo -> USD."""
+    facturas_por_moneda = defaultdict(set)
+    for f in filas:
+        factura = f.get("factura") or f"(sin-factura-{id(f)})"
+        facturas_por_moneda[f.get("moneda_operacion") or "USD"].add(factura)
+    usd_n = len(facturas_por_moneda.get("USD", ()))
+    eur_n = len(facturas_por_moneda.get("EUR", ()))
+    if usd_n > eur_n:
+        return "USD"
+    if eur_n > usd_n:
+        return "EUR"
+    if usd_n == 0 and eur_n == 0:
+        return "USD"
+    return _moneda_recurrente(proveedor_nombre, mapa_recurrente) or "USD"
+
+
+def _paridad_representativa_eur(filas):
+    """Paridad EUR "representativa" del corte actual -- promedio de las
+    paridades reales de las facturas en EUR, ponderado por su propio monto
+    en USD. Se usa solo para el caso raro de tener que expresar en EUR una
+    factura que realmente fue en USD (esa factura, por definición, no trae
+    una tasa EUR propia -- se aproxima con la tasa que sí manejó ese mismo
+    proveedor en fechas cercanas dentro del mismo corte)."""
+    total_peso = 0.0
+    acumulado = 0.0
+    for f in filas:
+        if (f.get("moneda_operacion") or "USD") == "EUR":
+            peso = f.get("total_usd") or 0
+            acumulado += (f.get("paridad") or 1.0) * peso
+            total_peso += peso
+    return (acumulado / total_peso) if total_peso else 1.0
+
+
+def _valor_en_moneda_dominante(valor_usd, moneda_fila, moneda_dominante, paridad_fila, paridad_representativa):
+    """Convierte un monto ya expresado en USD (total_usd/derechos_usd/
+    flete_usd/otros_gastos_usd -- todos disponibles siempre, sin importar
+    la moneda original de la factura) a la moneda dominante del corte
+    actual. Si la propia fila ya está en esa moneda, la conversión es
+    EXACTA (se usa la paridad real de esa factura). Si está en la moneda
+    contraria (caso raro dentro de un mismo proveedor), se aproxima con la
+    paridad representativa del corte."""
+    if moneda_dominante == "USD":
+        return valor_usd or 0
+    paridad = paridad_fila if moneda_fila == "EUR" else (paridad_representativa or paridad_fila or 1.0)
+    return (valor_usd or 0) * paridad
+
+
+def _totales_en_moneda(filas, moneda_dominante, paridad_representativa):
+    """Arma las 5 métricas del resumen (Cantidad de productos, Total
+    Invoice, Flete [+ % del Total Invoice], Derechos, Otros costos) para un
+    conjunto de filas, todas expresadas en `moneda_dominante`. Incluye
+    también el equivalente en USD del Total Invoice (total_invoice_usd_ref)
+    -- siempre exacto sin importar la moneda mostrada -- para poder
+    ordenar/calcular "% del total" entre proveedores que muestran monedas
+    distintas sin mezclar peras con manzanas."""
+    total = flete = derechos = otros = 0.0
+    total_usd_ref = 0.0
+    for f in filas:
+        mf = f.get("moneda_operacion") or "USD"
+        pf = f.get("paridad") or 1.0
+        total_usd_ref += f.get("total_usd") or 0
+        total += _valor_en_moneda_dominante(f.get("total_usd"), mf, moneda_dominante, pf, paridad_representativa)
+        flete += _valor_en_moneda_dominante(f.get("flete_usd"), mf, moneda_dominante, pf, paridad_representativa)
+        derechos += _valor_en_moneda_dominante(f.get("derechos_usd"), mf, moneda_dominante, pf, paridad_representativa)
+        otros += _valor_en_moneda_dominante(f.get("otros_gastos_usd"), mf, moneda_dominante, pf, paridad_representativa)
+    productos = {
+        (f.get("codigo_producto") or f.get("descripcion") or "").strip().upper()
+        for f in filas if (f.get("codigo_producto") or f.get("descripcion"))
+    }
+    return {
+        "moneda": moneda_dominante,
+        "simbolo": "€" if moneda_dominante == "EUR" else "US$",
+        "cantidad_productos": len(productos),
+        "total_invoice": total,
+        "total_invoice_usd_ref": total_usd_ref,
+        "flete": flete,
+        "flete_pct": (flete / total * 100) if total else 0,
+        "derechos": derechos,
+        "otros_gastos": otros,
+    }
+
+
 def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
     """Arma el Excel de carga al sistema de Inventarios: mismos encabezados
     y misma cadena de conversión de moneda (factura -> USD -> CLP) que la
@@ -6369,13 +6552,19 @@ def _fila_historica_dict(c, homologar):
         via_ergopyme = False
         homologado = False
 
+    # Ronda AC (2026-09-14): la paridad EFECTIVA (no la cruda) es la que
+    # define la moneda y las conversiones -- corrige el caso de las 54
+    # líneas con "Paridad EUR" en 0 (dato faltante, no una compra en USD;
+    # ver _paridad_efectiva_historica).
+    paridad_efectiva = _paridad_efectiva_historica(c)
+
     # Derechos y Otros gastos vienen en CLP en el histórico (columnas
     # "DERECHOS $" y "OTROS GASTOS $") -- se convierten a USD y a la
     # moneda de la propia operación (USD o EUR según la paridad de esa
     # línea) con la fórmula que confirmó el usuario (ver
     # _derecho_u_otro_costo_en_moneda).
-    derechos_usd, derechos_moneda = _derecho_u_otro_costo_en_moneda(c.derechos_clp, c.tipo_cambio, c.paridad_eur)
-    otros_usd, otros_moneda = _derecho_u_otro_costo_en_moneda(c.otros_gastos_clp, c.tipo_cambio, c.paridad_eur)
+    derechos_usd, derechos_moneda = _derecho_u_otro_costo_en_moneda(c.derechos_clp, c.tipo_cambio, paridad_efectiva)
+    otros_usd, otros_moneda = _derecho_u_otro_costo_en_moneda(c.otros_gastos_clp, c.tipo_cambio, paridad_efectiva)
 
     return {
         "origen": "Histórico",
@@ -6388,9 +6577,9 @@ def _fila_historica_dict(c, homologar):
         "unidades": c.unidades or 0,
         "total_invoice": c.total_invoice or 0,
         "total_usd": c.total_usd or 0,
-        "moneda_operacion": _moneda_operacion(c.paridad_eur),
+        "moneda_operacion": _moneda_operacion(paridad_efectiva),
         "tipo_cambio": c.tipo_cambio,
-        "paridad": c.paridad_eur,
+        "paridad": paridad_efectiva,
         "flete_usd": c.flete_usd or 0,
         "derechos_usd": derechos_usd,
         "derechos_moneda": derechos_moneda,
@@ -6474,59 +6663,44 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
     return filas
 
 
-def _resumen_por_proveedor(filas):
-    """Ronda AB (2026-09-14): agrega, por proveedor, exactamente las 5
-    métricas que pidió el usuario para el resumen (cantidad de productos
-    distintos, Total Invoice / Flete / Derechos / Otros costos -- todo
-    convertido a USD para poder sumar proveedores que mezclan facturas en
-    USD y en EUR, tal como el usuario confirmó: "Convertir todo a USD")."""
-    agregados = defaultdict(lambda: {
-        "productos": set(), "total_invoice_usd": 0.0,
-        "flete_usd": 0.0, "derechos_usd": 0.0, "otros_gastos_usd": 0.0,
-    })
+def _totales_reporte(filas, proveedor_nombre=None, mapa_recurrente=None):
+    """Ronda AC (2026-09-14): arma las 5 métricas del resumen (Cantidad de
+    productos, Total Invoice, Flete, Derechos, Otros costos) para un
+    conjunto de filas. Ya NO fuerza todo a USD: cuando `filas` pertenece a
+    UN proveedor puntual (se pasa `proveedor_nombre`), se resuelve la
+    moneda DOMINANTE de ese corte (ver _moneda_dominante -- cuenta
+    facturas, no líneas) y todo se expresa en esa moneda. Cuando no hay un
+    proveedor puntual (la vista general, sin filtrar), se usa USD -- es la
+    única forma sensata de sumar proveedores que operan en monedas
+    distintas entre sí."""
+    if proveedor_nombre:
+        moneda = _moneda_dominante(filas, proveedor_nombre, mapa_recurrente)
+        paridad_rep = _paridad_representativa_eur(filas) if moneda == "EUR" else 1.0
+    else:
+        moneda, paridad_rep = "USD", 1.0
+    return _totales_en_moneda(filas, moneda, paridad_rep)
+
+
+def _resumen_por_proveedor(filas, mapa_recurrente=None):
+    """Ronda AB (2026-09-13), corregido en ronda AC (2026-09-14): agrupa
+    por proveedor y arma las mismas 5 métricas que _totales_reporte, pero
+    cada proveedor en SU PROPIA moneda dominante (antes se forzaba todo a
+    USD parejo, lo que mostraba como "USD" o "MIXTO" compras que en
+    realidad son 100% en euros -- ver _moneda_dominante). El orden y el
+    "% del total" siguen usando el equivalente en USD (total_invoice_usd_ref,
+    siempre exacto sin importar la moneda que se muestra) para poder
+    comparar proveedores que se expresan en monedas distintas entre sí."""
+    mapa_recurrente = mapa_recurrente if mapa_recurrente is not None else _moneda_recurrente_proveedores()
+    agrupado = defaultdict(list)
     for f in filas:
-        a = agregados[f["proveedor"] or "(sin proveedor)"]
-        clave_producto = (f.get("codigo_producto") or f.get("descripcion") or "").strip().upper()
-        if clave_producto:
-            a["productos"].add(clave_producto)
-        a["total_invoice_usd"] += f.get("total_usd") or 0
-        a["flete_usd"] += f.get("flete_usd") or 0
-        a["derechos_usd"] += f.get("derechos_usd") or 0
-        a["otros_gastos_usd"] += f.get("otros_gastos_usd") or 0
+        agrupado[f["proveedor"] or "(sin proveedor)"].append(f)
 
     filas_resumen = []
-    for p, a in agregados.items():
-        filas_resumen.append({
-            "proveedor": p,
-            "cantidad_productos": len(a["productos"]),
-            "total_invoice_usd": a["total_invoice_usd"],
-            "flete_usd": a["flete_usd"],
-            "flete_pct": (a["flete_usd"] / a["total_invoice_usd"] * 100) if a["total_invoice_usd"] else 0,
-            "derechos_usd": a["derechos_usd"],
-            "otros_gastos_usd": a["otros_gastos_usd"],
-        })
-    return sorted(filas_resumen, key=lambda r: -r["total_invoice_usd"])
-
-
-def _totales_reporte(filas):
-    """Mismas 5 métricas que _resumen_por_proveedor pero para el conjunto
-    completo de filas (tarjetas de resumen arriba del todo)."""
-    productos = {
-        (f["proveedor"] or "", (f.get("codigo_producto") or f.get("descripcion") or "").strip().upper())
-        for f in filas if (f.get("codigo_producto") or f.get("descripcion"))
-    }
-    total_invoice_usd = sum(f.get("total_usd") or 0 for f in filas)
-    flete_usd = sum(f.get("flete_usd") or 0 for f in filas)
-    derechos_usd = sum(f.get("derechos_usd") or 0 for f in filas)
-    otros_gastos_usd = sum(f.get("otros_gastos_usd") or 0 for f in filas)
-    return {
-        "cantidad_productos": len(productos),
-        "total_invoice_usd": total_invoice_usd,
-        "flete_usd": flete_usd,
-        "flete_pct": (flete_usd / total_invoice_usd * 100) if total_invoice_usd else 0,
-        "derechos_usd": derechos_usd,
-        "otros_gastos_usd": otros_gastos_usd,
-    }
+    for p, filas_p in agrupado.items():
+        t = _totales_reporte(filas_p, proveedor_nombre=p, mapa_recurrente=mapa_recurrente)
+        t["proveedor"] = p
+        filas_resumen.append(t)
+    return sorted(filas_resumen, key=lambda r: -r["total_invoice_usd_ref"])
 
 
 def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha_hasta=None, homologar=None):
@@ -6575,13 +6749,19 @@ def reportes_compras_proveedor():
     fecha_hasta = parse_date(fecha_hasta_txt)
 
     homologar = _construir_homologador_ergopyme()
+    mapa_recurrente = _moneda_recurrente_proveedores()
     filas = _filas_reporte_compras(
         proveedor=proveedor or None, empresa=empresa or None,
         fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, homologar=homologar,
     )
 
-    resumen = _resumen_por_proveedor(filas)
-    totales = _totales_reporte(filas)
+    resumen = _resumen_por_proveedor(filas, mapa_recurrente=mapa_recurrente)
+    # Ronda AC (2026-09-14): si la pantalla ya está filtrada a UN proveedor
+    # puntual, las tarjetas de arriba usan la moneda dominante de ESE
+    # proveedor (igual que su fila en el resumen) en vez de forzar USD --
+    # solo la vista sin filtrar (mezcla de proveedores con monedas
+    # distintas entre sí) se muestra en USD.
+    totales = _totales_reporte(filas, proveedor_nombre=proveedor or None, mapa_recurrente=mapa_recurrente)
     sin_homologar = sum(1 for f in filas if f.get("homologado") is False)
 
     return render_template(
@@ -6620,9 +6800,23 @@ def reportes_compras_proveedor_detalle(proveedor):
         flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
         return redirect(url_for("reportes_compras_proveedor"))
 
-    totales = _totales_reporte(filas)
+    totales = _totales_reporte(filas, proveedor_nombre=proveedor)
+    # Ronda AC (2026-09-14): TODA la página (tarjetas de arriba, el
+    # resumen que se recalcula en vivo por JS, y la columna "Total" de
+    # cada producto en la tabla dinámica) usa la MISMA moneda dominante --
+    # la que ya resolvió _totales_reporte para este proveedor+rango de
+    # fechas -- para que nunca aparezcan dos monedas distintas en una
+    # misma pantalla. Las celdas mes a mes siguen mostrando el monto
+    # ORIGINAL de cada factura, sin convertir (así lo pidió el usuario).
+    moneda_dominante = totales["moneda"]
+    paridad_representativa = _paridad_representativa_eur(filas) if moneda_dominante == "EUR" else 1.0
 
     # --- Arma la tabla dinámica: producto (código de proveedor) x mes ---
+    # Ronda AC (2026-09-14): el "Total" de cada producto (y los montos que
+    # alimentan el resumen que se recalcula en vivo por JS) se acumulan ya
+    # convertidos a `moneda_dominante` -- las celdas mes a mes siguen
+    # guardando el monto ORIGINAL de cada factura (columna R, sin
+    # convertir), tal como pidió el usuario.
     productos = {}
     meses_set = {}
     for f in filas:
@@ -6637,32 +6831,33 @@ def reportes_compras_proveedor_detalle(proveedor):
         prod = productos.setdefault(codigo, {
             "codigo": codigo,
             "descripcion": f.get("descripcion") or "",
-            "monedas": set(),
-            "total_usd": 0.0,
-            "total_moneda": 0.0,
-            "flete_usd": 0.0,
-            "derechos_usd": 0.0,
-            "otros_gastos_usd": 0.0,
-            "meses": defaultdict(lambda: {"total_moneda": 0.0, "total_usd": 0.0}),
+            "facturas_por_moneda": defaultdict(set),
+            "total_dominante": 0.0,
+            "flete_dominante": 0.0,
+            "derechos_dominante": 0.0,
+            "otros_dominante": 0.0,
+            "meses": defaultdict(lambda: {"total_moneda": 0.0, "moneda": None}),
             "facturas": [],
         })
         if not prod["descripcion"] and f.get("descripcion"):
             prod["descripcion"] = f["descripcion"]
-        prod["monedas"].add(f.get("moneda_operacion") or "USD")
-        prod["total_usd"] += f.get("total_usd") or 0
-        prod["total_moneda"] += f.get("total_invoice") or 0
-        prod["flete_usd"] += f.get("flete_usd") or 0
-        prod["derechos_usd"] += f.get("derechos_usd") or 0
-        prod["otros_gastos_usd"] += f.get("otros_gastos_usd") or 0
+        mf = f.get("moneda_operacion") or "USD"
+        pf = f.get("paridad") or 1.0
+        if f.get("factura"):
+            prod["facturas_por_moneda"][mf].add(f["factura"])
+        prod["total_dominante"] += _valor_en_moneda_dominante(f.get("total_usd"), mf, moneda_dominante, pf, paridad_representativa)
+        prod["flete_dominante"] += _valor_en_moneda_dominante(f.get("flete_usd"), mf, moneda_dominante, pf, paridad_representativa)
+        prod["derechos_dominante"] += _valor_en_moneda_dominante(f.get("derechos_usd"), mf, moneda_dominante, pf, paridad_representativa)
+        prod["otros_dominante"] += _valor_en_moneda_dominante(f.get("otros_gastos_usd"), mf, moneda_dominante, pf, paridad_representativa)
         celda = prod["meses"][clave_mes]
         celda["total_moneda"] += f.get("total_invoice") or 0
-        celda["total_usd"] += f.get("total_usd") or 0
+        celda["moneda"] = mf if celda["moneda"] in (None, mf) else "MIXTO"
         prod["facturas"].append({
             "factura": f.get("factura") or "-",
             "fecha_factura": f["fecha_factura"],
             "unidades": f.get("unidades") or 0,
             "total_invoice": f.get("total_invoice") or 0,
-            "moneda_operacion": f.get("moneda_operacion") or "USD",
+            "moneda_operacion": mf,
             "origen": f.get("origen"),
         })
 
@@ -6674,24 +6869,26 @@ def reportes_compras_proveedor_detalle(proveedor):
 
     productos_lista = []
     for codigo, prod in productos.items():
-        moneda = next(iter(prod["monedas"])) if len(prod["monedas"]) == 1 else "MIXTO"
+        # Solo se marca "mezcla" cuando el propio producto tuvo facturas
+        # REALES en ambas monedas dentro del rango (no por forzar todo a
+        # una moneda pareja) -- caso raro, ver _paridad_efectiva_historica.
+        es_mixto = len(prod["facturas_por_moneda"]) > 1
         prod["facturas"].sort(key=lambda x: x["fecha_factura"] or date.min, reverse=True)
         productos_lista.append({
             "codigo": prod["codigo"],
             "descripcion": prod["descripcion"],
-            "moneda": moneda,
-            "total_usd": prod["total_usd"],
-            "total_moneda": prod["total_moneda"],
-            "flete_usd": prod["flete_usd"],
-            "derechos_usd": prod["derechos_usd"],
-            "otros_gastos_usd": prod["otros_gastos_usd"],
+            "es_mixto": es_mixto,
+            "total_dominante": prod["total_dominante"],
+            "flete_dominante": prod["flete_dominante"],
+            "derechos_dominante": prod["derechos_dominante"],
+            "otros_dominante": prod["otros_dominante"],
             "meses": {
-                f"{a}-{m:02d}": prod["meses"].get((a, m), {"total_moneda": 0.0, "total_usd": 0.0})
+                f"{a}-{m:02d}": prod["meses"].get((a, m), {"total_moneda": 0.0, "moneda": moneda_dominante})
                 for (a, m) in meses_ordenados
             },
             "facturas": prod["facturas"],
         })
-    productos_lista.sort(key=lambda p: -p["total_usd"])
+    productos_lista.sort(key=lambda p: -p["total_dominante"])
 
     return render_template(
         "reportes/compras_proveedor_detalle.html",

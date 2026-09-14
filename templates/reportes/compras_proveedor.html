@@ -70,48 +70,54 @@
   </div>
   <div class="col-md">
     <div class="card card-stat h-100 p-3">
-      <div class="text-muted small">Total Invoice (USD)</div>
-      <div class="stat-value fs-4">US$ {{ totales.total_invoice_usd | moneda }}</div>
+      <div class="text-muted small">Total Invoice</div>
+      <div class="stat-value fs-4">{{ totales.simbolo }} {{ totales.total_invoice | moneda }}</div>
     </div>
   </div>
   <div class="col-md">
     <div class="card card-stat h-100 p-3">
-      <div class="text-muted small">Flete (USD)</div>
-      <div class="stat-value fs-4">US$ {{ totales.flete_usd | moneda }}</div>
+      <div class="text-muted small">Flete</div>
+      <div class="stat-value fs-4">{{ totales.simbolo }} {{ totales.flete | moneda }}</div>
       <div class="text-muted small">{{ totales.flete_pct | round(1) }}% del Total Invoice</div>
     </div>
   </div>
   <div class="col-md">
     <div class="card card-stat h-100 p-3">
-      <div class="text-muted small">Derechos (USD)</div>
-      <div class="stat-value fs-4">US$ {{ totales.derechos_usd | moneda }}</div>
+      <div class="text-muted small">Derechos</div>
+      <div class="stat-value fs-4">{{ totales.simbolo }} {{ totales.derechos | moneda }}</div>
     </div>
   </div>
   <div class="col-md">
     <div class="card card-stat h-100 p-3">
-      <div class="text-muted small">Otros costos (USD)</div>
-      <div class="stat-value fs-4">US$ {{ totales.otros_gastos_usd | moneda }}</div>
+      <div class="text-muted small">Otros costos</div>
+      <div class="stat-value fs-4">{{ totales.simbolo }} {{ totales.otros_gastos | moneda }}</div>
     </div>
   </div>
 </div>
 <div class="text-muted small mb-3">
-  Total Invoice, Flete, Derechos y Otros costos se muestran convertidos a USD para poder sumar proveedores que
-  mezclan facturas en distintas monedas. Al entrar a un proveedor puntual puedes ver cada compra en su propia
-  moneda de origen.
+  {% if proveedor_sel %}
+  Cifras en {{ 'euros' if totales.moneda == 'EUR' else 'dólares' }} -- la moneda en la que más facturó
+  {{ proveedor_sel }} dentro del rango de fechas elegido (ver detalle de facturas para casos puntuales en otra moneda).
+  {% else %}
+  Cifras en dólares (USD): esta vista mezcla proveedores que operan en monedas distintas entre sí. Cada fila del
+  resumen de abajo, y la vista de cada proveedor, se muestran en la moneda en la que ese proveedor factura
+  habitualmente.
+  {% endif %}
 </div>
 
 <div class="card p-3">
   <div class="fw-semibold mb-2">Resumen por proveedor</div>
+  <div class="text-muted small mb-2">Cada proveedor se muestra en la moneda en la que más facturó dentro del rango de fechas elegido.</div>
   <div class="table-responsive">
     <table class="table table-sm table-hover align-middle mb-0">
       <thead>
         <tr>
           <th>Proveedor</th>
           <th class="text-end">Cant. productos</th>
-          <th class="text-end">Total Invoice (USD)</th>
-          <th class="text-end">Flete (USD)</th>
-          <th class="text-end">Derechos (USD)</th>
-          <th class="text-end">Otros costos (USD)</th>
+          <th class="text-end">Total Invoice</th>
+          <th class="text-end">Flete</th>
+          <th class="text-end">Derechos</th>
+          <th class="text-end">Otros costos</th>
           <th class="text-end">% del total</th>
         </tr>
       </thead>
@@ -124,12 +130,12 @@
             </a>
           </td>
           <td class="text-end">{{ r.cantidad_productos | numero_flex }}</td>
-          <td class="text-end fw-semibold">US$ {{ r.total_invoice_usd | moneda }}</td>
-          <td class="text-end">US$ {{ r.flete_usd | moneda }}</td>
-          <td class="text-end">US$ {{ r.derechos_usd | moneda }}</td>
-          <td class="text-end">US$ {{ r.otros_gastos_usd | moneda }}</td>
+          <td class="text-end fw-semibold">{{ r.simbolo }} {{ r.total_invoice | moneda }}</td>
+          <td class="text-end">{{ r.simbolo }} {{ r.flete | moneda }}</td>
+          <td class="text-end">{{ r.simbolo }} {{ r.derechos | moneda }}</td>
+          <td class="text-end">{{ r.simbolo }} {{ r.otros_gastos | moneda }}</td>
           <td class="text-end text-muted">
-            {{ ((r.total_invoice_usd / totales.total_invoice_usd * 100) if totales.total_invoice_usd else 0) | round(1) }}%
+            {{ ((r.total_invoice_usd_ref / totales.total_invoice_usd_ref * 100) if totales.total_invoice_usd_ref else 0) | round(1) }}%
           </td>
         </tr>
         {% else %}
