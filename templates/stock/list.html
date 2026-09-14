@@ -92,10 +92,13 @@
         <tr class="{% if not g.homologado %}text-muted{% endif %} {% if g.sin_stock_cargado %}table-warning{% endif %}">
           <td data-col="empresa" data-value="{{ (g.empresa.nombre if g.empresa else '')|lower }}">{{ g.empresa.nombre if g.empresa else '' }}</td>
           <td data-col="proveedor" data-value="{{ (g.proveedor_nombre or '')|lower }}">
-            {% if g.sin_stock_cargado %}
-            <span data-bs-toggle="tooltip" title="Este código tiene unidades pendientes en Notas de pedido, pero nunca apareció en el último reporte de Stock cargado.">(pedido sin stock cargado)</span>
+            {% if g.sin_stock_cargado and not g.proveedor_nombre %}
+            <span data-bs-toggle="tooltip" title="Este código tiene unidades pendientes en Notas de pedido, pero nunca apareció en el último reporte de Stock cargado, y tampoco está en el mapeo de códigos Ergopyme.">(pedido sin stock cargado)</span>
             {% else %}
             {{ g.proveedor_nombre or '(sin homologar)' }}
+            {% if g.via_ergopyme %}
+            <i class="bi bi-link-45deg text-muted" data-bs-toggle="tooltip" title="Proveedor y código homologados automáticamente desde el mapeo de códigos Ergopyme (2da Revisión códigos ergopyme), no está vinculado a un producto del catálogo."></i>
+            {% endif %}
             {% endif %}
           </td>
           <td data-col="codigo" data-value="{{ (g.codigo or '')|lower }}">{{ g.codigo or '-' }}</td>

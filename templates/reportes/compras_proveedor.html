@@ -62,43 +62,56 @@
 </form>
 
 <div class="row g-3 mb-3">
-  <div class="col-md-3">
+  <div class="col-md">
     <div class="card card-stat h-100 p-3">
-      <div class="text-muted small">Unidades compradas</div>
-      <div class="stat-value fs-4">{{ totales.unidades | numero_flex }}</div>
+      <div class="text-muted small">Cantidad de productos comprados</div>
+      <div class="stat-value fs-4">{{ totales.cantidad_productos | numero_flex }}</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col-md">
     <div class="card card-stat h-100 p-3">
-      <div class="text-muted small">Costo total (CLP)</div>
-      <div class="stat-value fs-4">{{ totales.costo_total_clp | clp }}</div>
+      <div class="text-muted small">Total Invoice (USD)</div>
+      <div class="stat-value fs-4">US$ {{ totales.total_invoice_usd | moneda }}</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col-md">
     <div class="card card-stat h-100 p-3">
-      <div class="text-muted small">N° de facturas</div>
-      <div class="stat-value fs-4">{{ totales.facturas }}</div>
+      <div class="text-muted small">Flete (USD)</div>
+      <div class="stat-value fs-4">US$ {{ totales.flete_usd | moneda }}</div>
+      <div class="text-muted small">{{ totales.flete_pct | round(1) }}% del Total Invoice</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col-md">
     <div class="card card-stat h-100 p-3">
-      <div class="text-muted small">N° de líneas</div>
-      <div class="stat-value fs-4">{{ totales.lineas }}</div>
+      <div class="text-muted small">Derechos (USD)</div>
+      <div class="stat-value fs-4">US$ {{ totales.derechos_usd | moneda }}</div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Otros costos (USD)</div>
+      <div class="stat-value fs-4">US$ {{ totales.otros_gastos_usd | moneda }}</div>
     </div>
   </div>
 </div>
+<div class="text-muted small mb-3">
+  Total Invoice, Flete, Derechos y Otros costos se muestran convertidos a USD para poder sumar proveedores que
+  mezclan facturas en distintas monedas. Al entrar a un proveedor puntual puedes ver cada compra en su propia
+  moneda de origen.
+</div>
 
-<div class="card p-3 mb-3">
+<div class="card p-3">
   <div class="fw-semibold mb-2">Resumen por proveedor</div>
   <div class="table-responsive">
     <table class="table table-sm table-hover align-middle mb-0">
       <thead>
         <tr>
           <th>Proveedor</th>
-          <th class="text-end">Unidades</th>
-          <th class="text-end">N° facturas</th>
-          <th class="text-end">N° líneas</th>
-          <th class="text-end">Costo total (CLP)</th>
+          <th class="text-end">Cant. productos</th>
+          <th class="text-end">Total Invoice (USD)</th>
+          <th class="text-end">Flete (USD)</th>
+          <th class="text-end">Derechos (USD)</th>
+          <th class="text-end">Otros costos (USD)</th>
           <th class="text-end">% del total</th>
         </tr>
       </thead>
@@ -106,76 +119,21 @@
         {% for r in resumen %}
         <tr>
           <td>
-            <a href="{{ url_for('reportes_compras_proveedor', proveedor=r.proveedor, empresa=empresa_sel, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}">
+            <a href="{{ url_for('reportes_compras_proveedor_detalle', proveedor=r.proveedor, empresa=empresa_sel, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}">
               {{ r.proveedor }}
             </a>
           </td>
-          <td class="text-end">{{ r.unidades | numero_flex }}</td>
-          <td class="text-end">{{ r.facturas }}</td>
-          <td class="text-end">{{ r.lineas }}</td>
-          <td class="text-end fw-semibold">{{ r.costo_total_clp | clp }}</td>
+          <td class="text-end">{{ r.cantidad_productos | numero_flex }}</td>
+          <td class="text-end fw-semibold">US$ {{ r.total_invoice_usd | moneda }}</td>
+          <td class="text-end">US$ {{ r.flete_usd | moneda }}</td>
+          <td class="text-end">US$ {{ r.derechos_usd | moneda }}</td>
+          <td class="text-end">US$ {{ r.otros_gastos_usd | moneda }}</td>
           <td class="text-end text-muted">
-            {{ ((r.costo_total_clp / totales.costo_total_clp * 100) if totales.costo_total_clp else 0) | round(1) }}%
+            {{ ((r.total_invoice_usd / totales.total_invoice_usd * 100) if totales.total_invoice_usd else 0) | round(1) }}%
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="6" class="text-center text-muted py-4">No hay compras que coincidan con los filtros.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<div class="card p-3">
-  <div class="d-flex justify-content-between align-items-center mb-2">
-    <div class="fw-semibold">Detalle de líneas</div>
-    {% if total_filas > limite_detalle %}
-    <div class="text-muted small">Mostrando las {{ limite_detalle }} más recientes de {{ total_filas }} -- usa los filtros de arriba para acotar.</div>
-    {% endif %}
-  </div>
-  <div class="table-responsive" style="max-height: 520px; overflow-y: auto;">
-    <table class="table table-sm table-hover align-middle mb-0">
-      <thead class="table-dark">
-        <tr>
-          <th>Origen</th>
-          <th>Fecha factura</th>
-          <th>Proveedor</th>
-          <th>N° Factura</th>
-          <th>Código</th>
-          <th>Descripción</th>
-          <th class="text-end">Unidades</th>
-          <th class="text-end">Costo unitario (CLP)</th>
-          <th class="text-end">Costo total (CLP)</th>
-          <th>Empresa</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for f in detalle %}
-        <tr class="{% if f.homologado == false %}text-muted{% endif %}">
-          <td>
-            {% if f.origen == 'Sistema' %}
-            <span class="badge badge-origen-sistema">Sistema</span>
-            {% else %}
-            <span class="badge bg-secondary">Histórico</span>
-            {% endif %}
-          </td>
-          <td>{{ f.fecha_factura.strftime('%d-%m-%Y') if f.fecha_factura else '-' }}</td>
-          <td>
-            {{ f.proveedor or '-' }}
-            {% if f.homologado == false %}
-            <i class="bi bi-question-circle text-warning ms-1" data-bs-toggle="tooltip" title="No se pudo homologar contra el mapeo de códigos Ergopyme."></i>
-            {% endif %}
-          </td>
-          <td>{{ f.factura or '-' }}</td>
-          <td>{{ f.codigo_interno or '-' }}</td>
-          <td style="max-width: 320px;">{{ f.descripcion }}</td>
-          <td class="text-end">{{ f.unidades | numero_flex }}</td>
-          <td class="text-end">{{ f.costo_unitario_clp | clp }}</td>
-          <td class="text-end fw-semibold">{{ f.costo_total_clp | clp }}</td>
-          <td>{{ f.empresa_compradora or '-' }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="10" class="text-center text-muted py-4">Sin resultados.</td></tr>
+        <tr><td colspan="7" class="text-center text-muted py-4">No hay compras que coincidan con los filtros.</td></tr>
         {% endfor %}
       </tbody>
     </table>

@@ -1,0 +1,324 @@
+{% extends "base.html" %}
+{% block title %}{{ proveedor }} · Compras Proveedor · Suite Logística{% endblock %}
+{% block content %}
+
+<style>
+  .badge-moneda-usd { background-color: #0d6efd; color: #fff; }
+  .badge-moneda-eur { background-color: #6f42c1; color: #fff; }
+  .badge-moneda-mixto { background-color: #fd7e14; color: #fff; }
+  th.ordenable { cursor: pointer; user-select: none; white-space: nowrap; }
+  th.ordenable .bi { opacity: .4; }
+  th.ordenable.orden-activo .bi { opacity: 1; }
+  tr.fila-producto { cursor: pointer; }
+  tr.fila-producto:hover { background-color: rgba(0,0,0,.035); }
+  tr.fila-facturas td { background-color: rgba(0,0,0,.02); }
+  .celda-mes { text-align: right; white-space: nowrap; }
+  #tabla-pivot th, #tabla-pivot td { font-size: .82rem; }
+</style>
+
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <div class="text-muted small mb-1">
+      <a href="{{ url_for('reportes_compras_proveedor') }}"><i class="bi bi-arrow-left"></i> Compras Proveedor</a>
+    </div>
+    <h3 class="section-title mb-0">{{ proveedor }} · Análisis por productos</h3>
+    <div class="text-muted small">
+      Compras por código de proveedor y mes, en la moneda de compra original. Usa el buscador para acotar
+      productos -- el resumen de arriba se recalcula solo con lo que quede visible en la tabla.
+    </div>
+  </div>
+</div>
+
+<form class="row g-2 mb-3 align-items-end">
+  <div class="col-auto">
+    <label class="form-label small mb-0">Empresa compradora</label>
+    <select class="form-select" name="empresa" onchange="this.form.submit()">
+      <option value="">Todas</option>
+      {% for e in empresas %}
+      <option value="{{ e.nombre }}" {% if empresa_sel|upper == e.nombre|upper %}selected{% endif %}>{{ e.nombre }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Fecha factura desde</label>
+    <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}" onchange="this.form.submit()">
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Fecha factura hasta</label>
+    <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}" onchange="this.form.submit()">
+  </div>
+  {% if empresa_sel or fecha_desde or fecha_hasta %}
+  <div class="col-auto">
+    <a href="{{ url_for('reportes_compras_proveedor_detalle', proveedor=proveedor) }}" class="btn btn-outline-secondary">Quitar filtros</a>
+  </div>
+  {% endif %}
+</form>
+
+<div class="row g-3 mb-3">
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Cantidad de productos</div>
+      <div class="stat-value fs-4" id="resumen-cantidad">{{ totales.cantidad_productos }}</div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Total Invoice (USD)</div>
+      <div class="stat-value fs-4">US$ <span id="resumen-total">{{ totales.total_invoice_usd | moneda }}</span></div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Flete (USD)</div>
+      <div class="stat-value fs-4">US$ <span id="resumen-flete">{{ totales.flete_usd | moneda }}</span></div>
+      <div class="text-muted small"><span id="resumen-flete-pct">{{ totales.flete_pct | round(1) }}</span>% del Total Invoice</div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Derechos (USD)</div>
+      <div class="stat-value fs-4">US$ <span id="resumen-derechos">{{ totales.derechos_usd | moneda }}</span></div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Otros costos (USD)</div>
+      <div class="stat-value fs-4">US$ <span id="resumen-otros">{{ totales.otros_gastos_usd | moneda }}</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <div class="fw-semibold">Análisis por productos (código proveedor × mes)</div>
+    <div class="input-group" style="max-width: 340px;">
+      <span class="input-group-text"><i class="bi bi-search"></i></span>
+      <input type="text" class="form-control" id="buscador-producto" list="lista-codigos"
+             placeholder="Buscar código o descripción...">
+    </div>
+    <datalist id="lista-codigos">
+      {% for p in productos %}
+      <option value="{{ p.codigo }}">{{ p.descripcion }}</option>
+      {% endfor %}
+    </datalist>
+  </div>
+  <div class="text-muted small mb-2">
+    Haz clic en una fila para ver las facturas con las que se compró ese producto.
+  </div>
+  <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
+    <table class="table table-sm table-hover align-middle mb-0" id="tabla-pivot">
+      <thead class="table-dark">
+        <tr>
+          <th style="width: 24px;"></th>
+          <th class="ordenable" data-sort="codigo">Código proveedor <i class="bi bi-arrow-down-up"></i></th>
+          <th class="ordenable" data-sort="descripcion">Descripción <i class="bi bi-arrow-down-up"></i></th>
+          <th>Moneda</th>
+          {% for m in meses_columnas %}
+          <th class="ordenable text-end" data-sort="mes:{{ m.clave }}">{{ m.etiqueta }} <i class="bi bi-arrow-down-up"></i></th>
+          {% endfor %}
+          <th class="ordenable text-end" data-sort="total">Total <i class="bi bi-arrow-down-up"></i></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in productos %}
+        <tr class="fila-producto" data-codigo="{{ p.codigo|lower }}" data-descripcion="{{ p.descripcion|lower }}"
+            data-total-usd="{{ p.total_usd }}" data-flete-usd="{{ p.flete_usd }}"
+            data-derechos-usd="{{ p.derechos_usd }}" data-otros-usd="{{ p.otros_gastos_usd }}"
+            data-sort-codigo="{{ p.codigo|lower }}" data-sort-descripcion="{{ p.descripcion|lower }}"
+            data-sort-total="{{ p.total_usd }}"
+            {% for m in meses_columnas %}data-sort-mes-{{ m.clave }}="{{ p.meses[m.clave].total_usd }}"{% if not loop.last %} {% endif %}{% endfor %}>
+          <td><i class="bi bi-chevron-right small text-muted"></i></td>
+          <td class="fw-semibold">{{ p.codigo }}</td>
+          <td style="max-width: 260px;">{{ p.descripcion }}</td>
+          <td>
+            {% if p.moneda == 'MIXTO' %}
+            <span class="badge badge-moneda-mixto" data-bs-toggle="tooltip" title="Este código tiene facturas en más de una moneda -- revisa el detalle de facturas.">MIXTO</span>
+            {% elif p.moneda == 'EUR' %}
+            <span class="badge badge-moneda-eur">EUR</span>
+            {% else %}
+            <span class="badge badge-moneda-usd">USD</span>
+            {% endif %}
+          </td>
+          {% for m in meses_columnas %}
+          {% set celda = p.meses[m.clave] %}
+          <td class="celda-mes">{% if celda.total_moneda %}{{ celda.total_moneda | moneda }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+          {% endfor %}
+          <td class="text-end fw-semibold">
+            {% if p.moneda == 'MIXTO' %}
+            ≈ US$ {{ p.total_usd | moneda }}
+            {% else %}
+            {{ p.total_moneda | moneda }}
+            {% endif %}
+          </td>
+        </tr>
+        <tr class="fila-facturas d-none">
+          <td></td>
+          <td colspan="{{ 3 + meses_columnas|length + 1 }}">
+            <div class="fw-semibold small mb-1">Facturas de {{ p.codigo }}</div>
+            <table class="table table-sm mb-0">
+              <thead>
+                <tr>
+                  <th>Origen</th>
+                  <th>Fecha factura</th>
+                  <th>N° Factura</th>
+                  <th class="text-end">Unidades</th>
+                  <th class="text-end">Total Invoice</th>
+                  <th>Moneda</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for fac in p.facturas %}
+                <tr>
+                  <td>
+                    {% if fac.origen == 'Sistema' %}<span class="badge" style="background-color: var(--brand);">Sistema</span>
+                    {% else %}<span class="badge bg-secondary">Histórico</span>{% endif %}
+                  </td>
+                  <td>{{ fac.fecha_factura.strftime('%d-%m-%Y') if fac.fecha_factura else '-' }}</td>
+                  <td>{{ fac.factura }}</td>
+                  <td class="text-end">{{ fac.unidades | numero_flex }}</td>
+                  <td class="text-end">{{ fac.total_invoice | moneda }}</td>
+                  <td>{{ fac.moneda_operacion }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="99" class="text-center text-muted py-4">No hay compras que coincidan con los filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+  try { new bootstrap.Tooltip(el); } catch (e) {}
+});
+
+(function () {
+  var tabla = document.getElementById('tabla-pivot');
+  if (!tabla) return;
+  var tbody = tabla.querySelector('tbody');
+  var buscador = document.getElementById('buscador-producto');
+
+  // --- Expandir/contraer facturas de un producto ---
+  tbody.querySelectorAll('tr.fila-producto').forEach(function (fila) {
+    fila.addEventListener('click', function () {
+      var sub = fila.nextElementSibling;
+      if (!sub || !sub.classList.contains('fila-facturas')) return;
+      var chevron = fila.querySelector('.bi-chevron-right, .bi-chevron-down');
+      sub.classList.toggle('d-none');
+      if (chevron) {
+        chevron.classList.toggle('bi-chevron-right');
+        chevron.classList.toggle('bi-chevron-down');
+      }
+    });
+  });
+
+  function paresFilas() {
+    var pares = [];
+    var filas = Array.prototype.slice.call(tbody.querySelectorAll('tr.fila-producto'));
+    filas.forEach(function (f) {
+      var sub = f.nextElementSibling;
+      pares.push({ principal: f, sub: (sub && sub.classList.contains('fila-facturas')) ? sub : null });
+    });
+    return pares;
+  }
+
+  // --- Buscador con texto predictivo (código o descripción) ---
+  function aplicarFiltro() {
+    var texto = (buscador.value || '').trim().toLowerCase();
+    paresFilas().forEach(function (par) {
+      var coincide = !texto
+        || par.principal.dataset.codigo.indexOf(texto) !== -1
+        || par.principal.dataset.descripcion.indexOf(texto) !== -1;
+      par.principal.classList.toggle('d-none', !coincide);
+      if (par.sub && !coincide) par.sub.classList.add('d-none');
+    });
+    recalcularResumen();
+  }
+  if (buscador) {
+    buscador.addEventListener('input', aplicarFiltro);
+  }
+
+  // --- Resumen que se recalcula con lo que queda VISIBLE en la tabla ---
+  function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+  function formatoUsd(n) {
+    var redondeado = Math.round(n * 100) / 100;
+    var partes = redondeado.toFixed(2).split('.');
+    partes[0] = partes[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    return partes[0] + ',' + partes[1];
+  }
+  function recalcularResumen() {
+    var cantidad = 0, total = 0, flete = 0, derechos = 0, otros = 0;
+    tbody.querySelectorAll('tr.fila-producto').forEach(function (fila) {
+      if (fila.classList.contains('d-none')) return;
+      cantidad += 1;
+      total += num(fila.dataset.totalUsd);
+      flete += num(fila.dataset.fleteUsd);
+      derechos += num(fila.dataset.derechosUsd);
+      otros += num(fila.dataset.otrosUsd);
+    });
+    document.getElementById('resumen-cantidad').textContent = cantidad;
+    document.getElementById('resumen-total').textContent = formatoUsd(total);
+    document.getElementById('resumen-flete').textContent = formatoUsd(flete);
+    document.getElementById('resumen-derechos').textContent = formatoUsd(derechos);
+    document.getElementById('resumen-otros').textContent = formatoUsd(otros);
+    document.getElementById('resumen-flete-pct').textContent = (total ? (flete / total * 100) : 0).toFixed(1);
+  }
+
+  // --- Orden por columna (código, descripción, cada mes, total) ---
+  var ordenActual = { clave: null, asc: true };
+  tabla.querySelectorAll('th.ordenable').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var clave = th.dataset.sort;
+      var asc = (ordenActual.clave === clave) ? !ordenActual.asc : true;
+      ordenActual = { clave: clave, asc: asc };
+      tabla.querySelectorAll('th.ordenable').forEach(function (t) { t.classList.remove('orden-activo'); });
+      th.classList.add('orden-activo');
+
+      // Para las columnas de mes se usa getAttribute() directo (en vez de
+      // .dataset) porque el nombre incluye numeros despues de un guion
+      // (ej. "data-sort-mes-2024-03") y la conversion automatica a
+      // camelCase de dataset no es confiable en ese caso.
+      var esMes = clave.indexOf('mes:') === 0;
+      var atributoMes = esMes ? ('data-sort-mes-' + clave.split(':')[1]) : null;
+
+      function valorDe(fila) {
+        if (esMes) return fila.getAttribute(atributoMes);
+        if (clave === 'total') return fila.dataset.sortTotal;
+        if (clave === 'codigo') return fila.dataset.sortCodigo;
+        if (clave === 'descripcion') return fila.dataset.sortDescripcion;
+        return '';
+      }
+
+      var pares = paresFilas();
+      pares.sort(function (a, b) {
+        var va = valorDe(a.principal);
+        var vb = valorDe(b.principal);
+        var esNumero = clave === 'total' || esMes;
+        if (esNumero) {
+          va = num(va); vb = num(vb);
+          return asc ? (va - vb) : (vb - va);
+        }
+        va = (va || '').toString(); vb = (vb || '').toString();
+        if (va < vb) return asc ? -1 : 1;
+        if (va > vb) return asc ? 1 : -1;
+        return 0;
+      });
+      pares.forEach(function (par) {
+        tbody.appendChild(par.principal);
+        if (par.sub) tbody.appendChild(par.sub);
+      });
+    });
+  });
+
+  recalcularResumen();
+})();
+</script>
+{% endblock %}

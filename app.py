@@ -1399,14 +1399,20 @@ def _normalizar_codigo_ergopyme(valor):
 
 
 def seed_codigos_ergopyme():
-    """Ronda AA (2026-09-13): carga UNA VEZ el mapeo maestro Proveedor +
-    Código Proveedor + Descripción para cada código interno de Ergopyme,
-    desde 'codigos_ergopyme_homologacion.xlsx' ("2da Revisión códigos
-    ergopyme" que mantiene el usuario) -- se usa para homologar el
-    histórico de compras (ver seed_compras_historicas abajo). Gateado:
-    si ya existe algún CodigoErgopyme, no hace nada."""
-    if CodigoErgopyme.query.count() > 0:
-        return
+    """Ronda AA (2026-09-13), convertido a upsert en Ronda AB (2026-09-14):
+    lee el mapeo maestro Proveedor + Código Proveedor + Descripción para
+    cada código interno de Ergopyme, desde 'codigos_ergopyme_homologacion.
+    xlsx' ("2da Revisión códigos ergopyme" que mantiene el usuario) -- se
+    usa para homologar en vivo cualquier archivo de Ergopyme (histórico de
+    compras, Notas de pedido, Consulta de Stock, etc.) por código interno.
+
+    A diferencia de Ronda AA, esto YA NO es "una sola vez": cada arranque
+    vuelve a leer el archivo completo y actualiza (o crea) cada código por
+    su codigo_interno, para que una corrección en el archivo de mapeo (ej.
+    el usuario resuelve un '#N/A' de Proveedor y sube una versión nueva) se
+    refleje con solo reiniciar la app, sin tener que vaciar la base de
+    datos. No borra códigos que ya no aparezcan en el archivo, por si se
+    sube por error una versión parcial."""
     if not os.path.isfile(CODIGOS_ERGOPYME_EXCEL):
         print(f"[seed] No se encontró {CODIGOS_ERGOPYME_EXCEL}, se omite la carga de códigos Ergopyme.")
         return
@@ -1423,7 +1429,9 @@ def seed_codigos_ergopyme():
         print("[seed] No se encontró el encabezado 'CODIGO ITEM' en codigos_ergopyme_homologacion.xlsx, se omite.")
         return
 
+    existentes = {c.codigo_interno: c for c in CodigoErgopyme.query.all()}
     creados = 0
+    actualizados = 0
     vistos = set()
     for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
         if not row or row[0] is None:
@@ -1435,13 +1443,28 @@ def seed_codigos_ergopyme():
         proveedor = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
         codigo_proveedor = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
         descripcion = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
-        db.session.add(CodigoErgopyme(
-            codigo_interno=codigo, proveedor_nombre=proveedor,
-            codigo_proveedor=codigo_proveedor, descripcion=descripcion,
-        ))
-        creados += 1
+        existente = existentes.get(codigo)
+        if existente:
+            if (existente.proveedor_nombre != proveedor
+                    or existente.codigo_proveedor != codigo_proveedor
+                    or existente.descripcion != descripcion):
+                existente.proveedor_nombre = proveedor
+                existente.codigo_proveedor = codigo_proveedor
+                existente.descripcion = descripcion
+                actualizados += 1
+        else:
+            nuevo = CodigoErgopyme(
+                codigo_interno=codigo, proveedor_nombre=proveedor,
+                codigo_proveedor=codigo_proveedor, descripcion=descripcion,
+            )
+            db.session.add(nuevo)
+            existentes[codigo] = nuevo
+            creados += 1
     db.session.commit()
-    print(f"[seed] Importados {creados} código(s) Ergopyme para el reporte Compras Proveedor.")
+    print(
+        f"[seed] Códigos Ergopyme: {creados} nuevo(s), {actualizados} "
+        "actualizado(s) para homologación (Stock, Reportes)."
+    )
 
 
 def seed_compras_historicas():
@@ -4697,6 +4720,88 @@ def _codigo_interno_homologado(parcial_linea):
     return producto.codigo_interno_inventario
 
 
+def _construir_homologador_ergopyme():
+    """Ronda AB (2026-09-14): arma (una sola vez por request) el
+    homologador de códigos internos de Ergopyme -> (proveedor real,
+    proveedor_id, código de proveedor, descripción), usando el mapeo
+    maestro `CodigoErgopyme` (archivo "2da Revisión códigos ergopyme" que
+    mantiene el usuario, ver seed_codigos_ergopyme). Se reutiliza tanto en
+    Consulta de Stock como en Reportes > Compras Proveedor -- misma regla
+    en los dos lugares: "no puede haber un código interno Ergopyme sin un
+    código de proveedor, o en su defecto que ya esté marcado sin marca".
+
+    IMPORTANTE: esta es la fuente de verdad VIVA -- siempre lee la tabla
+    CodigoErgopyme tal como está en este momento (que se resincroniza en
+    cada arranque desde el archivo de mapeo, ver seed_codigos_ergopyme).
+    No hay que confiar en los campos "congelados" que quedaron grabados en
+    CompraHistorica al momento de la carga histórica (esos quedan
+    desactualizados apenas el usuario corrige el archivo de mapeo)."""
+    codigo_ergopyme_map = {c.codigo_interno: c for c in CodigoErgopyme.query.all()}
+    proveedores_por_nombre = {p.nombre.strip().upper(): p for p in Proveedor.query.all()}
+
+    def _homologar(codigo_interno):
+        """Devuelve (proveedor_nombre, proveedor_id, codigo_proveedor,
+        descripcion) si el código interno está en el mapeo Ergopyme con un
+        proveedor real (no '#N/A'), o None si no se pudo resolver."""
+        if not codigo_interno:
+            return None
+        homolog = codigo_ergopyme_map.get(codigo_interno)
+        if not homolog:
+            return None
+        prov_nombre = (homolog.proveedor_nombre or "").strip()
+        if not prov_nombre or prov_nombre.upper() == "#N/A":
+            return None
+        prov_real = proveedores_por_nombre.get(prov_nombre.upper())
+        return (
+            prov_nombre,
+            prov_real.id if prov_real else None,
+            (homolog.codigo_proveedor or "").strip() or None,
+            (homolog.descripcion or "").strip() or None,
+        )
+    return _homologar
+
+
+def _moneda_operacion(paridad):
+    """Ronda AB (2026-09-14): en el histórico de compras (y en las
+    importaciones del sistema) solo existen dos monedas de operación
+    posibles -- USD (cuando la 'paridad' es 1, es decir, no hay paso de
+    conversión) o EUR (cuando la paridad es distinta de 1 -- el propio
+    encabezado del archivo histórico dice literalmente "Paridad EUR")."""
+    try:
+        p = float(paridad or 0)
+    except (TypeError, ValueError):
+        p = 0
+    if not p or abs(p - 1) < 1e-6:
+        return "USD"
+    return "EUR"
+
+
+def _derecho_u_otro_costo_en_moneda(valor_clp, tipo_cambio, paridad):
+    """Convierte un monto en CLP (Derechos o Otros gastos de la línea) a
+    USD y a la moneda de la operación, con la fórmula exacta que confirmó
+    el usuario con dos ejemplos reales del archivo histórico:
+      valor_USD = valor_CLP / tipo_cambio       (tipo_cambio = CLP por 1 USD)
+      valor_moneda_operacion = valor_USD * paridad
+    Cuando la operación es en USD, paridad = 1 y ambos valores coinciden
+    (fila 6097 del histórico: 7137 / 935,57 = 7,62 USD). Cuando es en otra
+    divisa (fila 6137: tipo cambio 925,25, paridad 0,8585) el segundo valor
+    queda expresado en esa divisa (euros)."""
+    try:
+        tc = float(tipo_cambio or 0)
+    except (TypeError, ValueError):
+        tc = 0
+    try:
+        par = float(paridad or 0)
+    except (TypeError, ValueError):
+        par = 0
+    if not par:
+        par = 1
+    valor_clp = float(valor_clp or 0)
+    valor_usd = (valor_clp / tc) if tc else 0.0
+    valor_moneda = valor_usd * par
+    return valor_usd, valor_moneda
+
+
 def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
     """Arma el Excel de carga al sistema de Inventarios: mismos encabezados
     y misma cadena de conversión de moneda (factura -> USD -> CLP) que la
@@ -5624,6 +5729,17 @@ def stock_list():
     # real) de "pendiente" (todavia sin resolver).
     estados_homologacion = _estados_homologacion_por_codigo()
 
+    # Ronda AB (2026-09-14): mapeo maestro Proveedor/Código Proveedor por
+    # código interno Ergopyme (el mismo que usa el reporte Compras
+    # Proveedor) -- se usa acá también como fuente de verdad para mostrar
+    # el proveedor y código REAL de un producto que no tiene Producto/
+    # Variante ligado en el catálogo, en vez de dejarlo "(sin homologar)"
+    # o "(pedido sin stock cargado)" a secas. Regla del usuario: ningún
+    # código interno Ergopyme debería quedar sin proveedor conocido, salvo
+    # que ya esté marcado "sin marca". (helper compartido con Reportes,
+    # ver _construir_homologador_ergopyme)
+    _homologar_via_ergopyme = _construir_homologador_ergopyme()
+
     # Ronda V: stock "Desglosado por variante exacta" -- se agrupa por
     # (empresa, producto, variante) sumando todos los lotes de esa
     # combinacion, mostrando el stock total y el proximo vencimiento (el
@@ -5644,6 +5760,7 @@ def stock_list():
             proveedor_id_grupo = None
             producto_id_grupo = None
             variante_codigo_grupo = None
+            via_ergopyme = False
             # Ronda X (2026-09-13, punto 2): un codigo todavia sin
             # homologar (sin marca / pendiente) ya NO muestra el codigo
             # crudo de Ergopyme en pantalla -- queda en blanco (se sigue
@@ -5672,6 +5789,14 @@ def stock_list():
                 # en /stock/homologacion para asignarlo a un proveedor real
                 # y darle mantenimiento a su codigo mas adelante.
                 proveedor_nombre = "Sin Marca"
+            else:
+                # Ronda AB (2026-09-14): antes de rendirse a "(sin
+                # homologar)", probar el mapeo Ergopyme (Proveedor +
+                # Código Proveedor) -- ver _homologar_via_ergopyme arriba.
+                resuelto = _homologar_via_ergopyme(fila.codigo_interno)
+                if resuelto:
+                    proveedor_nombre, proveedor_id_grupo, codigo_mostrar, _ = resuelto
+                    via_ergopyme = True
             grupo = {
                 "empresa": fila.empresa,
                 "proveedor_id": proveedor_id_grupo,
@@ -5682,7 +5807,8 @@ def stock_list():
                 "stock_total": 0,
                 "proximo_vencimiento": None,
                 "lotes": [],
-                "homologado": bool(fila.producto_id or fila.variante_id),
+                "homologado": bool(fila.producto_id or fila.variante_id or via_ergopyme),
+                "via_ergopyme": via_ergopyme,
                 "_producto_id": producto_id_grupo,
                 "_variante_codigo": variante_codigo_grupo,
             }
@@ -5723,32 +5849,53 @@ def stock_list():
     # pedidos.xlsx": 26 de las 154 unidades del archivo, en 7 codigos
     # distintos, no aparecian en ningun lado de la pantalla). Se arma una
     # fila "sintetica" (Stock actual = 0, Transito = 0) solo para poder
-    # mostrar el Pedido pendiente -- se omite si hay un filtro de Proveedor
-    # activo (estos codigos no tienen proveedor conocido) y respeta los
-    # filtros de Empresa/busqueda ya aplicados.
-    if not proveedor_id:
-        codigos_cubiertos = {(f.empresa_id, f.codigo_interno) for f in filas}
-        empresas_por_id = {e.id: e for e in Empresa.query.all()}
-        q_lower = q.lower() if q else ""
+    # mostrar el Pedido pendiente.
+    # Ronda AB (2026-09-14): antes se omitia esta fila por completo si habia
+    # un filtro de Proveedor activo (se asumia que estos codigos "no tienen
+    # proveedor conocido") -- ahora primero se intenta homologar cada codigo
+    # via el mapeo Ergopyme (mismo usado en Compras Proveedor), y solo si
+    # sigue sin resolverse se sigue ocultando bajo un filtro de Proveedor
+    # especifico (no tiene sentido mostrarlo bajo un proveedor que no le
+    # corresponde). Con proveedor resuelto, tambien se reemplaza el codigo
+    # interno de Ergopyme por el Codigo de Proveedor real en la columna
+    # "Codigo" -- para reportes/estadisticas el usuario quiere ver siempre
+    # el codigo del proveedor, nunca el codigo interno.
+    codigos_cubiertos = {(f.empresa_id, f.codigo_interno) for f in filas}
+    empresas_por_id = {e.id: e for e in Empresa.query.all()}
+    q_lower = q.lower() if q else ""
+    if proveedor_id != "sin_marca":
         for (emp_id, codigo), cantidad_pedido in pedido_por_codigo.items():
             if not cantidad_pedido or (emp_id, codigo) in codigos_cubiertos:
                 continue
+            resuelto = _homologar_via_ergopyme(codigo)
+            if resuelto:
+                prov_nombre_res, prov_id_res, codigo_prov_res, descripcion_ergopyme = resuelto
+            else:
+                prov_nombre_res = prov_id_res = codigo_prov_res = descripcion_ergopyme = None
+            if proveedor_id and str(prov_id_res or "") != str(proveedor_id):
+                continue
             if empresa_id and str(emp_id) != str(empresa_id):
                 continue
-            descripcion_pend = descripcion_pedido_por_codigo.get((emp_id, codigo), "")
-            if q_lower and q_lower not in (descripcion_pend or "").lower() and q_lower not in (codigo or "").lower():
+            descripcion_pend = descripcion_pedido_por_codigo.get((emp_id, codigo), "") or descripcion_ergopyme or ""
+            if (
+                q_lower
+                and q_lower not in (descripcion_pend or "").lower()
+                and q_lower not in (codigo or "").lower()
+                and q_lower not in (codigo_prov_res or "").lower()
+            ):
                 continue
             grupos[("pedido_sin_stock", codigo, emp_id)] = {
                 "empresa": empresas_por_id.get(emp_id),
-                "proveedor_id": None,
-                "proveedor_nombre": None,
-                "codigo": None,
+                "proveedor_id": prov_id_res,
+                "proveedor_nombre": prov_nombre_res,
+                "codigo": codigo_prov_res,
                 "codigo_interno": codigo,
                 "descripcion": descripcion_pend,
                 "stock_total": 0,
                 "proximo_vencimiento": None,
                 "lotes": [],
-                "homologado": False,
+                "homologado": bool(resuelto),
+                "via_ergopyme": bool(resuelto),
                 "sin_stock_cargado": True,
                 "_producto_id": None,
                 "_variante_codigo": None,
@@ -6175,33 +6322,96 @@ def admin_reset_ejecutar():
 
 
 # ---------------------------------------------------------------------------
-# Reportes (ronda AA, 2026-09-13)
+# Reportes (ronda AA, 2026-09-13 -- resumen y vista por proveedor rediseñados
+# en ronda AB, 2026-09-14)
 # ---------------------------------------------------------------------------
 
-def _proveedores_reporte_compras():
+def _proveedores_reporte_compras(homologar=None):
     """Lista de proveedores para el filtro del reporte Compras Proveedor:
-    los del catálogo activo + los que aparecen ya homologados en el
-    histórico cargado -- para no dejar fuera un proveedor antiguo que ya
-    no está en el catálogo (ej. una relación comercial discontinuada)."""
+    los del catálogo activo + los que resultan de homologar EN VIVO (ver
+    _construir_homologador_ergopyme) cada código interno distinto del
+    histórico -- para no dejar fuera un proveedor antiguo que ya no está
+    en el catálogo (ej. una relación comercial discontinuada), y para que
+    la lista siempre refleje el mapeo Ergopyme actual (no un valor
+    congelado de cuando se cargó el histórico)."""
+    homologar = homologar or _construir_homologador_ergopyme()
     nombres = {p.nombre for p in Proveedor.query.filter_by(activo=True).all()}
-    nombres |= {
-        r[0] for r in db.session.query(CompraHistorica.proveedor_homologado)
-        .filter(
-            CompraHistorica.proveedor_homologado.isnot(None),
-            CompraHistorica.proveedor_homologado != "",
-            db.func.upper(CompraHistorica.proveedor_homologado) != "#N/A",
-        ).distinct()
-    }
+    for codigo, proveedor_original in db.session.query(
+        CompraHistorica.codigo_interno, CompraHistorica.proveedor_original
+    ).distinct():
+        resuelto = homologar(codigo)
+        nombre = resuelto[0] if resuelto else (proveedor_original or "")
+        if nombre and nombre.upper() != "#N/A":
+            nombres.add(nombre)
     return sorted(nombres)
 
 
+def _fila_historica_dict(c, homologar):
+    """Ronda AB (2026-09-14): arma la fila de reporte para una línea de
+    CompraHistorica homologando el código interno EN VIVO contra el mapeo
+    Ergopyme actual (en vez de confiar en proveedor_homologado/
+    codigo_proveedor/homologado, que quedaron "congelados" en el momento
+    de la carga histórica y no se actualizan solos si el usuario corrige
+    el archivo de mapeo). Regla del usuario: para reportes/estadísticas
+    nunca se muestra el código interno de Ergopyme -- se usa el código y
+    la descripción del PROVEEDOR."""
+    resuelto = homologar(c.codigo_interno)
+    if resuelto:
+        proveedor, _prov_id, codigo_prov_resuelto, descripcion_resuelta = resuelto
+        codigo_producto = codigo_prov_resuelto or c.codigo_proveedor or c.codigo_interno
+        descripcion = descripcion_resuelta or c.descripcion
+        via_ergopyme = True
+        homologado = True
+    else:
+        proveedor = c.proveedor_original
+        codigo_producto = c.codigo_proveedor or c.codigo_interno
+        descripcion = c.descripcion
+        via_ergopyme = False
+        homologado = False
+
+    # Derechos y Otros gastos vienen en CLP en el histórico (columnas
+    # "DERECHOS $" y "OTROS GASTOS $") -- se convierten a USD y a la
+    # moneda de la propia operación (USD o EUR según la paridad de esa
+    # línea) con la fórmula que confirmó el usuario (ver
+    # _derecho_u_otro_costo_en_moneda).
+    derechos_usd, derechos_moneda = _derecho_u_otro_costo_en_moneda(c.derechos_clp, c.tipo_cambio, c.paridad_eur)
+    otros_usd, otros_moneda = _derecho_u_otro_costo_en_moneda(c.otros_gastos_clp, c.tipo_cambio, c.paridad_eur)
+
+    return {
+        "origen": "Histórico",
+        "fecha_factura": c.fecha_factura,
+        "proveedor": proveedor,
+        "factura": c.factura,
+        "codigo_interno": c.codigo_interno,
+        "codigo_producto": codigo_producto,
+        "descripcion": descripcion,
+        "unidades": c.unidades or 0,
+        "total_invoice": c.total_invoice or 0,
+        "total_usd": c.total_usd or 0,
+        "moneda_operacion": _moneda_operacion(c.paridad_eur),
+        "tipo_cambio": c.tipo_cambio,
+        "paridad": c.paridad_eur,
+        "flete_usd": c.flete_usd or 0,
+        "derechos_usd": derechos_usd,
+        "derechos_moneda": derechos_moneda,
+        "otros_gastos_usd": otros_usd,
+        "otros_gastos_moneda": otros_moneda,
+        "empresa_compradora": c.empresa_compradora,
+        "categoria": c.categoria,
+        "tipo_flete": c.tipo_flete,
+        "homologado": homologado,
+        "via_ergopyme": via_ergopyme,
+    }
+
+
 def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
-    """Ronda AA (2026-09-13): compras hechas DESDE la plataforma
-    (Importacion/Parcial/ParcialLinea, vía costing.py), transformadas a
-    filas con la MISMA forma que CompraHistorica -- así el reporte
-    "Compras Proveedor" combina ambas fuentes sin duplicar nada. De acá en
-    adelante, cada Costeo que se genere en el sistema alimenta este mismo
-    reporte automáticamente, sin tener que recargar ni recapturar nada."""
+    """Ronda AA (2026-09-13), extendido en ronda AB (2026-09-14) con
+    Derechos/Otros gastos/Flete por línea: compras hechas DESDE la
+    plataforma (Importacion/Parcial/ParcialLinea, vía costing.py),
+    transformadas a filas con la MISMA forma que el histórico -- así el
+    reporte "Compras Proveedor" combina ambas fuentes sin duplicar nada.
+    De acá en adelante, cada Costeo que se genere en el sistema alimenta
+    este mismo reporte automáticamente, sin recargar ni recapturar nada."""
     query = Importacion.query
     if proveedor:
         query = query.join(Proveedor).filter(db.func.upper(Proveedor.nombre) == proveedor.upper())
@@ -6220,26 +6430,122 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
             continue
         proveedor_nombre = importacion.proveedor.nombre if importacion.proveedor else ""
         empresa_nombre = importacion.empresa.nombre.upper() if importacion.empresa else "SIN ASIGNAR"
+        # tipo_cambio_aduanero = CLP por 1 USD (igual que la columna "USD
+        # TIPO CAMBIO" del histórico); tipo_cambio_moneda_usd = unidades de
+        # moneda_factura por 1 USD (igual que "Paridad EUR": queda en 1
+        # cuando la factura ya es en USD) -- mismos dos numeros, mismo rol.
+        tc_aduanero = importacion.tipo_cambio_aduanero or 0
+        tc_moneda_usd = importacion.tipo_cambio_moneda_usd or 1
+        moneda_factura = (importacion.moneda_factura or "USD").strip().upper()
+        moneda_operacion = "EUR" if moneda_factura.startswith("EUR") else moneda_factura
         for info in costeo["lineas"]:
             linea = info["linea"]
-            codigo = _codigo_interno_homologado(linea) or (linea.codigo or "")
+            codigo_interno = _codigo_interno_homologado(linea) or ""
+            derechos_usd = (info["derechos_clp"] / tc_aduanero) if tc_aduanero else 0.0
+            otros_usd = (info["otros_gastos_clp"] / tc_aduanero) if tc_aduanero else 0.0
             filas.append({
                 "origen": "Sistema",
                 "fecha_factura": importacion.fecha_factura,
                 "proveedor": proveedor_nombre,
                 "factura": importacion.numero_factura,
-                "codigo_interno": codigo,
+                "codigo_interno": codigo_interno,
+                # Una OC/Costeo hecho desde la plataforma ya guarda el
+                # código del PROVEEDOR en la línea (no el código interno de
+                # Ergopyme) -- se muestra directo, sin pasar por el mapeo.
+                "codigo_producto": (linea.codigo or "").strip() or codigo_interno or "(sin código)",
                 "descripcion": linea.descripcion,
                 "unidades": linea.cantidad_unidades or 0,
                 "total_invoice": linea.valor_total_moneda,
                 "total_usd": info["valor_usd"],
-                "costo_total_clp": info["costo_total_clp"],
-                "costo_unitario_clp": info["costo_unitario_clp"],
+                "moneda_operacion": moneda_operacion,
+                "tipo_cambio": tc_aduanero,
+                "paridad": tc_moneda_usd,
+                "flete_usd": info.get("flete_usd", 0) or 0,
+                "derechos_usd": derechos_usd,
+                "derechos_moneda": derechos_usd * tc_moneda_usd,
+                "otros_gastos_usd": otros_usd,
+                "otros_gastos_moneda": otros_usd * tc_moneda_usd,
                 "empresa_compradora": empresa_nombre,
                 "categoria": "",
                 "tipo_flete": "",
-                "homologado": None,
+                "homologado": True,
+                "via_ergopyme": False,
             })
+    return filas
+
+
+def _resumen_por_proveedor(filas):
+    """Ronda AB (2026-09-14): agrega, por proveedor, exactamente las 5
+    métricas que pidió el usuario para el resumen (cantidad de productos
+    distintos, Total Invoice / Flete / Derechos / Otros costos -- todo
+    convertido a USD para poder sumar proveedores que mezclan facturas en
+    USD y en EUR, tal como el usuario confirmó: "Convertir todo a USD")."""
+    agregados = defaultdict(lambda: {
+        "productos": set(), "total_invoice_usd": 0.0,
+        "flete_usd": 0.0, "derechos_usd": 0.0, "otros_gastos_usd": 0.0,
+    })
+    for f in filas:
+        a = agregados[f["proveedor"] or "(sin proveedor)"]
+        clave_producto = (f.get("codigo_producto") or f.get("descripcion") or "").strip().upper()
+        if clave_producto:
+            a["productos"].add(clave_producto)
+        a["total_invoice_usd"] += f.get("total_usd") or 0
+        a["flete_usd"] += f.get("flete_usd") or 0
+        a["derechos_usd"] += f.get("derechos_usd") or 0
+        a["otros_gastos_usd"] += f.get("otros_gastos_usd") or 0
+
+    filas_resumen = []
+    for p, a in agregados.items():
+        filas_resumen.append({
+            "proveedor": p,
+            "cantidad_productos": len(a["productos"]),
+            "total_invoice_usd": a["total_invoice_usd"],
+            "flete_usd": a["flete_usd"],
+            "flete_pct": (a["flete_usd"] / a["total_invoice_usd"] * 100) if a["total_invoice_usd"] else 0,
+            "derechos_usd": a["derechos_usd"],
+            "otros_gastos_usd": a["otros_gastos_usd"],
+        })
+    return sorted(filas_resumen, key=lambda r: -r["total_invoice_usd"])
+
+
+def _totales_reporte(filas):
+    """Mismas 5 métricas que _resumen_por_proveedor pero para el conjunto
+    completo de filas (tarjetas de resumen arriba del todo)."""
+    productos = {
+        (f["proveedor"] or "", (f.get("codigo_producto") or f.get("descripcion") or "").strip().upper())
+        for f in filas if (f.get("codigo_producto") or f.get("descripcion"))
+    }
+    total_invoice_usd = sum(f.get("total_usd") or 0 for f in filas)
+    flete_usd = sum(f.get("flete_usd") or 0 for f in filas)
+    derechos_usd = sum(f.get("derechos_usd") or 0 for f in filas)
+    otros_gastos_usd = sum(f.get("otros_gastos_usd") or 0 for f in filas)
+    return {
+        "cantidad_productos": len(productos),
+        "total_invoice_usd": total_invoice_usd,
+        "flete_usd": flete_usd,
+        "flete_pct": (flete_usd / total_invoice_usd * 100) if total_invoice_usd else 0,
+        "derechos_usd": derechos_usd,
+        "otros_gastos_usd": otros_gastos_usd,
+    }
+
+
+def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha_hasta=None, homologar=None):
+    """Junta histórico + sistema ya homologados y filtrados -- reutilizado
+    tanto por el listado general como por la vista de un proveedor
+    específico, para no repetir la lógica de armado en dos lugares."""
+    homologar = homologar or _construir_homologador_ergopyme()
+    query = CompraHistorica.query
+    if fecha_desde:
+        query = query.filter(CompraHistorica.fecha_factura >= fecha_desde)
+    if fecha_hasta:
+        query = query.filter(CompraHistorica.fecha_factura <= fecha_hasta)
+
+    filas = [_fila_historica_dict(c, homologar) for c in query.all()]
+    if proveedor:
+        filas = [f for f in filas if (f["proveedor"] or "").upper() == proveedor.upper()]
+    filas += _compras_sistema(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
+    if empresa:
+        filas = [f for f in filas if (f["empresa_compradora"] or "").upper() == empresa.upper()]
     return filas
 
 
@@ -6252,12 +6558,15 @@ def reportes_index():
 @app.route("/reportes/compras-proveedor")
 @requiere_permiso("reportes")
 def reportes_compras_proveedor():
-    """Ronda AA (2026-09-13): primer reporte del menú "Reportes" -- combina
-    el histórico de compras a proveedores (cargado una vez desde el Excel
-    de referencia del usuario, homologado por código Ergopyme) con las
-    compras hechas DESDE la plataforma (calculadas en vivo desde Costeo de
-    Importaciones), filtrable por Proveedor / Empresa compradora / rango
-    de fechas de factura."""
+    """Ronda AA (2026-09-13), resumen rediseñado en ronda AB (2026-09-14):
+    primer reporte del menú "Reportes" -- combina el histórico de compras a
+    proveedores (cargado desde el Excel de referencia del usuario,
+    homologado EN VIVO por código Ergopyme) con las compras hechas DESDE la
+    plataforma (calculadas en vivo desde Costeo de Importaciones), filtrable
+    por Proveedor / Empresa compradora / rango de fechas de factura. El
+    resumen ya no muestra N° de facturas/líneas/costo en CLP -- ahora
+    muestra Cantidad de productos, Total Invoice, Flete, Derechos y Otros
+    costos (los 3 últimos en la moneda de la operación / USD agregado)."""
     proveedor = request.args.get("proveedor", "").strip()
     empresa = request.args.get("empresa", "").strip()
     fecha_desde_txt = request.args.get("fecha_desde", "")
@@ -6265,79 +6574,131 @@ def reportes_compras_proveedor():
     fecha_desde = parse_date(fecha_desde_txt)
     fecha_hasta = parse_date(fecha_hasta_txt)
 
-    query = CompraHistorica.query
-    if proveedor:
-        query = query.filter(db.func.upper(CompraHistorica.proveedor_homologado) == proveedor.upper())
-    if empresa:
-        query = query.filter(db.func.upper(CompraHistorica.empresa_compradora) == empresa.upper())
-    if fecha_desde:
-        query = query.filter(CompraHistorica.fecha_factura >= fecha_desde)
-    if fecha_hasta:
-        query = query.filter(CompraHistorica.fecha_factura <= fecha_hasta)
-
-    filas = [
-        {
-            "origen": "Histórico",
-            "fecha_factura": c.fecha_factura,
-            "proveedor": c.proveedor_homologado or c.proveedor_original,
-            "factura": c.factura,
-            "codigo_interno": c.codigo_interno,
-            "descripcion": c.descripcion,
-            "unidades": c.unidades or 0,
-            "total_invoice": c.total_invoice,
-            "total_usd": c.total_usd,
-            "costo_total_clp": c.costo_total_clp,
-            "costo_unitario_clp": c.costo_unitario_clp,
-            "empresa_compradora": c.empresa_compradora,
-            "categoria": c.categoria,
-            "tipo_flete": c.tipo_flete,
-            "homologado": c.homologado,
-        }
-        for c in query.all()
-    ]
-    filas += _compras_sistema(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
-    if empresa:
-        filas = [f for f in filas if (f["empresa_compradora"] or "").upper() == empresa.upper()]
-
-    resumen_proveedor = defaultdict(lambda: {"unidades": 0, "costo_total_clp": 0, "facturas": set(), "lineas": 0})
-    for f in filas:
-        r = resumen_proveedor[f["proveedor"] or "(sin proveedor)"]
-        r["unidades"] += f["unidades"] or 0
-        r["costo_total_clp"] += f["costo_total_clp"] or 0
-        if f["factura"]:
-            r["facturas"].add(f["factura"])
-        r["lineas"] += 1
-
-    resumen = sorted(
-        (
-            {
-                "proveedor": p, "unidades": v["unidades"], "costo_total_clp": v["costo_total_clp"],
-                "facturas": len(v["facturas"]), "lineas": v["lineas"],
-            }
-            for p, v in resumen_proveedor.items()
-        ),
-        key=lambda r: -r["costo_total_clp"],
+    homologar = _construir_homologador_ergopyme()
+    filas = _filas_reporte_compras(
+        proveedor=proveedor or None, empresa=empresa or None,
+        fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, homologar=homologar,
     )
 
-    totales = {
-        "unidades": sum(f["unidades"] or 0 for f in filas),
-        "costo_total_clp": sum(f["costo_total_clp"] or 0 for f in filas),
-        "facturas": len({f["factura"] for f in filas if f["factura"]}),
-        "lineas": len(filas),
-    }
+    resumen = _resumen_por_proveedor(filas)
+    totales = _totales_reporte(filas)
     sin_homologar = sum(1 for f in filas if f.get("homologado") is False)
-
-    detalle_completo = sorted(filas, key=lambda f: (f["fecha_factura"] or date.min), reverse=True)
-    LIMITE_DETALLE = 500
-    detalle = detalle_completo[:LIMITE_DETALLE]
 
     return render_template(
         "reportes/compras_proveedor.html",
-        resumen=resumen, totales=totales, detalle=detalle,
-        proveedores=_proveedores_reporte_compras(), empresas=Empresa.query.order_by(Empresa.nombre).all(),
+        resumen=resumen, totales=totales,
+        proveedores=_proveedores_reporte_compras(homologar), empresas=Empresa.query.order_by(Empresa.nombre).all(),
         proveedor_sel=proveedor, empresa_sel=empresa,
         fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
-        sin_homologar=sin_homologar, total_filas=len(filas), limite_detalle=LIMITE_DETALLE,
+        sin_homologar=sin_homologar, total_filas=len(filas),
+    )
+
+
+@app.route("/reportes/compras-proveedor/<path:proveedor>")
+@requiere_permiso("reportes")
+def reportes_compras_proveedor_detalle(proveedor):
+    """Ronda AB (2026-09-14): vista "análisis por productos" al entrar a un
+    proveedor específico -- tabla dinámica (como la tabla dinámica de Excel
+    que trajo el usuario de referencia): filas = código de proveedor,
+    columnas = meses, valores = Total Invoice en la MONEDA DE COMPRA
+    (columna R del histórico, tal cual, sin convertir). Con buscador con
+    texto predictivo, flechas de orden por columna, expandir una fila para
+    ver las facturas, y el resumen de arriba recalculándose en vivo (JS)
+    según lo que quede visible en la tabla -- ver
+    reportes/compras_proveedor_detalle.html."""
+    empresa = request.args.get("empresa", "").strip()
+    fecha_desde_txt = request.args.get("fecha_desde", "")
+    fecha_hasta_txt = request.args.get("fecha_hasta", "")
+    fecha_desde = parse_date(fecha_desde_txt)
+    fecha_hasta = parse_date(fecha_hasta_txt)
+
+    filas = _filas_reporte_compras(
+        proveedor=proveedor, empresa=empresa or None,
+        fecha_desde=fecha_desde, fecha_hasta=fecha_hasta,
+    )
+    if not filas:
+        flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
+        return redirect(url_for("reportes_compras_proveedor"))
+
+    totales = _totales_reporte(filas)
+
+    # --- Arma la tabla dinámica: producto (código de proveedor) x mes ---
+    productos = {}
+    meses_set = {}
+    for f in filas:
+        if not f["fecha_factura"]:
+            continue
+        clave_mes = (f["fecha_factura"].year, f["fecha_factura"].month)
+        if clave_mes not in meses_set:
+            nombre_mes = TipoCambioMensual.MESES_NOMBRE[f["fecha_factura"].month - 1][:3]
+            meses_set[clave_mes] = f"{nombre_mes}-{str(f['fecha_factura'].year)[2:]}"
+
+        codigo = (f.get("codigo_producto") or "").strip() or "(sin código)"
+        prod = productos.setdefault(codigo, {
+            "codigo": codigo,
+            "descripcion": f.get("descripcion") or "",
+            "monedas": set(),
+            "total_usd": 0.0,
+            "total_moneda": 0.0,
+            "flete_usd": 0.0,
+            "derechos_usd": 0.0,
+            "otros_gastos_usd": 0.0,
+            "meses": defaultdict(lambda: {"total_moneda": 0.0, "total_usd": 0.0}),
+            "facturas": [],
+        })
+        if not prod["descripcion"] and f.get("descripcion"):
+            prod["descripcion"] = f["descripcion"]
+        prod["monedas"].add(f.get("moneda_operacion") or "USD")
+        prod["total_usd"] += f.get("total_usd") or 0
+        prod["total_moneda"] += f.get("total_invoice") or 0
+        prod["flete_usd"] += f.get("flete_usd") or 0
+        prod["derechos_usd"] += f.get("derechos_usd") or 0
+        prod["otros_gastos_usd"] += f.get("otros_gastos_usd") or 0
+        celda = prod["meses"][clave_mes]
+        celda["total_moneda"] += f.get("total_invoice") or 0
+        celda["total_usd"] += f.get("total_usd") or 0
+        prod["facturas"].append({
+            "factura": f.get("factura") or "-",
+            "fecha_factura": f["fecha_factura"],
+            "unidades": f.get("unidades") or 0,
+            "total_invoice": f.get("total_invoice") or 0,
+            "moneda_operacion": f.get("moneda_operacion") or "USD",
+            "origen": f.get("origen"),
+        })
+
+    meses_ordenados = sorted(meses_set.keys())
+    meses_columnas = [
+        {"clave": f"{a}-{m:02d}", "etiqueta": meses_set[(a, m)]}
+        for (a, m) in meses_ordenados
+    ]
+
+    productos_lista = []
+    for codigo, prod in productos.items():
+        moneda = next(iter(prod["monedas"])) if len(prod["monedas"]) == 1 else "MIXTO"
+        prod["facturas"].sort(key=lambda x: x["fecha_factura"] or date.min, reverse=True)
+        productos_lista.append({
+            "codigo": prod["codigo"],
+            "descripcion": prod["descripcion"],
+            "moneda": moneda,
+            "total_usd": prod["total_usd"],
+            "total_moneda": prod["total_moneda"],
+            "flete_usd": prod["flete_usd"],
+            "derechos_usd": prod["derechos_usd"],
+            "otros_gastos_usd": prod["otros_gastos_usd"],
+            "meses": {
+                f"{a}-{m:02d}": prod["meses"].get((a, m), {"total_moneda": 0.0, "total_usd": 0.0})
+                for (a, m) in meses_ordenados
+            },
+            "facturas": prod["facturas"],
+        })
+    productos_lista.sort(key=lambda p: -p["total_usd"])
+
+    return render_template(
+        "reportes/compras_proveedor_detalle.html",
+        proveedor=proveedor, totales=totales,
+        productos=productos_lista, meses_columnas=meses_columnas,
+        empresas=Empresa.query.order_by(Empresa.nombre).all(),
+        empresa_sel=empresa, fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
     )
 
 
