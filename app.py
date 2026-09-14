@@ -1561,9 +1561,30 @@ def seed_compras_historicas():
             codigos_sin_homologar.add(codigo)
 
         def num(nombre):
+            # Ronda AD (2026-09-14): corrige la causa RAÍZ de un bug
+            # encontrado en la ronda AC -- 54 filas de DORC (facturas
+            # CD100058713/CD100059451) traían la columna "Paridad EUR" como
+            # TEXTO con coma decimal ("0,8687", formato chileno/europeo) en
+            # vez de un número real de Excel. `float("0,8687")` lanza
+            # ValueError, y el código anterior lo coercionaba en silencio a
+            # 0.0 -- eso se interpretó (ronda AC) como "paridad faltante",
+            # cuando en realidad el dato SÍ estaba, solo mal formateado. El
+            # usuario confirmó revisando el archivo que ninguna celda real
+            # está vacía/en 0. Ahora se detecta el formato de texto y se
+            # convierte antes de fallar (soporta también miles con "." si
+            # los hubiera, ej. "1.234,56" -> 1234.56).
             v = col(nombre, row)
+            if v is None:
+                return 0.0
+            if isinstance(v, (int, float)):
+                return float(v)
+            texto = str(v).strip()
+            if not texto:
+                return 0.0
+            if "," in texto:
+                texto = texto.replace(".", "").replace(",", ".")
             try:
-                return float(v) if v is not None else 0.0
+                return float(texto)
             except (TypeError, ValueError):
                 return 0.0
 
@@ -1909,10 +1930,36 @@ def reparar_lotes_legacy():
         db.session.commit()
 
 
+def reparar_paridad_eur_historica():
+    """Ronda AD (2026-09-14): repara los datos YA CARGADOS de
+    compras_historicas (tabla insert-only/gated, no se vuelve a sembrar)
+    afectados por el bug de parseo corregido en seed_compras_historicas
+    (ver num() ahí): las 54 filas de DORC (facturas CD100058713 y
+    CD100059451) que quedaron con paridad_eur=0.0 porque la celda original
+    del Excel era el texto "0,8687" (coma decimal), no un dato faltante.
+    Idempotente: si ya no queda ninguna fila en 0.0 para esas facturas, no
+    hace nada."""
+    filas = CompraHistorica.query.filter(
+        CompraHistorica.factura.in_(["CD100058713", "CD100059451"]),
+        CompraHistorica.proveedor_original == "DORC",
+        CompraHistorica.paridad_eur == 0.0,
+    ).all()
+    if not filas:
+        return
+    for f in filas:
+        f.paridad_eur = 0.8687
+    db.session.commit()
+    print(
+        f"[reparar] Corregida paridad_eur (0.8687) en {len(filas)} fila(s) históricas de DORC "
+        "(facturas CD100058713/CD100059451, dato de texto con coma decimal mal parseado)."
+    )
+
+
 with app.app_context():
     reparar_ordenes_mezcladas()
     limpiar_ordenes_canceladas()
     reparar_lotes_legacy()
+    reparar_paridad_eur_historica()
 
 
 def _mensaje_division(ordenes_destino):
@@ -4809,23 +4856,18 @@ def _derecho_u_otro_costo_en_moneda(valor_clp, tipo_cambio, paridad):
 
 
 def _paridad_efectiva_historica(c):
-    """Ronda AC (2026-09-14): corrige un bug real detectado por el usuario
-    -- 54 líneas del histórico traen la columna "Paridad EUR" en 0 (dato
-    faltante en el Excel original, no una operación en USD), y el código
-    anterior interpretaba ese 0 como "paridad 1 = USD", mostrando como
-    dólar una compra que en realidad era en euros (ej. DORC, código
-    8310.25G12_01, facturas CD100058713/CD100059451: TODAS sus líneas
-    tienen paridad 0, pero el proveedor jamás compra en USD).
-
-    Fuente principal: la paridad tal como viene en el archivo (así lo pidió
-    el usuario: "para definir la moneda tiene que ver ese campo de
-    paridad"). Solo cuando esa paridad viene en 0/vacía, se reconstruye
-    dividiendo Total Invoice (columna R, moneda de factura) por el propio
-    Total USD (columna S) -- validado contra los datos reales: para TODA
-    fila con paridad ya informada, ese cociente reproduce la paridad
-    original casi exacto (la propia planilla del usuario calculó la
-    columna S dividiendo R por la paridad real, aunque la columna F haya
-    quedado en blanco para esa fila en particular)."""
+    """Ronda AC (2026-09-14), causa raíz corregida en la ronda AD: la
+    paridad tal como viene en el archivo ES la fuente de verdad (así lo
+    pidió el usuario: "para definir la moneda tiene que ver ese campo de
+    paridad") -- desde la ronda AD, `seed_compras_historicas` ya parsea
+    correctamente el formato de texto con coma decimal que traían 54 filas
+    de DORC ("0,8687"), así que en datos cargados de nuevo esta paridad
+    nunca debería venir realmente en 0/vacía (ver `num()` y
+    `reparar_paridad_eur_historica`, que corrige las filas que ya habían
+    quedado mal cargadas por el bug de parseo). Se mantiene igual la
+    reconstrucción por cociente (Total Invoice / Total USD) como red de
+    seguridad puramente defensiva, por si algún dato futuro llegara
+    genuinamente vacío -- no debería activarse en la práctica."""
     paridad = c.paridad_eur
     if paridad:
         return paridad
@@ -5828,6 +5870,13 @@ def _transito_por_linea():
             OrdenCompraLinea.anulada == False,  # noqa: E712
             OrdenCompraLinea.etapa.in_(ETAPAS_EN_TRANSITO),
             OrdenCompra.estado_aprobacion == "Aprobada",
+            # Ronda AD (2026-09-14): bug real reportado por el usuario --
+            # al cancelar una orden YA asociada a un despacho, `ordenes_
+            # cancelar` la marca "Cancelada" pero (a propósito, para no
+            # perder trazabilidad) no toca sus líneas ni el despacho -- así
+            # que sus líneas seguían contando acá como "en tránsito" aunque
+            # la orden ya estuviera cancelada/eliminada para el usuario.
+            OrdenCompra.estado != "Cancelada",
         )
         .all()
     )
@@ -6089,7 +6138,15 @@ def stock_list():
                 "stock_total_proyectado": 0 + 0 - cantidad_pedido,
             }
 
-    resultado = sorted(grupos.values(), key=lambda g: (g["proveedor_nombre"] or "", g["descripcion"] or ""))
+    # Ronda AD (2026-09-14): orden por defecto pedido por el usuario -- el
+    # producto con MAYOR stock total (proyectado, columna D) primero. Como
+    # este orden se recalcula en cada request (no se guarda en sesión ni en
+    # el navegador), cualquier cambio de filtro vuelve a aplicar este mismo
+    # orden por defecto sobre el resultado ya filtrado, sin que el usuario
+    # tenga que volver a ordenar a mano -- el ordenamiento manual por
+    # columna (ver JS abajo) sigue disponible y solo dura hasta el próximo
+    # cambio de filtro (recarga la página).
+    resultado = sorted(grupos.values(), key=lambda g: -(g["stock_total_proyectado"] or 0))
     empresas = Empresa.query.order_by(Empresa.nombre).all()
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     ultima_carga = db.session.query(db.func.max(StockExistencia.cargado_en)).scalar()
@@ -6703,6 +6760,25 @@ def _resumen_por_proveedor(filas, mapa_recurrente=None):
     return sorted(filas_resumen, key=lambda r: -r["total_invoice_usd_ref"])
 
 
+def _mapa_padre_por_variante_proveedor(proveedor_nombre):
+    """Ronda AD (2026-09-14): para proveedores de lentes que ya tienen
+    catálogo de código padre/variante (hoy MEDICONTUR y BVI PHYSIOL, ver
+    ProductoVariante y seed_variantes_lentes_medicontur/_physiol), arma
+    {codigo_variante_en_mayuscula: producto_padre} -- se usa en el reporte
+    Compras Proveedor para agrupar primero por código padre y recién al
+    entrar a ese padre mostrar el código de producto (variante) específico,
+    tal como pidió el usuario. Un proveedor SIN catálogo de variantes (la
+    gran mayoría) devuelve un mapa vacío, y el reporte sigue mostrando la
+    lista plana de siempre -- no hace falta ninguna lista de "proveedores
+    de lentes" hardcodeada, se deriva sola de qué proveedores ya tienen
+    ProductoVariante cargado."""
+    prov = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == (proveedor_nombre or "").upper()).first()
+    if not prov:
+        return {}
+    variantes = ProductoVariante.query.join(Producto).filter(Producto.proveedor_id == prov.id).all()
+    return {v.codigo.strip().upper(): v.producto for v in variantes if v.codigo}
+
+
 def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha_hasta=None, homologar=None):
     """Junta histórico + sistema ya homologados y filtrados -- reutilizado
     tanto por el listado general como por la vista de un proveedor
@@ -6887,13 +6963,65 @@ def reportes_compras_proveedor_detalle(proveedor):
                 for (a, m) in meses_ordenados
             },
             "facturas": prod["facturas"],
+            "busqueda": prod["codigo"].lower(),
         })
+
+    # Ronda AD (2026-09-14): para proveedores de lentes con catálogo de
+    # código padre/variante (MEDICONTUR, BVI PHYSIOL -- ver
+    # _mapa_padre_por_variante_proveedor), se pide mostrar PRIMERO el
+    # código padre (la "familia" del lente) y, al entrar a ese padre, recién
+    # ahí desplegar el código de producto/variante específico (dioptría).
+    # Un producto de ese mismo proveedor que NO es un lente con variante
+    # conocida (ej. inyectores, viscoelástico) sigue mostrándose suelto,
+    # igual que antes.
+    mapa_padre = _mapa_padre_por_variante_proveedor(proveedor)
+    if mapa_padre:
+        agrupados = {}
+        sueltos = []
+        for p in productos_lista:
+            producto_padre = mapa_padre.get(p["codigo"].strip().upper())
+            if not producto_padre:
+                sueltos.append(p)
+                continue
+            grupo = agrupados.get(producto_padre.id)
+            if grupo is None:
+                grupo = {
+                    "codigo": producto_padre.codigo,
+                    "descripcion": producto_padre.descripcion,
+                    "es_padre": True,
+                    "es_mixto": False,
+                    "total_dominante": 0.0,
+                    "flete_dominante": 0.0,
+                    "derechos_dominante": 0.0,
+                    "otros_dominante": 0.0,
+                    "meses": {m["clave"]: {"total_moneda": 0.0, "moneda": moneda_dominante} for m in meses_columnas},
+                    "facturas": [],
+                    "variantes": [],
+                    "busqueda": producto_padre.codigo.lower(),
+                }
+                agrupados[producto_padre.id] = grupo
+            grupo["variantes"].append(p)
+            grupo["es_mixto"] = grupo["es_mixto"] or p["es_mixto"]
+            grupo["total_dominante"] += p["total_dominante"]
+            grupo["flete_dominante"] += p["flete_dominante"]
+            grupo["derechos_dominante"] += p["derechos_dominante"]
+            grupo["otros_dominante"] += p["otros_dominante"]
+            for clave, celda in p["meses"].items():
+                grupo["meses"][clave]["total_moneda"] += celda["total_moneda"] or 0
+            grupo["facturas"].extend(p["facturas"])
+            grupo["busqueda"] += " " + p["busqueda"]
+        for grupo in agrupados.values():
+            grupo["variantes"].sort(key=lambda v: -v["total_dominante"])
+            grupo["facturas"].sort(key=lambda x: x["fecha_factura"] or date.min, reverse=True)
+        productos_lista = list(agrupados.values()) + sueltos
+
     productos_lista.sort(key=lambda p: -p["total_dominante"])
 
     return render_template(
         "reportes/compras_proveedor_detalle.html",
         proveedor=proveedor, totales=totales,
         productos=productos_lista, meses_columnas=meses_columnas,
+        agrupado_por_padre=bool(mapa_padre),
         empresas=Empresa.query.order_by(Empresa.nombre).all(),
         empresa_sel=empresa, fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
     )

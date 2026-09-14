@@ -14,6 +14,41 @@
   #tabla-pivot th, #tabla-pivot td { font-size: .82rem; }
 </style>
 
+{# Ronda AD (2026-09-14): tabla de facturas reutilizada tanto para un
+   producto suelto (sin código padre) como para cada variante dentro del
+   panel de un código padre -- misma estructura que antes, solo factorizada
+   a macro para no duplicar el markup en los dos niveles. #}
+{% macro facturas_tabla(prod) %}
+<div class="fw-semibold small mb-1">Facturas de {{ prod.codigo }}</div>
+<table class="table table-sm mb-0">
+  <thead>
+    <tr>
+      <th>Origen</th>
+      <th>Fecha factura</th>
+      <th>N° Factura</th>
+      <th class="text-end">Unidades</th>
+      <th class="text-end">Total Invoice</th>
+      <th>Moneda</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for fac in prod.facturas %}
+    <tr>
+      <td>
+        {% if fac.origen == 'Sistema' %}<span class="badge" style="background-color: var(--brand);">Sistema</span>
+        {% else %}<span class="badge bg-secondary">Histórico</span>{% endif %}
+      </td>
+      <td>{{ fac.fecha_factura.strftime('%d-%m-%Y') if fac.fecha_factura else '-' }}</td>
+      <td>{{ fac.factura }}</td>
+      <td class="text-end">{{ fac.unidades | numero_flex }}</td>
+      <td class="text-end">{{ fac.total_invoice | moneda }}</td>
+      <td>{{ fac.moneda_operacion }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <div>
     <div class="text-muted small mb-1">
@@ -41,14 +76,19 @@
   </div>
   <div class="col-auto">
     <label class="form-label small mb-0">Fecha factura desde</label>
-    <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}" onchange="this.form.submit()">
+    <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}">
   </div>
   <div class="col-auto">
     <label class="form-label small mb-0">Fecha factura hasta</label>
-    <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}" onchange="this.form.submit()">
+    <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}">
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0 d-block">&nbsp;</label>
+    <button type="submit" class="btn btn-brand"><i class="bi bi-search"></i> Filtrar</button>
   </div>
   {% if empresa_sel or fecha_desde or fecha_hasta %}
   <div class="col-auto">
+    <label class="form-label small mb-0 d-block">&nbsp;</label>
     <a href="{{ url_for('reportes_compras_proveedor_detalle', proveedor=proveedor) }}" class="btn btn-outline-secondary">Quitar filtros</a>
   </div>
   {% endif %}
@@ -120,7 +160,71 @@
       </thead>
       <tbody>
         {% for p in productos %}
-        <tr class="fila-producto" data-codigo="{{ p.codigo|lower }}" data-descripcion="{{ p.descripcion|lower }}"
+        {% if p.es_padre %}
+        <tr class="fila-producto fila-padre" data-codigo="{{ p.busqueda }}" data-descripcion="{{ p.descripcion|lower }}"
+            data-total-dominante="{{ p.total_dominante }}" data-flete-dominante="{{ p.flete_dominante }}"
+            data-derechos-dominante="{{ p.derechos_dominante }}" data-otros-dominante="{{ p.otros_dominante }}"
+            data-sort-codigo="{{ p.codigo|lower }}" data-sort-descripcion="{{ p.descripcion|lower }}"
+            data-sort-total="{{ p.total_dominante }}"
+            {% for m in meses_columnas %}data-sort-mes-{{ m.clave }}="{{ p.meses[m.clave].total_moneda }}"{% if not loop.last %} {% endif %}{% endfor %}>
+          <td><i class="bi bi-chevron-right small text-muted"></i></td>
+          <td class="fw-semibold">
+            {{ p.codigo }}
+            <span class="badge bg-secondary-subtle text-secondary-emphasis ms-1" data-bs-toggle="tooltip"
+                  title="Código padre -- agrupa {{ p.variantes|length }} código(s) de producto (variantes). Haz clic para verlos.">
+              {{ p.variantes|length }} código{{ 's' if p.variantes|length != 1 else '' }}
+            </span>
+            {% if p.es_mixto %}
+            <i class="bi bi-exclamation-triangle-fill text-warning ms-1" data-bs-toggle="tooltip"
+               title="Alguno de los códigos de esta familia tuvo facturas en más de una moneda dentro del rango -- revisa el detalle."></i>
+            {% endif %}
+          </td>
+          <td style="max-width: 260px;">{{ p.descripcion }}</td>
+          {% for m in meses_columnas %}
+          {% set celda = p.meses[m.clave] %}
+          <td class="celda-mes">{% if celda.total_moneda %}{{ celda.total_moneda | moneda }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+          {% endfor %}
+          <td class="text-end fw-semibold">{{ p.total_dominante | moneda }}</td>
+        </tr>
+        <tr class="fila-variantes d-none">
+          <td></td>
+          <td colspan="{{ 2 + meses_columnas|length + 1 }}">
+            <div class="fw-semibold small mb-1">Códigos de producto de {{ p.codigo }}</div>
+            <table class="table table-sm table-hover align-middle mb-0">
+              <tbody>
+                {% for v in p.variantes %}
+                <tr class="fila-producto" data-codigo="{{ v.codigo|lower }}" data-descripcion="{{ v.descripcion|lower }}"
+                    data-total-dominante="{{ v.total_dominante }}" data-flete-dominante="{{ v.flete_dominante }}"
+                    data-derechos-dominante="{{ v.derechos_dominante }}" data-otros-dominante="{{ v.otros_dominante }}"
+                    data-sub-fila="1">
+                  <td style="width: 24px;"><i class="bi bi-chevron-right small text-muted"></i></td>
+                  <td class="fw-semibold">
+                    {{ v.codigo }}
+                    {% if v.es_mixto %}
+                    <i class="bi bi-exclamation-triangle-fill text-warning ms-1" data-bs-toggle="tooltip"
+                       title="Este código tuvo facturas en más de una moneda dentro del rango -- revisa el detalle de facturas."></i>
+                    {% endif %}
+                  </td>
+                  <td style="max-width: 260px;">{{ v.descripcion }}</td>
+                  {% for m in meses_columnas %}
+                  {% set celda = v.meses[m.clave] %}
+                  <td class="celda-mes">{% if celda.total_moneda %}{{ celda.total_moneda | moneda }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+                  {% endfor %}
+                  <td class="text-end fw-semibold">{{ v.total_dominante | moneda }}</td>
+                </tr>
+                <tr class="fila-facturas d-none">
+                  <td></td>
+                  <td colspan="{{ 2 + meses_columnas|length + 1 }}">
+                    {{ facturas_tabla(v) }}
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </td>
+        </tr>
+        {% else %}
+        <tr class="fila-producto" data-codigo="{{ p.busqueda }}" data-descripcion="{{ p.descripcion|lower }}"
             data-total-dominante="{{ p.total_dominante }}" data-flete-dominante="{{ p.flete_dominante }}"
             data-derechos-dominante="{{ p.derechos_dominante }}" data-otros-dominante="{{ p.otros_dominante }}"
             data-sort-codigo="{{ p.codigo|lower }}" data-sort-descripcion="{{ p.descripcion|lower }}"
@@ -144,36 +248,10 @@
         <tr class="fila-facturas d-none">
           <td></td>
           <td colspan="{{ 2 + meses_columnas|length + 1 }}">
-            <div class="fw-semibold small mb-1">Facturas de {{ p.codigo }}</div>
-            <table class="table table-sm mb-0">
-              <thead>
-                <tr>
-                  <th>Origen</th>
-                  <th>Fecha factura</th>
-                  <th>N° Factura</th>
-                  <th class="text-end">Unidades</th>
-                  <th class="text-end">Total Invoice</th>
-                  <th>Moneda</th>
-                </tr>
-              </thead>
-              <tbody>
-                {% for fac in p.facturas %}
-                <tr>
-                  <td>
-                    {% if fac.origen == 'Sistema' %}<span class="badge" style="background-color: var(--brand);">Sistema</span>
-                    {% else %}<span class="badge bg-secondary">Histórico</span>{% endif %}
-                  </td>
-                  <td>{{ fac.fecha_factura.strftime('%d-%m-%Y') if fac.fecha_factura else '-' }}</td>
-                  <td>{{ fac.factura }}</td>
-                  <td class="text-end">{{ fac.unidades | numero_flex }}</td>
-                  <td class="text-end">{{ fac.total_invoice | moneda }}</td>
-                  <td>{{ fac.moneda_operacion }}</td>
-                </tr>
-                {% endfor %}
-              </tbody>
-            </table>
+            {{ facturas_tabla(p) }}
           </td>
         </tr>
+        {% endif %}
         {% else %}
         <tr><td colspan="99" class="text-center text-muted py-4">No hay compras que coincidan con los filtros.</td></tr>
         {% endfor %}
@@ -196,11 +274,16 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
   var tbody = tabla.querySelector('tbody');
   var buscador = document.getElementById('buscador-producto');
 
-  // --- Expandir/contraer facturas de un producto ---
-  tbody.querySelectorAll('tr.fila-producto').forEach(function (fila) {
+  // --- Expandir/contraer facturas de un producto (o los códigos de un
+  // código padre -- ronda AD, 2026-09-14) ---
+  // Se usa querySelectorAll (sin importar el nivel de anidamiento) a
+  // propósito: así el mismo click-para-expandir funciona tanto en las
+  // filas de primer nivel (producto suelto o código padre) como en las
+  // filas de variante anidadas dentro del panel de un código padre.
+  tabla.querySelectorAll('tr.fila-producto').forEach(function (fila) {
     fila.addEventListener('click', function () {
       var sub = fila.nextElementSibling;
-      if (!sub || !sub.classList.contains('fila-facturas')) return;
+      if (!sub || !(sub.classList.contains('fila-facturas') || sub.classList.contains('fila-variantes'))) return;
       var chevron = fila.querySelector('.bi-chevron-right, .bi-chevron-down');
       sub.classList.toggle('d-none');
       if (chevron) {
@@ -210,12 +293,21 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
     });
   });
 
+  // Ronda AD: el buscador/orden/resumen solo deben mirar las filas de
+  // PRIMER NIVEL (hijas directas de este tbody) -- las filas de variante
+  // anidadas dentro del panel de un código padre viven en otra <tbody>,
+  // adentro de una tabla anidada, así que `tbody.children` ya las excluye
+  // automáticamente sin necesidad de filtrar por profundidad a mano.
   function paresFilas() {
     var pares = [];
-    var filas = Array.prototype.slice.call(tbody.querySelectorAll('tr.fila-producto'));
-    filas.forEach(function (f) {
+    var hijos = Array.prototype.slice.call(tbody.children);
+    hijos.forEach(function (f) {
+      if (!f.classList || !f.classList.contains('fila-producto')) return;
       var sub = f.nextElementSibling;
-      pares.push({ principal: f, sub: (sub && sub.classList.contains('fila-facturas')) ? sub : null });
+      pares.push({
+        principal: f,
+        sub: (sub && (sub.classList.contains('fila-facturas') || sub.classList.contains('fila-variantes'))) ? sub : null,
+      });
     });
     return pares;
   }
@@ -248,8 +340,12 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
     return partes[0] + ',' + partes[1];
   }
   function recalcularResumen() {
+    // Ronda AD: solo filas de primer nivel (tbody.children) -- si se
+    // sumaran también las variantes anidadas dentro de un código padre, se
+    // contaría cada monto DOS veces (una en el padre, otra en su variante).
     var cantidad = 0, total = 0, flete = 0, derechos = 0, otros = 0;
-    tbody.querySelectorAll('tr.fila-producto').forEach(function (fila) {
+    Array.prototype.forEach.call(tbody.children, function (fila) {
+      if (!fila.classList || !fila.classList.contains('fila-producto')) return;
       if (fila.classList.contains('d-none')) return;
       cantidad += 1;
       total += num(fila.dataset.totalDominante);

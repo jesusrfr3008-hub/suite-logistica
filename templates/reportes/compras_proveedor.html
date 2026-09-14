@@ -48,14 +48,19 @@
   </div>
   <div class="col-auto">
     <label class="form-label small mb-0">Fecha factura desde</label>
-    <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}" onchange="this.form.submit()">
+    <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}">
   </div>
   <div class="col-auto">
     <label class="form-label small mb-0">Fecha factura hasta</label>
-    <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}" onchange="this.form.submit()">
+    <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}">
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0 d-block">&nbsp;</label>
+    <button type="submit" class="btn btn-brand"><i class="bi bi-search"></i> Filtrar</button>
   </div>
   {% if proveedor_sel or empresa_sel or fecha_desde or fecha_hasta %}
   <div class="col-auto">
+    <label class="form-label small mb-0 d-block">&nbsp;</label>
     <a href="{{ url_for('reportes_compras_proveedor') }}" class="btn btn-outline-secondary">Quitar filtros</a>
   </div>
   {% endif %}
