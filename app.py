@@ -5,7 +5,7 @@ import os
 import re
 import shutil
 import uuid
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime, date
 from functools import wraps
 from urllib.parse import quote
@@ -92,6 +92,27 @@ HISTORICO_COMPRAS_EXCEL = os.path.join(BASE_DIR, "historico_compras_proveedores.
 #    (ver _moneda_dominante), nunca como fuente principal: la moneda de
 #    cada línea/factura se sigue determinando por su propia paridad.
 MONEDA_PROVEEDOR_EXCEL = os.path.join(BASE_DIR, "moneda_proveedor.xlsx")
+# 4) Ronda AE (2026-09-14): listado de código padre/variante de lentes BVI
+#    PHYSIOL que mantiene el usuario aparte (superset corregido de la hoja
+#    "LENTES PHYSIOL" que trae INVENTARIOS_CODIGOS_INTERNOS_EXCEL -- agrega
+#    códigos que antes no estaban referenciados a ningún padre). Si existe,
+#    tiene prioridad sobre la hoja embebida -- ver seed_variantes_lentes_
+#    physiol() y reparar_variantes_physiol_ronda_ae().
+AJUSTE_PADRE_PHYSIOL_EXCEL = os.path.join(BASE_DIR, "Ajuste de cuentas padre Physiol.xlsx")
+
+# Ronda AE (2026-09-14): algunos proveedores extranjeros aparecen en el
+# histórico de compras (columna "Proveedor" original del archivo) con un
+# nombre corto que no trae el prefijo "BVI" que sí usa el catálogo de este
+# sistema (Proveedor.nombre) -- ej. "OPTIKON" en vez de "BVI OPTIKON". Se
+# homologa acá, en un solo lugar, para que el reporte de Compras Proveedor
+# agrupe cada proveedor bajo su nombre real de catálogo (ver
+# _proveedor_canonico_historico() y su uso en _fila_historica_dict() /
+# _proveedores_reporte_compras()).
+ALIAS_PROVEEDOR_HISTORICO = {
+    "OPTIKON": "BVI OPTIKON",
+    "PHYSIOL": "BVI PHYSIOL",
+    "BEAVER": "BVI BEAVER",
+}
 
 app = Flask(__name__)
 # Soporte Postgres (ronda M, 2026-09-10): si existe la variable de entorno
@@ -1386,6 +1407,195 @@ def reparar_datos_ronda_w():
         )
 
 
+def reparar_variantes_medicontur_ronda_ae():
+    """Ronda AE (2026-09-14, punto 1): repara los códigos de variante
+    MEDICONTUR que quedaron con la nomenclatura VIEJA de proveedor -- el
+    usuario corrigió 'Listado codigos lentes medicontur.xlsx' para que los
+    productos cuyo código padre es 877PETY y cuya descripción termina en
+    "CYL 1" usen la letra "O" al final del código de proveedor (ej.
+    877PETYP210O), en vez del "0" (cero) que se había usado antes. De
+    paso se detectó que 2 códigos (677MTYP230A y 877PETYP1200) habían
+    quedado compartiendo el MISMO texto de código entre 2 dioptrías
+    distintas -- el archivo nuevo los separa en códigos propios.
+
+    Como seed_variantes_lentes_medicontur() está gateada (corre una sola
+    vez, para no pisar ediciones manuales), estas correcciones NUNCA
+    llegan solas a una base ya sembrada -- de ahí esta función, que SÍ
+    corre en cada arranque (no gateada, idempotente: si ya no encuentra
+    nada por renombrar, no hace nada). NUNCA borra ni crea
+    ProductoVariante -- solo RENOMBRA pv.codigo (y ajusta la descripción
+    si cambió), comparando para cada código padre lo que ya existe en la
+    base contra lo que dice el archivo actual: primero empareja por
+    código EXACTO cuando ese código no está duplicado (para el caso de
+    "solo cambió la descripción"), y con lo que sobra empareja por
+    descripción (el caso real de esta ronda: un código viejo desaparece y
+    otro nuevo -- con la misma descripción -- lo reemplaza). Los códigos
+    duplicados en la base (2 filas con el mismo texto de código) se
+    excluyen a propósito del emparejamiento por código exacto y se
+    resuelven siempre por descripción, para no arriesgar pisar la
+    descripción de la fila equivocada por el orden en que vuelva la
+    consulta. HomologacionStock/StockExistencia enlazan por variante_id
+    (no por el texto del código), así que renombrar es seguro y se
+    refleja solo, tanto en Consulta de Stock como en los reportes."""
+    medicontur = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "MEDICONTUR").first()
+    if not medicontur or not os.path.isfile(VARIANTES_LENTES_MEDICONTUR_EXCEL):
+        return
+
+    import openpyxl
+    wb = openpyxl.load_workbook(VARIANTES_LENTES_MEDICONTUR_EXCEL, data_only=True)
+    ws = wb.worksheets[0]
+    fila_inicio = 2
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), start=1):
+        primera = str(row[0]).strip().lower() if row and row[0] else ""
+        if primera == "codigo padre":
+            fila_inicio = i + 1
+            break
+
+    nuevas_por_padre = defaultdict(list)
+    for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+        codigo_padre, codigo_variante, descripcion = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, None)
+        codigo_padre = str(codigo_padre).strip() if codigo_padre else ""
+        codigo_variante = str(codigo_variante).strip() if codigo_variante else ""
+        descripcion = str(descripcion).strip() if descripcion else ""
+        if not codigo_padre or not codigo_variante:
+            continue
+        nuevas_por_padre[codigo_padre.upper()].append({"codigo": codigo_variante, "desc": descripcion, "usada": False})
+
+    renombres = []
+    for padre in Producto.query.filter_by(proveedor_id=medicontur.id).all():
+        nuevas = nuevas_por_padre.get(padre.codigo.strip().upper())
+        if not nuevas:
+            continue
+        actuales = ProductoVariante.query.filter_by(producto_id=padre.id).all()
+        conteo_codigo_actual = Counter(v.codigo.strip().upper() for v in actuales)
+
+        # Paso 1: mismo código EXACTO (y sin ambigüedad) -- solo puede
+        # haber cambiado la descripción.
+        for v in actuales:
+            if conteo_codigo_actual[v.codigo.strip().upper()] != 1:
+                continue  # código duplicado en la base -- se resuelve en el paso 2
+            for n in nuevas:
+                if not n["usada"] and n["codigo"].upper() == v.codigo.strip().upper():
+                    n["usada"] = True
+                    if n["desc"] and v.descripcion != n["desc"]:
+                        v.descripcion = n["desc"]
+                    break
+
+        # Paso 2: lo que sobra de cada lado se empareja por descripción.
+        usados_codigo = {n["codigo"].upper() for n in nuevas if n["usada"]}
+        sobran_variantes = [v for v in actuales if v.codigo.strip().upper() not in usados_codigo]
+        por_desc = defaultdict(list)
+        for v in sobran_variantes:
+            por_desc[(v.descripcion or "").strip().upper()].append(v)
+        for n in nuevas:
+            if n["usada"]:
+                continue
+            candidatos = por_desc.get(n["desc"].strip().upper())
+            if not candidatos:
+                continue
+            v = candidatos.pop(0)
+            if v.codigo.strip().upper() != n["codigo"].upper():
+                renombres.append(f"{v.codigo}->{n['codigo']}")
+                v.codigo = n["codigo"]
+            if n["desc"]:
+                v.descripcion = n["desc"]
+            n["usada"] = True
+
+    if renombres:
+        db.session.commit()
+        print(f"[reparar_ronda_ae] MEDICONTUR: {len(renombres)} código(s) de variante renombrado(s): {renombres}")
+
+
+def reparar_variantes_physiol_ronda_ae():
+    """Ronda AE (2026-09-14, punto 2): el usuario aportó un archivo nuevo,
+    más completo, de variantes BVI PHYSIOL ('Ajuste de cuentas padre
+    Physiol.xlsx' -- ver AJUSTE_PADRE_PHYSIOL_EXCEL) porque el histórico de
+    compras traía códigos que no estaban referenciados con su código padre
+    correcto. Mismo mecanismo/misma tabla que seed_variantes_lentes_
+    physiol() (3 columnas: codigo padre, Codigo Producto, DESCRIPCION,
+    encabezado detectado igual), pero esta función SÍ corre en cada
+    arranque (no gateada) para que las variantes que falten en una base
+    donde seed_variantes_lentes_physiol() ya corrió (con el archivo viejo,
+    antes de este ajuste) se agreguen igual -- sin gate no hay forma de que
+    ese seed original vuelva a correr. Es puramente ADITIVA: si la
+    variante (código padre + código de variante) ya existe, no la toca; si
+    el código padre no existe todavía como Producto, lo crea igual que
+    hace seed_variantes_lentes_physiol() (copiando precio de una familia
+    "hermana" si el nombre es la versión " Toric" de una ya existente)."""
+    physiol = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "BVI PHYSIOL").first()
+    if not physiol or not os.path.isfile(AJUSTE_PADRE_PHYSIOL_EXCEL):
+        return
+
+    import openpyxl
+    wb = openpyxl.load_workbook(AJUSTE_PADRE_PHYSIOL_EXCEL, data_only=True)
+    if "LENTES PHYSIOL" not in wb.sheetnames:
+        return
+    ws = wb["LENTES PHYSIOL"]
+    fila_inicio = 2
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), start=1):
+        primera = str(row[0]).strip().lower() if row and row[0] else ""
+        if primera == "codigo padre":
+            fila_inicio = i + 1
+            break
+
+    productos_padre = {
+        p.codigo.strip().upper(): p
+        for p in Producto.query.filter_by(proveedor_id=physiol.id).all()
+    }
+    variantes_existentes = {
+        (v.producto_id, v.codigo.strip().upper())
+        for v in ProductoVariante.query.join(Producto).filter(Producto.proveedor_id == physiol.id).all()
+    }
+
+    creadas = 0
+    padres_creados = set()
+    vistos = set()
+    for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+        codigo_padre, codigo_variante, descripcion = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, None)
+        codigo_padre = str(codigo_padre).strip() if codigo_padre else ""
+        codigo_variante = str(codigo_variante).strip() if codigo_variante else ""
+        descripcion = str(descripcion).strip() if descripcion else ""
+        if not codigo_padre or not codigo_variante:
+            continue
+        clave = (codigo_padre.upper(), codigo_variante.upper())
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+
+        producto = productos_padre.get(codigo_padre.upper())
+        if not producto:
+            candidato_hermano = re.sub(r"\btoric\b", "", codigo_padre, flags=re.IGNORECASE)
+            candidato_hermano = re.sub(r"\s+", " ", candidato_hermano).strip()
+            hermano = productos_padre.get(candidato_hermano.upper()) if candidato_hermano else None
+            producto = Producto(
+                proveedor_id=physiol.id, codigo=codigo_padre, descripcion=codigo_padre,
+                empaque=(hermano.empaque if hermano else 1),
+                moneda=(hermano.moneda if hermano else (physiol.moneda_default or "USD")),
+                precio_caja=(hermano.precio_caja if hermano else 0),
+                precio_unitario=(hermano.precio_unitario if hermano else 0),
+                activo=True,
+            )
+            db.session.add(producto)
+            db.session.flush()
+            productos_padre[codigo_padre.upper()] = producto
+            padres_creados.add(codigo_padre)
+
+        if (producto.id, codigo_variante.upper()) in variantes_existentes:
+            continue
+        db.session.add(ProductoVariante(
+            producto_id=producto.id, codigo=codigo_variante, descripcion=descripcion or codigo_variante,
+        ))
+        variantes_existentes.add((producto.id, codigo_variante.upper()))
+        creadas += 1
+
+    if creadas or padres_creados:
+        db.session.commit()
+        print(
+            f"[reparar_ronda_ae] BVI PHYSIOL: {creadas} variante(s) nueva(s) agregada(s) desde el archivo de "
+            f"ajuste ({len(padres_creados)} código(s) padre nuevo(s) creados: {sorted(padres_creados)})."
+        )
+
+
 def _normalizar_codigo_ergopyme(valor):
     """Ronda AA (2026-09-13): normaliza un código interno del sistema de
     Inventarios (Ergopyme) tal como viene en los archivos de Reportes --
@@ -1683,6 +1893,8 @@ with app.app_context():
     seed_homologacion_y_stock_inicial()
     seed_administrador_inicial()
     reparar_datos_ronda_w()
+    reparar_variantes_medicontur_ronda_ae()
+    reparar_variantes_physiol_ronda_ae()
     seed_codigos_ergopyme()
     seed_compras_historicas()
 
@@ -4773,6 +4985,19 @@ def _codigo_interno_homologado(parcial_linea):
     return producto.codigo_interno_inventario
 
 
+def _proveedor_canonico_historico(proveedor_original):
+    """Ronda AE (2026-09-14): nombre de proveedor tal como debe mostrarse en
+    los reportes/Consulta de Stock, a partir del nombre CRUDO que trae la
+    columna "Proveedor" del histórico de compras -- aplica el alias BVI (ver
+    ALIAS_PROVEEDOR_HISTORICO) y nada más. Ver _fila_historica_dict() para
+    por qué esto reemplazó, para efectos de AGRUPACIÓN, al proveedor que
+    resolvía el mapeo Ergopyme."""
+    nombre = (proveedor_original or "").strip()
+    if not nombre:
+        return nombre
+    return ALIAS_PROVEEDOR_HISTORICO.get(nombre.upper(), nombre)
+
+
 def _construir_homologador_ergopyme():
     """Ronda AB (2026-09-14): arma (una sola vez por request) el
     homologador de códigos internos de Ergopyme -> (proveedor real,
@@ -5023,7 +5248,9 @@ def _totales_en_moneda(filas, moneda_dominante, paridad_representativa):
         "flete": flete,
         "flete_pct": (flete / total * 100) if total else 0,
         "derechos": derechos,
+        "derechos_pct": (derechos / total * 100) if total else 0,
         "otros_gastos": otros,
+        "otros_gastos_pct": (otros / total * 100) if total else 0,
     }
 
 
@@ -6568,19 +6795,15 @@ def admin_reset_ejecutar():
 
 def _proveedores_reporte_compras(homologar=None):
     """Lista de proveedores para el filtro del reporte Compras Proveedor:
-    los del catálogo activo + los que resultan de homologar EN VIVO (ver
-    _construir_homologador_ergopyme) cada código interno distinto del
-    histórico -- para no dejar fuera un proveedor antiguo que ya no está
-    en el catálogo (ej. una relación comercial discontinuada), y para que
-    la lista siempre refleje el mapeo Ergopyme actual (no un valor
-    congelado de cuando se cargó el histórico)."""
-    homologar = homologar or _construir_homologador_ergopyme()
+    los del catálogo activo + los que aparecen en el histórico de compras
+    (por su proveedor CRUDO, con el alias BVI aplicado -- ver
+    _proveedor_canonico_historico) -- para no dejar fuera un proveedor
+    antiguo que ya no está en el catálogo (ej. una relación comercial
+    discontinuada). El parámetro `homologar` se mantiene por compatibilidad
+    de firma pero ya no se usa para esto (ver Ronda AE, _fila_historica_dict)."""
     nombres = {p.nombre for p in Proveedor.query.filter_by(activo=True).all()}
-    for codigo, proveedor_original in db.session.query(
-        CompraHistorica.codigo_interno, CompraHistorica.proveedor_original
-    ).distinct():
-        resuelto = homologar(codigo)
-        nombre = resuelto[0] if resuelto else (proveedor_original or "")
+    for (proveedor_original,) in db.session.query(CompraHistorica.proveedor_original).distinct():
+        nombre = _proveedor_canonico_historico(proveedor_original)
         if nombre and nombre.upper() != "#N/A":
             nombres.add(nombre)
     return sorted(nombres)
@@ -6595,15 +6818,30 @@ def _fila_historica_dict(c, homologar):
     el archivo de mapeo). Regla del usuario: para reportes/estadísticas
     nunca se muestra el código interno de Ergopyme -- se usa el código y
     la descripción del PROVEEDOR."""
+    # Ronda AE (2026-09-14): el PROVEEDOR de cada línea histórica se toma
+    # SIEMPRE del proveedor crudo de esa factura (columna "Proveedor" del
+    # archivo histórico, con el alias BVI aplicado) -- NUNCA del proveedor
+    # que trae el mapeo Ergopyme. Se encontró (validado línea por línea
+    # contra la planilla de comprobación que trajo el usuario, cuadrando
+    # EXACTO mes a mes y proveedor por proveedor) que el mapeo Ergopyme
+    # tiene varios códigos internos con el campo Proveedor mal cargado
+    # (ej. repuestos de QUANTEL/BEAVER y sondas de OPTIKON marcados como
+    # "DORC" en el archivo de mapeo, dos de ellos con la nota "REVISAR CON
+    # LISTA PRECIO" del propio usuario) -- eso hacía que esas compras se
+    # sumaran al proveedor equivocado en el reporte, descuadrando el total
+    # del proveedor "de más" (y el del proveedor real "de menos"). El
+    # código de PRODUCTO sí se sigue resolviendo vía el mapeo Ergopyme
+    # cuando existe (es confiable y necesario para la agrupación por
+    # código padre) -- solo el nombre del proveedor dejó de depender de él.
+    proveedor = _proveedor_canonico_historico(c.proveedor_original)
     resuelto = homologar(c.codigo_interno)
     if resuelto:
-        proveedor, _prov_id, codigo_prov_resuelto, descripcion_resuelta = resuelto
+        _prov_ergopyme, _prov_id, codigo_prov_resuelto, descripcion_resuelta = resuelto
         codigo_producto = codigo_prov_resuelto or c.codigo_proveedor or c.codigo_interno
         descripcion = descripcion_resuelta or c.descripcion
         via_ergopyme = True
         homologado = True
     else:
-        proveedor = c.proveedor_original
         codigo_producto = c.codigo_proveedor or c.codigo_interno
         descripcion = c.descripcion
         via_ergopyme = False
@@ -6805,6 +7043,22 @@ def reportes_index():
     return redirect(url_for("reportes_compras_proveedor"))
 
 
+def _rango_fechas_reporte_compras():
+    """Ronda AE (2026-09-14): al entrar SIN filtro de fecha explícito, el
+    reporte de Compras Proveedor (resumen y detalle por proveedor) se
+    muestra por defecto filtrado al "año comercial" en curso -- desde el
+    01-01 del año actual hasta hoy. El año siguiente (ej. 2027) el default
+    avanza solo, porque se calcula con date.today() en cada request, no un
+    año quemado. Si la URL YA trae fecha_desde y/o fecha_hasta como
+    parámetro -- aunque venga vacío, como al hacer clic en "Quitar
+    filtros" -- se respeta tal cual sin forzar el default, para que
+    "Quitar filtros" de verdad muestre TODO el histórico sin fecha."""
+    if "fecha_desde" in request.args or "fecha_hasta" in request.args:
+        return request.args.get("fecha_desde", ""), request.args.get("fecha_hasta", "")
+    hoy = date.today()
+    return date(hoy.year, 1, 1).isoformat(), hoy.isoformat()
+
+
 @app.route("/reportes/compras-proveedor")
 @requiere_permiso("reportes")
 def reportes_compras_proveedor():
@@ -6819,8 +7073,7 @@ def reportes_compras_proveedor():
     costos (los 3 últimos en la moneda de la operación / USD agregado)."""
     proveedor = request.args.get("proveedor", "").strip()
     empresa = request.args.get("empresa", "").strip()
-    fecha_desde_txt = request.args.get("fecha_desde", "")
-    fecha_hasta_txt = request.args.get("fecha_hasta", "")
+    fecha_desde_txt, fecha_hasta_txt = _rango_fechas_reporte_compras()
     fecha_desde = parse_date(fecha_desde_txt)
     fecha_hasta = parse_date(fecha_hasta_txt)
 
@@ -6863,8 +7116,7 @@ def reportes_compras_proveedor_detalle(proveedor):
     según lo que quede visible en la tabla -- ver
     reportes/compras_proveedor_detalle.html."""
     empresa = request.args.get("empresa", "").strip()
-    fecha_desde_txt = request.args.get("fecha_desde", "")
-    fecha_hasta_txt = request.args.get("fecha_hasta", "")
+    fecha_desde_txt, fecha_hasta_txt = _rango_fechas_reporte_compras()
     fecha_desde = parse_date(fecha_desde_txt)
     fecha_hasta = parse_date(fecha_hasta_txt)
 
@@ -6912,7 +7164,8 @@ def reportes_compras_proveedor_detalle(proveedor):
             "flete_dominante": 0.0,
             "derechos_dominante": 0.0,
             "otros_dominante": 0.0,
-            "meses": defaultdict(lambda: {"total_moneda": 0.0, "moneda": None}),
+            "total_unidades": 0.0,
+            "meses": defaultdict(lambda: {"total_moneda": 0.0, "moneda": None, "unidades": 0.0}),
             "facturas": [],
         })
         if not prod["descripcion"] and f.get("descripcion"):
@@ -6925,8 +7178,10 @@ def reportes_compras_proveedor_detalle(proveedor):
         prod["flete_dominante"] += _valor_en_moneda_dominante(f.get("flete_usd"), mf, moneda_dominante, pf, paridad_representativa)
         prod["derechos_dominante"] += _valor_en_moneda_dominante(f.get("derechos_usd"), mf, moneda_dominante, pf, paridad_representativa)
         prod["otros_dominante"] += _valor_en_moneda_dominante(f.get("otros_gastos_usd"), mf, moneda_dominante, pf, paridad_representativa)
+        prod["total_unidades"] += f.get("unidades") or 0
         celda = prod["meses"][clave_mes]
         celda["total_moneda"] += f.get("total_invoice") or 0
+        celda["unidades"] += f.get("unidades") or 0
         celda["moneda"] = mf if celda["moneda"] in (None, mf) else "MIXTO"
         prod["facturas"].append({
             "factura": f.get("factura") or "-",
@@ -6958,8 +7213,9 @@ def reportes_compras_proveedor_detalle(proveedor):
             "flete_dominante": prod["flete_dominante"],
             "derechos_dominante": prod["derechos_dominante"],
             "otros_dominante": prod["otros_dominante"],
+            "total_unidades": prod["total_unidades"],
             "meses": {
-                f"{a}-{m:02d}": prod["meses"].get((a, m), {"total_moneda": 0.0, "moneda": moneda_dominante})
+                f"{a}-{m:02d}": prod["meses"].get((a, m), {"total_moneda": 0.0, "moneda": moneda_dominante, "unidades": 0.0})
                 for (a, m) in meses_ordenados
             },
             "facturas": prod["facturas"],
@@ -6994,7 +7250,8 @@ def reportes_compras_proveedor_detalle(proveedor):
                     "flete_dominante": 0.0,
                     "derechos_dominante": 0.0,
                     "otros_dominante": 0.0,
-                    "meses": {m["clave"]: {"total_moneda": 0.0, "moneda": moneda_dominante} for m in meses_columnas},
+                    "total_unidades": 0.0,
+                    "meses": {m["clave"]: {"total_moneda": 0.0, "moneda": moneda_dominante, "unidades": 0.0} for m in meses_columnas},
                     "facturas": [],
                     "variantes": [],
                     "busqueda": producto_padre.codigo.lower(),
@@ -7006,8 +7263,10 @@ def reportes_compras_proveedor_detalle(proveedor):
             grupo["flete_dominante"] += p["flete_dominante"]
             grupo["derechos_dominante"] += p["derechos_dominante"]
             grupo["otros_dominante"] += p["otros_dominante"]
+            grupo["total_unidades"] += p["total_unidades"]
             for clave, celda in p["meses"].items():
                 grupo["meses"][clave]["total_moneda"] += celda["total_moneda"] or 0
+                grupo["meses"][clave]["unidades"] += celda.get("unidades") or 0
             grupo["facturas"].extend(p["facturas"])
             grupo["busqueda"] += " " + p["busqueda"]
         for grupo in agrupados.values():

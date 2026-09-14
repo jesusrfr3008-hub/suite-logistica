@@ -12,6 +12,13 @@
   tr.fila-facturas td { background-color: rgba(0,0,0,.02); }
   .celda-mes { text-align: right; white-space: nowrap; }
   #tabla-pivot th, #tabla-pivot td { font-size: .82rem; }
+  /* Ronda AE (2026-09-14): checkbox "Mostrar en unidades" dentro del
+     análisis por productos -- por defecto se ve el valor monetario; al
+     activar el switch, #tabla-pivot recibe la clase modo-unidades y se
+     invierte qué span de cada celda queda visible. Ver JS más abajo. */
+  #tabla-pivot .valor-unidades { display: none; }
+  #tabla-pivot.modo-unidades .valor-monto { display: none; }
+  #tabla-pivot.modo-unidades .valor-unidades { display: inline; }
 </style>
 
 {# Ronda AD (2026-09-14): tabla de facturas reutilizada tanto para un
@@ -89,7 +96,7 @@
   {% if empresa_sel or fecha_desde or fecha_hasta %}
   <div class="col-auto">
     <label class="form-label small mb-0 d-block">&nbsp;</label>
-    <a href="{{ url_for('reportes_compras_proveedor_detalle', proveedor=proveedor) }}" class="btn btn-outline-secondary">Quitar filtros</a>
+    <a href="{{ url_for('reportes_compras_proveedor_detalle', proveedor=proveedor, fecha_desde='', fecha_hasta='') }}" class="btn btn-outline-secondary">Quitar filtros</a>
   </div>
   {% endif %}
 </form>
@@ -118,12 +125,14 @@
     <div class="card card-stat h-100 p-3">
       <div class="text-muted small">Derechos</div>
       <div class="stat-value fs-4">{{ totales.simbolo }} <span id="resumen-derechos">{{ totales.derechos | moneda }}</span></div>
+      <div class="text-muted small"><span id="resumen-derechos-pct">{{ totales.derechos_pct | round(1) }}</span>% del Total Invoice</div>
     </div>
   </div>
   <div class="col-md">
     <div class="card card-stat h-100 p-3">
       <div class="text-muted small">Otros costos</div>
       <div class="stat-value fs-4">{{ totales.simbolo }} <span id="resumen-otros">{{ totales.otros_gastos | moneda }}</span></div>
+      <div class="text-muted small"><span id="resumen-otros-pct">{{ totales.otros_gastos_pct | round(1) }}</span>% del Total Invoice</div>
     </div>
   </div>
 </div>
@@ -131,6 +140,10 @@
 <div class="card p-3">
   <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
     <div class="fw-semibold">Análisis por productos (código proveedor × mes)</div>
+    <div class="form-check form-switch mb-0">
+      <input class="form-check-input" type="checkbox" role="switch" id="toggle-unidades">
+      <label class="form-check-label small" for="toggle-unidades">Mostrar en unidades</label>
+    </div>
     <div class="input-group" style="max-width: 340px;">
       <span class="input-group-text"><i class="bi bi-search"></i></span>
       <input type="text" class="form-control" id="buscador-producto" list="lista-codigos"
@@ -155,7 +168,7 @@
           {% for m in meses_columnas %}
           <th class="ordenable text-end" data-sort="mes:{{ m.clave }}">{{ m.etiqueta }} <i class="bi bi-arrow-down-up"></i></th>
           {% endfor %}
-          <th class="ordenable text-end" data-sort="total">Total ({{ totales.simbolo }}) <i class="bi bi-arrow-down-up"></i></th>
+          <th class="ordenable text-end" data-sort="total">Total <span class="valor-monto">({{ totales.simbolo }})</span><span class="valor-unidades">(unid.)</span> <i class="bi bi-arrow-down-up"></i></th>
         </tr>
       </thead>
       <tbody>
@@ -182,9 +195,15 @@
           <td style="max-width: 260px;">{{ p.descripcion }}</td>
           {% for m in meses_columnas %}
           {% set celda = p.meses[m.clave] %}
-          <td class="celda-mes">{% if celda.total_moneda %}{{ celda.total_moneda | moneda }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+          <td class="celda-mes">
+            {% if celda.total_moneda %}<span class="valor-monto">{{ celda.total_moneda | moneda }}</span>{% else %}<span class="valor-monto text-muted">-</span>{% endif %}
+            {% if celda.unidades %}<span class="valor-unidades">{{ celda.unidades | numero_flex }}</span>{% else %}<span class="valor-unidades text-muted">-</span>{% endif %}
+          </td>
           {% endfor %}
-          <td class="text-end fw-semibold">{{ p.total_dominante | moneda }}</td>
+          <td class="text-end fw-semibold">
+            <span class="valor-monto">{{ p.total_dominante | moneda }}</span>
+            <span class="valor-unidades">{{ p.total_unidades | numero_flex }}</span>
+          </td>
         </tr>
         <tr class="fila-variantes d-none">
           <td></td>
@@ -208,9 +227,15 @@
                   <td style="max-width: 260px;">{{ v.descripcion }}</td>
                   {% for m in meses_columnas %}
                   {% set celda = v.meses[m.clave] %}
-                  <td class="celda-mes">{% if celda.total_moneda %}{{ celda.total_moneda | moneda }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+                  <td class="celda-mes">
+                    {% if celda.total_moneda %}<span class="valor-monto">{{ celda.total_moneda | moneda }}</span>{% else %}<span class="valor-monto text-muted">-</span>{% endif %}
+                    {% if celda.unidades %}<span class="valor-unidades">{{ celda.unidades | numero_flex }}</span>{% else %}<span class="valor-unidades text-muted">-</span>{% endif %}
+                  </td>
                   {% endfor %}
-                  <td class="text-end fw-semibold">{{ v.total_dominante | moneda }}</td>
+                  <td class="text-end fw-semibold">
+                    <span class="valor-monto">{{ v.total_dominante | moneda }}</span>
+                    <span class="valor-unidades">{{ v.total_unidades | numero_flex }}</span>
+                  </td>
                 </tr>
                 <tr class="fila-facturas d-none">
                   <td></td>
@@ -241,9 +266,15 @@
           <td style="max-width: 260px;">{{ p.descripcion }}</td>
           {% for m in meses_columnas %}
           {% set celda = p.meses[m.clave] %}
-          <td class="celda-mes">{% if celda.total_moneda %}{{ celda.total_moneda | moneda }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+          <td class="celda-mes">
+            {% if celda.total_moneda %}<span class="valor-monto">{{ celda.total_moneda | moneda }}</span>{% else %}<span class="valor-monto text-muted">-</span>{% endif %}
+            {% if celda.unidades %}<span class="valor-unidades">{{ celda.unidades | numero_flex }}</span>{% else %}<span class="valor-unidades text-muted">-</span>{% endif %}
+          </td>
           {% endfor %}
-          <td class="text-end fw-semibold">{{ p.total_dominante | moneda }}</td>
+          <td class="text-end fw-semibold">
+            <span class="valor-monto">{{ p.total_dominante | moneda }}</span>
+            <span class="valor-unidades">{{ p.total_unidades | numero_flex }}</span>
+          </td>
         </tr>
         <tr class="fila-facturas d-none">
           <td></td>
@@ -359,6 +390,21 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
     document.getElementById('resumen-derechos').textContent = formatoMoneda(derechos);
     document.getElementById('resumen-otros').textContent = formatoMoneda(otros);
     document.getElementById('resumen-flete-pct').textContent = (total ? (flete / total * 100) : 0).toFixed(1);
+    document.getElementById('resumen-derechos-pct').textContent = (total ? (derechos / total * 100) : 0).toFixed(1);
+    document.getElementById('resumen-otros-pct').textContent = (total ? (otros / total * 100) : 0).toFixed(1);
+  }
+
+  // --- Ronda AE (2026-09-14): checkbox "Mostrar en unidades" -- alterna,
+  // solo dentro de esta tabla de análisis por productos (NO en las
+  // tarjetas de resumen de arriba, ni en el resumen por proveedor de la
+  // pantalla anterior), qué span de cada celda queda visible: el monto en
+  // la moneda dominante (valor-monto, por defecto) o las unidades
+  // compradas (valor-unidades). Puro CSS -- no hace falta recalcular nada. ---
+  var toggleUnidades = document.getElementById('toggle-unidades');
+  if (toggleUnidades) {
+    toggleUnidades.addEventListener('change', function () {
+      tabla.classList.toggle('modo-unidades', toggleUnidades.checked);
+    });
   }
 
   // --- Orden por columna (código, descripción, cada mes, total) ---
