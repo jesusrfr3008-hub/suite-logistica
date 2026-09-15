@@ -5298,24 +5298,34 @@ def _valor_en_moneda_dominante(valor_usd, moneda_fila, moneda_dominante, paridad
     return (valor_usd or 0) * paridad
 
 
-def _totales_en_moneda(filas, moneda_dominante, paridad_representativa):
+def _totales_en_moneda(filas, moneda_dominante, paridad_representativa, excluir_consignacion=False):
     """Arma las 5 métricas del resumen (Cantidad de productos, Total
     Invoice, Flete [+ % del Total Invoice], Derechos, Otros costos) para un
     conjunto de filas, todas expresadas en `moneda_dominante`. Incluye
     también el equivalente en USD del Total Invoice (total_invoice_usd_ref)
     -- siempre exacto sin importar la moneda mostrada -- para poder
     ordenar/calcular "% del total" entre proveedores que muestran monedas
-    distintas sin mezclar peras con manzanas."""
+    distintas sin mezclar peras con manzanas.
+
+    Ronda AH (2026-09-16, punto 3C): `excluir_consignacion=True` saca las
+    líneas en consignación (ver _fila_historica_dict) del Total Invoice --
+    todavía no se le deben al proveedor, no son una compra en firme. Flete,
+    Derechos y Otros costos NO cambian con este parámetro -- a pedido
+    explícito del usuario, esos gastos ya se pagaron para traer la
+    mercadería (junto con el resto del embarque) sin importar la condición
+    comercial de cada línea, así que siempre suman TODAS las filas."""
     total = flete = derechos = otros = 0.0
     total_usd_ref = 0.0
     for f in filas:
         mf = f.get("moneda_operacion") or "USD"
         pf = f.get("paridad") or 1.0
-        total_usd_ref += f.get("total_usd") or 0
-        total += _valor_en_moneda_dominante(f.get("total_usd"), mf, moneda_dominante, pf, paridad_representativa)
         flete += _valor_en_moneda_dominante(f.get("flete_usd"), mf, moneda_dominante, pf, paridad_representativa)
         derechos += _valor_en_moneda_dominante(f.get("derechos_usd"), mf, moneda_dominante, pf, paridad_representativa)
         otros += _valor_en_moneda_dominante(f.get("otros_gastos_usd"), mf, moneda_dominante, pf, paridad_representativa)
+        if excluir_consignacion and f.get("es_consignacion"):
+            continue
+        total_usd_ref += f.get("total_usd") or 0
+        total += _valor_en_moneda_dominante(f.get("total_usd"), mf, moneda_dominante, pf, paridad_representativa)
     productos = {
         (f.get("codigo_producto") or f.get("descripcion") or "").strip().upper()
         for f in filas if (f.get("codigo_producto") or f.get("descripcion"))
@@ -7043,6 +7053,13 @@ def _fila_historica_dict(c, homologar):
         "tipo_flete": c.tipo_flete,
         "homologado": homologado,
         "via_ergopyme": via_ergopyme,
+        # Ronda AH (2026-09-16, punto 3): el histórico marca una línea como
+        # "en consignación" escribiendo literalmente "CONSIGNACION" en la
+        # columna Factura (en vez de un número de factura real) -- todavía
+        # no se le debe al proveedor, se factura recién cuando se vende (ver
+        # _filas_reporte_compras y el nuevo checkbox "Consignación" del
+        # resumen por proveedor). Por ahora SOLO MEDICONTUR tiene líneas así.
+        "es_consignacion": (c.factura or "").strip().upper() == "CONSIGNACION",
     }
 
 
@@ -7112,11 +7129,16 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
                 "tipo_flete": "",
                 "homologado": True,
                 "via_ergopyme": False,
+                # Ronda AH (2026-09-16): las compras hechas DESDE la
+                # plataforma todavía no tienen forma de marcarse como
+                # consignación (pendiente -- ver punto 4, checkbox en la
+                # Orden de Compra) -- por ahora ninguna lo es.
+                "es_consignacion": False,
             })
     return filas
 
 
-def _totales_reporte(filas, proveedor_nombre=None, mapa_recurrente=None):
+def _totales_reporte(filas, proveedor_nombre=None, mapa_recurrente=None, excluir_consignacion=False):
     """Ronda AC (2026-09-14): arma las 5 métricas del resumen (Cantidad de
     productos, Total Invoice, Flete, Derechos, Otros costos) para un
     conjunto de filas. Ya NO fuerza todo a USD: cuando `filas` pertenece a
@@ -7125,16 +7147,20 @@ def _totales_reporte(filas, proveedor_nombre=None, mapa_recurrente=None):
     facturas, no líneas) y todo se expresa en esa moneda. Cuando no hay un
     proveedor puntual (la vista general, sin filtrar), se usa USD -- es la
     única forma sensata de sumar proveedores que operan en monedas
-    distintas entre sí."""
+    distintas entre sí.
+
+    Ronda AH (2026-09-16): `excluir_consignacion` se pasa tal cual a
+    _totales_en_moneda -- ver ahí el detalle de qué queda afuera (solo
+    Total Invoice) y qué no (flete/derechos/otros/cantidad_productos)."""
     if proveedor_nombre:
         moneda = _moneda_dominante(filas, proveedor_nombre, mapa_recurrente)
         paridad_rep = _paridad_representativa_eur(filas) if moneda == "EUR" else 1.0
     else:
         moneda, paridad_rep = "USD", 1.0
-    return _totales_en_moneda(filas, moneda, paridad_rep)
+    return _totales_en_moneda(filas, moneda, paridad_rep, excluir_consignacion=excluir_consignacion)
 
 
-def _resumen_por_proveedor(filas, mapa_recurrente=None):
+def _resumen_por_proveedor(filas, mapa_recurrente=None, excluir_consignacion=False):
     """Ronda AB (2026-09-13), corregido en ronda AC (2026-09-14): agrupa
     por proveedor y arma las mismas 5 métricas que _totales_reporte, pero
     cada proveedor en SU PROPIA moneda dominante (antes se forzaba todo a
@@ -7142,7 +7168,10 @@ def _resumen_por_proveedor(filas, mapa_recurrente=None):
     realidad son 100% en euros -- ver _moneda_dominante). El orden y el
     "% del total" siguen usando el equivalente en USD (total_invoice_usd_ref,
     siempre exacto sin importar la moneda que se muestra) para poder
-    comparar proveedores que se expresan en monedas distintas entre sí."""
+    comparar proveedores que se expresan en monedas distintas entre sí.
+
+    Ronda AH (2026-09-16): `excluir_consignacion` se propaga a cada
+    _totales_reporte por proveedor (ver ahí y en _totales_en_moneda)."""
     mapa_recurrente = mapa_recurrente if mapa_recurrente is not None else _moneda_recurrente_proveedores()
     agrupado = defaultdict(list)
     for f in filas:
@@ -7150,7 +7179,7 @@ def _resumen_por_proveedor(filas, mapa_recurrente=None):
 
     filas_resumen = []
     for p, filas_p in agrupado.items():
-        t = _totales_reporte(filas_p, proveedor_nombre=p, mapa_recurrente=mapa_recurrente)
+        t = _totales_reporte(filas_p, proveedor_nombre=p, mapa_recurrente=mapa_recurrente, excluir_consignacion=excluir_consignacion)
         t["proveedor"] = p
         filas_resumen.append(t)
     return sorted(filas_resumen, key=lambda r: -r["total_invoice_usd_ref"])
@@ -7242,22 +7271,52 @@ def reportes_compras_proveedor():
         fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, homologar=homologar,
     )
 
-    resumen = _resumen_por_proveedor(filas, mapa_recurrente=mapa_recurrente)
+    # Ronda AH (2026-09-16): botón "Consignación" -- por default la vista
+    # EXCLUYE el valor de las líneas en consignación del Total Invoice
+    # (checkbox destildado = excluir_consignacion=True), porque esos
+    # productos legalmente siguen siendo del proveedor y todavía no son una
+    # compra real. Flete/derechos/otros gastos/cantidad de productos NUNCA
+    # cambian con este botón -- se pagaron igual, vinieron en el mismo
+    # embarque que el resto -- ver _totales_en_moneda. Se calculan AMBAS
+    # variantes (sin y con consignación) de una sola vez para que el toggle
+    # en el navegador sea instantáneo (JS, sin recargar), igual que el
+    # patrón ya usado para "Mostrar en unidades".
+    resumen_sin = _resumen_por_proveedor(filas, mapa_recurrente=mapa_recurrente, excluir_consignacion=True)
+    resumen_con = _resumen_por_proveedor(filas, mapa_recurrente=mapa_recurrente, excluir_consignacion=False)
+    con_por_proveedor = {r["proveedor"]: r for r in resumen_con}
+    # El orden visible de la tabla lo manda "sin consignación" -- para cada
+    # fila se le agrega su contraparte "con consignación" ya buscada por
+    # nombre de proveedor, así el orden nunca diverge entre ambas vistas.
+    resumen = []
+    for r in resumen_sin:
+        r_con = con_por_proveedor.get(r["proveedor"], r)
+        r["total_invoice_con"] = r_con["total_invoice"]
+        r["total_invoice_usd_ref_con"] = r_con["total_invoice_usd_ref"]
+        resumen.append(r)
+    total_usd_ref_general_sin = sum(r["total_invoice_usd_ref"] for r in resumen_sin) or 1.0
+    total_usd_ref_general_con = sum(r["total_invoice_usd_ref_con"] for r in resumen) or 1.0
+    for r in resumen:
+        r["pct_del_total"] = r["total_invoice_usd_ref"] / total_usd_ref_general_sin * 100
+        r["pct_del_total_con"] = r["total_invoice_usd_ref_con"] / total_usd_ref_general_con * 100
+
     # Ronda AC (2026-09-14): si la pantalla ya está filtrada a UN proveedor
     # puntual, las tarjetas de arriba usan la moneda dominante de ESE
     # proveedor (igual que su fila en el resumen) en vez de forzar USD --
     # solo la vista sin filtrar (mezcla de proveedores con monedas
     # distintas entre sí) se muestra en USD.
-    totales = _totales_reporte(filas, proveedor_nombre=proveedor or None, mapa_recurrente=mapa_recurrente)
+    totales_sin = _totales_reporte(filas, proveedor_nombre=proveedor or None, mapa_recurrente=mapa_recurrente, excluir_consignacion=True)
+    totales_con = _totales_reporte(filas, proveedor_nombre=proveedor or None, mapa_recurrente=mapa_recurrente, excluir_consignacion=False)
     sin_homologar = sum(1 for f in filas if f.get("homologado") is False)
+    hay_consignacion = any(f.get("es_consignacion") for f in filas)
 
     return render_template(
         "reportes/compras_proveedor.html",
-        resumen=resumen, totales=totales,
+        resumen=resumen, totales=totales_sin, totales_con=totales_con,
         proveedores=_proveedores_reporte_compras(homologar), empresas=Empresa.query.order_by(Empresa.nombre).all(),
         proveedor_sel=proveedor, empresa_sel=empresa,
         fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
         sin_homologar=sin_homologar, total_filas=len(filas),
+        hay_consignacion=hay_consignacion,
     )
 
 
@@ -7282,6 +7341,16 @@ def reportes_compras_proveedor_detalle(proveedor):
         proveedor=proveedor, empresa=empresa or None,
         fecha_desde=fecha_desde, fecha_hasta=fecha_hasta,
     )
+    # Ronda AH (2026-09-16): las líneas en "Consignación" (columna Factura =
+    # "CONSIGNACION" en el histórico -- ver es_consignacion en
+    # _fila_historica_dict) NO son una compra como tal todavía -- el
+    # proveedor sigue siendo dueño de esos productos hasta que los
+    # vendamos. Por eso este reporte (análisis por producto/código) las
+    # excluye SIEMPRE, sin toggle, tanto de unidades como de valores. Sí
+    # siguen apareciendo en el resumen por proveedor (con su propio botón
+    # Consignación -- ver reportes_compras_proveedor) porque el flete/
+    # derechos/otros gastos de esas líneas sí se pagaron de verdad.
+    filas = [f for f in filas if not f.get("es_consignacion")]
     if not filas:
         flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
         return redirect(url_for("reportes_compras_proveedor"))

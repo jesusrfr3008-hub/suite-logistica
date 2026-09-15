@@ -40,9 +40,14 @@
   tr.fila-variante td:nth-child(2) { padding-left: 1.75rem; }
   tr.fila-variante { background-color: rgba(0,0,0,.015); }
   tr.fila-variantes-caption td { background-color: rgba(0,0,0,.03); }
-  /* Ronda AG (2026-09-15): scrollbar horizontal siempre visible (no solo
-     "auto"/overlay) para que se note que hay más meses hacia los lados. */
-  .table-responsive-pivot { overflow-x: scroll; }
+  /* Ronda AG/AH (2026-09-15/16): scrollbars horizontal Y vertical SIEMPRE
+     visibles (no "auto"/overlay, que se nota poco) para que quede claro
+     que hay más meses hacia los lados y más productos hacia abajo --
+     "scroll" (en vez de "auto") reserva el espacio y dibuja la barra
+     siempre, pero si no hay más contenido en esa dirección el track queda
+     lleno/sin nada que mover (el navegador la muestra "inactiva" solo,
+     sin código extra). */
+  .table-responsive-pivot { overflow-x: scroll; overflow-y: scroll; }
 </style>
 
 {# Ronda AD (2026-09-14): tabla de facturas reutilizada tanto para un
@@ -182,7 +187,7 @@
   <div class="text-muted small mb-2">
     Haz clic en una fila para ver las facturas con las que se compró ese producto.
   </div>
-  <div class="table-responsive table-responsive-pivot" style="max-height: 600px; overflow-y: auto;">
+  <div class="table-responsive table-responsive-pivot" style="max-height: 600px;">
     <table class="table table-sm table-hover align-middle mb-0" id="tabla-pivot">
       <thead class="table-dark">
         <tr>
