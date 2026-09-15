@@ -5,16 +5,78 @@
 <h3 class="section-title mb-1">Homologación de Stock</h3>
 <div class="text-muted small mb-3">
   Códigos internos del sistema de Inventarios que todavía no están ligados a ningún producto de
-  nuestro catálogo -- incluye tanto los recién aparecidos ("Pendiente") como los que ya se
-  clasificaron como "Sin Marca" (genéricos, sin proveedor asignado) por si en algún momento quieres
-  editarlos y asignarlos a un proveedor real. Resuélvelos abajo: vincúlalos a un producto ya
-  existente, créalo si es nuevo, márcalo "sin marca" (se sigue mostrando en Stock, pero sin
-  producto asociado) o "excluido" (se descarta siempre, no vuelve a aparecer).
+  nuestro catálogo. Resuélvelos abajo: vincúlalos a un producto ya existente, créalo si es nuevo,
+  márcalo "sin marca" (se sigue mostrando en Stock, pero sin producto asociado) o "excluido" (se
+  descarta siempre, no vuelve a aparecer).
+</div>
+
+<div class="btn-group mb-3" role="group">
+  <a href="{{ url_for('stock_homologacion', ver='pendiente') }}"
+     class="btn btn-sm {{ 'btn-brand' if ver == 'pendiente' else 'btn-outline-secondary' }}">
+    Pendiente <span class="badge bg-light text-dark">{{ total_pendiente }}</span>
+  </a>
+  <a href="{{ url_for('stock_homologacion', ver='sin_marca') }}"
+     class="btn btn-sm {{ 'btn-brand' if ver == 'sin_marca' else 'btn-outline-secondary' }}">
+    Sin Marca <span class="badge bg-light text-dark">{{ total_sin_marca }}</span>
+  </a>
+  <a href="{{ url_for('stock_homologacion', ver='todos') }}"
+     class="btn btn-sm {{ 'btn-brand' if ver == 'todos' else 'btn-outline-secondary' }}">
+    Todos
+  </a>
+</div>
+<div class="text-muted small mb-3">
+  {% if ver == 'pendiente' %}
+  Mostrando solo los códigos <strong>pendientes</strong> (recién aparecidos, sin resolver todavía).
+  Los ya clasificados como "Sin Marca" ({{ total_sin_marca }}) quedan ocultos por defecto -- usa el
+  filtro de arriba para revisarlos o reasignarlos a un proveedor real.
+  {% elif ver == 'sin_marca' %}
+  Mostrando solo los códigos ya clasificados como <strong>"Sin Marca"</strong> (genéricos, sin
+  proveedor asignado).
+  {% else %}
+  Mostrando <strong>todos</strong>: pendientes y "Sin Marca".
+  {% endif %}
 </div>
 
 {% if not pendientes %}
-<div class="alert alert-success">No hay códigos pendientes ni "Sin Marca" por resolver.</div>
+<div class="alert alert-success">
+  {% if ver == 'pendiente' %}No hay códigos pendientes por resolver.
+  {% elif ver == 'sin_marca' %}No hay códigos "Sin Marca" cargados.
+  {% else %}No hay códigos pendientes ni "Sin Marca" por resolver.{% endif %}
+</div>
 {% endif %}
+
+<div class="card p-3 mb-4">
+  <div class="fw-semibold mb-1">Asignar código interno Ergopyme a un producto nuevo</div>
+  <div class="text-muted small mb-2">
+    Para un producto que acabas de agregar en una Orden de Compra y que nunca existió en el sistema
+    Ergopyme (no se ha vendido, o es nuevo) -- así no aparecerá "pendiente" arriba (nunca pasó por un
+    reporte de Inventarios), pero sin código interno tampoco puede salir en la planilla de Costeo.
+    Búscalo aquí por código o descripción y asígnale el código interno directamente.
+  </div>
+  <form method="post" action="{{ url_for('stock_homologacion_asignar_codigo_interno') }}" class="row g-2 align-items-end">
+    <input type="hidden" name="ver" value="{{ ver }}">
+    <div class="col-md-4">
+      <label class="form-label small mb-0">Producto</label>
+      <input type="text" class="form-control form-control-sm buscador-producto" id="buscador-nuevo" data-target="nuevo" placeholder="Buscar código o descripción...">
+      <select class="form-select form-select-sm mt-1" name="producto_id" id="select-producto-nuevo" required>
+        <option value="">Selecciona un producto...</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small mb-0">Variante (si aplica)</label>
+      <select class="form-select form-select-sm" name="variante_id" id="select-variante-nuevo">
+        <option value="">(sin variante -- producto simple)</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small mb-0">Código interno Ergopyme</label>
+      <input type="text" class="form-control form-control-sm" name="codigo_interno" placeholder="Ej. 20102201000123" required>
+    </div>
+    <div class="col-md-2">
+      <button type="submit" class="btn btn-sm btn-brand w-100">Asignar</button>
+    </div>
+  </form>
+</div>
 
 {% for h in pendientes %}
 <div class="card p-3 mb-3">

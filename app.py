@@ -1506,6 +1506,86 @@ def reparar_variantes_medicontur_ronda_ae():
         print(f"[reparar_ronda_ae] MEDICONTUR: {len(renombres)} código(s) de variante renombrado(s): {renombres}")
 
 
+def reparar_variantes_medicontur_ronda_ag():
+    """Ronda AG (2026-09-15, punto 3): el usuario reportó 6 códigos MEDICONTUR
+    (lentes "ADDON" -- familias A45DT, A45RD2, A46R, 690MY, 860PAY, 860PEY)
+    que nunca habían existido en el catálogo ni como código padre ni como
+    variante -- por eso el reporte de Compras Proveedor los mostraba sueltos
+    con el número de código interno en vez de su descripción, y no agrupaban
+    con nada. Se agregaron al final de 'Listado codigos lentes medicontur.
+    xlsx' -- mismo mecanismo que reparar_variantes_physiol_ronda_ae() (esta
+    función corre en cada arranque, a diferencia de seed_variantes_lentes_
+    medicontur() que está gateada y no vuelve a leer el archivo una vez
+    sembrada la base): crea el Producto padre si no existe (precio 0 EUR,
+    a pedido explícito del usuario -- se corrige después desde el catálogo)
+    y cada ProductoVariante que falte. Puramente ADITIVA -- si el padre o la
+    variante ya existen, no los toca."""
+    medicontur = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "MEDICONTUR").first()
+    if not medicontur or not os.path.isfile(VARIANTES_LENTES_MEDICONTUR_EXCEL):
+        return
+
+    import openpyxl
+    wb = openpyxl.load_workbook(VARIANTES_LENTES_MEDICONTUR_EXCEL, data_only=True)
+    ws = wb.worksheets[0]
+    fila_inicio = 2
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), start=1):
+        primera = str(row[0]).strip().lower() if row and row[0] else ""
+        if primera == "codigo padre":
+            fila_inicio = i + 1
+            break
+
+    productos_padre = {
+        p.codigo.strip().upper(): p
+        for p in Producto.query.filter_by(proveedor_id=medicontur.id).all()
+    }
+    variantes_existentes = {
+        (v.producto_id, v.codigo.strip().upper())
+        for v in ProductoVariante.query.join(Producto).filter(Producto.proveedor_id == medicontur.id).all()
+    }
+
+    creadas = 0
+    padres_creados = set()
+    vistos = set()
+    for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+        codigo_padre, codigo_variante, descripcion = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, None)
+        codigo_padre = str(codigo_padre).strip() if codigo_padre else ""
+        codigo_variante = str(codigo_variante).strip() if codigo_variante else ""
+        descripcion = str(descripcion).strip() if descripcion else ""
+        if not codigo_padre or not codigo_variante:
+            continue
+        clave = (codigo_padre.upper(), codigo_variante.upper())
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+
+        producto = productos_padre.get(codigo_padre.upper())
+        if not producto:
+            producto = Producto(
+                proveedor_id=medicontur.id, codigo=codigo_padre, descripcion=descripcion or codigo_padre,
+                empaque=1, moneda="EUR", precio_caja=0, precio_unitario=0, activo=True,
+            )
+            db.session.add(producto)
+            db.session.flush()
+            productos_padre[codigo_padre.upper()] = producto
+            padres_creados.add(codigo_padre)
+
+        if (producto.id, codigo_variante.upper()) in variantes_existentes:
+            continue
+        db.session.add(ProductoVariante(
+            producto_id=producto.id, codigo=codigo_variante, descripcion=descripcion or codigo_variante,
+        ))
+        variantes_existentes.add((producto.id, codigo_variante.upper()))
+        creadas += 1
+
+    if creadas or padres_creados:
+        db.session.commit()
+        print(
+            f"[reparar_ronda_ag] MEDICONTUR: {creadas} variante(s) nueva(s) agregada(s) "
+            f"({len(padres_creados)} código(s) padre nuevo(s) creados, precio 0 a completar por el usuario: "
+            f"{sorted(padres_creados)})."
+        )
+
+
 def reparar_variantes_physiol_ronda_ae():
     """Ronda AE (2026-09-14, punto 2): el usuario aportó un archivo nuevo,
     más completo, de variantes BVI PHYSIOL ('Ajuste de cuentas padre
@@ -1894,6 +1974,7 @@ with app.app_context():
     seed_administrador_inicial()
     reparar_datos_ronda_w()
     reparar_variantes_medicontur_ronda_ae()
+    reparar_variantes_medicontur_ronda_ag()
     reparar_variantes_physiol_ronda_ae()
     seed_codigos_ergopyme()
     seed_compras_historicas()
@@ -6577,12 +6658,89 @@ def stock_homologacion():
     'pendiente', asi que un codigo marcado 'sin_marca' quedaba sin ninguna
     forma de editarlo despues; ahora tambien aparece aca, para poder
     asignarlo mas adelante a un proveedor real y darle mantenimiento a su
-    código -- desde acá se resuelven a mano, uno por uno."""
+    código -- desde acá se resuelven a mano, uno por uno.
+
+    Ronda AG (2026-09-15): los códigos 'sin_marca' ya clasificados (varios
+    cientos, genéricos y sin proveedor) se acumulaban SIEMPRE visibles junto
+    a los 'pendiente' de verdad -- el usuario los quiere mantener así, pero
+    NO viéndolos por defecto (le ensucian la pantalla de códigos realmente
+    nuevos por resolver). Por defecto ahora solo se muestran los
+    'pendiente' -- ?ver=sin_marca (o ?ver=todos) trae de vuelta los otros
+    dos casos para cuando sí quiera revisarlos/reasignarlos."""
+    ver = request.args.get("ver", "pendiente").strip().lower()
+    if ver == "todos":
+        estados = ["pendiente", "sin_marca"]
+    elif ver == "sin_marca":
+        estados = ["sin_marca"]
+    else:
+        ver = "pendiente"
+        estados = ["pendiente"]
     pendientes = HomologacionStock.query.filter(
-        HomologacionStock.estado.in_(["pendiente", "sin_marca"])
+        HomologacionStock.estado.in_(estados)
     ).order_by(HomologacionStock.estado, HomologacionStock.codigo_interno).all()
+    total_sin_marca = HomologacionStock.query.filter_by(estado="sin_marca").count()
+    total_pendiente = HomologacionStock.query.filter_by(estado="pendiente").count()
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
-    return render_template("stock/homologacion.html", pendientes=pendientes, proveedores=proveedores)
+    return render_template(
+        "stock/homologacion.html", pendientes=pendientes, proveedores=proveedores,
+        ver=ver, total_sin_marca=total_sin_marca, total_pendiente=total_pendiente,
+    )
+
+
+@app.route("/stock/homologacion/asignar-codigo-interno", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_homologacion_asignar_codigo_interno():
+    """Ronda AG (2026-09-15, punto 4): un producto nuevo agregado directo en
+    una Orden de Compra (proveedor y código de producto ya conocidos) puede
+    no existir todavía en el sistema Ergopyme -- nunca se vendió, o recién se
+    incorporó -- así que no tiene código interno y no puede subirse en la
+    planilla de Costeo. Antes la única forma de que un producto consiguiera
+    su código interno era al revés (subiendo el reporte de Inventarios y
+    resolviendo el 'pendiente' que aparece acá); esto permite hacerlo
+    directamente: buscar el producto/variante ya existente en el catálogo y
+    escribirle su código interno a mano, sin pasar por HomologacionStock (no
+    aplica -- este producto nunca apareció en un reporte de Inventarios)."""
+    producto_id = request.form.get("producto_id") or None
+    variante_id = request.form.get("variante_id") or None
+    codigo_interno = (request.form.get("codigo_interno") or "").strip()
+    ver = request.form.get("ver", "pendiente")
+
+    if not producto_id or not codigo_interno:
+        flash("Selecciona un producto e indica el código interno Ergopyme a asignar.", "warning")
+        return redirect(url_for("stock_homologacion", ver=ver))
+
+    producto = Producto.query.get_or_404(producto_id)
+    variante = ProductoVariante.query.get(variante_id) if variante_id else None
+    objetivo = variante or producto
+    etiqueta = f"{producto.codigo}" + (f" / {variante.codigo}" if variante else "")
+
+    # Aviso (no bloqueante) si ese código interno ya está en uso en OTRO
+    # producto/variante -- evita pisar sin darse cuenta una homologación
+    # existente.
+    ya_usado_en = None
+    otro_p = Producto.query.filter(
+        Producto.codigo_interno_inventario == codigo_interno, Producto.id != producto.id,
+    ).first()
+    otro_v = ProductoVariante.query.filter(
+        ProductoVariante.codigo_interno_inventario == codigo_interno,
+        ProductoVariante.id != (variante.id if variante else -1),
+    ).first()
+    if otro_p:
+        ya_usado_en = otro_p.codigo
+    elif otro_v:
+        ya_usado_en = otro_v.codigo
+
+    objetivo.codigo_interno_inventario = codigo_interno
+    db.session.commit()
+
+    if ya_usado_en:
+        flash(
+            f"Código interno '{codigo_interno}' asignado a {etiqueta} -- OJO: ese mismo código ya estaba "
+            f"asignado también a '{ya_usado_en}', revisa que no sea un error.", "warning",
+        )
+    else:
+        flash(f"Código interno '{codigo_interno}' asignado a {etiqueta}.", "success")
+    return redirect(url_for("stock_homologacion", ver=ver))
 
 
 @app.route("/stock/homologacion/<int:homolog_id>/resolver", methods=["POST"])

@@ -28,6 +28,21 @@
   #tabla-pivot.modo-unidades .col-descripcion {
     max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  /* Ronda AG (2026-09-15): las filas de variante (al desplegar un código
+     padre) ANTES vivían dentro de una <table> anidada dentro de una sola
+     celda -- una tabla aparte calcula el ancho de sus columnas por su
+     cuenta, así que sus meses NUNCA quedaban alineados pixel a pixel con
+     el encabezado de la tabla principal (se notaba sobre todo en modo
+     unidades, con números angostos). Ahora las variantes son filas
+     normales de la MISMA tabla (ocultas con d-none hasta que se despliega
+     el padre), así que comparten exactamente las mismas columnas -- ver
+     el nuevo bloque de filas más abajo y el JS de expandir/contraer. */
+  tr.fila-variante td:nth-child(2) { padding-left: 1.75rem; }
+  tr.fila-variante { background-color: rgba(0,0,0,.015); }
+  tr.fila-variantes-caption td { background-color: rgba(0,0,0,.03); }
+  /* Ronda AG (2026-09-15): scrollbar horizontal siempre visible (no solo
+     "auto"/overlay) para que se note que hay más meses hacia los lados. */
+  .table-responsive-pivot { overflow-x: scroll; }
 </style>
 
 {# Ronda AD (2026-09-14): tabla de facturas reutilizada tanto para un
@@ -167,7 +182,7 @@
   <div class="text-muted small mb-2">
     Haz clic en una fila para ver las facturas con las que se compró ese producto.
   </div>
-  <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
+  <div class="table-responsive table-responsive-pivot" style="max-height: 600px; overflow-y: auto;">
     <table class="table table-sm table-hover align-middle mb-0" id="tabla-pivot">
       <thead class="table-dark">
         <tr>
@@ -183,7 +198,8 @@
       <tbody>
         {% for p in productos %}
         {% if p.es_padre %}
-        <tr class="fila-producto fila-padre" data-codigo="{{ p.busqueda }}" data-descripcion="{{ p.descripcion|lower }}"
+        {% set grupo_id = 'grp-' ~ loop.index0 %}
+        <tr class="fila-producto fila-padre" data-grupo="{{ grupo_id }}" data-codigo="{{ p.busqueda }}" data-descripcion="{{ p.descripcion|lower }}"
             data-total-dominante="{{ p.total_dominante }}" data-flete-dominante="{{ p.flete_dominante }}"
             data-derechos-dominante="{{ p.derechos_dominante }}" data-otros-dominante="{{ p.otros_dominante }}"
             data-sort-codigo="{{ p.codigo|lower }}" data-sort-descripcion="{{ p.descripcion|lower }}"
@@ -214,49 +230,44 @@
             <span class="valor-unidades">{{ p.total_unidades | numero_flex }}</span>
           </td>
         </tr>
-        <tr class="fila-variantes d-none">
+        <tr class="fila-variantes-caption d-none" data-parent-grupo="{{ grupo_id }}">
           <td></td>
-          <td colspan="{{ 2 + meses_columnas|length + 1 }}">
-            <div class="fw-semibold small mb-1">Códigos de producto de {{ p.codigo }}</div>
-            <table class="table table-sm table-hover align-middle mb-0">
-              <tbody>
-                {% for v in p.variantes %}
-                <tr class="fila-producto" data-codigo="{{ v.codigo|lower }}" data-descripcion="{{ v.descripcion|lower }}"
-                    data-total-dominante="{{ v.total_dominante }}" data-flete-dominante="{{ v.flete_dominante }}"
-                    data-derechos-dominante="{{ v.derechos_dominante }}" data-otros-dominante="{{ v.otros_dominante }}"
-                    data-sub-fila="1">
-                  <td style="width: 24px;"><i class="bi bi-chevron-right small text-muted"></i></td>
-                  <td class="fw-semibold">
-                    {{ v.codigo }}
-                    {% if v.es_mixto %}
-                    <i class="bi bi-exclamation-triangle-fill text-warning ms-1" data-bs-toggle="tooltip"
-                       title="Este código tuvo facturas en más de una moneda dentro del rango -- revisa el detalle de facturas."></i>
-                    {% endif %}
-                  </td>
-                  <td class="col-descripcion" title="{{ v.descripcion }}">{{ v.descripcion }}</td>
-                  {% for m in meses_columnas %}
-                  {% set celda = v.meses[m.clave] %}
-                  <td class="celda-mes">
-                    {% if celda.total_moneda %}<span class="valor-monto">{{ celda.total_moneda | moneda }}</span>{% else %}<span class="valor-monto text-muted">-</span>{% endif %}
-                    {% if celda.unidades %}<span class="valor-unidades">{{ celda.unidades | numero_flex }}</span>{% else %}<span class="valor-unidades text-muted">-</span>{% endif %}
-                  </td>
-                  {% endfor %}
-                  <td class="text-end fw-semibold">
-                    <span class="valor-monto">{{ v.total_dominante | moneda }}</span>
-                    <span class="valor-unidades">{{ v.total_unidades | numero_flex }}</span>
-                  </td>
-                </tr>
-                <tr class="fila-facturas d-none">
-                  <td></td>
-                  <td colspan="{{ 2 + meses_columnas|length + 1 }}">
-                    {{ facturas_tabla(v) }}
-                  </td>
-                </tr>
-                {% endfor %}
-              </tbody>
-            </table>
+          <td colspan="{{ 2 + meses_columnas|length + 1 }}" class="small text-muted fw-semibold">
+            Códigos de producto de {{ p.codigo }}
           </td>
         </tr>
+        {% for v in p.variantes %}
+        <tr class="fila-producto fila-variante d-none" data-parent-grupo="{{ grupo_id }}" data-codigo="{{ v.codigo|lower }}" data-descripcion="{{ v.descripcion|lower }}"
+            data-total-dominante="{{ v.total_dominante }}" data-flete-dominante="{{ v.flete_dominante }}"
+            data-derechos-dominante="{{ v.derechos_dominante }}" data-otros-dominante="{{ v.otros_dominante }}">
+          <td><i class="bi bi-chevron-right small text-muted"></i></td>
+          <td class="fw-semibold">
+            {{ v.codigo }}
+            {% if v.es_mixto %}
+            <i class="bi bi-exclamation-triangle-fill text-warning ms-1" data-bs-toggle="tooltip"
+               title="Este código tuvo facturas en más de una moneda dentro del rango -- revisa el detalle de facturas."></i>
+            {% endif %}
+          </td>
+          <td class="col-descripcion" title="{{ v.descripcion }}">{{ v.descripcion }}</td>
+          {% for m in meses_columnas %}
+          {% set celda = v.meses[m.clave] %}
+          <td class="celda-mes">
+            {% if celda.total_moneda %}<span class="valor-monto">{{ celda.total_moneda | moneda }}</span>{% else %}<span class="valor-monto text-muted">-</span>{% endif %}
+            {% if celda.unidades %}<span class="valor-unidades">{{ celda.unidades | numero_flex }}</span>{% else %}<span class="valor-unidades text-muted">-</span>{% endif %}
+          </td>
+          {% endfor %}
+          <td class="text-end fw-semibold">
+            <span class="valor-monto">{{ v.total_dominante | moneda }}</span>
+            <span class="valor-unidades">{{ v.total_unidades | numero_flex }}</span>
+          </td>
+        </tr>
+        <tr class="fila-facturas d-none" data-parent-grupo="{{ grupo_id }}">
+          <td></td>
+          <td colspan="{{ 2 + meses_columnas|length + 1 }}">
+            {{ facturas_tabla(v) }}
+          </td>
+        </tr>
+        {% endfor %}
         {% else %}
         <tr class="fila-producto" data-codigo="{{ p.busqueda }}" data-descripcion="{{ p.descripcion|lower }}"
             data-total-dominante="{{ p.total_dominante }}" data-flete-dominante="{{ p.flete_dominante }}"
@@ -314,16 +325,43 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
   var tbody = tabla.querySelector('tbody');
   var buscador = document.getElementById('buscador-producto');
 
-  // --- Expandir/contraer facturas de un producto (o los códigos de un
-  // código padre -- ronda AD, 2026-09-14) ---
-  // Se usa querySelectorAll (sin importar el nivel de anidamiento) a
-  // propósito: así el mismo click-para-expandir funciona tanto en las
-  // filas de primer nivel (producto suelto o código padre) como en las
-  // filas de variante anidadas dentro del panel de un código padre.
+  // --- Expandir/contraer facturas de un producto, o los códigos de un
+  // código padre (ronda AD, 2026-09-14; refactor ronda AG, 2026-09-15) ---
+  // Ronda AG: las filas de variante ya NO viven en una tabla anidada --
+  // son filas normales de esta misma tabla, ocultas con d-none y marcadas
+  // con data-parent-grupo="<id del padre>". Un código padre expande/contrae
+  // TODO su grupo (caption + cada variante + las facturas que estuvieran
+  // abiertas); un producto suelto o una variante expande/contrae solo su
+  // fila-facturas hermana inmediata, igual que antes.
   tabla.querySelectorAll('tr.fila-producto').forEach(function (fila) {
     fila.addEventListener('click', function () {
+      if (fila.classList.contains('fila-padre')) {
+        var grupo = fila.dataset.grupo;
+        var filasGrupo = tabla.querySelectorAll('[data-parent-grupo="' + grupo + '"]');
+        if (!filasGrupo.length) return;
+        var expandiendo = filasGrupo[0].classList.contains('d-none');
+        filasGrupo.forEach(function (fg) {
+          if (fg.classList.contains('fila-facturas')) {
+            // Las facturas de una variante solo se muestran si el usuario
+            // las abre a mano -- al contraer el padre, siempre se cierran.
+            if (!expandiendo) fg.classList.add('d-none');
+          } else {
+            fg.classList.toggle('d-none', !expandiendo);
+            if (!expandiendo) {
+              var chevronV = fg.querySelector('.bi-chevron-down');
+              if (chevronV) { chevronV.classList.remove('bi-chevron-down'); chevronV.classList.add('bi-chevron-right'); }
+            }
+          }
+        });
+        var chevronP = fila.querySelector('.bi-chevron-right, .bi-chevron-down');
+        if (chevronP) {
+          chevronP.classList.toggle('bi-chevron-right', !expandiendo);
+          chevronP.classList.toggle('bi-chevron-down', expandiendo);
+        }
+        return;
+      }
       var sub = fila.nextElementSibling;
-      if (!sub || !(sub.classList.contains('fila-facturas') || sub.classList.contains('fila-variantes'))) return;
+      if (!sub || !sub.classList.contains('fila-facturas')) return;
       var chevron = fila.querySelector('.bi-chevron-right, .bi-chevron-down');
       sub.classList.toggle('d-none');
       if (chevron) {
@@ -333,20 +371,21 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
     });
   });
 
-  // Ronda AD: el buscador/orden/resumen solo deben mirar las filas de
-  // PRIMER NIVEL (hijas directas de este tbody) -- las filas de variante
-  // anidadas dentro del panel de un código padre viven en otra <tbody>,
-  // adentro de una tabla anidada, así que `tbody.children` ya las excluye
-  // automáticamente sin necesidad de filtrar por profundidad a mano.
+  // Ronda AG: el buscador/orden/resumen solo deben mirar las filas de
+  // PRIMER NIVEL -- ahora que las variantes son filas normales del mismo
+  // tbody, se excluyen explícitamente por la clase fila-variante (antes
+  // vivían en una tabla anidada aparte y quedaban excluidas solas).
   function paresFilas() {
     var pares = [];
     var hijos = Array.prototype.slice.call(tbody.children);
     hijos.forEach(function (f) {
       if (!f.classList || !f.classList.contains('fila-producto')) return;
+      if (f.classList.contains('fila-variante')) return;
       var sub = f.nextElementSibling;
       pares.push({
         principal: f,
-        sub: (sub && (sub.classList.contains('fila-facturas') || sub.classList.contains('fila-variantes'))) ? sub : null,
+        sub: (sub && sub.classList.contains('fila-facturas')) ? sub : null,
+        grupo: f.classList.contains('fila-padre') ? f.dataset.grupo : null,
       });
     });
     return pares;
@@ -360,7 +399,16 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
         || par.principal.dataset.codigo.indexOf(texto) !== -1
         || par.principal.dataset.descripcion.indexOf(texto) !== -1;
       par.principal.classList.toggle('d-none', !coincide);
-      if (par.sub && !coincide) par.sub.classList.add('d-none');
+      if (!coincide) {
+        if (par.sub) par.sub.classList.add('d-none');
+        if (par.grupo) {
+          tabla.querySelectorAll('[data-parent-grupo="' + par.grupo + '"]').forEach(function (fg) {
+            fg.classList.add('d-none');
+          });
+          var chevron = par.principal.querySelector('.bi-chevron-down');
+          if (chevron) { chevron.classList.remove('bi-chevron-down'); chevron.classList.add('bi-chevron-right'); }
+        }
+      }
     });
     recalcularResumen();
   }
@@ -380,12 +428,16 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
     return partes[0] + ',' + partes[1];
   }
   function recalcularResumen() {
-    // Ronda AD: solo filas de primer nivel (tbody.children) -- si se
-    // sumaran también las variantes anidadas dentro de un código padre, se
-    // contaría cada monto DOS veces (una en el padre, otra en su variante).
+    // Ronda AD: solo filas de primer nivel -- si se sumaran también las
+    // variantes de un código padre, se contaría cada monto DOS veces (una
+    // en el padre, otra en su variante). Ronda AG: las variantes ahora son
+    // filas normales del mismo tbody (ver fila-variante), así que se
+    // excluyen a mano igual que antes se excluían solas por estar en una
+    // tabla anidada aparte.
     var cantidad = 0, total = 0, flete = 0, derechos = 0, otros = 0;
     Array.prototype.forEach.call(tbody.children, function (fila) {
       if (!fila.classList || !fila.classList.contains('fila-producto')) return;
+      if (fila.classList.contains('fila-variante')) return;
       if (fila.classList.contains('d-none')) return;
       cantidad += 1;
       total += num(fila.dataset.totalDominante);
@@ -457,7 +509,15 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
       });
       pares.forEach(function (par) {
         tbody.appendChild(par.principal);
-        if (par.sub) tbody.appendChild(par.sub);
+        if (par.grupo) {
+          // Código padre: mueve TODO su grupo (caption + cada variante +
+          // las facturas de cada una) junto, en su mismo orden relativo.
+          tabla.querySelectorAll('[data-parent-grupo="' + par.grupo + '"]').forEach(function (fg) {
+            tbody.appendChild(fg);
+          });
+        } else if (par.sub) {
+          tbody.appendChild(par.sub);
+        }
       });
     });
   });
