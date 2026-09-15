@@ -67,7 +67,12 @@
       <tbody>
         {% for o in ordenes %}
         <tr>
-          <td>{{ o.numero_po }}</td>
+          <td>
+            {{ o.numero_po }}
+            {% if o.es_consignacion %}
+            <span class="badge text-white" style="background-color:#6f42c1;" data-bs-toggle="tooltip" title="Orden en consignación">Consig.</span>
+            {% endif %}
+          </td>
           <td>{% if o.empresa %}{{ o.empresa.nombre }}{% else %}<span class="badge bg-warning text-dark">Sin asignar</span>{% endif %}</td>
           <td>{{ o.proveedor.nombre }}</td>
           <td>{{ o.fecha_emision }}</td>

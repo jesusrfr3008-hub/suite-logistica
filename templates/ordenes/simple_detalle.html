@@ -26,7 +26,12 @@
 
 <div class="d-flex justify-content-between align-items-start mb-3">
   <div>
-    <h3 class="section-title mb-0">{{ orden.numero_po }}</h3>
+    <h3 class="section-title mb-0">
+      {{ orden.numero_po }}
+      {% if orden.es_consignacion %}
+      <span class="badge text-white" style="background-color:#6f42c1;" data-bs-toggle="tooltip" title="Esta orden llega en consignación">Consignación</span>
+      {% endif %}
+    </h3>
     <div class="text-muted">
       {% if orden.empresa %}Empresa: <strong>{{ orden.empresa.nombre }}</strong> · {% endif %}
       Proveedor: {{ orden.proveedor.nombre }} · Emitida: {{ orden.fecha_emision }} · Moneda: {{ orden.moneda }}

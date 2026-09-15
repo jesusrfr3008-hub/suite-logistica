@@ -65,6 +65,7 @@
         <div class="meta">
           Fecha emisi&oacute;n: {{ orden.fecha_emision }}<br>
           Moneda: {{ orden.moneda }}
+          {% if orden.es_consignacion %}<br><strong>Condici&oacute;n: CONSIGNACI&Oacute;N</strong>{% endif %}
         </div>
       </td>
     </tr>

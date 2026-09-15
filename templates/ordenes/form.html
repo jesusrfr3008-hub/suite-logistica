@@ -42,6 +42,25 @@
         <input type="text" class="form-control" name="notas" placeholder="Opcional">
       </div>
     </div>
+    <div class="row g-3 mt-1">
+      <div class="col-12">
+        <!-- Ronda AH (2026-09-16): consignación es por ORDEN COMPLETA -- los
+             productos de esta orden llegan con pro-forma invoice, y el
+             proveedor factura de verdad recién cuando se le informa qué se
+             vendió (ver es_consignacion en models.OrdenCompra). -->
+        <div class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" role="switch" id="esConsignacion" name="es_consignacion">
+          <label class="form-check-label" for="esConsignacion">
+            Orden en <strong>Consignación</strong>
+          </label>
+        </div>
+        <div class="text-muted small">
+          Marca esta orden si el proveedor la despacha en consignación (pro-forma invoice; factura
+          real semanas/meses después, cuando se le reporte qué se vendió). Déjala apagada para una
+          compra regular.
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="card p-3 mb-3">

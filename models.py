@@ -515,6 +515,15 @@ class OrdenCompra(db.Model):
     # ESTADOS_APROBACION_OC mas arriba. Default "Aprobada" para que la
     # migracion automatica no oculte ninguna orden ya existente.
     estado_aprobacion = db.Column(db.String(20), default="Aprobada")
+    # Consignación (ronda AH, 2026-09-16): la orden COMPLETA (no por línea)
+    # se marca en consignación desde su emisión -- esos productos llegan con
+    # una pro-forma invoice y el proveedor solo emite la factura real
+    # semanas/meses después, cuando se le informa qué se vendió (ver
+    # es_consignacion en _fila_historica_dict, que hoy solo detecta
+    # consignación en el histórico de Excel por la columna Factura -- esta
+    # marca es el equivalente para órdenes creadas DESDE la plataforma).
+    # Default False para no afectar ninguna orden ya existente.
+    es_consignacion = db.Column(db.Boolean, default=False)
 
     lineas = db.relationship(
         "OrdenCompraLinea", backref="orden", cascade="all, delete-orphan", lazy="dynamic"

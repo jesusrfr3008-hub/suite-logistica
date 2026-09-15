@@ -79,6 +79,21 @@
     </div>
 
     <div class="mb-3">
+      <!-- Ronda AH (2026-09-16): consignación es por ORDEN COMPLETA. -->
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" role="switch" id="esConsignacionSimple" name="es_consignacion">
+        <label class="form-check-label" for="esConsignacionSimple">
+          Orden en <strong>Consignación</strong>
+        </label>
+      </div>
+      <div class="text-muted small">
+        Marca esta orden si el proveedor la despacha en consignación (pro-forma invoice; factura real
+        semanas/meses después, cuando se le reporte qué se vendió). Déjala apagada para una compra
+        regular.
+      </div>
+    </div>
+
+    <div class="mb-3">
       <label class="form-label">Notas (opcional)</label>
       <textarea class="form-control" name="notas" rows="2" placeholder="Cualquier contexto adicional para quien va a revisar esta orden..."></textarea>
     </div>

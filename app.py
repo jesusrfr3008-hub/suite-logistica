@@ -363,6 +363,7 @@ def ensure_schema_migrations():
             ("empresa_id", "INTEGER"),
             ("creado_por_usuario_id", "INTEGER"),
             ("estado_aprobacion", "VARCHAR(20) DEFAULT 'Aprobada'"),
+            ("es_consignacion", "BOOLEAN DEFAULT 0"),
         ],
         "importaciones": [
             ("despacho_id", "INTEGER"),
@@ -2665,6 +2666,8 @@ def ordenes_nueva():
             notas=request.form.get("notas", "").strip(),
             creado_por_usuario_id=current_user.id,
             estado_aprobacion="Por Aprobar",
+            # Ronda AH (2026-09-16): consignación es por ORDEN COMPLETA.
+            es_consignacion=request.form.get("es_consignacion") == "on",
         )
         db.session.add(orden)
         db.session.flush()
@@ -2788,6 +2791,8 @@ def ordenes_simple_nueva():
             notas=nota_sistema,
             creado_por_usuario_id=current_user.id,
             estado_aprobacion="Por Aprobar",
+            # Ronda AH (2026-09-16): consignación es por ORDEN COMPLETA.
+            es_consignacion=request.form.get("es_consignacion") == "on",
         )
         db.session.add(orden)
         db.session.flush()
@@ -3239,6 +3244,10 @@ def ordenes_editar(orden_id):
     orden.fecha_emision = parse_date(request.form.get("fecha_emision")) or orden.fecha_emision
     orden.moneda = request.form.get("moneda", orden.moneda)
     orden.notas = request.form.get("notas", "").strip()
+    # Ronda AH (2026-09-16): permite corregir la marca de Consignación
+    # después de emitida (por si se marcó mal al crearla) -- sigue siendo
+    # por ORDEN COMPLETA.
+    orden.es_consignacion = request.form.get("es_consignacion") == "on"
     db.session.commit()
     flash(f"Orden actualizada: {orden.numero_po}.", "success")
     return redirect(url_for("ordenes_detalle", orden_id=orden.id))
