@@ -19,6 +19,15 @@
   #tabla-pivot .valor-unidades { display: none; }
   #tabla-pivot.modo-unidades .valor-monto { display: none; }
   #tabla-pivot.modo-unidades .valor-unidades { display: inline; }
+  /* Ronda AF (2026-09-15): la columna Descripción es ancha (260px) para el
+     modo de montos, pero eso empuja las columnas de mes fuera de la vista
+     y hace que las unidades no se vean alineadas bajo su mes -- en modo
+     unidades se angosta bastante (la descripción se puede truncar, ya se
+     ve completa al pasar el mouse o al abrir la fila). */
+  .col-descripcion { max-width: 260px; }
+  #tabla-pivot.modo-unidades .col-descripcion {
+    max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 </style>
 
 {# Ronda AD (2026-09-14): tabla de facturas reutilizada tanto para un
@@ -192,7 +201,7 @@
                title="Alguno de los códigos de esta familia tuvo facturas en más de una moneda dentro del rango -- revisa el detalle."></i>
             {% endif %}
           </td>
-          <td style="max-width: 260px;">{{ p.descripcion }}</td>
+          <td class="col-descripcion" title="{{ p.descripcion }}">{{ p.descripcion }}</td>
           {% for m in meses_columnas %}
           {% set celda = p.meses[m.clave] %}
           <td class="celda-mes">
@@ -224,7 +233,7 @@
                        title="Este código tuvo facturas en más de una moneda dentro del rango -- revisa el detalle de facturas."></i>
                     {% endif %}
                   </td>
-                  <td style="max-width: 260px;">{{ v.descripcion }}</td>
+                  <td class="col-descripcion" title="{{ v.descripcion }}">{{ v.descripcion }}</td>
                   {% for m in meses_columnas %}
                   {% set celda = v.meses[m.clave] %}
                   <td class="celda-mes">
@@ -263,7 +272,7 @@
                title="Este código tuvo facturas en más de una moneda dentro del rango -- revisa el detalle de facturas."></i>
             {% endif %}
           </td>
-          <td style="max-width: 260px;">{{ p.descripcion }}</td>
+          <td class="col-descripcion" title="{{ p.descripcion }}">{{ p.descripcion }}</td>
           {% for m in meses_columnas %}
           {% set celda = p.meses[m.clave] %}
           <td class="celda-mes">
