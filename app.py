@@ -850,11 +850,19 @@ def _clasificar_y_cargar_stock(filas):
     resumen = {
         "cargados": 0, "vinculados": 0, "sin_marca": 0, "excluidos": 0,
         "pendientes_nuevos": 0, "empresas_no_encontradas": set(),
+        # Ronda AI (mejora pedida por el usuario, 2026-09-17): totales de
+        # UNIDADES (no de filas/productos) para poder validar que el Stock
+        # cargado coincide con el reporte descargado de Ergopyme -- ver
+        # stock_cargar() para el mensaje de reconciliación que se le
+        # muestra al usuario.
+        "unidades_reporte": 0, "unidades_cargadas": 0,
+        "unidades_excluidas": 0, "unidades_sin_empresa": 0,
     }
     cache_empresas = {}
     homologaciones = {h.codigo_interno: h for h in HomologacionStock.query.all()}
     for fila in filas:
         codigo = fila["codigo_interno"]
+        resumen["unidades_reporte"] += fila["stock_fisico"] or 0
         homolog = homologaciones.get(codigo)
         if homolog is None:
             homolog = HomologacionStock(
@@ -870,11 +878,13 @@ def _clasificar_y_cargar_stock(filas):
 
         if homolog.estado == "excluido":
             resumen["excluidos"] += 1
+            resumen["unidades_excluidas"] += fila["stock_fisico"] or 0
             continue
 
         empresa = _empresa_por_nombre_reporte(fila["empresa_texto"], cache_empresas)
         if not empresa:
             resumen["empresas_no_encontradas"].add(fila["empresa_texto"] or "(sin identificar)")
+            resumen["unidades_sin_empresa"] += fila["stock_fisico"] or 0
             continue
 
         db.session.add(StockExistencia(
@@ -888,6 +898,7 @@ def _clasificar_y_cargar_stock(filas):
             stock_fisico=fila["stock_fisico"],
         ))
         resumen["cargados"] += 1
+        resumen["unidades_cargadas"] += fila["stock_fisico"] or 0
         if homolog.estado == "vinculado":
             resumen["vinculados"] += 1
         elif homolog.estado == "sin_marca":
@@ -6528,7 +6539,37 @@ def stock_cargar():
         )
     if resumen["empresas_no_encontradas"]:
         mensaje += f" No se pudo identificar la empresa para: {', '.join(sorted(resumen['empresas_no_encontradas']))}."
-    flash(mensaje, "success" if not resumen["pendientes_nuevos"] and not resumen["empresas_no_encontradas"] else "warning")
+
+    # Ronda AI (mejora pedida por el usuario, 2026-09-17): validar que las
+    # unidades totales que quedaron cargadas en el Stock coincidan con las
+    # unidades totales del archivo descargado de Ergopyme. Por construcción
+    # cada fila del archivo cae en exactamente uno de tres grupos (cargada /
+    # excluida por homologación / empresa no identificada), así que
+    # "cargadas + excluidas + sin empresa" SIEMPRE debería sumar exactamente
+    # el total del reporte -- si no calza, es señal de un problema real de
+    # lectura del archivo (fila corrupta, celda con texto en vez de número,
+    # etc.) y se avisa como error en vez de dejarlo pasar en silencio.
+    total_reporte = resumen["unidades_reporte"]
+    total_reconciliado = (
+        resumen["unidades_cargadas"] + resumen["unidades_excluidas"] + resumen["unidades_sin_empresa"]
+    )
+    mensaje += (
+        f" Unidades totales del reporte: {total_reporte:,}. Unidades cargadas al Stock: "
+        f"{resumen['unidades_cargadas']:,}."
+    )
+    if resumen["unidades_excluidas"]:
+        mensaje += f" ({resumen['unidades_excluidas']:,} unidades en código(s) marcados 'excluido', no se cargan a propósito.)"
+
+    if total_reconciliado != total_reporte:
+        diferencia = total_reporte - total_reconciliado
+        mensaje += (
+            f" ⚠ VALIDACIÓN FALLIDA: hay una diferencia de {diferencia:,} unidades sin explicar entre el "
+            f"archivo y lo cargado -- no confíes en este Stock todavía, revisa el archivo (puede tener una "
+            f"fila con un valor de stock que no es un número) y avisa para ajustar la carga."
+        )
+        flash(mensaje, "danger")
+    else:
+        flash(mensaje, "success" if not resumen["pendientes_nuevos"] and not resumen["empresas_no_encontradas"] else "warning")
     return redirect(url_for("stock_list"))
 
 
