@@ -6,7 +6,7 @@ import re
 import shutil
 import uuid
 from collections import defaultdict, Counter
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from functools import wraps
 from urllib.parse import quote
 
@@ -134,6 +134,33 @@ app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB por archivo subido
 # SECRET_KEY tambien viene de variable de entorno en produccion (Railway) --
 # localmente, sin la variable, sigue usando la misma llave de siempre.
 app.secret_key = os.environ.get("SECRET_KEY", "suite-logistica-dev-key")  # cambiar en un despliegue real
+if _database_url and not os.environ.get("SECRET_KEY"):
+    # Ronda AI (2026-09-17, revision de seguridad pedida por el usuario):
+    # correr en produccion (Postgres/Railway) SIN una SECRET_KEY propia deja
+    # las sesiones firmadas con la llave de desarrollo, que es publica (esta
+    # en el codigo). No se frena el arranque de la app a proposito -- un
+    # RuntimeError aca tumbaria la app en produccion sin aviso previo -- pero
+    # se deja bien visible en los logs de Railway para que se corrija cuanto
+    # antes agregando la variable SECRET_KEY en Railway > Variables.
+    print(
+        "[SEGURIDAD] ADVERTENCIA: corriendo contra Postgres (produccion) sin la variable de entorno "
+        "SECRET_KEY -- las sesiones se estan firmando con la llave de desarrollo, que no es secreta. "
+        "Agrega SECRET_KEY en Railway > Variables (un valor aleatorio largo) y vuelve a desplegar."
+    )
+
+# Ronda AI (2026-09-17): cookies de sesion mas seguras. SECURE exige HTTPS
+# para enviar la cookie (Railway ya sirve todo por HTTPS, asi que esto no
+# rompe nada en produccion) -- se deja en False en local/SQLite porque ahi
+# se corre por http:// sin certificado. HTTPONLY evita que JavaScript en la
+# pagina pueda leer la cookie de sesion (proteccion basica contra XSS).
+# SAMESITE="Lax" evita que la cookie se envie en una peticion iniciada desde
+# OTRO sitio (proteccion basica contra CSRF en los casos mas comunes).
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(_database_url),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
 
 db.init_app(app)
 
