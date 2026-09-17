@@ -183,10 +183,29 @@ def _cargar_usuario(user_id):
 # 2026-09-12): antes de esta ronda la app no tenia ningun control de acceso.
 _ENDPOINTS_PUBLICOS = {"login", "static"}
 
+# Ronda AI (2026-09-17): endpoints pensados para que los llame un SCRIPT (la
+# automatizacion de Ergopyme), no una persona con sesion iniciada en el
+# navegador -- se autentican con su propia clave (ver STOCK_UPLOAD_API_KEY
+# mas abajo y api_stock_cargar_auto()), nunca con la sesion de Flask-Login.
+# Quedan afuera del control de sesion de _requerir_login a proposito, pero
+# cada vista de este grupo hace su propio chequeo de la clave antes de
+# hacer nada -- no es una puerta abierta.
+_ENDPOINTS_API_KEY = {"api_stock_cargar_auto"}
+
+# Clave compartida para /api/stock/cargar-auto -- se genera una vez (ej.
+# `python -c "import secrets; print(secrets.token_hex(32))"`) y se guarda
+# como variable de entorno STOCK_UPLOAD_API_KEY en Railway, y en el propio
+# script de la automatizacion en el PC de Jesus (nunca en este repositorio).
+# Si no esta configurada, el endpoint se niega a funcionar (falla "cerrado",
+# nunca "abierto") -- ver api_stock_cargar_auto().
+STOCK_UPLOAD_API_KEY = os.environ.get("STOCK_UPLOAD_API_KEY")
+
 
 @app.before_request
 def _requerir_login():
     if request.endpoint is None or request.endpoint in _ENDPOINTS_PUBLICOS:
+        return None
+    if request.endpoint in _ENDPOINTS_API_KEY:
         return None
     if not current_user.is_authenticated:
         return redirect(url_for("login", next=request.path))
@@ -814,26 +833,27 @@ def _empresa_por_nombre_reporte(nombre_reporte, cache):
     return empresa
 
 
-def _leer_filas_reporte_stock(ws):
-    """Ronda V (2026-09-12): lee una hoja con el formato ORIGINAL del
-    reporte de Stock del sistema de Inventarios ('Ergopyme') -- columnas
-    A-H: Cód.Bod (se ignora), Cód.Producto, Denominacion, Uni, Cód.Lote,
-    Vencimiento, F.Compra (se ignora), Stock físico. El archivo trae el
-    stock de VARIAS empresas seguidas, cada bloque separado por una fila
-    con solo el nombre de la empresa en la columna A (ej. 'ACCUVISION
-    SPA'), seguida del titulo, la fecha de emision, una fila en blanco, el
-    encabezado de la tabla y una fila de guiones -- todo eso se reconoce y
-    se salta solo, sin asumir un numero de fila fijo (la cantidad de filas
-    de cada empresa cambia en cada carga segun compras/ventas)."""
+def _filas_desde_filas_crudas(filas_crudas):
+    """Ronda AI (2026-09-17): cuerpo compartido de la lectura del reporte de
+    Stock, extraído de _leer_filas_reporte_stock para poder alimentarlo
+    tanto desde una hoja .xlsx (ver _leer_filas_reporte_stock, que sigue
+    siendo el nombre de siempre para el formato original subido a mano)
+    como desde un archivo .csv ya separado en filas de texto (ver
+    _leer_filas_reporte_stock_csv, usado por la automatización de Ergopyme
+    vía /api/stock/cargar-auto) -- misma lógica de reconocer bloques de
+    empresa / encabezado / fila de guiones, sin duplicarla entre los dos
+    formatos. `filas_crudas` es cualquier iterable de tuplas/listas de
+    valores por fila (celdas de openpyxl o strings de un CSV, todo se trata
+    igual salvo la conversión de fecha, que sí distingue tipo más abajo)."""
     filas = []
     empresa_actual = None
-    for row in ws.iter_rows(min_row=1, values_only=True):
+    for row in filas_crudas:
         a = row[0] if len(row) > 0 else None
         b = row[1] if len(row) > 1 else None
-        if a is None and b is None:
+        if (a is None or a == "") and (b is None or b == ""):
             continue
-        if b is None:
-            texto = str(a).strip() if a is not None else ""
+        if b is None or b == "":
+            texto = str(a).strip() if a not in (None, "") else ""
             if not texto or texto.lower().startswith("fecha") or texto.lower() == "cód.bod" or set(texto) <= {"-"}:
                 continue
             empresa_actual = texto
@@ -843,14 +863,27 @@ def _leer_filas_reporte_stock(ws):
         codigo_interno = _normalizar_codigo_interno(b)
         if not codigo_interno:
             continue
-        descripcion = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
-        codigo_lote = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
+        descripcion = str(row[2]).strip() if len(row) > 2 and row[2] not in (None, "") else ""
+        codigo_lote = str(row[4]).strip() if len(row) > 4 and row[4] not in (None, "") else ""
         fecha_venc = row[5] if len(row) > 5 else None
         if isinstance(fecha_venc, datetime):
             fecha_venc = fecha_venc.date()
+        elif isinstance(fecha_venc, str):
+            # Ronda AI (2026-09-17): el .csv de la automatizacion de Ergopyme
+            # trae la fecha como texto ISO ("2030-12-30"), no como objeto
+            # fecha de Excel -- una celda vacia en el .csv llega como "" (no
+            # None), y un valor irreconocible se descarta a "sin
+            # vencimiento" en vez de romper toda la carga.
+            fecha_venc = fecha_venc.strip()
+            try:
+                fecha_venc = datetime.strptime(fecha_venc, "%Y-%m-%d").date() if fecha_venc else None
+            except ValueError:
+                fecha_venc = None
         stock = row[7] if len(row) > 7 else 0
+        if isinstance(stock, str):
+            stock = stock.strip()
         try:
-            stock = int(stock) if stock is not None else 0
+            stock = int(stock) if stock not in (None, "") else 0
         except (TypeError, ValueError):
             stock = 0
         filas.append({
@@ -862,6 +895,29 @@ def _leer_filas_reporte_stock(ws):
             "stock_fisico": stock,
         })
     return filas
+
+
+def _leer_filas_reporte_stock(ws):
+    """Formato de siempre: hoja .xlsx subida a mano desde /stock (botón
+    'Cargar reporte de Stock') -- ver _filas_desde_filas_crudas para la
+    lógica real, compartida con el formato .csv de la ronda AI."""
+    return _filas_desde_filas_crudas(ws.iter_rows(min_row=1, values_only=True))
+
+
+def _leer_filas_reporte_stock_csv(contenido_bytes):
+    """Ronda AI (2026-09-17): mismo reporte de Stock, pero en el formato
+    .csv que guarda la automatización de Ergopyme (RDP + AutoHotkey) --
+    confirmado contra un archivo real capturado: UTF-8 con BOM, separado
+    por ';' (no ','), fin de línea CRLF, SIEMPRE de una sola empresa por
+    archivo (la que esté logueada en esa sesión de Ergopyme, a diferencia
+    del .xlsx manual que trae varias empresas seguidas). Se decodifica con
+    'utf-8-sig' (saca el BOM solo) y se tolera cualquier fila corta o
+    corrupta al final del archivo (ej. bytes sueltos que a veces quedan del
+    portapapeles) delegando en _filas_desde_filas_crudas, que ya ignora
+    filas que no calzan con el patrón esperado."""
+    texto = contenido_bytes.decode("utf-8-sig", errors="replace")
+    lector = csv.reader(texto.splitlines(), delimiter=";")
+    return _filas_desde_filas_crudas(list(lector))
 
 
 def _clasificar_y_cargar_stock(filas):
@@ -6555,6 +6611,19 @@ def stock_cargar():
     resumen = _clasificar_y_cargar_stock(filas)
     db.session.commit()
 
+    mensaje, severidad = _mensaje_resumen_carga_stock(resumen)
+    flash(mensaje, severidad)
+    return redirect(url_for("stock_list"))
+
+
+def _mensaje_resumen_carga_stock(resumen):
+    """Ronda AI (2026-09-17): arma el mismo mensaje de confirmación/aviso a
+    partir de un `resumen` de _clasificar_y_cargar_stock, compartido entre
+    la carga manual (stock_cargar, como flash) y la carga automática
+    (api_stock_cargar_auto, como JSON) para no mantener el texto en dos
+    lugares. Devuelve (mensaje, severidad) -- severidad es "success",
+    "warning" o "danger" (Bootstrap), usable tal cual como categoría de
+    flash() o como campo en la respuesta JSON."""
     mensaje = (
         f"Stock actualizado: {resumen['cargados']} producto(s)/lote(s) cargados "
         f"({resumen['vinculados']} ligados al catálogo, {resumen['sin_marca']} sin marca)."
@@ -6567,15 +6636,15 @@ def stock_cargar():
     if resumen["empresas_no_encontradas"]:
         mensaje += f" No se pudo identificar la empresa para: {', '.join(sorted(resumen['empresas_no_encontradas']))}."
 
-    # Ronda AI (mejora pedida por el usuario, 2026-09-17): validar que las
-    # unidades totales que quedaron cargadas en el Stock coincidan con las
-    # unidades totales del archivo descargado de Ergopyme. Por construcción
-    # cada fila del archivo cae en exactamente uno de tres grupos (cargada /
-    # excluida por homologación / empresa no identificada), así que
-    # "cargadas + excluidas + sin empresa" SIEMPRE debería sumar exactamente
-    # el total del reporte -- si no calza, es señal de un problema real de
-    # lectura del archivo (fila corrupta, celda con texto en vez de número,
-    # etc.) y se avisa como error en vez de dejarlo pasar en silencio.
+    # Mejora pedida por el usuario (ronda AI): validar que las unidades
+    # totales que quedaron cargadas en el Stock coincidan con las unidades
+    # totales del archivo descargado de Ergopyme. Por construcción cada fila
+    # del archivo cae en exactamente uno de tres grupos (cargada / excluida
+    # por homologación / empresa no identificada), así que "cargadas +
+    # excluidas + sin empresa" SIEMPRE debería sumar exactamente el total
+    # del reporte -- si no calza, es señal de un problema real de lectura
+    # del archivo (fila corrupta, celda con texto en vez de número, etc.) y
+    # se avisa como error en vez de dejarlo pasar en silencio.
     total_reporte = resumen["unidades_reporte"]
     total_reconciliado = (
         resumen["unidades_cargadas"] + resumen["unidades_excluidas"] + resumen["unidades_sin_empresa"]
@@ -6594,10 +6663,67 @@ def stock_cargar():
             f"archivo y lo cargado -- no confíes en este Stock todavía, revisa el archivo (puede tener una "
             f"fila con un valor de stock que no es un número) y avisa para ajustar la carga."
         )
-        flash(mensaje, "danger")
-    else:
-        flash(mensaje, "success" if not resumen["pendientes_nuevos"] and not resumen["empresas_no_encontradas"] else "warning")
-    return redirect(url_for("stock_list"))
+        return mensaje, "danger"
+    if resumen["pendientes_nuevos"] or resumen["empresas_no_encontradas"]:
+        return mensaje, "warning"
+    return mensaje, "success"
+
+
+@app.route("/api/stock/cargar-auto", methods=["POST"])
+def api_stock_cargar_auto():
+    """Ronda AI (2026-09-17): version SIN pantalla de /stock/cargar, pensada
+    para que la automatizacion de Ergopyme (RDP + AutoHotkey, en el PC de
+    Jesus) suba el Stock sola despues de generarlo, sin que nadie tenga que
+    entrar a la app a mano. Se autentica con una clave propia en el header
+    'X-Api-Key' (ver STOCK_UPLOAD_API_KEY) -- NUNCA con una sesion de
+    usuario, porque un script no puede loguearse como una persona. Acepta
+    tanto '.xlsx' (el formato de siempre) como '.csv' (el que efectivamente
+    genera el script .ahk) -- mismo comportamiento que /stock/cargar en
+    todo lo demas: reemplaza por completo el Stock cargado antes y valida
+    que las unidades totales del archivo coincidan con lo cargado. Responde
+    siempre en JSON (quien llama es un script, no un navegador)."""
+    if not STOCK_UPLOAD_API_KEY:
+        # Fallar "cerrado": si nadie configuro la clave en el servidor,
+        # este endpoint no hace nada -- nunca queda como una puerta abierta
+        # por descuido de configuracion.
+        return jsonify(ok=False, error="Endpoint no configurado (falta STOCK_UPLOAD_API_KEY en el servidor)."), 503
+    clave_recibida = request.headers.get("X-Api-Key", "")
+    if not clave_recibida or clave_recibida != STOCK_UPLOAD_API_KEY:
+        return jsonify(ok=False, error="Clave de acceso inválida o ausente."), 401
+
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        return jsonify(ok=False, error="Falta el archivo ('archivo') en el POST."), 400
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls", ".csv"):
+        return jsonify(ok=False, error="Formato no soportado -- sube .xlsx o .csv."), 400
+
+    try:
+        if extension == ".csv":
+            filas = _leer_filas_reporte_stock_csv(archivo.read())
+        else:
+            wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
+            filas = _leer_filas_reporte_stock(wb.active)
+    except Exception as exc:
+        return jsonify(ok=False, error=f"No se pudo leer el archivo: {exc}"), 400
+
+    if not filas:
+        return jsonify(ok=False, error="El archivo no tiene filas de stock reconocibles -- no se cambió nada."), 400
+
+    StockExistencia.query.delete()
+    resumen = _clasificar_y_cargar_stock(filas)
+    db.session.commit()
+
+    mensaje, severidad = _mensaje_resumen_carga_stock(resumen)
+    return jsonify(
+        ok=(severidad != "danger"),
+        severidad=severidad,
+        mensaje=mensaje,
+        unidades_reporte=resumen["unidades_reporte"],
+        unidades_cargadas=resumen["unidades_cargadas"],
+        cargados=resumen["cargados"],
+        pendientes_nuevos=resumen["pendientes_nuevos"],
+    ), (200 if severidad != "danger" else 422)
 
 
 @app.route("/stock/pedidos/cargar", methods=["POST"])

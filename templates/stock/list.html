@@ -3,19 +3,46 @@
 {% block content %}
 
 <style>
-  th.ordenable { cursor: pointer; user-select: none; white-space: nowrap; }
+  /* Ronda AI (2026-09-17): pedido explícito del usuario -- encabezados
+     parejos (antes "Cantidad Licitación" se envolvía en 2 líneas mientras
+     el resto quedaba en 1, dejando la fila de encabezado dispareja) y
+     Descripción siempre en una sola línea (antes podía envolverse según el
+     largo del texto, corriendo el resto de las columnas de esa fila y
+     dando la sensación de que "no está alineado con los encabezados").
+     Se le da `white-space: nowrap` a TODA la tabla (headers y celdas) --
+     como eso hace que la tabla sea más ancha que la pantalla, se usa el
+     mismo tratamiento de scroll horizontal SIEMPRE VISIBLE que ya se probó
+     y confirmó en la ronda AH para la pantalla de Compras Proveedor, en
+     vez de que aparezca/desaparezca según el mouse. */
+  #tablaStock th, #tablaStock td {
+    white-space: nowrap;
+    vertical-align: middle;
+    font-size: 0.85rem;
+  }
+  th.ordenable { cursor: pointer; user-select: none; }
   th.ordenable:hover { background-color: rgba(0,0,0,0.03); }
   .icono-orden { font-size: 0.7em; color: #adb5bd; margin-left: 2px; }
   .icono-orden.orden-activo { color: var(--brand); font-weight: bold; }
   .btn-autofiltro { color: #adb5bd; text-decoration: none; vertical-align: baseline; }
   .btn-autofiltro.filtro-activo { color: var(--brand); }
   .btn-autofiltro:hover { color: var(--brand); }
-  /* Ronda AD (2026-09-14): la consulta de Stock puede tener cientos de
-     filas -- se le da scroll vertical propio (con el encabezado fijo
-     arriba) para no perder de vista las columnas al desplazarse, en vez de
-     desplazar toda la pantalla. Mismo patrón ya usado en Costeo (ronda G,
-     .tabla-scroll de importaciones/detalle.html). */
-  .tabla-stock-scroll { max-height: 70vh; overflow-y: auto; }
+  /* Descripción: SIEMPRE en una sola línea, cortada con "..." si no cabe
+     (el texto completo se ve en un tooltip al pasar el mouse, y el
+     buscador de arriba sigue encontrando por el texto completo aunque
+     esté cortado en pantalla). */
+  #tablaStock td[data-col="descripcion"] {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Ronda AD (2026-09-14) + AI (2026-09-17): la consulta de Stock puede
+     tener cientos de filas y, ahora que ningún encabezado se envuelve,
+     también más columnas de ancho que la pantalla -- scroll propio en
+     los dos sentidos, con el encabezado fijo arriba, en vez de desplazar
+     toda la pantalla. overflow: scroll (no "auto") para que la barra
+     quede siempre dibujada y visible, mismo tratamiento ya confirmado en
+     la ronda AH para "Análisis por productos" de Compras Proveedor.  */
+  .tabla-stock-scroll { max-height: 70vh; overflow-y: scroll; overflow-x: scroll; }
   #tablaStock thead th {
     position: sticky;
     top: 0;
@@ -116,7 +143,7 @@
             {% endif %}
           </td>
           <td data-col="codigo" data-value="{{ (g.codigo or '')|lower }}">{{ g.codigo or '-' }}</td>
-          <td data-col="descripcion" data-value="{{ (g.descripcion or '')|lower }}" style="max-width: 380px;">{{ g.descripcion }}</td>
+          <td data-col="descripcion" data-value="{{ (g.descripcion or '')|lower }}" title="{{ g.descripcion }}">{{ g.descripcion }}</td>
           <td class="text-end" data-col="stock_actual" data-value="{{ g.stock_actual }}">{{ g.stock_actual }}</td>
           <td class="text-end" data-col="transito" data-value="{{ g.transito }}">
             {% if g.transito %}
