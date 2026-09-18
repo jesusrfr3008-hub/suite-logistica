@@ -2476,11 +2476,112 @@ def reparar_paridad_eur_historica():
     )
 
 
+def reparar_costeo_topi_ex20260720():
+    """Ronda AJ (2026-09-18): corrige 6 filas YA CARGADAS de compras_historicas
+    para la factura TOPI-EX20260720 (proveedor TOWARDPI -- 3x BM-400K ULTRA OCT
+    + 3 accesorios). El usuario detectó un error de distribución de costo en el
+    archivo original: la columna "Total Invoice EU" (en USD, paridad_eur=1) traía
+    el valor correcto por ítem (106.150 / 106.200 / 570 / 636), pero la columna
+    "US$" (de la que salen CIF, flete, gastos de importación y costo final) traía
+    un valor mucho menor -- ej. 41.091,26 en vez de 106.150 -- arrastrado
+    incorrectamente de otra factura/fórmula. Además el código del último ítem
+    ("GZBM07 POINT SPREAD ADJ TOOL") había quedado copiado del ítem anterior
+    (7010340020, el mismo de "GZBM06 PAPER GRID TOOL") en vez de su propio código
+    7010340030. El usuario corrigió el Excel a mano y confirmó los valores
+    correctos (ver 'Cuentas por pagar proveedores al 18-09-2026.xlsx' del mismo
+    día para el contexto de por qué se detectó). Esta función aplica esos mismos
+    valores a las filas ya cargadas (compras_historicas es insert-only, no se
+    vuelve a sembrar sola). Idempotente: cada fila solo se toca si todavía tiene
+    el valor VIEJO (con el bug) tal cual quedó cargado -- si ya se corrigió, no
+    hace nada."""
+    FACTURA = "TOPI-EX20260720"
+    PROVEEDOR = "TOWARDPI"
+    total_corregidas = 0
+
+    # Los 3 equipos BM-400K ULTRA OCT (mismo código, 2 valores de factura
+    # distintos -- 106.200 se repite en 2 filas idénticas).
+    equipos = [
+        (106150, 41091.26327553805, {
+            "total_usd": 106150, "flete_usd": 0, "cif_usd": 106150,
+            "cif_clp": 99310755.5, "otros_gastos_clp": 3228902.4237807733,
+            "costo_total_clp": 102539657.92378077, "costo_unitario_clp": 102539657.92378077,
+        }),
+        (106200, 41110.61855734471, {
+            "total_usd": 106200, "flete_usd": 0, "cif_usd": 106200,
+            "cif_clp": 99357534.0, "otros_gastos_clp": 3230423.3387236753,
+            "costo_total_clp": 102587957.33872367, "costo_unitario_clp": 102587957.33872367,
+        }),
+    ]
+    for total_invoice_eu, us_viejo, nuevos in equipos:
+        filas = CompraHistorica.query.filter(
+            CompraHistorica.factura == FACTURA,
+            CompraHistorica.proveedor_original == PROVEEDOR,
+            CompraHistorica.codigo_interno == "3010340020",
+            CompraHistorica.total_invoice == total_invoice_eu,
+            CompraHistorica.total_usd == us_viejo,
+        ).all()
+        for f in filas:
+            for campo, valor in nuevos.items():
+                setattr(f, campo, valor)
+            total_corregidas += 1
+
+    # Los 3 accesorios -- el tercero es el que además tenía el código mal
+    # copiado (7010340020 -> el correcto es 7010340030).
+    accesorios = [
+        ("7010340010", "GZBM05 METAL GRID TOOL", 570, 220.65021259591794, None),
+        ("7010340020", "GZBM06 PAPER GRID TOOL", 570, 220.65021259591794, None),
+        ("7010340020", "GZBM07 POINT SPREAD ADJ TOOL", 636, 246.19918458070842, "7010340030"),
+    ]
+    valores_por_total = {
+        570: {
+            "total_usd": 570, "flete_usd": 0, "cif_usd": 570, "cif_clp": 533274.9,
+            "otros_gastos_clp": 17338.43034908187, "costo_total_clp": 550613.3303490819,
+            "costo_unitario_clp": 550613.3303490819,
+        },
+        636: {
+            "total_usd": 636, "flete_usd": 0, "cif_usd": 636, "cif_clp": 595022.52,
+            "otros_gastos_clp": 19346.038073712407, "costo_total_clp": 614368.5580737124,
+            "costo_unitario_clp": 614368.5580737124,
+        },
+    }
+    for codigo_viejo, descripcion, total_invoice_eu, us_viejo, codigo_nuevo in accesorios:
+        filas = CompraHistorica.query.filter(
+            CompraHistorica.factura == FACTURA,
+            CompraHistorica.proveedor_original == PROVEEDOR,
+            CompraHistorica.codigo_interno == codigo_viejo,
+            CompraHistorica.descripcion == descripcion,
+            CompraHistorica.total_invoice == total_invoice_eu,
+            CompraHistorica.total_usd == us_viejo,
+        ).all()
+        for f in filas:
+            if codigo_nuevo:
+                f.codigo_interno = codigo_nuevo
+            for campo, valor in valores_por_total[total_invoice_eu].items():
+                setattr(f, campo, valor)
+            total_corregidas += 1
+
+    if total_corregidas:
+        db.session.commit()
+        print(
+            f"[reparar] Corregida distribución de costo de la factura {FACTURA} "
+            f"({PROVEEDOR}) en {total_corregidas} fila(s) históricas -- columna "
+            "US$ actualizada para que coincida con Total Invoice EU (paridad_eur=1), "
+            "y el código interno del ítem 'GZBM07 POINT SPREAD ADJ TOOL' corregido "
+            "de 7010340020 a 7010340030 (estaba copiado del ítem anterior)."
+        )
+        if total_corregidas != 6:
+            print(
+                f"[reparar] AVISO: se esperaban 6 filas corregidas para {FACTURA} "
+                f"y se corrigieron {total_corregidas} -- revisar a mano si no calza."
+            )
+
+
 with app.app_context():
     reparar_ordenes_mezcladas()
     limpiar_ordenes_canceladas()
     reparar_lotes_legacy()
     reparar_paridad_eur_historica()
+    reparar_costeo_topi_ex20260720()
 
 
 def _mensaje_division(ordenes_destino):
