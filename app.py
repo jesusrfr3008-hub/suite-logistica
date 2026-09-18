@@ -4,6 +4,7 @@ import io
 import os
 import re
 import shutil
+import unicodedata
 import uuid
 from collections import defaultdict, Counter
 from datetime import datetime, date, timedelta
@@ -897,27 +898,149 @@ def _filas_desde_filas_crudas(filas_crudas):
     return filas
 
 
+def _normalizar_encabezado(texto):
+    """Ronda AI (2026-09-18): compara nombres de columna del reporte sin
+    depender de tildes/mayúsculas exactas (por si el encoding del .csv
+    llega con algún caracter raro) -- "Cód.Bod" y "cod.bod" deben matchear
+    igual."""
+    if texto is None:
+        return ""
+    s = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode("ascii")
+    return s.strip().lower()
+
+
+def _filas_desde_reporte_consolidado(filas_crudas):
+    """Ronda AI (2026-09-18): desde que Ergopyme separó la generación de la
+    planilla de Stock en "Generación solo ACCUVISION SPA" / "Generación
+    Consolidada" / "Retroceder", se pasó a usar SIEMPRE la Consolidada (junta
+    ACCUVISION + ACCUMEDICAL, ya no tenía sentido pedirla separada si se
+    termina usando para las 2). Ese formato consolidado NO trae más los
+    bloques de "nombre de empresa" seguidos de sus items (ver
+    _filas_desde_filas_crudas, formato viejo) -- en vez de eso, cada fila de
+    producto trae 2 columnas de stock por empresa ("Stock ACCUV", "Stock
+    ACCUM") más una columna de total ("Stock físico"), confirmado contra un
+    archivo real del 17/09/2026. Se busca la fila de encabezado por nombre de
+    columna (no por posición fija -- ya cambió de posición una vez al
+    agregarse "F.Compra" en el medio, y puede volver a cambiar) y se generan
+    hasta 2 filas de salida por producto (una por empresa con stock > 0),
+    reusando el mismo formato de salida que _filas_desde_filas_crudas para
+    no tener que tocar _clasificar_y_cargar_stock.
+
+    Devuelve None (en vez de una lista, aunque sea vacía) si las filas no
+    tienen pinta de ser este formato consolidado -- así el que llama sabe
+    que tiene que probar con el parser viejo en su lugar, en vez de asumir
+    silenciosamente "0 filas" para un archivo que en realidad es del formato
+    anterior (ej. alguien sube a mano un "Generación solo ACCUVISION SPA")."""
+    filas_crudas = list(filas_crudas)
+    idx_encabezado = None
+    columnas = None
+    for i, row in enumerate(filas_crudas):
+        primera = _normalizar_encabezado(row[0]) if len(row) > 0 else ""
+        if primera == "cod.bod":
+            columnas = {}
+            for j, valor in enumerate(row):
+                nombre = _normalizar_encabezado(valor)
+                if nombre:
+                    columnas[nombre] = j
+            idx_encabezado = i
+            break
+
+    if idx_encabezado is None or "stock accuv" not in columnas or "stock accum" not in columnas:
+        return None
+
+    idx_codigo = columnas.get("cod.producto")
+    idx_desc = columnas.get("denominacion")
+    idx_lote = columnas.get("cod.lote")
+    idx_venc = columnas.get("vencimiento")
+    idx_accuv = columnas["stock accuv"]
+    idx_accum = columnas["stock accum"]
+    if idx_codigo is None:
+        return None
+
+    filas = []
+    for row in filas_crudas[idx_encabezado + 1:]:
+        codigo_raw = row[idx_codigo] if len(row) > idx_codigo else None
+        if not (isinstance(codigo_raw, str) and codigo_raw.strip().startswith("'")):
+            continue
+        codigo_interno = _normalizar_codigo_interno(codigo_raw)
+        if not codigo_interno:
+            continue
+
+        descripcion = ""
+        if idx_desc is not None and len(row) > idx_desc and row[idx_desc] not in (None, ""):
+            descripcion = str(row[idx_desc]).strip()
+
+        codigo_lote = ""
+        if idx_lote is not None and len(row) > idx_lote and row[idx_lote] not in (None, ""):
+            codigo_lote = str(row[idx_lote]).strip()
+
+        fecha_venc = row[idx_venc] if idx_venc is not None and len(row) > idx_venc else None
+        if isinstance(fecha_venc, datetime):
+            fecha_venc = fecha_venc.date()
+        elif isinstance(fecha_venc, str):
+            fecha_venc = fecha_venc.strip()
+            try:
+                fecha_venc = datetime.strptime(fecha_venc, "%Y-%m-%d").date() if fecha_venc else None
+            except ValueError:
+                fecha_venc = None
+
+        for empresa_texto, idx_stock in (("ACCUVISION SPA", idx_accuv), ("ACCUMEDICAL SPA", idx_accum)):
+            valor_stock = row[idx_stock] if len(row) > idx_stock else 0
+            if isinstance(valor_stock, str):
+                valor_stock = valor_stock.strip()
+            try:
+                valor_stock = int(valor_stock) if valor_stock not in (None, "") else 0
+            except (TypeError, ValueError):
+                valor_stock = 0
+            if valor_stock <= 0:
+                continue
+            filas.append({
+                "empresa_texto": empresa_texto,
+                "codigo_interno": codigo_interno,
+                "descripcion": descripcion,
+                "codigo_lote": codigo_lote,
+                "fecha_vencimiento": fecha_venc,
+                "stock_fisico": valor_stock,
+            })
+    return filas
+
+
 def _leer_filas_reporte_stock(ws):
     """Formato de siempre: hoja .xlsx subida a mano desde /stock (botón
-    'Cargar reporte de Stock') -- ver _filas_desde_filas_crudas para la
-    lógica real, compartida con el formato .csv de la ronda AI."""
-    return _filas_desde_filas_crudas(ws.iter_rows(min_row=1, values_only=True))
+    'Cargar reporte de Stock'). Ronda AI (2026-09-18): primero prueba el
+    formato consolidado nuevo (ver _filas_desde_reporte_consolidado); si el
+    archivo no tiene esa pinta (por ejemplo, alguien sube a mano un
+    "Generación solo ACCUVISION SPA" de los de antes), cae al parser
+    original (_filas_desde_filas_crudas, bloques de empresa)."""
+    filas_crudas = list(ws.iter_rows(min_row=1, values_only=True))
+    filas = _filas_desde_reporte_consolidado(filas_crudas)
+    if filas is not None:
+        return filas
+    return _filas_desde_filas_crudas(filas_crudas)
 
 
 def _leer_filas_reporte_stock_csv(contenido_bytes):
-    """Ronda AI (2026-09-17): mismo reporte de Stock, pero en el formato
-    .csv que guarda la automatización de Ergopyme (RDP + AutoHotkey) --
-    confirmado contra un archivo real capturado: UTF-8 con BOM, separado
-    por ';' (no ','), fin de línea CRLF, SIEMPRE de una sola empresa por
-    archivo (la que esté logueada en esa sesión de Ergopyme, a diferencia
-    del .xlsx manual que trae varias empresas seguidas). Se decodifica con
-    'utf-8-sig' (saca el BOM solo) y se tolera cualquier fila corta o
-    corrupta al final del archivo (ej. bytes sueltos que a veces quedan del
-    portapapeles) delegando en _filas_desde_filas_crudas, que ya ignora
-    filas que no calzan con el patrón esperado."""
+    """Mismo reporte de Stock, pero en el formato .csv que guarda la
+    automatización de Ergopyme (RDP + AutoHotkey). Ronda AI (2026-09-17):
+    confirmado que llega como UTF-8 con BOM, separado por ';' (no ','), fin
+    de línea CRLF -- se decodifica con 'utf-8-sig' (saca el BOM solo) y se
+    tolera cualquier fila corta o corrupta al final del archivo (ej. bytes
+    sueltos que a veces quedan del portapapeles).
+
+    Ronda AI (2026-09-18): desde que la automatización pasó a pedir
+    "Generación Consolidada" (junta ACCUVISION + ACCUMEDICAL en vez de
+    generarlas separadas -- ver Actualizar_Stock_Ergopyme.ahk), el archivo
+    real ya no trae una sola empresa por archivo como decía la nota vieja
+    acá -- ahora trae las 2 juntas, con 2 columnas de stock por producto.
+    Por eso primero se prueba el parser consolidado, y si el archivo no
+    tiene esa pinta (ej. alguien vuelve a generar "solo ACCUVISION SPA" a
+    mano alguna vez), cae al formato viejo de bloques por empresa."""
     texto = contenido_bytes.decode("utf-8-sig", errors="replace")
-    lector = csv.reader(texto.splitlines(), delimiter=";")
-    return _filas_desde_filas_crudas(list(lector))
+    filas_crudas = list(csv.reader(texto.splitlines(), delimiter=";"))
+    filas = _filas_desde_reporte_consolidado(filas_crudas)
+    if filas is not None:
+        return filas
+    return _filas_desde_filas_crudas(filas_crudas)
 
 
 def _clasificar_y_cargar_stock(filas):
