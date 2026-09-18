@@ -30,6 +30,12 @@ PERMISOS_DISPONIBLES = [
     # "inventarios" de arriba (ese es para quien administra/genera el costeo
     # de importaciones); este es de solo consulta de saldos de existencias.
     ("consultar_stock", "Consulta de Stock (saldos de existencias)"),
+    # Ronda AJ (2026-09-18): modulo de Pago Proveedores (facturas
+    # pendientes/pagadas, plazos de credito, registro de pagos y NC) --
+    # separado de "inventarios"/"reportes" porque es informacion financiera
+    # sensible (montos y fechas de vencimiento de pago a proveedores) que no
+    # todo el que ve Reportes deberia poder ver/operar.
+    ("pagos_proveedores", "Pago Proveedores"),
 ]
 
 
@@ -57,6 +63,8 @@ class Rol(db.Model):
     # Ronda V (2026-09-12): consulta de saldos de Stock -- ver PERMISOS_
     # DISPONIBLES arriba.
     permiso_consultar_stock = db.Column(db.Boolean, default=False)
+    # Ronda AJ (2026-09-18): ver PERMISOS_DISPONIBLES arriba.
+    permiso_pagos_proveedores = db.Column(db.Boolean, default=False)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
 
     usuarios = db.relationship("Usuario", backref="rol", lazy="dynamic")
@@ -168,6 +176,16 @@ class Proveedor(db.Model):
     # "Inventario" (columna "RUT" de la cabecera, ver _construir_excel_inventario
     # en app.py). Queda en blanco hasta que el usuario lo completa.
     codigo_sistema_inventario = db.Column(db.String(50))
+
+    # Ronda AJ (2026-09-18): plazo de credito pactado con este proveedor,
+    # para el modulo de Pago Proveedores -- en dias corridos desde la fecha
+    # de emision de la factura (ver FacturaProveedor.fecha_vencimiento_
+    # sugerida abajo). None/0 = sin plazo definido todavia. Si
+    # requiere_pago_previo esta marcado, el proveedor no despacha hasta
+    # recibir el pago (factura queda "pendiente" igual, pero se muestra
+    # resaltada en el listado como "pago previo").
+    plazo_credito_dias = db.Column(db.Integer, nullable=True)
+    requiere_pago_previo = db.Column(db.Boolean, default=False)
 
     productos = db.relationship(
         "Producto", backref="proveedor", cascade="all, delete-orphan", lazy="dynamic"
@@ -961,6 +979,19 @@ class Importacion(db.Model):
                 total += linea.valor_total_usd
         return total
 
+    @property
+    def fob_total_moneda(self):
+        """Ronda AJ (2026-09-18): total FOB en la MONEDA DE LA FACTURA (no en
+        USD) -- es el "Valor total de la factura" que el modulo de Pago
+        Proveedores usa para la cuenta por pagar (a pedido explicito del
+        usuario: se paga el valor de la factura, no el costo total nacionalizado
+        con derechos/gastos incluidos)."""
+        total = 0.0
+        for parcial in self.parciales:
+            for linea in parcial.lineas:
+                total += linea.valor_total_moneda
+        return total
+
     def __repr__(self):
         return f"<Importacion {self.numero_factura}>"
 
@@ -1208,3 +1239,103 @@ class TipoCambioMensual(db.Model):
 
     def __repr__(self):
         return f"<TipoCambioMensual {self.mes}/{self.anio}>"
+
+
+# ---------------------------------------------------------------------------
+# Modulo: Pago Proveedores
+# ---------------------------------------------------------------------------
+# Ronda AJ (2026-09-18, fase 1 -- ver ronda-aj-pago-proveedores-costo-
+# producto-multi-factura.md en el proyecto para el detalle completo y el
+# estado de cada requerimiento). FacturaProveedor es la cuenta por pagar
+# propiamente tal -- una fila por factura de compra a un proveedor
+# extranjero, ya sea:
+#   1) cargada UNA VEZ desde el archivo de saldos iniciales del usuario
+#      ("Cuentas por pagar proveedores al 18-09-2026.xlsx", ver
+#      seed_facturas_proveedor_pendientes en app.py) -- importacion_id queda
+#      en None porque esas facturas son anteriores a este modulo (no hay
+#      Importacion del sistema asociada), o
+#   2) generada automaticamente cuando se costea una Importacion NUEVA en el
+#      sistema -- importacion_id apunta a esa Importacion, y el monto es el
+#      "Valor total factura" (Importacion.fob_total_moneda), NO el costo
+#      nacionalizado con derechos/gastos incluidos (a pedido explicito del
+#      usuario: se le paga al proveedor el valor de SU factura).
+# Cada pago (parcial o total) queda como fila propia en
+# PagoFacturaProveedor -- una factura puede tener varios abonos antes de
+# quedar 'pagada'. El tipo de cambio de CADA pago se guarda ahi porque es
+# el dato que, a pedido del usuario, se necesitara para recostear el FOB/CIF
+# de la Importacion asociada una vez que la factura quede pagada por
+# completo (fase 2, pendiente -- ver el documento de ronda mencionado
+# arriba; por ahora el pago se registra y el estado de la factura se
+# actualiza, pero el costeo de la Importacion todavia NO se recalcula solo).
+ESTADOS_FACTURA_PROVEEDOR = ["pendiente", "abonada", "pagada", "anulada"]
+
+
+class FacturaProveedor(db.Model):
+    __tablename__ = "facturas_proveedor"
+
+    id = db.Column(db.Integer, primary_key=True)
+    proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False)
+    importacion_id = db.Column(db.Integer, db.ForeignKey("importaciones.id"), nullable=True)
+
+    numero_factura = db.Column(db.String(80), nullable=False)
+    fecha_emision = db.Column(db.Date, nullable=True)
+    moneda = db.Column(db.String(10), default="USD")
+    valor_factura = db.Column(db.Float, default=0)  # en 'moneda' -- el valor TOTAL de la factura
+    fecha_vencimiento = db.Column(db.Date, nullable=True)
+    # Valor en CLP solo de REFERENCIA (al tipo de cambio vigente cuando se
+    # registro la factura) -- informativo para el listado; NO es el que se
+    # usara para recostear (ese sera el tipo de cambio del PAGO real, fase 2).
+    valor_clp_referencial = db.Column(db.Float, default=0)
+
+    estado = db.Column(db.String(20), default="pendiente")
+    notas = db.Column(db.Text)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    proveedor = db.relationship("Proveedor")
+    importacion = db.relationship("Importacion", backref=db.backref("factura_pago", uselist=False))
+    pagos = db.relationship(
+        "PagoFacturaProveedor", backref="factura", cascade="all, delete-orphan",
+        lazy="dynamic", order_by="PagoFacturaProveedor.fecha_pago",
+    )
+
+    @property
+    def monto_pagado(self):
+        return sum((p.monto or 0) for p in self.pagos)
+
+    @property
+    def saldo_pendiente(self):
+        return round((self.valor_factura or 0) - self.monto_pagado, 2)
+
+    @property
+    def dias_para_vencer(self):
+        """Positivo = dias que faltan para vencer, negativo = dias de atraso
+        (ya vencida). None si todavia no hay fecha de vencimiento cargada."""
+        if not self.fecha_vencimiento:
+            return None
+        return (self.fecha_vencimiento - datetime.utcnow().date()).days
+
+    def __repr__(self):
+        return f"<FacturaProveedor {self.numero_factura} ({self.estado})>"
+
+
+class PagoFacturaProveedor(db.Model):
+    __tablename__ = "pagos_factura_proveedor"
+
+    id = db.Column(db.Integer, primary_key=True)
+    factura_id = db.Column(db.Integer, db.ForeignKey("facturas_proveedor.id"), nullable=False)
+    fecha_pago = db.Column(db.Date, nullable=False)
+    monto = db.Column(db.Float, default=0)  # en la MISMA moneda de la factura (FacturaProveedor.moneda)
+    tipo_cambio_pago = db.Column(db.Float, default=0)  # CLP por 1 unidad de esa moneda, EL DIA DEL PAGO real
+    es_abono = db.Column(db.Boolean, default=False)  # informativo -- el estado real lo decide el saldo restante
+    notas = db.Column(db.String(300))
+    registrado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    registrado_por = db.relationship("Usuario")
+
+    @property
+    def monto_clp(self):
+        return (self.monto or 0) * (self.tipo_cambio_pago or 0)
+
+    def __repr__(self):
+        return f"<PagoFacturaProveedor factura={self.factura_id} {self.monto}>"

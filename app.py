@@ -36,6 +36,7 @@ from models import (
     Usuario, Rol, PERMISOS_DISPONIBLES,
     HomologacionStock, StockExistencia, PedidoComprometido,
     CodigoErgopyme, CompraHistorica,
+    FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
 )
 from seed_data import seed_from_excel
 import costing
@@ -100,6 +101,10 @@ MONEDA_PROVEEDOR_EXCEL = os.path.join(BASE_DIR, "moneda_proveedor.xlsx")
 #    tiene prioridad sobre la hoja embebida -- ver seed_variantes_lentes_
 #    physiol() y reparar_variantes_physiol_ronda_ae().
 AJUSTE_PADRE_PHYSIOL_EXCEL = os.path.join(BASE_DIR, "Ajuste de cuentas padre Physiol.xlsx")
+# Ronda AJ (2026-09-18): saldos iniciales de cuentas por pagar a proveedores
+# extranjeros (facturas de compras anteriores a este modulo, ya emitidas y
+# pendientes de pago) -- ver seed_facturas_proveedor_pendientes() abajo.
+CUENTAS_POR_PAGAR_EXCEL = os.path.join(BASE_DIR, "cuentas_por_pagar_proveedores.xlsx")
 
 # Ronda AE (2026-09-14): algunos proveedores extranjeros aparecen en el
 # histórico de compras (columna "Proveedor" original del archivo) con un
@@ -432,6 +437,8 @@ def ensure_schema_migrations():
         ],
         "proveedores": [
             ("codigo_sistema_inventario", "VARCHAR(50)"),
+            ("plazo_credito_dias", "INTEGER"),
+            ("requiere_pago_previo", "BOOLEAN DEFAULT 0"),
         ],
         "parcial_lineas": [
             ("orden_compra_linea_id", "INTEGER"),
@@ -463,6 +470,7 @@ def ensure_schema_migrations():
         ],
         "roles": [
             ("permiso_consultar_stock", "BOOLEAN DEFAULT 0"),
+            ("permiso_pagos_proveedores", "BOOLEAN DEFAULT 0"),
         ],
     }
 
@@ -2150,6 +2158,119 @@ def seed_compras_historicas():
         print(f"[seed] Códigos históricos sin homologar: {sorted(codigos_sin_homologar)}")
 
 
+def seed_facturas_proveedor_pendientes():
+    """Ronda AJ (2026-09-18): carga UNA VEZ los saldos iniciales de cuentas
+    por pagar a proveedores extranjeros para el módulo Pago Proveedores --
+    facturas de compras anteriores a este módulo, ya emitidas y todavía
+    pendientes de pago al momento de activarlo (ver 'Cuentas por pagar
+    proveedores al 18-09-2026.xlsx', hoja RESUME, tabla con encabezado
+    PROVEEDOR/FACTURA/FECHA DOCUMENTO/VALOR/MONDEDA/VCTO/CLP -- el propio
+    archivo del usuario trae "MONDEDA" así, sin la primera E). Gateado: si
+    ya hay alguna FacturaProveedor cargada, no hace nada -- de ahí en
+    adelante las facturas nuevas se generan solas al costear una Importación
+    en el sistema, o se cargan/editan a mano."""
+    if FacturaProveedor.query.count() > 0:
+        return
+    if not os.path.isfile(CUENTAS_POR_PAGAR_EXCEL):
+        print(f"[seed] No se encontró {CUENTAS_POR_PAGAR_EXCEL}, se omite la carga de cuentas por pagar iniciales.")
+        return
+
+    wb = openpyxl.load_workbook(CUENTAS_POR_PAGAR_EXCEL, data_only=True)
+    ws = wb.worksheets[0]
+
+    fila_inicio = None
+    columnas = {}
+    for i, row in enumerate(ws.iter_rows(min_row=1, values_only=True), start=1):
+        nombres = [str(v).strip().upper() if v is not None else "" for v in row]
+        if "PROVEEDOR" in nombres and "FACTURA" in nombres:
+            fila_inicio = i + 1
+            for idx, nombre in enumerate(nombres):
+                if nombre:
+                    columnas[nombre] = idx
+            break
+    if fila_inicio is None:
+        print(
+            "[seed] No se encontró el encabezado esperado (PROVEEDOR/FACTURA) en "
+            "cuentas_por_pagar_proveedores.xlsx, se omite."
+        )
+        return
+
+    def col(nombre, row):
+        idx = columnas.get(nombre)
+        return row[idx] if idx is not None and idx < len(row) else None
+
+    MAPA_MONEDA_PAGAR = {"EUROS": "EURO", "EURO": "EURO", "USD": "USD", "US$": "USD", "CLP": "CLP"}
+
+    def num(valor):
+        if valor is None:
+            return 0.0
+        if isinstance(valor, (int, float)):
+            return float(valor)
+        texto = str(valor).strip()
+        if not texto:
+            return 0.0
+        if "," in texto:
+            texto = texto.replace(".", "").replace(",", ".")
+        try:
+            return float(texto)
+        except (TypeError, ValueError):
+            return 0.0
+
+    proveedores_no_encontrados = set()
+    creadas = 0
+    for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+        if not row or all(v is None for v in row):
+            continue
+        proveedor_valor = col("PROVEEDOR", row)
+        factura_valor = col("FACTURA", row)
+        if not proveedor_valor or not factura_valor:
+            continue
+
+        # Se usa el mismo alias que _proveedor_canonico_historico (definida
+        # más abajo en el archivo, no disponible todavía en este punto de
+        # carga del módulo) en vez de llamarla directamente.
+        nombre_crudo = str(proveedor_valor).strip()
+        nombre_canonico = ALIAS_PROVEEDOR_HISTORICO.get(nombre_crudo.upper(), nombre_crudo)
+        proveedor = Proveedor.query.filter(
+            db.func.upper(Proveedor.nombre) == (nombre_canonico or "").upper()
+        ).first()
+        if not proveedor:
+            proveedores_no_encontrados.add(str(proveedor_valor).strip())
+            continue
+
+        fecha_emision = col("FECHA DOCUMENTO", row)
+        fecha_emision = fecha_emision.date() if isinstance(fecha_emision, datetime) else None
+        fecha_vencimiento = col("VCTO", row)
+        fecha_vencimiento = fecha_vencimiento.date() if isinstance(fecha_vencimiento, datetime) else None
+
+        moneda_cruda = str(col("MONDEDA", row) or col("MONEDA", row) or "").strip().upper()
+        moneda = MAPA_MONEDA_PAGAR.get(moneda_cruda, moneda_cruda or "USD")
+
+        db.session.add(FacturaProveedor(
+            proveedor_id=proveedor.id,
+            numero_factura=str(factura_valor).strip(),
+            fecha_emision=fecha_emision,
+            moneda=moneda,
+            valor_factura=num(col("VALOR", row)),
+            fecha_vencimiento=fecha_vencimiento,
+            valor_clp_referencial=num(col("CLP", row)),
+            estado="pendiente",
+            notas="Saldo inicial cargado al activar Pago Proveedores (ronda AJ, 2026-09-18).",
+        ))
+        creadas += 1
+
+    if creadas:
+        db.session.commit()
+    print(
+        f"[seed] Cuentas por pagar iniciales: {creadas} factura(s) pendiente(s) cargada(s)."
+        + (
+            f" Proveedor(es) no encontrado(s) en el catálogo (se omitieron, revisar a mano): "
+            f"{sorted(proveedores_no_encontrados)}"
+            if proveedores_no_encontrados else ""
+        )
+    )
+
+
 # Contraseña temporal del Administrador inicial (ronda R, 2026-09-12) --
 # ver seed_administrador_inicial() abajo. Puramente informativa aca (el
 # usuario la cambia desde "Mi cuenta" apenas entra la primera vez); no es
@@ -2206,6 +2327,7 @@ with app.app_context():
     reparar_variantes_physiol_ronda_ae()
     seed_codigos_ergopyme()
     seed_compras_historicas()
+    seed_facturas_proveedor_pendientes()
 
 
 # ---------------------------------------------------------------------------
@@ -7948,6 +8070,200 @@ def reportes_compras_proveedor_detalle(proveedor):
         empresas=Empresa.query.order_by(Empresa.nombre).all(),
         empresa_sel=empresa, fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
     )
+
+
+# ---------------------------------------------------------------------------
+# Modulo: Pago Proveedores (ronda AJ, 2026-09-18, fase 1)
+# ---------------------------------------------------------------------------
+# Ver ronda-aj-pago-proveedores-costo-producto-multi-factura.md en el
+# proyecto para el detalle completo de los 4 requerimientos pedidos y el
+# estado de cada uno. Esta fase 1 cubre: listado de facturas pendientes por
+# proveedor con fecha de vencimiento, plazo de credito/pago previo por
+# proveedor, y registro de pagos (abono o total) con su tipo de cambio.
+# Todavia NO cubre (fase 2, pendiente): recosteo automatico del FOB/CIF de
+# la Importacion asociada al marcar una factura como pagada, notas de
+# credito, ni la generacion automatica de FacturaProveedor al costear una
+# Importacion nueva (por ahora las facturas nuevas se cargan a mano aca
+# mismo, igual que se cargaron los saldos iniciales).
+
+def _factura_proveedor_estado_por_saldo(factura):
+    """Recalcula el estado de una FacturaProveedor a partir de su saldo
+    pendiente real (nunca confia solo en el flag manual 'es_abono' de cada
+    pago individual, para que el estado no pueda quedar desincronizado)."""
+    saldo = factura.saldo_pendiente
+    if saldo <= 0.01:
+        return "pagada"
+    if factura.monto_pagado > 0:
+        return "abonada"
+    return "pendiente"
+
+
+@app.route("/pagos-proveedores")
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_list():
+    """Listado de cuentas por pagar a proveedores extranjeros, agrupado por
+    proveedor y ordenado por fecha de vencimiento (las mas urgentes
+    primero). Filtrable por estado y por proveedor."""
+    estado_filtro = request.args.get("estado", "pendientes").strip().lower()
+    proveedor_filtro = request.args.get("proveedor_id", "").strip()
+
+    q = FacturaProveedor.query
+    if estado_filtro == "pendientes":
+        q = q.filter(FacturaProveedor.estado.in_(["pendiente", "abonada"]))
+    elif estado_filtro in ESTADOS_FACTURA_PROVEEDOR:
+        q = q.filter(FacturaProveedor.estado == estado_filtro)
+    if proveedor_filtro.isdigit():
+        q = q.filter(FacturaProveedor.proveedor_id == int(proveedor_filtro))
+
+    facturas = q.order_by(
+        db.case((FacturaProveedor.fecha_vencimiento.is_(None), 1), else_=0),
+        FacturaProveedor.fecha_vencimiento,
+    ).all()
+
+    hoy = datetime.utcnow().date()
+    agrupado = {}
+    for f in facturas:
+        agrupado.setdefault(f.proveedor, []).append(f)
+
+    proveedores_con_facturas = Proveedor.query.join(FacturaProveedor).distinct().order_by(Proveedor.nombre).all()
+
+    return render_template(
+        "pagos_proveedores/list.html",
+        agrupado=agrupado, hoy=hoy, estado_filtro=estado_filtro,
+        proveedor_filtro=proveedor_filtro, proveedores=proveedores_con_facturas,
+        ESTADOS_FACTURA_PROVEEDOR=ESTADOS_FACTURA_PROVEEDOR,
+    )
+
+
+@app.route("/pagos-proveedores/<int:factura_id>")
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_detalle(factura_id):
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    pagos = factura.pagos.order_by(PagoFacturaProveedor.fecha_pago.desc()).all()
+    return render_template("pagos_proveedores/detalle.html", factura=factura, pagos=pagos, hoy=datetime.utcnow().date())
+
+
+@app.route("/pagos-proveedores/<int:factura_id>/registrar-pago", methods=["POST"])
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_registrar_pago(factura_id):
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    if factura.estado == "pagada":
+        flash("Esta factura ya está marcada como pagada por completo.", "warning")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    try:
+        monto = float((request.form.get("monto") or "0").replace(",", "."))
+        tipo_cambio_pago = float((request.form.get("tipo_cambio_pago") or "0").replace(",", "."))
+    except ValueError:
+        flash("Monto o tipo de cambio inválido.", "danger")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    fecha_pago_txt = request.form.get("fecha_pago", "").strip()
+    try:
+        fecha_pago = datetime.strptime(fecha_pago_txt, "%Y-%m-%d").date() if fecha_pago_txt else datetime.utcnow().date()
+    except ValueError:
+        fecha_pago = datetime.utcnow().date()
+
+    if monto <= 0:
+        flash("El monto del pago debe ser mayor a 0.", "danger")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    saldo_antes = factura.saldo_pendiente
+    es_abono = monto < (saldo_antes - 0.01)
+
+    pago = PagoFacturaProveedor(
+        factura_id=factura.id,
+        fecha_pago=fecha_pago,
+        monto=monto,
+        tipo_cambio_pago=tipo_cambio_pago,
+        es_abono=es_abono,
+        notas=request.form.get("notas", "").strip(),
+        registrado_por_id=current_user.id,
+    )
+    db.session.add(pago)
+    db.session.flush()
+    factura.estado = _factura_proveedor_estado_por_saldo(factura)
+    db.session.commit()
+
+    if factura.estado == "pagada":
+        flash(
+            f"Pago registrado -- la factura {factura.numero_factura} quedó marcada como PAGADA. "
+            "Nota: el recosteo automático del FOB/CIF de la importación asociada con este tipo de "
+            "cambio todavía no está implementado (fase 2) -- si corresponde, ajusta el costeo a mano "
+            "en Costeo Importaciones mientras tanto.",
+            "success",
+        )
+    else:
+        flash(
+            f"Abono registrado -- saldo pendiente de la factura {factura.numero_factura}: "
+            f"{factura.saldo_pendiente:,.2f} {factura.moneda}.",
+            "success",
+        )
+    return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+
+@app.route("/pagos-proveedores/nueva", methods=["GET", "POST"])
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_nueva():
+    """Carga manual de una factura de proveedor pendiente de pago -- para
+    cuando todavia no existe generacion automatica desde una Importacion
+    costeada (fase 2, pendiente) y aparece una factura nueva que hay que
+    trackear en el modulo."""
+    if request.method == "POST":
+        proveedor_id = request.form.get("proveedor_id", "").strip()
+        numero_factura = request.form.get("numero_factura", "").strip()
+        if not proveedor_id.isdigit() or not numero_factura:
+            flash("Proveedor y número de factura son obligatorios.", "danger")
+            return redirect(url_for("pagos_proveedores_nueva"))
+
+        def fecha(nombre):
+            txt = request.form.get(nombre, "").strip()
+            try:
+                return datetime.strptime(txt, "%Y-%m-%d").date() if txt else None
+            except ValueError:
+                return None
+
+        def num(nombre):
+            try:
+                return float((request.form.get(nombre) or "0").replace(",", "."))
+            except ValueError:
+                return 0.0
+
+        factura = FacturaProveedor(
+            proveedor_id=int(proveedor_id),
+            numero_factura=numero_factura,
+            fecha_emision=fecha("fecha_emision"),
+            moneda=request.form.get("moneda", "USD").strip().upper() or "USD",
+            valor_factura=num("valor_factura"),
+            fecha_vencimiento=fecha("fecha_vencimiento"),
+            valor_clp_referencial=num("valor_clp_referencial"),
+            estado="pendiente",
+            notas=request.form.get("notas", "").strip(),
+        )
+        db.session.add(factura)
+        db.session.commit()
+        flash(f"Factura {factura.numero_factura} cargada en Pago Proveedores.", "success")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    return render_template(
+        "pagos_proveedores/nueva.html",
+        proveedores=Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all(),
+    )
+
+
+@app.route("/proveedores/<int:proveedor_id>/credito", methods=["POST"])
+@requiere_permiso("pagos_proveedores")
+def proveedor_actualizar_credito(proveedor_id):
+    """Guarda el plazo de crédito (días) y si el proveedor exige pago previo
+    al despacho -- editable desde el propio listado de Pago Proveedores
+    (no hay una pantalla de edición de Proveedor separada para esto)."""
+    proveedor = Proveedor.query.get_or_404(proveedor_id)
+    plazo_txt = request.form.get("plazo_credito_dias", "").strip()
+    proveedor.plazo_credito_dias = int(plazo_txt) if plazo_txt.isdigit() else None
+    proveedor.requiere_pago_previo = bool(request.form.get("requiere_pago_previo"))
+    db.session.commit()
+    flash(f"Condiciones de crédito de {proveedor.nombre} actualizadas.", "success")
+    return redirect(url_for("pagos_proveedores_list", **request.args.to_dict()))
 
 
 if __name__ == "__main__":

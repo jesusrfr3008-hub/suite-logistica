@@ -70,6 +70,11 @@
             <a class="nav-link {% if request.endpoint == 'stock_list' %}active{% endif %}" href="{{ url_for('stock_list') }}">Consulta de Stock</a>
           </li>
           {% endif %}
+          {% if current_user.tiene_permiso('pagos_proveedores') %}
+          <li class="nav-item">
+            <a class="nav-link {% if request.endpoint and 'pagos_proveedores' in request.endpoint %}active{% endif %}" href="{{ url_for('pagos_proveedores_list') }}">Pago Proveedores</a>
+          </li>
+          {% endif %}
           {% if es_admin or current_user.tiene_permiso('inventarios') %}
           <li class="nav-item dropdown">
             <a class="nav-link dropdown-toggle {% if 'tipo_cambio' in request.endpoint or 'admin_reset' in request.endpoint or 'empresas' in request.endpoint or 'roles' in request.endpoint or 'usuarios' in request.endpoint or request.endpoint == 'stock_homologacion' %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Configuración</a>

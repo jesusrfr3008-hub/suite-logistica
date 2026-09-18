@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Cargar factura · Pago Proveedores{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-3">Cargar factura de proveedor</h3>
+<div class="text-muted small mb-3">
+  Uso manual -- todavía no hay generación automática de la factura al costear una Importación nueva en el
+  sistema (fase 2, pendiente). Cárgala aquí para que aparezca en el listado de Pago Proveedores.
+</div>
+
+<div class="card p-3" style="max-width: 720px;">
+  <form method="post" class="row g-3">
+    <div class="col-md-6">
+      <label class="form-label small mb-0">Proveedor</label>
+      <select name="proveedor_id" class="form-select form-select-sm" required>
+        <option value="">Selecciona...</option>
+        {% for p in proveedores %}
+        <option value="{{ p.id }}">{{ p.nombre }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-6">
+      <label class="form-label small mb-0">Número de factura</label>
+      <input type="text" class="form-control form-control-sm" name="numero_factura" required>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label small mb-0">Fecha de emisión</label>
+      <input type="date" class="form-control form-control-sm" name="fecha_emision">
+    </div>
+    <div class="col-md-4">
+      <label class="form-label small mb-0">Fecha de vencimiento</label>
+      <input type="date" class="form-control form-control-sm" name="fecha_vencimiento">
+    </div>
+    <div class="col-md-4">
+      <label class="form-label small mb-0">Moneda</label>
+      <select name="moneda" class="form-select form-select-sm">
+        <option value="USD">USD</option>
+        <option value="EURO">EURO</option>
+        <option value="CLP">CLP</option>
+      </select>
+    </div>
+    <div class="col-md-6">
+      <label class="form-label small mb-0">Valor de la factura</label>
+      <input type="text" class="form-control form-control-sm" name="valor_factura" placeholder="En la moneda de arriba" required>
+    </div>
+    <div class="col-md-6">
+      <label class="form-label small mb-0">Valor CLP de referencia (opcional)</label>
+      <input type="text" class="form-control form-control-sm" name="valor_clp_referencial">
+    </div>
+    <div class="col-12">
+      <label class="form-label small mb-0">Notas</label>
+      <input type="text" class="form-control form-control-sm" name="notas" placeholder="Opcional">
+    </div>
+    <div class="col-12">
+      <button type="submit" class="btn btn-sm btn-brand">Cargar factura</button>
+      <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-sm btn-outline-secondary">Cancelar</a>
+    </div>
+  </form>
+</div>
+
+{% endblock %}

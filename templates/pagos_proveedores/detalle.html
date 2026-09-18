@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}Factura {{ factura.numero_factura }} · Pago Proveedores{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+  <div>
+    <h3 class="section-title mb-1">Factura {{ factura.numero_factura }}</h3>
+    <div class="text-muted small">{{ factura.proveedor.nombre }}</div>
+  </div>
+  <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-sm btn-outline-secondary">&larr; Volver al listado</a>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-8">
+    <div class="card p-3 h-100">
+      <div class="row g-3">
+        <div class="col-6 col-md-3">
+          <div class="small text-muted">Emisión</div>
+          <div class="fw-semibold">{{ factura.fecha_emision.strftime('%d-%m-%Y') if factura.fecha_emision else '--' }}</div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="small text-muted">Vencimiento</div>
+          <div class="fw-semibold">{{ factura.fecha_vencimiento.strftime('%d-%m-%Y') if factura.fecha_vencimiento else '--' }}</div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="small text-muted">Valor factura</div>
+          <div class="fw-semibold">{{ factura.valor_factura|moneda }} {{ factura.moneda }}</div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="small text-muted">Saldo pendiente</div>
+          <div class="fw-semibold fs-5">{{ factura.saldo_pendiente|moneda }} {{ factura.moneda }}</div>
+        </div>
+        {% if factura.importacion %}
+        <div class="col-12">
+          <div class="small text-muted">Importación asociada</div>
+          <a href="{{ url_for('importaciones_detalle', importacion_id=factura.importacion_id) }}">
+            Ver Costeo Importaciones -- {{ factura.importacion.numero_factura }}
+          </a>
+        </div>
+        {% else %}
+        <div class="col-12">
+          <div class="small text-muted">Sin importación asociada del sistema (factura anterior al módulo, o cargada a mano).</div>
+        </div>
+        {% endif %}
+        {% if factura.notas %}
+        <div class="col-12">
+          <div class="small text-muted">Notas</div>
+          <div>{{ factura.notas }}</div>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card p-3 h-100">
+      <div class="small text-muted">Estado actual</div>
+      <div class="mb-2">
+        {% if factura.estado == 'pagada' %}<span class="badge bg-success fs-6">Pagada</span>
+        {% elif factura.estado == 'abonada' %}<span class="badge bg-info text-dark fs-6">Abonada</span>
+        {% elif factura.estado == 'anulada' %}<span class="badge bg-secondary fs-6">Anulada</span>
+        {% else %}<span class="badge bg-warning text-dark fs-6">Pendiente</span>
+        {% endif %}
+      </div>
+      {% if factura.proveedor.requiere_pago_previo %}
+      <div class="alert alert-danger small mb-0">Este proveedor exige pago previo al despacho.</div>
+      {% elif factura.proveedor.plazo_credito_dias %}
+      <div class="small text-muted">Plazo de crédito del proveedor: {{ factura.proveedor.plazo_credito_dias }} día(s).</div>
+      {% else %}
+      <div class="small text-muted">Este proveedor todavía no tiene un plazo de crédito definido (ver listado).</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{% if factura.estado != 'pagada' and factura.estado != 'anulada' %}
+<div class="card p-3 mb-4">
+  <div class="fw-semibold mb-2">Registrar pago</div>
+  <form method="post" action="{{ url_for('pagos_proveedores_registrar_pago', factura_id=factura.id) }}" class="row g-2 align-items-end">
+    <div class="col-md-2">
+      <label class="form-label small mb-0">Fecha de pago</label>
+      <input type="date" class="form-control form-control-sm" name="fecha_pago" required>
+    </div>
+    <div class="col-md-2">
+      <label class="form-label small mb-0">Monto ({{ factura.moneda }})</label>
+      <input type="text" class="form-control form-control-sm" name="monto" placeholder="Ej. {{ factura.saldo_pendiente }}" required>
+    </div>
+    <div class="col-md-2">
+      <label class="form-label small mb-0">Tipo de cambio del pago</label>
+      <input type="text" class="form-control form-control-sm" name="tipo_cambio_pago" placeholder="CLP por 1 {{ factura.moneda }}" required>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small mb-0">Notas</label>
+      <input type="text" class="form-control form-control-sm" name="notas" placeholder="Opcional">
+    </div>
+    <div class="col-md-3">
+      <button type="submit" class="btn btn-sm btn-brand w-100">Registrar pago</button>
+    </div>
+  </form>
+  <div class="text-muted small mt-2">
+    Si el monto ingresado cubre el saldo pendiente completo, la factura queda "Pagada"; si es menor, queda
+    "Abonada" y puedes seguir registrando pagos hasta completarla.
+  </div>
+</div>
+{% endif %}
+
+<div class="card p-3">
+  <div class="fw-semibold mb-2">Historial de pagos</div>
+  {% if not pagos %}
+  <div class="text-muted small">Todavía no se ha registrado ningún pago para esta factura.</div>
+  {% else %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>Fecha</th>
+          <th class="text-end">Monto</th>
+          <th class="text-end">Tipo de cambio</th>
+          <th class="text-end">CLP</th>
+          <th>Tipo</th>
+          <th>Notas</th>
+          <th>Registrado por</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in pagos %}
+        <tr>
+          <td>{{ p.fecha_pago.strftime('%d-%m-%Y') }}</td>
+          <td class="text-end">{{ p.monto|moneda }} {{ factura.moneda }}</td>
+          <td class="text-end">{{ p.tipo_cambio_pago|moneda }}</td>
+          <td class="text-end">{{ p.monto_clp|clp }}</td>
+          <td>{{ 'Abono' if p.es_abono else 'Pago total' }}</td>
+          <td class="text-muted small">{{ p.notas or '' }}</td>
+          <td class="text-muted small">{{ p.registrado_por.nombre_completo if p.registrado_por else '--' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+
+{% endblock %}

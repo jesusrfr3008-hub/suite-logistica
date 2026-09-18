@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Pago Proveedores · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-start mb-1">
+  <h3 class="section-title mb-1">Pago Proveedores</h3>
+  <a href="{{ url_for('pagos_proveedores_nueva') }}" class="btn btn-sm btn-brand">+ Cargar factura</a>
+</div>
+<div class="text-muted small mb-3">
+  Cuentas por pagar a proveedores extranjeros: facturas pendientes, su fecha de vencimiento y el plazo de
+  crédito pactado con cada proveedor. Fase 1 del módulo -- el recosteo automático del FOB/CIF al marcar una
+  factura como pagada y las notas de crédito todavía no están disponibles (ver estado en el documento del
+  proyecto).
+</div>
+
+<form method="get" class="row g-2 align-items-end mb-3">
+  <div class="col-auto">
+    <label class="form-label small mb-0">Estado</label>
+    <select name="estado" class="form-select form-select-sm" onchange="this.form.submit()">
+      <option value="pendientes" {{ 'selected' if estado_filtro == 'pendientes' }}>Pendientes + Abonadas</option>
+      {% for e in ESTADOS_FACTURA_PROVEEDOR %}
+      <option value="{{ e }}" {{ 'selected' if estado_filtro == e }}>{{ e|capitalize }}</option>
+      {% endfor %}
+      <option value="todos" {{ 'selected' if estado_filtro == 'todos' }}>Todos</option>
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Proveedor</label>
+    <select name="proveedor_id" class="form-select form-select-sm" onchange="this.form.submit()">
+      <option value="">Todos</option>
+      {% for p in proveedores %}
+      <option value="{{ p.id }}" {{ 'selected' if proveedor_filtro == p.id|string }}>{{ p.nombre }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</form>
+
+{% if not agrupado %}
+<div class="alert alert-success">No hay facturas que calcen con este filtro.</div>
+{% endif %}
+
+{% for proveedor, facturas in agrupado.items() %}
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <div class="d-flex align-items-center gap-2">
+      <span class="fw-semibold">{{ proveedor.nombre }}</span>
+      {% if proveedor.requiere_pago_previo %}
+      <span class="badge bg-danger">Pago previo (sin crédito)</span>
+      {% endif %}
+    </div>
+    <form method="post" action="{{ url_for('proveedor_actualizar_credito', proveedor_id=proveedor.id) }}?estado={{ estado_filtro }}&proveedor_id={{ proveedor_filtro }}"
+          class="d-flex align-items-center gap-2">
+      <label class="small text-muted mb-0">Plazo de crédito (días)</label>
+      <input type="number" min="0" name="plazo_credito_dias" value="{{ proveedor.plazo_credito_dias or '' }}"
+             class="form-control form-control-sm" style="width: 80px;" placeholder="--">
+      <div class="form-check form-check-inline mb-0">
+        <input class="form-check-input" type="checkbox" name="requiere_pago_previo" value="1"
+               id="pp-{{ proveedor.id }}" {{ 'checked' if proveedor.requiere_pago_previo }}>
+        <label class="form-check-label small" for="pp-{{ proveedor.id }}">Pago previo</label>
+      </div>
+      <button type="submit" class="btn btn-sm btn-outline-secondary">Guardar</button>
+    </form>
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>Factura</th>
+          <th>Emisión</th>
+          <th class="text-end">Valor</th>
+          <th class="text-end">Pagado</th>
+          <th class="text-end">Saldo</th>
+          <th>Vencimiento</th>
+          <th>Estado</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in facturas %}
+        <tr>
+          <td class="fw-semibold">{{ f.numero_factura }}</td>
+          <td>{{ f.fecha_emision.strftime('%d-%m-%Y') if f.fecha_emision else '--' }}</td>
+          <td class="text-end">{{ f.valor_factura|moneda }} {{ f.moneda }}</td>
+          <td class="text-end">{{ f.monto_pagado|moneda }} {{ f.moneda }}</td>
+          <td class="text-end fw-semibold">{{ f.saldo_pendiente|moneda }} {{ f.moneda }}</td>
+          <td>
+            {% if f.fecha_vencimiento %}
+              {{ f.fecha_vencimiento.strftime('%d-%m-%Y') }}
+              {% set dias = f.dias_para_vencer %}
+              {% if f.estado != 'pagada' and dias is not none %}
+                {% if dias < 0 %}
+                  <span class="badge bg-danger">Vencida hace {{ -dias }} día(s)</span>
+                {% elif dias <= 7 %}
+                  <span class="badge bg-warning text-dark">Vence en {{ dias }} día(s)</span>
+                {% endif %}
+              {% endif %}
+            {% else %}
+              <span class="text-muted">--</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if f.estado == 'pagada' %}<span class="badge bg-success">Pagada</span>
+            {% elif f.estado == 'abonada' %}<span class="badge bg-info text-dark">Abonada</span>
+            {% elif f.estado == 'anulada' %}<span class="badge bg-secondary">Anulada</span>
+            {% else %}<span class="badge bg-warning text-dark">Pendiente</span>
+            {% endif %}
+          </td>
+          <td class="text-end">
+            <a href="{{ url_for('pagos_proveedores_detalle', factura_id=f.id) }}" class="btn btn-sm btn-outline-secondary">Ver / registrar pago</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endfor %}
+
+{% endblock %}
