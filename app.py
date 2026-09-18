@@ -195,11 +195,21 @@ _ENDPOINTS_API_KEY = {"api_stock_cargar_auto"}
 
 # Clave compartida para /api/stock/cargar-auto -- se genera una vez (ej.
 # `python -c "import secrets; print(secrets.token_hex(32))"`) y se guarda
-# como variable de entorno STOCK_UPLOAD_API_KEY en Railway, y en el propio
-# script de la automatizacion en el PC de Jesus (nunca en este repositorio).
-# Si no esta configurada, el endpoint se niega a funcionar (falla "cerrado",
-# nunca "abierto") -- ver api_stock_cargar_auto().
-STOCK_UPLOAD_API_KEY = os.environ.get("STOCK_UPLOAD_API_KEY")
+# como variable de entorno en Railway, y en el propio script de la
+# automatizacion en el PC de Jesus (nunca en este repositorio). Si no esta
+# configurada, el endpoint se niega a funcionar (falla "cerrado", nunca
+# "abierto") -- ver api_stock_cargar_auto().
+#
+# Ronda AI (2026-09-18): el build de Railway (Railpack) empezo a fallar de
+# forma repetible con "failed to solve: secret STOCK_UPLOAD_API_KEY not
+# found" apenas esa variable quedo "aplicada" de verdad en el servicio (no
+# paso con DATABASE_URL) -- se probo borrarla y crearla de nuevo con el
+# mismo nombre y siguio fallando igual, asi que parece un problema del lado
+# de Railway con ese nombre puntual, no de configuracion nuestra. Se lee
+# tambien un nombre alternativo (SUITE_STOCK_KEY) como respaldo, para poder
+# probar con un nombre de variable nuevo sin tener que tocar el codigo de
+# nuevo si el problema resulta ser especifico del nombre viejo.
+STOCK_UPLOAD_API_KEY = os.environ.get("SUITE_STOCK_KEY") or os.environ.get("STOCK_UPLOAD_API_KEY")
 
 
 @app.before_request
