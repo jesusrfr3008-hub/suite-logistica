@@ -24,34 +24,38 @@
           <li class="nav-item">
             <a class="nav-link {% if request.endpoint == 'dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}">Dashboard</a>
           </li>
-          {% if current_user.tiene_permiso('crear_orden') or current_user.tiene_permiso('generar_costeo') %}
-          <li class="nav-item">
-            <a class="nav-link {% if 'proveedores' in request.endpoint %}active{% endif %}" href="{{ url_for('proveedores_list') }}">Proveedores</a>
-          </li>
-          {% endif %}
-          {% if current_user.tiene_permiso('crear_orden') or current_user.tiene_permiso('aprobar_orden') %}
+          {% set puede_orden_completa = current_user.tiene_permiso('crear_orden') %}
+          {% set puede_aprobar_orden = current_user.tiene_permiso('aprobar_orden') %}
+          {% set puede_orden_simple = current_user.tiene_permiso('orden_simple') %}
+          {% if puede_orden_completa or puede_aprobar_orden or puede_orden_simple %}
           <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if request.endpoint and 'ordenes' in request.endpoint and not request.endpoint.startswith('ordenes_simple') %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">
-              Compras / Órdenes
+            <a class="nav-link dropdown-toggle {% if request.endpoint and 'ordenes' in request.endpoint %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">
+              Orden de Compra
               {% if ordenes_por_aprobar_count %}<span class="badge bg-warning text-dark ms-1">{{ ordenes_por_aprobar_count }}</span>{% endif %}
             </a>
             <ul class="dropdown-menu">
-              <li><a class="dropdown-item" href="{{ url_for('ordenes_list') }}">Todas</a></li>
+              {% if puede_orden_completa %}
+              <li><a class="dropdown-item" href="{{ url_for('ordenes_nueva') }}">Nueva orden</a></li>
+              {% endif %}
+              {% if puede_orden_simple %}
+              <li><a class="dropdown-item" href="{{ url_for('ordenes_simple_nueva') }}">Orden Simple</a></li>
+              {% endif %}
+              {% if (puede_orden_completa or puede_aprobar_orden) and puede_orden_simple %}
+              <li><hr class="dropdown-divider"></li>
+              {% endif %}
+              {% if puede_orden_completa or puede_aprobar_orden %}
+              <li><span class="dropdown-item-text text-muted small fw-semibold">Mis Órdenes</span></li>
+              <li><a class="dropdown-item ps-4" href="{{ url_for('ordenes_list') }}">Todas</a></li>
               <li>
-                <a class="dropdown-item" href="{{ url_for('ordenes_por_aprobar') }}">
+                <a class="dropdown-item ps-4" href="{{ url_for('ordenes_por_aprobar') }}">
                   Por Aprobar
                   {% if ordenes_por_aprobar_count %}<span class="badge bg-warning text-dark ms-1">{{ ordenes_por_aprobar_count }}</span>{% endif %}
                 </a>
               </li>
-            </ul>
-          </li>
-          {% endif %}
-          {% if current_user.tiene_permiso('orden_simple') %}
-          <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if request.endpoint and request.endpoint.startswith('ordenes_simple') %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Mis Órdenes</a>
-            <ul class="dropdown-menu">
-              <li><a class="dropdown-item" href="{{ url_for('ordenes_simple_nueva') }}">Nueva orden</a></li>
-              <li><a class="dropdown-item" href="{{ url_for('ordenes_simple_list') }}">Mis órdenes</a></li>
+              {% endif %}
+              {% if puede_orden_simple %}
+              <li><a class="dropdown-item" href="{{ url_for('ordenes_simple_list') }}">Mis órdenes (Orden Simple)</a></li>
+              {% endif %}
             </ul>
           </li>
           {% endif %}
@@ -70,38 +74,18 @@
             <a class="nav-link {% if request.endpoint == 'stock_list' %}active{% endif %}" href="{{ url_for('stock_list') }}">Consulta de Stock</a>
           </li>
           {% endif %}
-          {% if current_user.tiene_permiso('pagos_proveedores') %}
-          <li class="nav-item">
-            <a class="nav-link {% if request.endpoint and 'pagos_proveedores' in request.endpoint %}active{% endif %}" href="{{ url_for('pagos_proveedores_list') }}">Pago Proveedores</a>
-          </li>
-          {% endif %}
-          {% if es_admin or current_user.tiene_permiso('inventarios') %}
+          {% set puede_reportes = current_user.tiene_permiso('reportes') %}
+          {% set puede_pagos_proveedores = current_user.tiene_permiso('pagos_proveedores') %}
+          {% if puede_reportes or puede_pagos_proveedores %}
           <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if 'tipo_cambio' in request.endpoint or 'admin_reset' in request.endpoint or 'empresas' in request.endpoint or 'roles' in request.endpoint or 'usuarios' in request.endpoint or request.endpoint == 'stock_homologacion' %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Configuración</a>
+            <a class="nav-link dropdown-toggle {% if request.endpoint and ('reportes' in request.endpoint or 'pagos_proveedores' in request.endpoint) %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Reportes</a>
             <ul class="dropdown-menu">
-              {% if es_admin %}
-              <li><a class="dropdown-item" href="{{ url_for('empresas_list') }}">Empresas compradoras</a></li>
-              <li><a class="dropdown-item" href="{{ url_for('tipo_cambio_list') }}">Tipo de cambio mensual</a></li>
-              <li><hr class="dropdown-divider"></li>
-              <li><a class="dropdown-item" href="{{ url_for('roles_list') }}">Perfiles</a></li>
-              <li><a class="dropdown-item" href="{{ url_for('usuarios_list') }}">Usuarios</a></li>
-              <li><hr class="dropdown-divider"></li>
-              {% endif %}
-              {% if current_user.tiene_permiso('inventarios') %}
-              <li><a class="dropdown-item" href="{{ url_for('stock_homologacion') }}">Homologación de Stock</a></li>
-              {% endif %}
-              {% if es_admin %}
-              <li><hr class="dropdown-divider"></li>
-              <li><a class="dropdown-item" href="{{ url_for('admin_reset') }}">Reiniciar datos</a></li>
-              {% endif %}
-            </ul>
-          </li>
-          {% endif %}
-          {% if current_user.tiene_permiso('reportes') %}
-          <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if request.endpoint and 'reportes' in request.endpoint %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Reportes</a>
-            <ul class="dropdown-menu">
+              {% if puede_reportes %}
               <li><a class="dropdown-item" href="{{ url_for('reportes_compras_proveedor') }}">Compras Proveedor</a></li>
+              {% endif %}
+              {% if puede_pagos_proveedores %}
+              <li><a class="dropdown-item" href="{{ url_for('pagos_proveedores_list') }}">Pago Proveedores</a></li>
+              {% endif %}
             </ul>
           </li>
           {% endif %}
@@ -117,6 +101,7 @@
               <li><span class="dropdown-item-text text-muted small">{{ current_user.rol.nombre if current_user.rol else '' }}</span></li>
               <li><hr class="dropdown-divider"></li>
               <li><a class="dropdown-item" href="{{ url_for('mi_cuenta') }}">Mi cuenta</a></li>
+              <li><a class="dropdown-item" href="{{ url_for('configuracion_index') }}">Configuración</a></li>
               <li><a class="dropdown-item" href="{{ url_for('logout') }}">Cerrar sesión</a></li>
             </ul>
           </li>

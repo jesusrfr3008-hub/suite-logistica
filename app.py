@@ -481,6 +481,7 @@ def ensure_schema_migrations():
         # consignacion, notas de credito y crédito por Proveedor.
         "compras_historicas": [
             ("factura_generada_id", "INTEGER"),
+            ("fue_consignacion", "BOOLEAN DEFAULT 0"),
         ],
         "facturas_proveedor": [
             ("origen", "VARCHAR(20) DEFAULT 'manual'"),
@@ -2761,6 +2762,13 @@ def reparar_facturacion_consignacion_medicontur():
         _proveedor, cod_erg, cod_prov, _lote, cantidad, precio, fecha_factura, numero_factura = row[:8]
         if cod_erg is None or numero_factura is None:
             continue
+        # Ronda AL (2026-09-19, corrección pedida por el usuario): la
+        # factura ZK2603227 fue un movimiento INTERNO del proveedor,
+        # reportado por error en su planilla -- no se debe considerar como
+        # facturación real. Las unidades que traía quedan (o vuelven a
+        # quedar) pendientes de facturar, igual que antes de este cruce.
+        if str(numero_factura).strip().upper() == "ZK2603227":
+            continue
         codigo = str(int(cod_erg)) if isinstance(cod_erg, (int, float)) else str(cod_erg).strip()
         fecha = fecha_factura.date() if isinstance(fecha_factura, datetime) else fecha_factura
         archivo_filas.append({
@@ -2841,6 +2849,7 @@ def reparar_facturacion_consignacion_medicontur():
                 categoria=fila_hist.categoria,
                 otros_costos_usd=(fila_hist.otros_costos_usd or 0) / n_original,
                 empresa_compradora=fila_hist.empresa_compradora, homologado=True,
+                fue_consignacion=True,
             ))
             n_facturadas += 1
             consumidas_por_fila[fila_hist.id] = consumidas_por_fila.get(fila_hist.id, 0) + 1
@@ -2886,6 +2895,7 @@ def reparar_facturacion_consignacion_medicontur():
                     flete_usd=0, seguro_usd=0, cif_usd=0, cif_clp=0, derechos_clp=0, otros_gastos_clp=0,
                     costo_total_clp=0, costo_unitario_clp=0, categoria="LENTES", otros_costos_usd=0,
                     empresa_compradora="ACCUVISION", homologado=True,
+                    fue_consignacion=True,
                 ))
                 n_nuevas += 1
 
@@ -6589,6 +6599,28 @@ def cargos_eliminar_multiple(importacion_id):
 
 
 # ---------------------------------------------------------------------------
+# Modulo: Configuracion -- pagina indice (ronda AL, 2026-09-19)
+# ---------------------------------------------------------------------------
+# El usuario pidio que Configuracion deje de ser un menu de nivel superior en
+# la barra de navegacion y pase a vivir como una opcion mas dentro del icono
+# de Usuario (Mi cuenta / Configuracion / Cerrar sesion) -- ver base.html.
+# Esta pagina agrupa los accesos que antes vivian sueltos en ese menu (mas
+# Proveedores, que tambien se pidio mover aca), cada uno mostrado solo si el
+# usuario tiene el permiso correspondiente -- misma logica de permisos que
+# ya usaba el dropdown viejo, ahora en tarjetas dentro de esta pagina.
+
+@app.route("/configuracion")
+def configuracion_index():
+    es_admin = current_user.rol and current_user.rol.es_administrador
+    return render_template(
+        "configuracion/index.html",
+        es_admin=es_admin,
+        puede_proveedores=current_user.tiene_permiso("crear_orden") or current_user.tiene_permiso("generar_costeo"),
+        puede_inventarios=current_user.tiene_permiso("inventarios"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Modulo: Configuracion -- Empresas compradoras (2026-09-07, ronda K)
 # ---------------------------------------------------------------------------
 
@@ -7891,6 +7923,10 @@ def _fila_historica_dict(c, homologar):
         # _filas_reporte_compras y el nuevo checkbox "Consignación" del
         # resumen por proveedor). Por ahora SOLO MEDICONTUR tiene líneas así.
         "es_consignacion": (c.factura or "").strip().upper() == "CONSIGNACION",
+        # Ronda AL (2026-09-19): para sombrear en el reporte las líneas que
+        # llegaron en consignación y después se facturaron de verdad -- ver
+        # CompraHistorica.fue_consignacion.
+        "fue_consignacion": bool(c.fue_consignacion),
     }
 
 
@@ -7965,6 +8001,7 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
                 # consignación (pendiente -- ver punto 4, checkbox en la
                 # Orden de Compra) -- por ahora ninguna lo es.
                 "es_consignacion": False,
+                "fue_consignacion": False,
             })
     return filas
 
@@ -8248,6 +8285,10 @@ def reportes_compras_proveedor_detalle(proveedor):
             "total_invoice": f.get("total_invoice") or 0,
             "moneda_operacion": mf,
             "origen": f.get("origen"),
+            # Ronda AL (2026-09-19): para sombrear en cream esta fila si vino
+            # de una facturación de consignación -- ver fue_consignacion en
+            # _fila_historica_dict.
+            "fue_consignacion": f.get("fue_consignacion", False),
         })
 
     meses_ordenados = sorted(meses_set.keys())
@@ -8705,6 +8746,10 @@ def pagos_proveedores_facturar_consignacion():
             compra.factura = numero_factura
             compra.fecha_factura = fecha_emision
             compra.factura_generada_id = factura.id
+            # Ronda AL (2026-09-19): marca esta línea para que el reporte
+            # Compras Proveedor la sombree en crema -- llegó en consignación
+            # y recién ahora se factura de verdad.
+            compra.fue_consignacion = True
 
         factura.valor_factura = round(valor_total, 2)
         db.session.commit()

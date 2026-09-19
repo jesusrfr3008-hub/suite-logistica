@@ -48,6 +48,12 @@
      lleno/sin nada que mover (el navegador la muestra "inactiva" solo,
      sin código extra). */
   .table-responsive-pivot { overflow-x: scroll; overflow-y: scroll; }
+  /* Ronda AL (2026-09-19, punto 1): las líneas facturadas por consignación
+     (llegaron sin costo, se facturaron después al venderse -- ver
+     fue_consignacion) se sombrean en crema dentro de la tabla de facturas de
+     cada producto, para diferenciarlas de una factura de compra directa. */
+  tr.fila-consignacion-facturada td { background-color: #fdf6e3 !important; }
+  .badge-consignacion-facturada { background-color: #d4a017; color: #fff; }
 </style>
 
 {# Ronda AD (2026-09-14): tabla de facturas reutilizada tanto para un
@@ -69,10 +75,11 @@
   </thead>
   <tbody>
     {% for fac in prod.facturas %}
-    <tr>
+    <tr{% if fac.fue_consignacion %} class="fila-consignacion-facturada"{% endif %}>
       <td>
         {% if fac.origen == 'Sistema' %}<span class="badge" style="background-color: var(--brand);">Sistema</span>
         {% else %}<span class="badge bg-secondary">Histórico</span>{% endif %}
+        {% if fac.fue_consignacion %}<span class="badge badge-consignacion-facturada ms-1" data-bs-toggle="tooltip" title="Llegó en consignación (sin costo para el proveedor hasta venderse) y se facturó después de vendida.">Consignación facturada</span>{% endif %}
       </td>
       <td>{{ fac.fecha_factura.strftime('%d-%m-%Y') if fac.fecha_factura else '-' }}</td>
       <td>{{ fac.factura }}</td>

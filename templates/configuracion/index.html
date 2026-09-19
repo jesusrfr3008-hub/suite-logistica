@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Configuración · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-1">Configuración</h3>
+<div class="text-muted small mb-3">
+  Solo se muestran las secciones a las que tu perfil tiene acceso.
+</div>
+
+<div class="row g-3">
+  {% if puede_proveedores %}
+  <div class="col-md-4">
+    <a href="{{ url_for('proveedores_list') }}" class="text-decoration-none">
+      <div class="card p-3 h-100">
+        <div class="fw-semibold"><i class="bi bi-truck me-1"></i> Proveedores</div>
+        <div class="text-muted small">Catálogo de proveedores, condiciones de crédito y datos de contacto.</div>
+      </div>
+    </a>
+  </div>
+  {% endif %}
+
+  {% if es_admin %}
+  <div class="col-md-4">
+    <a href="{{ url_for('empresas_list') }}" class="text-decoration-none">
+      <div class="card p-3 h-100">
+        <div class="fw-semibold"><i class="bi bi-building me-1"></i> Empresas compradoras</div>
+        <div class="text-muted small">Empresas que aparecen como "Comprador" en la Orden de Compra.</div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-4">
+    <a href="{{ url_for('tipo_cambio_list') }}" class="text-decoration-none">
+      <div class="card p-3 h-100">
+        <div class="fw-semibold"><i class="bi bi-currency-exchange me-1"></i> Tipo de cambio mensual</div>
+        <div class="text-muted small">Valores de referencia usados en los costeos de importación.</div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-4">
+    <a href="{{ url_for('roles_list') }}" class="text-decoration-none">
+      <div class="card p-3 h-100">
+        <div class="fw-semibold"><i class="bi bi-person-badge me-1"></i> Perfiles</div>
+        <div class="text-muted small">Permisos de cada perfil de usuario.</div>
+      </div>
+    </a>
+  </div>
+  <div class="col-md-4">
+    <a href="{{ url_for('usuarios_list') }}" class="text-decoration-none">
+      <div class="card p-3 h-100">
+        <div class="fw-semibold"><i class="bi bi-people me-1"></i> Usuarios</div>
+        <div class="text-muted small">Cuentas de acceso del equipo y su perfil asignado.</div>
+      </div>
+    </a>
+  </div>
+  {% endif %}
+
+  {% if puede_inventarios %}
+  <div class="col-md-4">
+    <a href="{{ url_for('stock_homologacion') }}" class="text-decoration-none">
+      <div class="card p-3 h-100">
+        <div class="fw-semibold"><i class="bi bi-diagram-3 me-1"></i> Homologación de Stock</div>
+        <div class="text-muted small">Vincula códigos de Stock con el catálogo de productos.</div>
+      </div>
+    </a>
+  </div>
+  {% endif %}
+
+  {% if es_admin %}
+  <div class="col-md-4">
+    <a href="{{ url_for('admin_reset') }}" class="text-decoration-none">
+      <div class="card p-3 h-100 border-danger-subtle">
+        <div class="fw-semibold text-danger"><i class="bi bi-exclamation-triangle me-1"></i> Reiniciar datos</div>
+        <div class="text-muted small">Borra datos de prueba -- acción irreversible.</div>
+      </div>
+    </a>
+  </div>
+  {% endif %}
+</div>
+
+{% if not puede_proveedores and not es_admin and not puede_inventarios %}
+<div class="alert alert-light border text-muted mt-2">
+  Tu perfil no tiene acceso a ninguna sección de Configuración.
+</div>
+{% endif %}
+
+{% endblock %}

@@ -443,6 +443,18 @@ class CompraHistorica(db.Model):
     # apuntando a la FacturaProveedor real que la reemplaza, para no volver a
     # ofrecerla como "pendiente de facturar" ni facturarla dos veces.
     factura_generada_id = db.Column(db.Integer, db.ForeignKey("facturas_proveedor.id"), nullable=True)
+    # Ronda AL (2026-09-19, punto 1 del pedido del usuario): True cuando esta
+    # linea llego alguna vez como consignacion (factura == "CONSIGNACION") y
+    # DESPUES se facturo de verdad -- ya sea por la reconciliacion masiva del
+    # archivo del proveedor o por Pago Proveedores > Facturar consignacion.
+    # Se usa SOLO para sombrear esas filas en el reporte Compras Proveedor
+    # (ver reportes_compras_proveedor_detalle) y diferenciarlas visualmente
+    # de una factura de compra directa -- no cambia ningun calculo, es
+    # puramente informativo. Una linea que SIGUE en consignacion (factura ==
+    # "CONSIGNACION" todavia) tiene este campo en False -- ver es_consignacion
+    # en _fila_historica_dict, que se calcula de la columna factura, no de este
+    # campo.
+    fue_consignacion = db.Column(db.Boolean, default=False)
 
     def __repr__(self):
         return f"<CompraHistorica {self.codigo_interno} {self.factura}>"
