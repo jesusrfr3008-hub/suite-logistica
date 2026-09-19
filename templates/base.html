@@ -86,6 +86,9 @@
               {% if puede_pagos_proveedores %}
               <li><a class="dropdown-item" href="{{ url_for('pagos_proveedores_list') }}">Pago Proveedores</a></li>
               {% endif %}
+              {% if puede_reportes %}
+              <li><a class="dropdown-item" href="{{ url_for('stock_valorizado_list') }}">Stock Valorizado</a></li>
+              {% endif %}
             </ul>
           </li>
           {% endif %}

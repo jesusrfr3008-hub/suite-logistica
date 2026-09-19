@@ -1,0 +1,227 @@
+{% extends "base.html" %}
+{% block title %}Stock Valorizado · Suite Logística{% endblock %}
+{% block content %}
+
+<style>
+  #tablaValorizado th, #tablaValorizado td {
+    white-space: nowrap;
+    vertical-align: middle;
+    font-size: 0.85rem;
+  }
+  th.ordenable { cursor: pointer; user-select: none; }
+  th.ordenable:hover { background-color: rgba(0,0,0,0.03); }
+  .icono-orden { font-size: 0.7em; color: #adb5bd; margin-left: 2px; }
+  .icono-orden.orden-activo { color: var(--brand); font-weight: bold; }
+  #tablaValorizado td[data-col="descripcion"] {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tabla-valorizado-scroll { max-height: 70vh; overflow-y: scroll; overflow-x: scroll; }
+  #tablaValorizado thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #fff;
+    box-shadow: inset 0 -1px 0 #dee2e6;
+  }
+  .grupo-accuv { background-color: rgba(13, 110, 253, 0.04); }
+  .grupo-accum { background-color: rgba(25, 135, 84, 0.04); }
+  .grupo-tot { background-color: rgba(0,0,0,0.02); }
+</style>
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+  <div>
+    <h3 class="section-title mb-0">Stock Valorizado</h3>
+    <div class="text-muted small">
+      Costo y valor de inventario por código (Accuvision, Accumedical y total combinado) --
+      información de costos, visible solo con permiso de Reportes. No aparece en Consulta de Stock.
+      {% if ultima_carga %}Última actualización: {{ ultima_carga.strftime('%d-%m-%Y %H:%M') }}.{% else %}Todavía no se ha cargado ningún reporte de Stock Valorizado.{% endif %}
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <button class="btn btn-outline-brand" data-bs-toggle="modal" data-bs-target="#modalCargarValorizado">
+      <i class="bi bi-upload"></i> Cargar reporte
+    </button>
+  </div>
+</div>
+
+<div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+  <div class="btn-group" role="group" aria-label="Vista de consignación">
+    <a href="{{ url_for('stock_valorizado_list', vista='desactivado', q=q) }}"
+       class="btn btn-sm {{ 'btn-brand' if vista == 'desactivado' else 'btn-outline-secondary' }}">
+      Desactivado <span class="d-none d-md-inline">(solo propio)</span>
+    </a>
+    <a href="{{ url_for('stock_valorizado_list', vista='consolidado', q=q) }}"
+       class="btn btn-sm {{ 'btn-brand' if vista == 'consolidado' else 'btn-outline-secondary' }}">
+      Consolidado <span class="d-none d-md-inline">(propio + consignación)</span>
+    </a>
+    <a href="{{ url_for('stock_valorizado_list', vista='consignacion', q=q) }}"
+       class="btn btn-sm {{ 'btn-brand' if vista == 'consignacion' else 'btn-outline-secondary' }}">
+      Consignación <span class="d-none d-md-inline">(solo consignación)</span>
+    </a>
+  </div>
+  <div class="text-muted small" data-bs-toggle="tooltip"
+       title="Hoy solo se reconocen como &quot;en consignación&quot; los códigos que ya rastreamos en Pago Proveedores (Medicontur, pendientes de facturar). Es una aproximación parcial mientras no se suba el archivo maestro de códigos+lotes en consignación de todos los proveedores -- ver ronda AM.">
+    <i class="bi bi-info-circle"></i> {{ total_codigos_consignacion }} código(s) reconocidos hoy como en consignación (solo Medicontur -- dato parcial)
+  </div>
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <input type="hidden" name="vista" value="{{ vista }}">
+  <div class="col-auto">
+    <input type="text" class="form-control" name="q" value="{{ q }}" placeholder="Buscar código o descripción...">
+  </div>
+  <div class="col-auto">
+    <button class="btn btn-outline-secondary" type="submit">Buscar</button>
+  </div>
+</form>
+
+<div class="row g-2 mb-3">
+  <div class="col-auto">
+    <div class="card p-2 px-3">
+      <div class="text-muted small">Códigos en esta vista</div>
+      <div class="fs-5 fw-semibold">{{ filas|length }}</div>
+    </div>
+  </div>
+  <div class="col-auto">
+    <div class="card p-2 px-3">
+      <div class="text-muted small">Stock total (unidades)</div>
+      <div class="fs-5 fw-semibold">{{ stock_total_vista }}</div>
+    </div>
+  </div>
+  <div class="col-auto">
+    <div class="card p-2 px-3">
+      <div class="text-muted small">Valor total</div>
+      <div class="fs-5 fw-semibold">{{ "{:,.0f}".format(valor_total_vista).replace(",", ".") }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3">
+  <div id="contadorFilasValorizado" class="text-muted small mb-2"></div>
+  <div class="table-responsive tabla-valorizado-scroll">
+    <table class="table table-sm table-hover align-middle mb-0" id="tablaValorizado">
+      <thead>
+        <tr>
+          <th class="ordenable" data-col="codigo" data-tipo="text" rowspan="2">Código <span class="icono-orden">⇅</span></th>
+          <th class="ordenable" data-col="descripcion" data-tipo="text" rowspan="2">Descripción <span class="icono-orden">⇅</span></th>
+          <th rowspan="2">U/M</th>
+          <th class="text-center grupo-accuv" colspan="3">Accuvision</th>
+          <th class="text-center grupo-accum" colspan="3">Accumedical</th>
+          <th class="text-center grupo-tot" colspan="3">Total combinado</th>
+        </tr>
+        <tr>
+          <th class="text-end ordenable grupo-accuv" data-col="stock_accuv" data-tipo="num">Stock <span class="icono-orden">⇅</span></th>
+          <th class="text-end ordenable grupo-accuv" data-col="valor_accuv" data-tipo="num">Valor <span class="icono-orden">⇅</span></th>
+          <th class="text-end ordenable grupo-accuv" data-col="pmp_accuv" data-tipo="num">PMP <span class="icono-orden">⇅</span></th>
+          <th class="text-end ordenable grupo-accum" data-col="stock_accum" data-tipo="num">Stock <span class="icono-orden">⇅</span></th>
+          <th class="text-end ordenable grupo-accum" data-col="valor_accum" data-tipo="num">Valor <span class="icono-orden">⇅</span></th>
+          <th class="text-end ordenable grupo-accum" data-col="pmp_accum" data-tipo="num">PMP <span class="icono-orden">⇅</span></th>
+          <th class="text-end ordenable grupo-tot" data-col="stock_tot" data-tipo="num">Stock <span class="icono-orden orden-activo">▼</span></th>
+          <th class="text-end ordenable grupo-tot" data-col="valor_tot" data-tipo="num">Valor <span class="icono-orden">⇅</span></th>
+          <th class="text-end ordenable grupo-tot" data-col="pmp_tot" data-tipo="num">PMP <span class="icono-orden">⇅</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in filas|sort(attribute='stock_total', reverse=True) %}
+        <tr>
+          <td data-col="codigo" data-value="{{ (f.codigo_interno or '')|lower }}">{{ f.codigo_interno }}</td>
+          <td data-col="descripcion" data-value="{{ (f.descripcion or '')|lower }}" title="{{ f.descripcion }}">{{ f.descripcion }}</td>
+          <td>{{ f.unidad_medida or '-' }}</td>
+          <td class="text-end grupo-accuv" data-col="stock_accuv" data-value="{{ f.stock_accuvision or 0 }}">{{ f.stock_accuvision or 0 }}</td>
+          <td class="text-end grupo-accuv" data-col="valor_accuv" data-value="{{ f.valor_accuvision or 0 }}">{{ "{:,.0f}".format(f.valor_accuvision or 0).replace(",", ".") }}</td>
+          <td class="text-end grupo-accuv" data-col="pmp_accuv" data-value="{{ f.pmp_accuvision or 0 }}">{{ "{:,.0f}".format(f.pmp_accuvision).replace(",", ".") if f.pmp_accuvision is not none else '-' }}</td>
+          <td class="text-end grupo-accum" data-col="stock_accum" data-value="{{ f.stock_accumedical or 0 }}">{{ f.stock_accumedical or 0 }}</td>
+          <td class="text-end grupo-accum" data-col="valor_accum" data-value="{{ f.valor_accumedical or 0 }}">{{ "{:,.0f}".format(f.valor_accumedical or 0).replace(",", ".") }}</td>
+          <td class="text-end grupo-accum" data-col="pmp_accum" data-value="{{ f.pmp_accumedical or 0 }}">{{ "{:,.0f}".format(f.pmp_accumedical).replace(",", ".") if f.pmp_accumedical is not none else '-' }}</td>
+          <td class="text-end fw-semibold grupo-tot" data-col="stock_tot" data-value="{{ f.stock_total or 0 }}">{{ f.stock_total or 0 }}</td>
+          <td class="text-end fw-semibold grupo-tot" data-col="valor_tot" data-value="{{ f.valor_total or 0 }}">{{ "{:,.0f}".format(f.valor_total or 0).replace(",", ".") }}</td>
+          <td class="text-end fw-semibold grupo-tot" data-col="pmp_tot" data-value="{{ f.pmp_total or 0 }}">{{ "{:,.0f}".format(f.pmp_total).replace(",", ".") if f.pmp_total is not none else '-' }}</td>
+        </tr>
+        {% else %}
+        <tr class="fila-vacia"><td colspan="12" class="text-center text-muted py-4">Sin resultados para esta vista.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal fade" id="modalCargarValorizado" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('stock_valorizado_cargar') }}" enctype="multipart/form-data">
+        <div class="modal-header">
+          <h5 class="modal-title">Cargar reporte de Stock Valorizado</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">
+            Sube el archivo .xlsx del reporte "Stock General Consolidado" del sistema de Inventarios.
+            Esto <strong>reemplaza por completo</strong> el Stock Valorizado cargado antes -- siempre queda la última foto real.
+          </p>
+          <input type="file" class="form-control" name="archivo" accept=".xlsx,.xls" required>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-brand">Cargar y reemplazar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var tabla = document.getElementById('tablaValorizado');
+  if (!tabla) return;
+  var tbody = tabla.querySelector('tbody');
+
+  var ordenActual = { col: 'stock_tot', asc: false };
+  document.querySelectorAll('#tablaValorizado th.ordenable').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var col = th.dataset.col;
+      var tipo = th.dataset.tipo;
+      var asc = (ordenActual.col === col) ? !ordenActual.asc : true;
+      ordenActual = { col: col, asc: asc };
+
+      var filas = Array.prototype.slice.call(tbody.querySelectorAll('tr')).filter(function (f) {
+        return !f.classList.contains('fila-vacia');
+      });
+      filas.sort(function (a, b) {
+        var celdaA = a.querySelector('[data-col="' + col + '"]');
+        var celdaB = b.querySelector('[data-col="' + col + '"]');
+        var va = celdaA ? (celdaA.dataset.value || '') : '';
+        var vb = celdaB ? (celdaB.dataset.value || '') : '';
+        var cmp;
+        if (tipo === 'num') {
+          cmp = (parseFloat(va) || 0) - (parseFloat(vb) || 0);
+        } else {
+          cmp = va.localeCompare(vb, 'es', { sensitivity: 'base' });
+        }
+        return asc ? cmp : -cmp;
+      });
+      filas.forEach(function (f) { tbody.appendChild(f); });
+
+      document.querySelectorAll('#tablaValorizado th.ordenable .icono-orden').forEach(function (ic) {
+        ic.textContent = '⇅';
+        ic.classList.remove('orden-activo');
+      });
+      var iconoActual = th.querySelector('.icono-orden');
+      iconoActual.textContent = asc ? '▲' : '▼';
+      iconoActual.classList.add('orden-activo');
+    });
+  });
+})();
+
+try {
+  document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+    new bootstrap.Tooltip(el);
+  });
+} catch (e) {
+  console.warn('No se pudieron inicializar los tooltips de Stock Valorizado:', e);
+}
+</script>
+{% endblock %}

@@ -336,6 +336,56 @@ class StockExistencia(db.Model):
         return f"<StockExistencia {self.codigo_interno} x{self.stock_fisico}>"
 
 
+class StockValorizado(db.Model):
+    """Ronda AM (2026-09-19): valorización de inventario (costo/valor) por
+    código, tal como viene del reporte "Stock General Consolidado" del
+    sistema de Inventarios (Ergopyme: Logística > Control de Existencias >
+    Informes > Stock General) -- una fila por código con el detalle de
+    Accuvision, Accumedical y el total combinado. A diferencia de
+    StockExistencia (que no trae costos y sí trae lote/vencimiento), este
+    reporte NO trae lote -- es un consolidado por código -- y SÍ trae
+    costo/valor de inventario, por eso tiene su propia pantalla con su
+    propio permiso ("reportes"): los usuarios que solo tienen acceso a
+    Consulta de Stock (permiso "consultar_stock") no deben ver esta data.
+
+    El PMP (precio medio ponderado) de cada bloque se calcula acá como
+    Valor Final / Stock Final -- el usuario lo pidió así explícitamente en
+    vez de usar la columna P.M.P. que el propio Ergopyme ya trae en el
+    archivo (aunque en la práctica coinciden, salvo redondeo). Ver
+    _fila_stock_valorizado_pmp en app.py.
+
+    Se recarga POR COMPLETO cada vez que se sube un reporte nuevo (igual
+    que StockExistencia): se borran todas las filas anteriores y se
+    insertan las del archivo nuevo."""
+    __tablename__ = "stock_valorizado"
+
+    id = db.Column(db.Integer, primary_key=True)
+    codigo_interno = db.Column(db.String(40), nullable=False, index=True)
+    descripcion = db.Column(db.String(300))
+    unidad_medida = db.Column(db.String(20))
+
+    # Bloque ACCUV del reporte (columnas G=Stock Final, L=Valor Final)
+    stock_accuvision = db.Column(db.Integer, default=0)
+    valor_accuvision = db.Column(db.Float, default=0)
+    pmp_accuvision = db.Column(db.Float, nullable=True)
+
+    # Bloque ACCUM del reporte (columnas Q=Stock Final, V=Valor Final --
+    # OJO: no son AA/AF, esas son el bloque TOT, ver nota de ronda AM)
+    stock_accumedical = db.Column(db.Integer, default=0)
+    valor_accumedical = db.Column(db.Float, default=0)
+    pmp_accumedical = db.Column(db.Float, nullable=True)
+
+    # Bloque TOT del reporte (columnas AA=Stock Final, AF=Valor Final)
+    stock_total = db.Column(db.Integer, default=0)
+    valor_total = db.Column(db.Float, default=0)
+    pmp_total = db.Column(db.Float, nullable=True)
+
+    cargado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<StockValorizado {self.codigo_interno}>"
+
+
 class PedidoComprometido(db.Model):
     """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
     clientes (OC de clientes, no de nosotros a los proveedores), tal como

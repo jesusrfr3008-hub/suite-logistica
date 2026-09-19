@@ -34,7 +34,7 @@ from models import (
     Despacho, ESTADOS_DESPACHO,
     CargoAdicionalImportacion, TipoCambioMensual,
     Usuario, Rol, PERMISOS_DISPONIBLES,
-    HomologacionStock, StockExistencia, PedidoComprometido,
+    HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
     CodigoErgopyme, CompraHistorica,
     FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
@@ -1142,6 +1142,291 @@ def _clasificar_y_cargar_stock(filas):
         elif homolog.estado == "sin_marca":
             resumen["sin_marca"] += 1
     return resumen
+
+
+def _filas_desde_reporte_stock_valorizado(filas_crudas):
+    """Ronda AM (2026-09-19): lee el reporte "Stock General Consolidado"
+    de Ergopyme (Logística > Control de Existencias > Informes > Stock
+    General) -- el que el usuario llama "Stock Valorizado". A diferencia
+    del reporte de Stock normal, este trae DOS filas de encabezado: la
+    fila con "CODIGO ITEM" en la primera columna, y la fila INMEDIATAMENTE
+    ARRIBA con el nombre del bloque de cada columna (ACCUV / ACCUM / TOT,
+    uno para Accuvision, otro para Accumedical, y el último con el total
+    de las dos empresas combinadas). Se ubica cada columna por el par
+    (bloque, etiqueta) normalizado -- no por letra fija -- para no
+    depender de que Ergopyme nunca reordene columnas.
+
+    OJO con un detalle real del archivo (confirmado abriendo el archivo de
+    ejemplo "Stock valorizado 19-09-2026.xlsx" que dejó el usuario): las
+    columnas "Stock Final"/"Valor Final" de Accumedical NO son AA/AF como
+    dijo el usuario en un principio -- esas son el bloque TOT (el total
+    combinado de las 2 empresas). Las columnas realmente exclusivas de
+    Accumedical son Q (Stock Final) y V (Valor Final) -- confirmado con el
+    usuario y verificado contra la columna P.M.P. que el propio Ergopyme
+    ya trae en el archivo (coincide exacto). Por eso acá se ubica cada
+    columna por nombre (bloque ACCUM + etiqueta "stock final"/"valor
+    final"), no por letra -- así no importa si son Q/V, AA/AF o cualquier
+    otra letra, mientras el archivo siga usando los mismos rótulos.
+
+    Devuelve None si el archivo no tiene esta forma (no se encontró el
+    encabezado esperado)."""
+    filas_crudas = list(filas_crudas)
+    idx_encabezado = None
+    for i, row in enumerate(filas_crudas):
+        primera = _normalizar_encabezado(row[0]) if len(row) > 0 else ""
+        if primera == "codigo item":
+            idx_encabezado = i
+            break
+    if idx_encabezado is None or idx_encabezado == 0:
+        return None
+
+    fila_grupo = filas_crudas[idx_encabezado - 1]
+    fila_etiqueta = filas_crudas[idx_encabezado]
+    ancho = max(len(fila_grupo), len(fila_etiqueta))
+
+    columnas = {}  # (grupo_normalizado, etiqueta_normalizada) -> indice de columna
+    grupo_actual = ""
+    for j in range(ancho):
+        grupo_raw = fila_grupo[j] if j < len(fila_grupo) else None
+        if grupo_raw not in (None, ""):
+            grupo_actual = _normalizar_encabezado(grupo_raw)
+        etiqueta = _normalizar_encabezado(fila_etiqueta[j]) if j < len(fila_etiqueta) else ""
+        if etiqueta:
+            columnas[(grupo_actual, etiqueta)] = j
+
+    idx_codigo = columnas.get(("", "codigo item"))
+    idx_desc = columnas.get(("", "descripcion de item"))
+    idx_um = columnas.get(("", "u/m"))
+    idx_stock_accuv = columnas.get(("accuv", "stock final"))
+    idx_valor_accuv = columnas.get(("accuv", "valor final"))
+    idx_stock_accum = columnas.get(("accum", "stock final"))
+    idx_valor_accum = columnas.get(("accum", "valor final"))
+    idx_stock_tot = columnas.get(("tot", "stock final"))
+    idx_valor_tot = columnas.get(("tot", "valor final"))
+
+    if idx_codigo is None or idx_stock_accuv is None or idx_valor_accuv is None:
+        return None
+
+    def _num(valor):
+        if valor in (None, ""):
+            return 0.0
+        if isinstance(valor, str):
+            valor = valor.strip()
+            if not valor:
+                return 0.0
+            # el .csv del portapapeles puede traer separador de miles "."
+            # y decimales con "," (formato chileno) -- el .xlsx ya trae
+            # numeros nativos, esto solo aplica al texto del csv
+            if "," in valor:
+                valor = valor.replace(".", "").replace(",", ".")
+        try:
+            return float(valor)
+        except (TypeError, ValueError):
+            return 0.0
+
+    filas = []
+    for row in filas_crudas[idx_encabezado + 1:]:
+        codigo_raw = row[idx_codigo] if len(row) > idx_codigo else None
+        if codigo_raw in (None, ""):
+            continue
+        texto_codigo = str(codigo_raw).strip()
+        if not texto_codigo or set(texto_codigo) <= {"-"}:
+            continue
+        codigo_interno = _normalizar_codigo_interno(codigo_raw)
+        if not codigo_interno or not codigo_interno.isdigit():
+            # el "codigo item" de este reporte siempre es numerico -- una
+            # fila que no lo sea no es una fila de producto real (ej. una
+            # fila de totales generales al final del archivo)
+            continue
+
+        descripcion = ""
+        if idx_desc is not None and len(row) > idx_desc and row[idx_desc] not in (None, ""):
+            descripcion = str(row[idx_desc]).strip()
+        unidad = ""
+        if idx_um is not None and len(row) > idx_um and row[idx_um] not in (None, ""):
+            unidad = str(row[idx_um]).strip()
+
+        stock_accuv = _num(row[idx_stock_accuv] if len(row) > idx_stock_accuv else 0)
+        valor_accuv = _num(row[idx_valor_accuv] if len(row) > idx_valor_accuv else 0)
+        stock_accum = _num(row[idx_stock_accum]) if idx_stock_accum is not None and len(row) > idx_stock_accum else 0.0
+        valor_accum = _num(row[idx_valor_accum]) if idx_valor_accum is not None and len(row) > idx_valor_accum else 0.0
+        if idx_stock_tot is not None and len(row) > idx_stock_tot:
+            stock_tot = _num(row[idx_stock_tot])
+        else:
+            stock_tot = stock_accuv + stock_accum
+        if idx_valor_tot is not None and len(row) > idx_valor_tot:
+            valor_tot = _num(row[idx_valor_tot])
+        else:
+            valor_tot = valor_accuv + valor_accum
+
+        if not any((stock_accuv, valor_accuv, stock_accum, valor_accum, stock_tot, valor_tot)):
+            continue
+
+        filas.append({
+            "codigo_interno": codigo_interno,
+            "descripcion": descripcion,
+            "unidad_medida": unidad,
+            "stock_accuvision": int(stock_accuv),
+            "valor_accuvision": valor_accuv,
+            "stock_accumedical": int(stock_accum),
+            "valor_accumedical": valor_accum,
+            "stock_total": int(stock_tot),
+            "valor_total": valor_tot,
+        })
+    return filas
+
+
+def _leer_filas_stock_valorizado(ws):
+    """Hoja .xlsx del reporte Stock Valorizado, subida a mano desde
+    /stock-valorizado o vía la API de la automatización."""
+    filas_crudas = list(ws.iter_rows(min_row=1, values_only=True))
+    return _filas_desde_reporte_stock_valorizado(filas_crudas)
+
+
+def _leer_filas_stock_valorizado_csv(contenido_bytes):
+    """Mismo reporte, en el formato .csv que guarda la automatización de
+    Ergopyme -- mismo formato ya confirmado para el reporte de Stock (ver
+    _leer_filas_reporte_stock_csv): UTF-8 con BOM, separado por ';', fin
+    de línea CRLF."""
+    texto = contenido_bytes.decode("utf-8-sig", errors="replace")
+    filas_crudas = list(csv.reader(texto.splitlines(), delimiter=";"))
+    return _filas_desde_reporte_stock_valorizado(filas_crudas)
+
+
+def _cargar_stock_valorizado(filas):
+    """Reemplaza POR COMPLETO StockValorizado con las filas ya leídas.
+    Ronda AM (2026-09-19): el usuario pidió calcular el PMP (precio medio
+    ponderado) de cada bloque como Valor Final / Stock Final -- se calcula
+    acá, no se usa la columna P.M.P. que el propio Ergopyme ya trae en el
+    archivo (aunque en la práctica coinciden salvo redondeo). None cuando
+    el stock del bloque es 0, para no guardar una división por cero como
+    si fuera un costo real."""
+    def _pmp(valor, stock):
+        return (valor / stock) if stock else None
+
+    StockValorizado.query.delete()
+    total_unidades = 0
+    for fila in filas:
+        db.session.add(StockValorizado(
+            codigo_interno=fila["codigo_interno"],
+            descripcion=fila["descripcion"],
+            unidad_medida=fila["unidad_medida"],
+            stock_accuvision=fila["stock_accuvision"],
+            valor_accuvision=fila["valor_accuvision"],
+            pmp_accuvision=_pmp(fila["valor_accuvision"], fila["stock_accuvision"]),
+            stock_accumedical=fila["stock_accumedical"],
+            valor_accumedical=fila["valor_accumedical"],
+            pmp_accumedical=_pmp(fila["valor_accumedical"], fila["stock_accumedical"]),
+            stock_total=fila["stock_total"],
+            valor_total=fila["valor_total"],
+            pmp_total=_pmp(fila["valor_total"], fila["stock_total"]),
+        ))
+        total_unidades += fila["stock_total"]
+    return {"cargados": len(filas), "unidades_total": total_unidades}
+
+
+def _codigos_en_consignacion():
+    """Ronda AM (2026-09-19): códigos internos (Ergopyme) que HOY sabemos
+    que están en consignación -- por ahora, únicamente lo que ya
+    rastreamos en Pago Proveedores para Medicontur (CompraHistorica con
+    factura == "CONSIGNACION" y todavía sin facturar, ver
+    _pendientes_consignacion). Es una APROXIMACIÓN PARCIAL a propósito: el
+    usuario confirmó usar esto mientras no suba el archivo maestro de
+    códigos+lotes en consignación de todos los proveedores (pendiente,
+    ligado al diseño de "Reposición Consignación" de la ronda AL). Cuando
+    ese archivo exista, este es el único lugar que hay que tocar para
+    ampliar/reemplazar la fuente de este toggle -- el resto de Stock
+    Valorizado (vista, filtros) no cambia."""
+    filas = (
+        CompraHistorica.query
+        .filter(CompraHistorica.factura == "CONSIGNACION")
+        .filter(CompraHistorica.factura_generada_id.is_(None))
+        .filter(CompraHistorica.codigo_interno.isnot(None))
+        .filter(CompraHistorica.codigo_interno != "")
+        .with_entities(CompraHistorica.codigo_interno)
+        .distinct()
+        .all()
+    )
+    return {c[0] for c in filas}
+
+
+def _procesar_filas_notas_pedido(filas_excel):
+    """Ronda AM (2026-09-19): lógica de parseo del reporte "Notas de
+    pedido" (Balance de Productos) extraída de stock_pedidos_cargar (ronda
+    X) para reusarla también desde /api/notas-pedido/cargar-auto, sin
+    duplicarla. Recibe las filas crudas ya leídas (de .xlsx o .csv, ambas
+    listas de tuplas/listas) y NO escribe nada en la BD -- solo parsea.
+    Devuelve (empresa, nuevas_filas, error): si error no es None,
+    nuevas_filas viene vacía; empresa puede venir None si ni siquiera se
+    pudo identificar la empresa del archivo."""
+    if not filas_excel:
+        return None, [], "El archivo está vacío -- no se cambió nada."
+
+    nombre_empresa_reporte = str(filas_excel[0][0]).strip() if filas_excel[0] and filas_excel[0][0] else ""
+    empresa = _empresa_por_nombre_reporte(nombre_empresa_reporte, {})
+    if not empresa:
+        return None, [], (
+            f"No se pudo identificar a qué empresa pertenece este archivo (fila 1 dice "
+            f"'{nombre_empresa_reporte or '(vacío)'}') -- no se cambió nada."
+        )
+
+    fila_inicio = None
+    for i, row in enumerate(filas_excel[:10], start=1):
+        primera = str(row[0]).strip().lower() if row and row[0] else ""
+        if primera.replace("ó", "o") == "cód.producto".replace("ó", "o"):
+            fila_inicio = i + 1
+            break
+    if fila_inicio is None:
+        return empresa, [], "No se encontró el encabezado 'Cód.Producto' en el archivo -- no se cambió nada."
+
+    nuevas_filas = []
+    for row in filas_excel[fila_inicio - 1:]:
+        codigo_crudo = row[0] if len(row) > 0 else None
+        if not codigo_crudo:
+            continue
+        codigo_interno = _normalizar_codigo_interno(codigo_crudo)
+        if not codigo_interno:
+            continue
+        descripcion = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+        nro_pedido = str(row[6]).strip() if len(row) > 6 and row[6] is not None else ""
+        fecha_pedido = row[8] if len(row) > 8 else None
+        if isinstance(fecha_pedido, datetime):
+            fecha_pedido = fecha_pedido.date()
+        elif isinstance(fecha_pedido, str) and fecha_pedido.strip():
+            # el .csv del portapapeles trae la fecha como texto ISO (igual
+            # que el reporte de Stock, ver _leer_filas_reporte_stock_csv)
+            try:
+                fecha_pedido = datetime.strptime(fecha_pedido.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                fecha_pedido = None
+        else:
+            fecha_pedido = None
+        cliente_nombre = str(row[10]).strip() if len(row) > 10 and row[10] is not None else ""
+        cantidad = row[11] if len(row) > 11 else 0
+        try:
+            cantidad = int(cantidad) if cantidad is not None else 0
+        except (TypeError, ValueError):
+            cantidad = 0
+        if cantidad <= 0:
+            continue
+        nuevas_filas.append(PedidoComprometido(
+            empresa_id=empresa.id, codigo_interno=codigo_interno, descripcion=descripcion,
+            nro_pedido=nro_pedido, fecha_pedido=fecha_pedido, cliente_nombre=cliente_nombre,
+            cantidad=cantidad,
+        ))
+
+    if not nuevas_filas:
+        return empresa, [], "El archivo no tiene filas de pedidos comprometidos reconocibles -- no se cambió nada."
+    return empresa, nuevas_filas, None
+
+
+def _guardar_notas_pedido(empresa, nuevas_filas):
+    """Reemplaza solo los registros de PedidoComprometido de `empresa` con
+    `nuevas_filas` y confirma. Devuelve el total de unidades cargadas."""
+    PedidoComprometido.query.filter_by(empresa_id=empresa.id).delete()
+    db.session.add_all(nuevas_filas)
+    db.session.commit()
+    return sum(f.cantidad for f in nuevas_filas)
 
 
 def seed_homologacion_y_stock_inicial():
@@ -7386,6 +7671,131 @@ def api_stock_cargar_auto():
     ), (200 if severidad != "danger" else 422)
 
 
+@app.route("/stock-valorizado")
+@requiere_permiso("reportes")
+def stock_valorizado_list():
+    """Ronda AM (2026-09-19): pantalla de Stock Valorizado -- costo/valor
+    de inventario por código (Accuvision, Accumedical y total combinado).
+    Separada a propósito de /stock (Consulta de Stock, permiso
+    "consultar_stock"/"inventarios") porque trae datos de costo que esos
+    usuarios no deben ver -- acá se exige el permiso "reportes".
+
+    El filtro "vista" es el botón de 3 fases que pidió el usuario:
+    - "desactivado": solo stock propio, EXCLUYE los códigos que hoy
+      sabemos que están en consignación (ver _codigos_en_consignacion).
+    - "consolidado" (default): todos los códigos, propios + consignación.
+    - "consignacion": SOLO los códigos en consignación.
+    Ver la nota en _codigos_en_consignacion sobre por qué esto es hoy una
+    aproximación parcial (solo Medicontur) mientras no llegue el archivo
+    maestro de consignación de todos los proveedores."""
+    vista = request.args.get("vista", "consolidado")
+    if vista not in ("desactivado", "consolidado", "consignacion"):
+        vista = "consolidado"
+    q = request.args.get("q", "").strip()
+
+    query = StockValorizado.query
+    if q:
+        like = f"%{q}%"
+        query = query.filter(db.or_(
+            StockValorizado.descripcion.ilike(like),
+            StockValorizado.codigo_interno.ilike(like),
+        ))
+    filas = query.order_by(StockValorizado.descripcion).all()
+
+    codigos_consignacion = _codigos_en_consignacion()
+    if vista == "desactivado":
+        filas = [f for f in filas if f.codigo_interno not in codigos_consignacion]
+    elif vista == "consignacion":
+        filas = [f for f in filas if f.codigo_interno in codigos_consignacion]
+
+    stock_total_vista = sum(f.stock_total or 0 for f in filas)
+    valor_total_vista = sum(f.valor_total or 0 for f in filas)
+    ultima_carga = db.session.query(db.func.max(StockValorizado.cargado_en)).scalar()
+    return render_template(
+        "stock/valorizado.html", filas=filas, vista=vista, q=q,
+        ultima_carga=ultima_carga, total_codigos_consignacion=len(codigos_consignacion),
+        stock_total_vista=stock_total_vista, valor_total_vista=valor_total_vista,
+    )
+
+
+@app.route("/stock-valorizado/cargar", methods=["POST"])
+@requiere_permiso("reportes")
+def stock_valorizado_cargar():
+    """Carga manual del reporte Stock Valorizado (mismo botón que /stock,
+    para cuando la automatización esté caída o alguien quiera forzar una
+    actualización al toque)."""
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona el archivo de Stock Valorizado para cargar.", "warning")
+        return redirect(url_for("stock_valorizado_list"))
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls"):
+        flash("Formato no soportado. Sube el archivo .xlsx del reporte de Stock Valorizado.", "danger")
+        return redirect(url_for("stock_valorizado_list"))
+
+    try:
+        wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
+        filas = _leer_filas_stock_valorizado(wb.active)
+    except Exception:
+        flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
+        return redirect(url_for("stock_valorizado_list"))
+
+    if not filas:
+        flash(
+            "El archivo no tiene filas de Stock Valorizado reconocibles (¿cambió el formato del "
+            "reporte en Ergopyme?) -- no se cambió nada.", "warning",
+        )
+        return redirect(url_for("stock_valorizado_list"))
+
+    resumen = _cargar_stock_valorizado(filas)
+    db.session.commit()
+    flash(
+        f"Stock Valorizado actualizado: {resumen['cargados']} código(s), "
+        f"{resumen['unidades_total']} unidades totales.", "success",
+    )
+    return redirect(url_for("stock_valorizado_list"))
+
+
+@app.route("/api/stock-valorizado/cargar-auto", methods=["POST"])
+def api_stock_valorizado_cargar_auto():
+    """Ronda AM (2026-09-19): version sin pantalla de /stock-valorizado/
+    cargar, para la automatización de Ergopyme -- mismo patrón y misma
+    clave (STOCK_UPLOAD_API_KEY) que /api/stock/cargar-auto: misma
+    automatización, mismo PC de confianza, nunca con sesión de usuario."""
+    if not STOCK_UPLOAD_API_KEY:
+        return jsonify(ok=False, error="Endpoint no configurado (falta STOCK_UPLOAD_API_KEY en el servidor)."), 503
+    clave_recibida = request.headers.get("X-Api-Key", "")
+    if not clave_recibida or clave_recibida != STOCK_UPLOAD_API_KEY:
+        return jsonify(ok=False, error="Clave de acceso inválida o ausente."), 401
+
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        return jsonify(ok=False, error="Falta el archivo ('archivo') en el POST."), 400
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls", ".csv"):
+        return jsonify(ok=False, error="Formato no soportado -- sube .xlsx o .csv."), 400
+
+    try:
+        if extension == ".csv":
+            filas = _leer_filas_stock_valorizado_csv(archivo.read())
+        else:
+            wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
+            filas = _leer_filas_stock_valorizado(wb.active)
+    except Exception as exc:
+        return jsonify(ok=False, error=f"No se pudo leer el archivo: {exc}"), 400
+
+    if not filas:
+        return jsonify(ok=False, error="El archivo no tiene filas de Stock Valorizado reconocibles -- no se cambió nada."), 400
+
+    resumen = _cargar_stock_valorizado(filas)
+    db.session.commit()
+    return jsonify(
+        ok=True,
+        mensaje=f"Stock Valorizado actualizado: {resumen['cargados']} código(s), {resumen['unidades_total']} unidades.",
+        **resumen,
+    ), 200
+
+
 @app.route("/stock/pedidos/cargar", methods=["POST"])
 @requiere_permiso("inventarios")
 def stock_pedidos_cargar():
@@ -7417,65 +7827,12 @@ def stock_pedidos_cargar():
         flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
         return redirect(url_for("stock_list"))
 
-    if not filas_excel:
-        flash("El archivo está vacío -- no se cambió nada.", "warning")
+    empresa, nuevas_filas, error = _procesar_filas_notas_pedido(filas_excel)
+    if error:
+        flash(error, "danger" if empresa is None else "warning")
         return redirect(url_for("stock_list"))
 
-    nombre_empresa_reporte = str(filas_excel[0][0]).strip() if filas_excel[0] and filas_excel[0][0] else ""
-    empresa = _empresa_por_nombre_reporte(nombre_empresa_reporte, {})
-    if not empresa:
-        flash(
-            f"No se pudo identificar a qué empresa pertenece este archivo (fila 1 dice "
-            f"'{nombre_empresa_reporte or '(vacío)'}') -- no se cambió nada.", "danger",
-        )
-        return redirect(url_for("stock_list"))
-
-    fila_inicio = None
-    for i, row in enumerate(filas_excel[:10], start=1):
-        primera = str(row[0]).strip().lower() if row and row[0] else ""
-        if primera.replace("ó", "o") == "cód.producto".replace("ó", "o"):
-            fila_inicio = i + 1
-            break
-    if fila_inicio is None:
-        flash("No se encontró el encabezado 'Cód.Producto' en el archivo -- no se cambió nada.", "danger")
-        return redirect(url_for("stock_list"))
-
-    nuevas_filas = []
-    for row in filas_excel[fila_inicio - 1:]:
-        codigo_crudo = row[0] if len(row) > 0 else None
-        if not codigo_crudo:
-            continue
-        codigo_interno = _normalizar_codigo_interno(codigo_crudo)
-        if not codigo_interno:
-            continue
-        descripcion = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
-        nro_pedido = str(row[6]).strip() if len(row) > 6 and row[6] is not None else ""
-        fecha_pedido = row[8] if len(row) > 8 else None
-        if isinstance(fecha_pedido, datetime):
-            fecha_pedido = fecha_pedido.date()
-        else:
-            fecha_pedido = None
-        cliente_nombre = str(row[10]).strip() if len(row) > 10 and row[10] is not None else ""
-        cantidad = row[11] if len(row) > 11 else 0
-        try:
-            cantidad = int(cantidad) if cantidad is not None else 0
-        except (TypeError, ValueError):
-            cantidad = 0
-        if cantidad <= 0:
-            continue
-        nuevas_filas.append(PedidoComprometido(
-            empresa_id=empresa.id, codigo_interno=codigo_interno, descripcion=descripcion,
-            nro_pedido=nro_pedido, fecha_pedido=fecha_pedido, cliente_nombre=cliente_nombre,
-            cantidad=cantidad,
-        ))
-
-    if not nuevas_filas:
-        flash("El archivo no tiene filas de pedidos comprometidos reconocibles -- no se cambió nada.", "warning")
-        return redirect(url_for("stock_list"))
-
-    PedidoComprometido.query.filter_by(empresa_id=empresa.id).delete()
-    db.session.add_all(nuevas_filas)
-    db.session.commit()
+    total_unidades = _guardar_notas_pedido(empresa, nuevas_filas)
 
     # Guarda el archivo original para poder volver a consultarlo despues
     # (un archivo por empresa, se reemplaza cada vez).
@@ -7484,13 +7841,62 @@ def stock_pedidos_cargar():
     archivo.stream.seek(0)
     archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
 
-    total_unidades = sum(f.cantidad for f in nuevas_filas)
     flash(
         f"Notas de pedido de {empresa.nombre} actualizadas: {len(nuevas_filas)} línea(s), "
         f"{total_unidades} unidad(es) comprometidas en total. Verifica que este total coincida con el "
         f"archivo que subiste antes de confiar en la columna 'Pedido'.", "success",
     )
     return redirect(url_for("stock_list"))
+
+
+@app.route("/api/notas-pedido/cargar-auto", methods=["POST"])
+def api_notas_pedido_cargar_auto():
+    """Ronda AM (2026-09-19): version de /stock/pedidos/cargar sin pantalla,
+    para que la automatización de Ergopyme (RDP + AutoHotkey) suba sola el
+    reporte "Balance de Productos" (lo que el usuario llama "Notas de
+    Pedido") -- mismo patrón que /api/stock/cargar-auto: autenticación por
+    X-Api-Key (STOCK_UPLOAD_API_KEY), nunca con sesión de usuario."""
+    if not STOCK_UPLOAD_API_KEY:
+        return jsonify(ok=False, error="Endpoint no configurado (falta STOCK_UPLOAD_API_KEY en el servidor)."), 503
+    clave_recibida = request.headers.get("X-Api-Key", "")
+    if not clave_recibida or clave_recibida != STOCK_UPLOAD_API_KEY:
+        return jsonify(ok=False, error="Clave de acceso inválida o ausente."), 401
+
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        return jsonify(ok=False, error="Falta el archivo ('archivo') en el POST."), 400
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls", ".csv"):
+        return jsonify(ok=False, error="Formato no soportado -- sube .xlsx o .csv."), 400
+
+    try:
+        if extension == ".csv":
+            texto = archivo.read().decode("utf-8-sig", errors="replace")
+            filas_excel = list(csv.reader(texto.splitlines(), delimiter=";"))
+        else:
+            wb = openpyxl.load_workbook(archivo, data_only=True)
+            ws = wb.active
+            filas_excel = list(ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True))
+    except Exception as exc:
+        return jsonify(ok=False, error=f"No se pudo leer el archivo: {exc}"), 400
+
+    empresa, nuevas_filas, error = _procesar_filas_notas_pedido(filas_excel)
+    if error:
+        return jsonify(ok=False, error=error), (400 if empresa is None else 422)
+
+    total_unidades = _guardar_notas_pedido(empresa, nuevas_filas)
+
+    if extension != ".csv":
+        os.makedirs(REPORTES_DIR, exist_ok=True)
+        nombre_archivo = f"notas_pedido_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
+        archivo.stream.seek(0)
+        archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
+
+    return jsonify(
+        ok=True,
+        mensaje=f"Notas de pedido de {empresa.nombre} actualizadas: {len(nuevas_filas)} línea(s), {total_unidades} unidad(es).",
+        empresa=empresa.nombre, lineas=len(nuevas_filas), unidades=total_unidades,
+    ), 200
 
 
 @app.route("/api/stock/productos")
