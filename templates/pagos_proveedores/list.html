@@ -4,13 +4,15 @@
 
 <div class="d-flex justify-content-between align-items-start mb-1">
   <h3 class="section-title mb-1">Pago Proveedores</h3>
-  <a href="{{ url_for('pagos_proveedores_nueva') }}" class="btn btn-sm btn-brand">+ Cargar factura</a>
+  <a href="{{ url_for('pagos_proveedores_facturar_consignacion') }}" class="btn btn-sm btn-brand">+ Facturar consignación</a>
 </div>
 <div class="text-muted small mb-3">
   Cuentas por pagar a proveedores extranjeros: facturas pendientes, su fecha de vencimiento y el plazo de
-  crédito pactado con cada proveedor. Fase 1 del módulo -- el recosteo automático del FOB/CIF al marcar una
-  factura como pagada y las notas de crédito todavía no están disponibles (ver estado en el documento del
-  proyecto).
+  crédito pactado con cada proveedor (se edita desde <a href="{{ url_for('proveedores_list') }}">el catálogo
+  de Proveedores</a>). Las facturas normales se generan con el botón "Generar factura" desde la Importación
+  ya costeada; la única que se carga a mano aquí es la de consignación -- ver "+ Facturar consignación"
+  arriba. El recosteo automático del FOB/CIF al marcar una factura como pagada todavía no está disponible
+  (fase 2, ver estado en el documento del proyecto).
 </div>
 
 <form method="get" class="row g-2 align-items-end mb-3">
@@ -46,20 +48,15 @@
       <span class="fw-semibold">{{ proveedor.nombre }}</span>
       {% if proveedor.requiere_pago_previo %}
       <span class="badge bg-danger">Pago previo (sin crédito)</span>
+      {% elif proveedor.plazo_credito_dias %}
+      <span class="badge bg-secondary">Crédito {{ proveedor.plazo_credito_dias }} día(s)</span>
+      {% else %}
+      <span class="badge bg-light text-muted border">Sin plazo de crédito cargado</span>
       {% endif %}
     </div>
-    <form method="post" action="{{ url_for('proveedor_actualizar_credito', proveedor_id=proveedor.id) }}?estado={{ estado_filtro }}&proveedor_id={{ proveedor_filtro }}"
-          class="d-flex align-items-center gap-2">
-      <label class="small text-muted mb-0">Plazo de crédito (días)</label>
-      <input type="number" min="0" name="plazo_credito_dias" value="{{ proveedor.plazo_credito_dias or '' }}"
-             class="form-control form-control-sm" style="width: 80px;" placeholder="--">
-      <div class="form-check form-check-inline mb-0">
-        <input class="form-check-input" type="checkbox" name="requiere_pago_previo" value="1"
-               id="pp-{{ proveedor.id }}" {{ 'checked' if proveedor.requiere_pago_previo }}>
-        <label class="form-check-label small" for="pp-{{ proveedor.id }}">Pago previo</label>
-      </div>
-      <button type="submit" class="btn btn-sm btn-outline-secondary">Guardar</button>
-    </form>
+    <a href="{{ url_for('proveedores_editar', proveedor_id=proveedor.id) }}" class="btn btn-sm btn-outline-secondary">
+      Editar condiciones de crédito
+    </a>
   </div>
 
   <div class="table-responsive">

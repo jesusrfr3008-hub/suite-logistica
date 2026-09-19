@@ -4,10 +4,20 @@
 
 <div class="d-flex justify-content-between align-items-start mb-3">
   <div>
-    <h3 class="section-title mb-1">Factura {{ factura.numero_factura }}</h3>
+    <h3 class="section-title mb-1">
+      Factura {{ factura.numero_factura }}
+      {% if factura.origen == 'consignacion' %}<span class="badge bg-purple" style="background:#6f42c1;">Consignación facturada</span>
+      {% elif factura.origen == 'costeo' %}<span class="badge bg-secondary">Desde Costeo</span>
+      {% endif %}
+    </h3>
     <div class="text-muted small">{{ factura.proveedor.nombre }}</div>
   </div>
-  <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-sm btn-outline-secondary">&larr; Volver al listado</a>
+  <div class="d-flex gap-2">
+    {% if factura.estado not in ['pagada', 'anulada'] %}
+    <a href="{{ url_for('pagos_proveedores_nota_credito', factura_id=factura.id) }}" class="btn btn-sm btn-outline-danger">+ Nota de crédito</a>
+    {% endif %}
+    <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-sm btn-outline-secondary">&larr; Volver al listado</a>
+  </div>
 </div>
 
 <div class="row g-3 mb-4">
@@ -30,6 +40,16 @@
           <div class="small text-muted">Saldo pendiente</div>
           <div class="fw-semibold fs-5">{{ factura.saldo_pendiente|moneda }} {{ factura.moneda }}</div>
         </div>
+        {% if factura.total_notas_credito %}
+        <div class="col-6 col-md-3">
+          <div class="small text-muted">Notas de crédito</div>
+          <div class="fw-semibold text-danger">-{{ factura.total_notas_credito|moneda }} {{ factura.moneda }}</div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="small text-muted">Valor neto (con NC)</div>
+          <div class="fw-semibold">{{ factura.valor_neto|moneda }} {{ factura.moneda }}</div>
+        </div>
+        {% endif %}
         {% if factura.importacion %}
         <div class="col-12">
           <div class="small text-muted">Importación asociada</div>
@@ -99,6 +119,70 @@
   <div class="text-muted small mt-2">
     Si el monto ingresado cubre el saldo pendiente completo, la factura queda "Pagada"; si es menor, queda
     "Abonada" y puedes seguir registrando pagos hasta completarla.
+  </div>
+</div>
+{% endif %}
+
+{% if lineas %}
+<div class="card p-3 mb-4">
+  <div class="fw-semibold mb-2">Productos / lotes de esta factura</div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>Código</th>
+          <th>Descripción</th>
+          <th>Lote</th>
+          <th class="text-end">Cantidad</th>
+          <th class="text-end">Acreditado (NC)</th>
+          <th class="text-end">Precio unitario</th>
+          <th class="text-end">Valor total</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for l in lineas %}
+        <tr>
+          <td>{{ l.codigo_producto or '--' }}</td>
+          <td>{{ l.descripcion or '--' }}</td>
+          <td>{{ l.codigo_lote or '--' }}</td>
+          <td class="text-end">{{ l.cantidad|numero_flex }}</td>
+          <td class="text-end text-muted">{{ l.cantidad_acreditada|numero_flex }}</td>
+          <td class="text-end">{{ l.precio_unitario|moneda }}</td>
+          <td class="text-end">{{ l.valor_total|moneda }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% if notas_credito %}
+<div class="card p-3 mb-4">
+  <div class="fw-semibold mb-2">Notas de crédito aplicadas</div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>N° NC</th>
+          <th>Fecha</th>
+          <th>Tipo</th>
+          <th>Motivo</th>
+          <th class="text-end">Monto</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for nc in notas_credito %}
+        <tr>
+          <td>{{ nc.numero_nc or '--' }}</td>
+          <td>{{ nc.fecha.strftime('%d-%m-%Y') if nc.fecha else '--' }}</td>
+          <td>{{ 'Cantidad y valor' if nc.tipo == 'cantidad_y_valor' else 'Solo valor' }}</td>
+          <td class="text-muted small">{{ nc.motivo or '' }}</td>
+          <td class="text-end text-danger">-{{ nc.monto|moneda }} {{ factura.moneda }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
 </div>
 {% endif %}

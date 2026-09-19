@@ -57,6 +57,26 @@
       </div>
       <div class="col-md-6"></div>
 
+      <div class="col-12"><hr class="my-2"></div>
+      <div class="col-12">
+        <div class="fw-semibold small text-muted mb-1">Condiciones de crédito (Pago Proveedores)</div>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Plazo de crédito (días)</label>
+        <input type="number" min="0" class="form-control" name="plazo_credito_dias"
+               value="{{ proveedor.plazo_credito_dias if proveedor and proveedor.plazo_credito_dias is not none else '' }}"
+               placeholder="ej. 60">
+        <div class="form-text">Toda factura nueva de este proveedor calcula sola su fecha de vencimiento como
+          fecha de emisión + este plazo.</div>
+      </div>
+      <div class="col-md-6 d-flex align-items-end">
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" name="requiere_pago_previo" value="1" id="requiere_pago_previo"
+                 {{ 'checked' if proveedor and proveedor.requiere_pago_previo }}>
+          <label class="form-check-label" for="requiere_pago_previo">Exige pago previo al despacho (sin crédito)</label>
+        </div>
+      </div>
+
       <div class="col-12">
         <label class="form-label">Notas</label>
         <textarea class="form-control" name="notas" rows="3">{{ proveedor.notas if proveedor else '' }}</textarea>

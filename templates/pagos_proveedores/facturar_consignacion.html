@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Facturar consignación · Pago Proveedores · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-1">Facturar consignación</h3>
+<div class="text-muted small mb-3">
+  Convierte productos que este proveedor ya te entregó en consignación (todavía no se le deben) en una
+  factura real, ahora que te informó y facturó lo vendido. Elige el proveedor, marca los productos que llegaron
+  facturados, indica el precio real de cada uno y el número/fecha de la factura -- esas líneas dejan de
+  contarse como consignación y pasan a ser compra en firme.
+</div>
+
+<div class="card p-3 mb-3">
+  <form method="get" class="row g-2 align-items-end">
+    <div class="col-md-6">
+      <label class="form-label small mb-0">Proveedor</label>
+      <select name="proveedor_id" class="form-select" onchange="this.form.submit()">
+        <option value="">Selecciona un proveedor…</option>
+        {% for p in proveedores %}
+        <option value="{{ p.id }}" {{ 'selected' if proveedor and proveedor.id == p.id }}>{{ p.nombre }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </form>
+</div>
+
+{% if proveedor and not pendientes %}
+<div class="alert alert-success">
+  {{ proveedor.nombre }} no tiene productos pendientes de facturar en consignación -- todo lo que se le ha
+  recibido bajo esa condición ya fue facturado, o no hay ninguno registrado.
+</div>
+{% endif %}
+
+{% if proveedor and pendientes %}
+<form method="post">
+  <input type="hidden" name="proveedor_id" value="{{ proveedor.id }}">
+  <div class="card p-3 mb-3">
+    <div class="row g-3">
+      <div class="col-md-3">
+        <label class="form-label">Número de factura *</label>
+        <input type="text" class="form-control" name="numero_factura" required>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Fecha de emisión</label>
+        <input type="date" class="form-control" name="fecha_emision">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Moneda</label>
+        <select class="form-select" name="moneda">
+          {% for m in ['EUR', 'USD', 'CLP'] %}
+          <option value="{{ m }}" {{ 'selected' if proveedor.moneda_default and proveedor.moneda_default.upper().startswith(m[:3]) }}>{{ m }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Fecha de vencimiento</label>
+        <input type="date" class="form-control" name="fecha_vencimiento" placeholder="Se calcula sola si la dejas en blanco">
+        <div class="form-text">
+          {% if proveedor.plazo_credito_dias %}
+            Se calcula sola (emisión + {{ proveedor.plazo_credito_dias }} día(s)) si la dejas en blanco.
+          {% else %}
+            Este proveedor no tiene plazo de crédito cargado -- <a href="{{ url_for('proveedores_editar', proveedor_id=proveedor.id) }}">cárgalo aquí</a>.
+          {% endif %}
+        </div>
+      </div>
+      <div class="col-12">
+        <label class="form-label">Notas</label>
+        <input type="text" class="form-control" name="notas">
+      </div>
+    </div>
+  </div>
+
+  <div class="card p-3 mb-3">
+    <div class="fw-semibold mb-2">Productos recibidos en consignación, pendientes de facturar ({{ pendientes|length }})</div>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead>
+          <tr class="text-muted small">
+            <th style="width: 32px;"></th>
+            <th>Código proveedor</th>
+            <th>Descripción</th>
+            <th class="text-end">Unidades</th>
+            <th>Recibido</th>
+            <th class="text-end">Precio unitario real</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in pendientes %}
+          <tr>
+            <td><input type="checkbox" name="compra_id" value="{{ c.id }}" class="form-check-input chk-consig"></td>
+            <td>{{ c.codigo_proveedor or c.codigo_interno }}</td>
+            <td>{{ c.descripcion }}</td>
+            <td class="text-end">{{ c.unidades|int }}</td>
+            <td class="small text-muted">{{ c.fecha_factura.strftime('%d-%m-%Y') if c.fecha_factura else '--' }}</td>
+            <td class="text-end" style="width: 160px;">
+              <input type="number" step="0.01" min="0" name="precio_{{ c.id }}" class="form-control form-control-sm text-end"
+                     value="{{ '%.2f'|format(c.costo_unitario_clp) if c.costo_unitario_clp else '' }}" placeholder="0.00">
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="form-text mt-2">
+      El precio sugerido es el costo de importación registrado -- reemplázalo por el precio real que indica la
+      factura del proveedor si es distinto (lo normal, ya que esta suele incluir su condición comercial, no el
+      costo de importación).
+    </div>
+  </div>
+
+  <button type="submit" class="btn btn-brand">Generar factura</button>
+  <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-outline-secondary">Cancelar</a>
+</form>
+
+<script>
+  // Marcar/desmarcar todo con un clic en el encabezado no es crítico -- se deja simple a propósito.
+</script>
+{% endif %}
+
+{% endblock %}

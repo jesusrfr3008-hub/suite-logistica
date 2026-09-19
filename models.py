@@ -436,6 +436,13 @@ class CompraHistorica(db.Model):
     otros_costos_usd = db.Column(db.Float, default=0)
     empresa_compradora = db.Column(db.String(80))     # ACCUVISION / ACCUMEDICAL, tal como viene en el archivo
     homologado = db.Column(db.Boolean, default=False)
+    # Ronda AK (2026-09-19): cuando una linea "en consignacion" (factura ==
+    # "CONSIGNACION", ver es_consignacion en _fila_historica_dict) se factura
+    # de verdad -- ya sea a mano desde Pago Proveedores > Facturar
+    # consignacion, o por la carga masiva del archivo del proveedor -- queda
+    # apuntando a la FacturaProveedor real que la reemplaza, para no volver a
+    # ofrecerla como "pendiente de facturar" ni facturarla dos veces.
+    factura_generada_id = db.Column(db.Integer, db.ForeignKey("facturas_proveedor.id"), nullable=True)
 
     def __repr__(self):
         return f"<CompraHistorica {self.codigo_interno} {self.factura}>"
@@ -1290,6 +1297,11 @@ class FacturaProveedor(db.Model):
     estado = db.Column(db.String(20), default="pendiente")
     notas = db.Column(db.Text)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    # Ronda AK (2026-09-19): de donde salio esta factura -- "costeo" (boton
+    # "Generar factura" en una Importacion ya costeada), "consignacion"
+    # (Pago Proveedores > Facturar consignacion) o "manual" (las que se
+    # cargaron una sola vez desde el Excel de saldos iniciales, fase 1).
+    origen = db.Column(db.String(20), default="manual")
 
     proveedor = db.relationship("Proveedor")
     importacion = db.relationship("Importacion", backref=db.backref("factura_pago", uselist=False))
@@ -1303,8 +1315,21 @@ class FacturaProveedor(db.Model):
         return sum((p.monto or 0) for p in self.pagos)
 
     @property
+    def total_notas_credito(self):
+        """Ronda AK (2026-09-19): suma de todas las NC aplicadas a esta
+        factura -- reduce el saldo real que se le debe al proveedor (ver
+        NotaCreditoProveedor)."""
+        return round(sum((nc.monto or 0) for nc in self.notas_credito), 2)
+
+    @property
+    def valor_neto(self):
+        """Valor de la factura despues de notas de credito -- lo que
+        realmente se le termina debiendo al proveedor."""
+        return round((self.valor_factura or 0) - self.total_notas_credito, 2)
+
+    @property
     def saldo_pendiente(self):
-        return round((self.valor_factura or 0) - self.monto_pagado, 2)
+        return round((self.valor_factura or 0) - self.monto_pagado - self.total_notas_credito, 2)
 
     @property
     def dias_para_vencer(self):
@@ -1339,3 +1364,102 @@ class PagoFacturaProveedor(db.Model):
 
     def __repr__(self):
         return f"<PagoFacturaProveedor factura={self.factura_id} {self.monto}>"
+
+
+class FacturaProveedorLinea(db.Model):
+    """Ronda AK (2026-09-19): detalle por producto/lote de una
+    FacturaProveedor -- hace falta para poder aplicar una Nota de Credito
+    sobre productos puntuales (ver NotaCreditoProveedor). Se llena de 2
+    formas: automatico al generar la factura desde un Costeo ya confirmado
+    (una linea por cada ParcialLinea de la Importacion asociada), o manual
+    al facturar consignacion (una linea por cada producto de
+    CompraHistorica que el usuario eligio facturar)."""
+
+    __tablename__ = "facturas_proveedor_lineas"
+
+    id = db.Column(db.Integer, primary_key=True)
+    factura_id = db.Column(db.Integer, db.ForeignKey("facturas_proveedor.id"), nullable=False)
+    codigo_producto = db.Column(db.String(120))
+    descripcion = db.Column(db.String(500))
+    codigo_lote = db.Column(db.String(80))
+    cantidad = db.Column(db.Float, default=0)
+    precio_unitario = db.Column(db.Float, default=0)
+    valor_total = db.Column(db.Float, default=0)
+    # Trazabilidad de origen -- como mucho uno de los dos esta lleno.
+    parcial_linea_id = db.Column(db.Integer, db.ForeignKey("parcial_lineas.id"), nullable=True)
+    compra_historica_id = db.Column(db.Integer, db.ForeignKey("compras_historicas.id"), nullable=True)
+
+    factura = db.relationship(
+        "FacturaProveedor",
+        backref=db.backref("lineas", cascade="all, delete-orphan", lazy="dynamic", order_by="FacturaProveedorLinea.id"),
+    )
+
+    @property
+    def cantidad_acreditada(self):
+        return sum((l.cantidad or 0) for l in self.notas_credito_lineas)
+
+    @property
+    def cantidad_disponible(self):
+        return round((self.cantidad or 0) - self.cantidad_acreditada, 4)
+
+    def __repr__(self):
+        return f"<FacturaProveedorLinea {self.codigo_producto} x{self.cantidad}>"
+
+
+TIPOS_NC_PROVEEDOR = ["cantidad_y_valor", "solo_valor"]
+
+
+class NotaCreditoProveedor(db.Model):
+    """Ronda AK (2026-09-19): nota de credito de un proveedor sobre una
+    FacturaProveedor ya cargada -- por descuento comercial ("solo_valor",
+    un monto que se resta sin tocar cantidades) o por devolucion de
+    producto ("cantidad_y_valor", resta unidades y valor de lineas
+    puntuales, ver NotaCreditoProveedorLinea). Reduce el saldo pendiente
+    real de la factura (ver FacturaProveedor.saldo_pendiente) -- el motivo
+    de este modulo: los reportes historicos solo contemplaban cantidades y
+    valor importado, sobreestimando la compra real cuando el proveedor
+    despues hace una NC por descuento o devolucion."""
+
+    __tablename__ = "notas_credito_proveedor"
+
+    id = db.Column(db.Integer, primary_key=True)
+    factura_id = db.Column(db.Integer, db.ForeignKey("facturas_proveedor.id"), nullable=False)
+    numero_nc = db.Column(db.String(80))
+    fecha = db.Column(db.Date, nullable=True)
+    tipo = db.Column(db.String(20), default="solo_valor")  # ver TIPOS_NC_PROVEEDOR
+    monto = db.Column(db.Float, default=0)  # siempre en la moneda de la factura
+    motivo = db.Column(db.Text)
+    creado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    factura = db.relationship(
+        "FacturaProveedor",
+        backref=db.backref("notas_credito", cascade="all, delete-orphan", lazy="dynamic", order_by="NotaCreditoProveedor.fecha.desc()"),
+    )
+    creado_por = db.relationship("Usuario")
+
+    def __repr__(self):
+        return f"<NotaCreditoProveedor factura={self.factura_id} {self.monto}>"
+
+
+class NotaCreditoProveedorLinea(db.Model):
+    """Detalle de una NC 'cantidad_y_valor': cuanta cantidad y valor se
+    acredita de una linea puntual de la factura. Una NC 'solo_valor' no
+    tiene lineas -- su monto ya queda directo en NotaCreditoProveedor.monto."""
+
+    __tablename__ = "notas_credito_proveedor_lineas"
+
+    id = db.Column(db.Integer, primary_key=True)
+    nota_credito_id = db.Column(db.Integer, db.ForeignKey("notas_credito_proveedor.id"), nullable=False)
+    factura_linea_id = db.Column(db.Integer, db.ForeignKey("facturas_proveedor_lineas.id"), nullable=False)
+    cantidad = db.Column(db.Float, default=0)
+    valor = db.Column(db.Float, default=0)
+
+    nota_credito = db.relationship(
+        "NotaCreditoProveedor",
+        backref=db.backref("lineas", cascade="all, delete-orphan", lazy="dynamic"),
+    )
+    factura_linea = db.relationship(
+        "FacturaProveedorLinea",
+        backref=db.backref("notas_credito_lineas", lazy="dynamic"),
+    )

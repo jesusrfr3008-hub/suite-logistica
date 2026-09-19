@@ -37,6 +37,7 @@ from models import (
     HomologacionStock, StockExistencia, PedidoComprometido,
     CodigoErgopyme, CompraHistorica,
     FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
+    FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
 )
 from seed_data import seed_from_excel
 import costing
@@ -88,6 +89,10 @@ CODIGOS_ERGOPYME_EXCEL = os.path.join(BASE_DIR, "codigos_ergopyme_homologacion.x
 #    sistema (una fila por linea de producto de cada factura, 2023-2026),
 #    homologado contra (1) al cargarse.
 HISTORICO_COMPRAS_EXCEL = os.path.join(BASE_DIR, "historico_compras_proveedores.xlsx")
+# Ronda AK (2026-09-19): archivo que el usuario entregó con la facturación
+# real de lentes MEDICONTUR recibidos en consignación desde 2023 -- ver
+# reparar_facturacion_consignacion_medicontur().
+FACTURACION_CONSIGNACION_MEDICONTUR_EXCEL = os.path.join(BASE_DIR, "facturacion_consignacion_medicontur.xlsx")
 # 3) Ronda AC (2026-09-14): planilla de referencia que mantiene el usuario
 #    con la moneda HABITUAL de cada proveedor extranjero (USD/EURO) -- se
 #    usa solo como DESEMPATE al elegir en qué moneda expresar un resumen
@@ -471,6 +476,14 @@ def ensure_schema_migrations():
         "roles": [
             ("permiso_consultar_stock", "BOOLEAN DEFAULT 0"),
             ("permiso_pagos_proveedores", "BOOLEAN DEFAULT 0"),
+        ],
+        # Ronda AK (2026-09-19): ajustes a Pago Proveedores -- facturar
+        # consignacion, notas de credito y crédito por Proveedor.
+        "compras_historicas": [
+            ("factura_generada_id", "INTEGER"),
+        ],
+        "facturas_proveedor": [
+            ("origen", "VARCHAR(20) DEFAULT 'manual'"),
         ],
     }
 
@@ -2698,12 +2711,200 @@ def reparar_costeo_topi_ex20260720():
             )
 
 
+def reparar_facturacion_consignacion_medicontur():
+    """Ronda AK (2026-09-19, punto 4 del pedido del usuario): incorpora
+    'facturacion_consignacion_medicontur.xlsx' (reporte que el usuario
+    entregó con TODA la facturación real de lentes MEDICONTUR recibidos en
+    consignación desde 2023 -- columnas código interno Ergopyme, código
+    proveedor, lote, unidades, precio unitario, fecha de factura, número de
+    factura) al histórico de compras (CompraHistorica), reemplazando el
+    placeholder "CONSIGNACION" por la factura real cuando corresponde.
+
+    Cómo empareja (no hay campo de lote en CompraHistorica, así que no se
+    puede cruzar 1 a 1 por lote): para cada código interno, ordena las filas
+    YA cargadas como "CONSIGNACION" de ese código por fecha (más antigua
+    primero, tratando una fila con unidades>1 como esa cantidad de unidades
+    sueltas) y las filas del archivo nuevo por fecha de factura, y las
+    empareja en ese mismo orden (FIFO) de a una unidad -- el criterio más
+    razonable sin lote: lo que se recibió primero es lo más probable que se
+    haya vendido y facturado primero. Con cada par:
+      - La unidad emparejada se marca con la factura/fecha REAL, y su valor
+        (Total Invoice / US$) se reemplaza por el precio unitario real de
+        la factura -- deja de ser consignación (es_consignacion se calcula
+        de la columna factura, ver _fila_historica_dict). Flete/derechos/
+        otros gastos de esa unidad NO cambian (son costos de importación ya
+        pagados, no dependen de si se facturó o no).
+      - Si el archivo trae MÁS unidades facturadas de un código que las que
+        había como "CONSIGNACION" pendiente, la diferencia son unidades que
+        llegaron DESPUÉS del corte del histórico y nunca se cargaron -- se
+        agregan como filas nuevas (ya con su factura real, sin
+        flete/derechos/otros porque esos embarques no se cargaron en el
+        histórico y no hay forma de saber ese costo).
+      - Si sobran filas "CONSIGNACION" sin correspondencia en el archivo,
+        quedan tal cual -- siguen pendientes de facturar.
+
+    Idempotente: se activa revisando si la PRIMERA fila del archivo ya
+    quedó cargada con su factura real (si existe, ya se corrió antes y no
+    hace nada). compras_historicas es insert-only y esto modifica filas ya
+    existentes, así que -- a diferencia de los otros seeds -- no alcanza
+    con un count()==0."""
+    if not os.path.isfile(FACTURACION_CONSIGNACION_MEDICONTUR_EXCEL):
+        print(f"[reparar] No se encontró {FACTURACION_CONSIGNACION_MEDICONTUR_EXCEL}, se omite.")
+        return
+
+    wb = openpyxl.load_workbook(FACTURACION_CONSIGNACION_MEDICONTUR_EXCEL, data_only=True)
+    ws = wb.active
+    archivo_filas = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or all(v is None for v in row):
+            continue
+        _proveedor, cod_erg, cod_prov, _lote, cantidad, precio, fecha_factura, numero_factura = row[:8]
+        if cod_erg is None or numero_factura is None:
+            continue
+        codigo = str(int(cod_erg)) if isinstance(cod_erg, (int, float)) else str(cod_erg).strip()
+        fecha = fecha_factura.date() if isinstance(fecha_factura, datetime) else fecha_factura
+        archivo_filas.append({
+            "codigo_interno": codigo, "codigo_proveedor": (cod_prov or "").strip(),
+            "precio_unitario": float(precio or 0), "fecha": fecha, "factura": str(numero_factura).strip(),
+        })
+    if not archivo_filas:
+        print("[reparar] facturacion_consignacion_medicontur.xlsx no tiene filas reconocibles, se omite.")
+        return
+
+    # Gate de idempotencia: si la primera fila del archivo ya quedó con su
+    # factura real cargada en compras_historicas, esto ya se corrió antes.
+    primera = archivo_filas[0]
+    ya_aplicado = CompraHistorica.query.filter(
+        CompraHistorica.codigo_interno == primera["codigo_interno"],
+        CompraHistorica.factura == primera["factura"],
+        CompraHistorica.proveedor_homologado == "MEDICONTUR",
+    ).first()
+    if ya_aplicado:
+        return
+
+    hist_por_codigo = {}
+    for c in (
+        CompraHistorica.query
+        .filter(CompraHistorica.factura == "CONSIGNACION")
+        .order_by(CompraHistorica.codigo_interno, CompraHistorica.fecha_factura, CompraHistorica.id)
+        .all()
+    ):
+        nombre_crudo = (c.proveedor_original or "").strip()
+        nombre_canonico = ALIAS_PROVEEDOR_HISTORICO.get(nombre_crudo.upper(), nombre_crudo)
+        if nombre_canonico.strip().upper() != "MEDICONTUR":
+            continue
+        hist_por_codigo.setdefault(c.codigo_interno, []).append(c)
+
+    archivo_por_codigo = {}
+    for f in archivo_filas:
+        archivo_por_codigo.setdefault(f["codigo_interno"], []).append(f)
+    for codigo, filas in archivo_por_codigo.items():
+        filas.sort(key=lambda f: f["fecha"] or date.min)
+
+    n_facturadas = n_eliminadas = n_nuevas = n_recortadas = 0
+
+    for codigo in set(hist_por_codigo) | set(archivo_por_codigo):
+        hist_filas = hist_por_codigo.get(codigo, [])
+        archivo_lista = archivo_por_codigo.get(codigo, [])
+
+        slots = []
+        for fila in hist_filas:
+            n = int(fila.unidades or 0) or 0
+            for _ in range(n):
+                slots.append(fila)
+
+        n_par = min(len(slots), len(archivo_lista))
+        consumidas_por_fila = {}
+        for i in range(n_par):
+            fila_hist = slots[i]
+            fila_archivo = archivo_lista[i]
+            n_original = int(fila_hist.unidades or 1) or 1
+            paridad = fila_hist.paridad_eur or 1.0
+            db.session.add(CompraHistorica(
+                fecha_factura=fila_archivo["fecha"],
+                mes_anio=fila_archivo["fecha"].strftime("%Y-%m") if fila_archivo["fecha"] else fila_hist.mes_anio,
+                proveedor_original="MEDICONTUR", proveedor_homologado="MEDICONTUR",
+                factura=fila_archivo["factura"], tipo_cambio=fila_hist.tipo_cambio, paridad_eur=paridad,
+                transporte=fila_hist.transporte, codigo_interno=codigo,
+                codigo_proveedor=fila_archivo["codigo_proveedor"] or fila_hist.codigo_proveedor,
+                descripcion=fila_hist.descripcion, tipo_flete=fila_hist.tipo_flete, unidades=1,
+                total_invoice=round(fila_archivo["precio_unitario"], 6),
+                total_usd=round(fila_archivo["precio_unitario"] / paridad, 6) if paridad else 0,
+                flete_usd=(fila_hist.flete_usd or 0) / n_original,
+                seguro_usd=(fila_hist.seguro_usd or 0) / n_original,
+                cif_usd=(fila_hist.cif_usd or 0) / n_original,
+                cif_clp=(fila_hist.cif_clp or 0) / n_original,
+                derechos_clp=(fila_hist.derechos_clp or 0) / n_original,
+                otros_gastos_clp=(fila_hist.otros_gastos_clp or 0) / n_original,
+                costo_total_clp=(fila_hist.costo_total_clp or 0) / n_original,
+                costo_unitario_clp=fila_hist.costo_unitario_clp,
+                categoria=fila_hist.categoria,
+                otros_costos_usd=(fila_hist.otros_costos_usd or 0) / n_original,
+                empresa_compradora=fila_hist.empresa_compradora, homologado=True,
+            ))
+            n_facturadas += 1
+            consumidas_por_fila[fila_hist.id] = consumidas_por_fila.get(fila_hist.id, 0) + 1
+
+        for fila_hist in hist_filas:
+            original = int(fila_hist.unidades or 0)
+            consumidas = consumidas_por_fila.get(fila_hist.id, 0)
+            if consumidas == 0:
+                continue
+            restante = original - consumidas
+            if restante <= 0:
+                db.session.delete(fila_hist)
+                n_eliminadas += 1
+            else:
+                frac = restante / original
+                fila_hist.unidades = restante
+                fila_hist.total_invoice = round((fila_hist.total_invoice or 0) * frac, 6)
+                fila_hist.total_usd = round((fila_hist.total_usd or 0) * frac, 6)
+                fila_hist.flete_usd = round((fila_hist.flete_usd or 0) * frac, 6)
+                fila_hist.seguro_usd = round((fila_hist.seguro_usd or 0) * frac, 6)
+                fila_hist.cif_usd = round((fila_hist.cif_usd or 0) * frac, 6)
+                fila_hist.cif_clp = round((fila_hist.cif_clp or 0) * frac, 6)
+                fila_hist.derechos_clp = round((fila_hist.derechos_clp or 0) * frac, 6)
+                fila_hist.otros_gastos_clp = round((fila_hist.otros_gastos_clp or 0) * frac, 6)
+                fila_hist.costo_total_clp = round((fila_hist.costo_total_clp or 0) * frac, 6)
+                fila_hist.otros_costos_usd = round((fila_hist.otros_costos_usd or 0) * frac, 6)
+                n_recortadas += 1
+
+        if len(archivo_lista) > len(slots):
+            descripcion_ref = hist_filas[0].descripcion if hist_filas else ""
+            paridad_ref = hist_filas[-1].paridad_eur if hist_filas else 1.0
+            tipo_cambio_ref = hist_filas[-1].tipo_cambio if hist_filas else 0
+            for fila_archivo in archivo_lista[len(slots):]:
+                db.session.add(CompraHistorica(
+                    fecha_factura=fila_archivo["fecha"],
+                    mes_anio=fila_archivo["fecha"].strftime("%Y-%m") if fila_archivo["fecha"] else "",
+                    proveedor_original="MEDICONTUR", proveedor_homologado="MEDICONTUR",
+                    factura=fila_archivo["factura"], tipo_cambio=tipo_cambio_ref, paridad_eur=paridad_ref,
+                    transporte="", codigo_interno=codigo, codigo_proveedor=fila_archivo["codigo_proveedor"],
+                    descripcion=descripcion_ref, tipo_flete="", unidades=1,
+                    total_invoice=round(fila_archivo["precio_unitario"], 6),
+                    total_usd=round(fila_archivo["precio_unitario"] / paridad_ref, 6) if paridad_ref else 0,
+                    flete_usd=0, seguro_usd=0, cif_usd=0, cif_clp=0, derechos_clp=0, otros_gastos_clp=0,
+                    costo_total_clp=0, costo_unitario_clp=0, categoria="LENTES", otros_costos_usd=0,
+                    empresa_compradora="ACCUVISION", homologado=True,
+                ))
+                n_nuevas += 1
+
+    db.session.commit()
+    print(
+        f"[reparar] Facturación consignación MEDICONTUR: {n_facturadas} unidad(es) pasaron de 'CONSIGNACION' "
+        f"a compra en firme con su factura real, {n_eliminadas} fila(s) placeholder reemplazadas por completo, "
+        f"{n_recortadas} fila(s) recortadas (parcialmente facturadas), {n_nuevas} fila(s) nueva(s) para unidades "
+        "facturadas que no tenían placeholder histórico (embarques posteriores al corte del archivo original)."
+    )
+
+
 with app.app_context():
     reparar_ordenes_mezcladas()
     limpiar_ordenes_canceladas()
     reparar_lotes_legacy()
     reparar_paridad_eur_historica()
     reparar_costeo_topi_ex20260720()
+    reparar_facturacion_consignacion_medicontur()
 
 
 def _mensaje_division(ordenes_destino):
@@ -2792,6 +2993,8 @@ def proveedores_nuevo():
             moneda_default=request.form.get("moneda_default", "USD"),
             codigo_sistema_inventario=request.form.get("codigo_sistema_inventario", "").strip(),
             notas=request.form.get("notas", "").strip(),
+            plazo_credito_dias=_int_o_none(request.form.get("plazo_credito_dias")),
+            requiere_pago_previo=bool(request.form.get("requiere_pago_previo")),
             activo=True,
         )
         db.session.add(prov)
@@ -2816,6 +3019,8 @@ def proveedores_editar(proveedor_id):
         prov.moneda_default = request.form.get("moneda_default", "USD")
         prov.codigo_sistema_inventario = request.form.get("codigo_sistema_inventario", "").strip()
         prov.notas = request.form.get("notas", "").strip()
+        prov.plazo_credito_dias = _int_o_none(request.form.get("plazo_credito_dias"))
+        prov.requiere_pago_previo = bool(request.form.get("requiere_pago_previo"))
         db.session.commit()
         flash(f"Proveedor '{prov.nombre}' actualizado.", "success")
         return redirect(url_for("proveedores_list"))
@@ -4954,6 +5159,73 @@ def importaciones_editar(importacion_id):
     db.session.commit()
     flash("Datos de la importación actualizados.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
+
+
+@app.route("/importaciones/<int:importacion_id>/generar-factura", methods=["POST"])
+@requiere_permiso("generar_costeo", "pagos_proveedores")
+def importacion_generar_factura(importacion_id):
+    """Ronda AK (2026-09-19, punto 1 del pedido del usuario): esta es la
+    fuente real de una FacturaProveedor que NO es de consignación -- el
+    usuario fue explícito en que no ve caso de registrar una factura que no
+    venga del flujo Orden de Compra > Despacho > Costeo. Se genera con este
+    botón (una vez que la Importación ya está costeada, con el número/fecha
+    de factura real cargados) en vez de automático al primer cálculo de
+    Costeo, porque el Costeo se recalcula en vivo cada vez que se abre la
+    pantalla (nada se "confirma") -- así el usuario decide el momento exacto
+    en que esa cuenta por pagar queda registrada, y nunca se duplica (una
+    Importación solo puede tener una FacturaProveedor, ver
+    Importacion.factura_pago)."""
+    imp = Importacion.query.get_or_404(importacion_id)
+    if imp.factura_pago:
+        flash(
+            f"Esta importación ya tiene una factura en Pago Proveedores ({imp.factura_pago.numero_factura}).",
+            "warning",
+        )
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=imp.factura_pago.id))
+    if imp.parciales.count() == 0:
+        flash("Esta importación todavía no tiene parciales/productos cargados -- no hay nada que facturar.", "warning")
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
+    if not imp.numero_factura or not imp.fecha_factura:
+        flash("Carga el número y la fecha de factura de esta importación antes de generar la cuenta por pagar.", "warning")
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
+
+    moneda = (imp.moneda_factura or "USD").strip().upper()
+    moneda = "EUR" if moneda.startswith("EUR") else moneda
+    factura = FacturaProveedor(
+        proveedor_id=imp.proveedor_id,
+        importacion_id=imp.id,
+        numero_factura=imp.numero_factura,
+        fecha_emision=imp.fecha_factura,
+        moneda=moneda,
+        valor_factura=round(imp.fob_total_moneda, 2),
+        fecha_vencimiento=_calcular_fecha_vencimiento(imp.proveedor, imp.fecha_factura),
+        estado="pendiente",
+        origen="costeo",
+    )
+    db.session.add(factura)
+    db.session.flush()
+
+    n_lineas = 0
+    for parcial in imp.parciales:
+        for linea in parcial.lineas:
+            db.session.add(FacturaProveedorLinea(
+                factura_id=factura.id,
+                codigo_producto=linea.codigo,
+                descripcion=linea.descripcion,
+                codigo_lote=linea.codigo_lote,
+                cantidad=linea.cantidad_unidades or 0,
+                precio_unitario=linea.valor_unitario_moneda or 0,
+                valor_total=round(linea.valor_total_moneda, 2),
+                parcial_linea_id=linea.id,
+            ))
+            n_lineas += 1
+    db.session.commit()
+    flash(
+        f"Factura {factura.numero_factura} generada en Pago Proveedores ({n_lineas} línea(s), "
+        f"{factura.valor_factura:,.2f} {moneda}).",
+        "success",
+    )
+    return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
 
 
 @app.route("/importaciones/<int:importacion_id>/eliminar", methods=["POST"])
@@ -8075,16 +8347,39 @@ def reportes_compras_proveedor_detalle(proveedor):
 # ---------------------------------------------------------------------------
 # Modulo: Pago Proveedores (ronda AJ, 2026-09-18, fase 1)
 # ---------------------------------------------------------------------------
-# Ver ronda-aj-pago-proveedores-costo-producto-multi-factura.md en el
-# proyecto para el detalle completo de los 4 requerimientos pedidos y el
-# estado de cada uno. Esta fase 1 cubre: listado de facturas pendientes por
-# proveedor con fecha de vencimiento, plazo de credito/pago previo por
-# proveedor, y registro de pagos (abono o total) con su tipo de cambio.
-# Todavia NO cubre (fase 2, pendiente): recosteo automatico del FOB/CIF de
-# la Importacion asociada al marcar una factura como pagada, notas de
-# credito, ni la generacion automatica de FacturaProveedor al costear una
-# Importacion nueva (por ahora las facturas nuevas se cargan a mano aca
-# mismo, igual que se cargaron los saldos iniciales).
+# Ver ronda-aj-pago-proveedores-costo-producto-multi-factura.md y
+# ronda-ak-consignacion-nc-credito-proveedor.md en el proyecto para el
+# detalle completo. Fase 1 (ronda AJ): listado de facturas pendientes por
+# proveedor, registro de pagos (abono o total) con su tipo de cambio. Ronda
+# AK (2026-09-19) agrego: el plazo de credito se edita desde el catalogo de
+# Proveedores (no aqui) y calcula solo el vencimiento de cada factura nueva;
+# "Cargar factura" se reemplazo por "Facturar consignacion" (la unica forma
+# de registrar una factura que NO viene de un Costeo: convierte productos ya
+# recibidos en consignacion -- ver OrdenCompra.es_consignacion y el
+# historico CompraHistorica -- en una compra en firme); las facturas
+# normales ahora se generan con un boton desde la Importacion ya costeada
+# (ver importacion_generar_factura); y se agrego Nota de Credito por
+# cantidad+valor o solo valor sobre una factura ya cargada. Todavia NO cubre
+# (fase 2, pendiente): recosteo automatico del FOB/CIF de la Importacion al
+# marcar una factura como pagada.
+
+def _int_o_none(texto):
+    texto = (texto or "").strip()
+    return int(texto) if texto.lstrip("-").isdigit() else None
+
+
+def _calcular_fecha_vencimiento(proveedor, fecha_emision, fecha_vencimiento_manual=None):
+    """Ronda AK (2026-09-19): el plazo de credito ahora es un parametro del
+    Proveedor (ver proveedores_editar) -- toda FacturaProveedor nueva calcula
+    sola su vencimiento como fecha_emision + plazo_credito_dias, salvo que se
+    entregue una fecha de vencimiento manual explicita (ej. la carga inicial
+    de saldos, que trae el vencimiento real del Excel de origen)."""
+    if fecha_vencimiento_manual:
+        return fecha_vencimiento_manual
+    if fecha_emision and proveedor and proveedor.plazo_credito_dias:
+        return fecha_emision + timedelta(days=proveedor.plazo_credito_dias)
+    return None
+
 
 def _factura_proveedor_estado_por_saldo(factura):
     """Recalcula el estado de una FacturaProveedor a partir de su saldo
@@ -8140,7 +8435,12 @@ def pagos_proveedores_list():
 def pagos_proveedores_detalle(factura_id):
     factura = FacturaProveedor.query.get_or_404(factura_id)
     pagos = factura.pagos.order_by(PagoFacturaProveedor.fecha_pago.desc()).all()
-    return render_template("pagos_proveedores/detalle.html", factura=factura, pagos=pagos, hoy=datetime.utcnow().date())
+    lineas = factura.lineas.all()
+    notas_credito = factura.notas_credito.all()
+    return render_template(
+        "pagos_proveedores/detalle.html", factura=factura, pagos=pagos, lineas=lineas,
+        notas_credito=notas_credito, hoy=datetime.utcnow().date(),
+    )
 
 
 @app.route("/pagos-proveedores/<int:factura_id>/registrar-pago", methods=["POST"])
@@ -8202,19 +8502,153 @@ def pagos_proveedores_registrar_pago(factura_id):
     return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
 
 
-@app.route("/pagos-proveedores/nueva", methods=["GET", "POST"])
+@app.route("/pagos-proveedores/<int:factura_id>/nota-credito", methods=["GET", "POST"])
 @requiere_permiso("pagos_proveedores")
-def pagos_proveedores_nueva():
-    """Carga manual de una factura de proveedor pendiente de pago -- para
-    cuando todavia no existe generacion automatica desde una Importacion
-    costeada (fase 2, pendiente) y aparece una factura nueva que hay que
-    trackear en el modulo."""
+def pagos_proveedores_nota_credito(factura_id):
+    """Ronda AK (2026-09-19, punto 3 del pedido del usuario): al estar la
+    factura ya cargada (con Costeo o con Facturar consignación) el sistema
+    ya conoce sus productos y lotes (FacturaProveedorLinea) -- se ofrecen
+    para aplicar una NC "cantidad y valor" (devolución: se descuenta una
+    cantidad de unidades de una o más líneas, el valor se calcula solo al
+    precio de esa línea) o "solo valor" (descuento comercial: un monto fijo,
+    sin tocar cantidades). Motivo del usuario: los reportes históricos solo
+    contemplaban cantidades y valor importado, sobreestimando la compra real
+    cuando el proveedor hace después una NC -- esta NC reduce el saldo
+    pendiente real (ver FacturaProveedor.saldo_pendiente/valor_neto)."""
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    lineas = factura.lineas.all()
+
+    if request.method == "POST":
+        tipo = request.form.get("tipo", "").strip()
+        if tipo not in TIPOS_NC_PROVEEDOR:
+            flash("Elige el tipo de nota de crédito.", "danger")
+            return redirect(url_for("pagos_proveedores_nota_credito", factura_id=factura.id))
+
+        numero_nc = request.form.get("numero_nc", "").strip()
+        fecha_txt = request.form.get("fecha", "").strip()
+        try:
+            fecha_nc = datetime.strptime(fecha_txt, "%Y-%m-%d").date() if fecha_txt else datetime.utcnow().date()
+        except ValueError:
+            fecha_nc = datetime.utcnow().date()
+        motivo = request.form.get("motivo", "").strip()
+
+        if tipo == "solo_valor":
+            try:
+                monto = float((request.form.get("monto_solo_valor") or "0").replace(",", "."))
+            except ValueError:
+                monto = 0.0
+            if monto <= 0:
+                flash("El monto de la nota de crédito debe ser mayor a 0.", "danger")
+                return redirect(url_for("pagos_proveedores_nota_credito", factura_id=factura.id))
+            nc = NotaCreditoProveedor(
+                factura_id=factura.id, numero_nc=numero_nc, fecha=fecha_nc,
+                tipo="solo_valor", monto=round(monto, 2), motivo=motivo,
+                creado_por_id=current_user.id,
+            )
+            db.session.add(nc)
+        else:
+            nc = NotaCreditoProveedor(
+                factura_id=factura.id, numero_nc=numero_nc, fecha=fecha_nc,
+                tipo="cantidad_y_valor", monto=0, motivo=motivo,
+                creado_por_id=current_user.id,
+            )
+            db.session.add(nc)
+            db.session.flush()
+
+            monto_total = 0.0
+            n_lineas = 0
+            for linea in lineas:
+                try:
+                    cantidad = float((request.form.get(f"cantidad_{linea.id}") or "0").replace(",", "."))
+                except ValueError:
+                    cantidad = 0.0
+                if cantidad <= 0:
+                    continue
+                if cantidad > linea.cantidad_disponible + 0.0001:
+                    flash(
+                        f"'{linea.descripcion or linea.codigo_producto}': pediste acreditar {cantidad} pero "
+                        f"solo quedan {linea.cantidad_disponible} disponibles sin acreditar -- no se guardó nada.",
+                        "danger",
+                    )
+                    db.session.rollback()
+                    return redirect(url_for("pagos_proveedores_nota_credito", factura_id=factura.id))
+                valor = round(cantidad * (linea.precio_unitario or 0), 2)
+                db.session.add(NotaCreditoProveedorLinea(
+                    nota_credito_id=nc.id, factura_linea_id=linea.id, cantidad=cantidad, valor=valor,
+                ))
+                monto_total += valor
+                n_lineas += 1
+
+            if n_lineas == 0:
+                db.session.rollback()
+                flash("Indica al menos una cantidad a acreditar.", "danger")
+                return redirect(url_for("pagos_proveedores_nota_credito", factura_id=factura.id))
+            nc.monto = round(monto_total, 2)
+
+        factura.estado = _factura_proveedor_estado_por_saldo(factura)
+        db.session.commit()
+        flash(
+            f"Nota de crédito registrada por {nc.monto:,.2f} {factura.moneda} -- saldo pendiente ahora: "
+            f"{factura.saldo_pendiente:,.2f} {factura.moneda}.",
+            "success",
+        )
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    return render_template(
+        "pagos_proveedores/nota_credito.html", factura=factura, lineas=lineas,
+        TIPOS_NC_PROVEEDOR=TIPOS_NC_PROVEEDOR,
+    )
+
+
+def _pendientes_consignacion(proveedor):
+    """Ronda AK (2026-09-19): filas de CompraHistorica en consignacion
+    (factura == "CONSIGNACION") de este proveedor que todavia no se han
+    facturado de verdad (factura_generada_id vacio) -- lo que el usuario
+    llama "productos recibidos en consignacion" en el punto 1 de su pedido.
+    Hoy esto solo existe para MEDICONTUR (ver ronda AH), cargado como
+    historico "congelado"; el dia que la Orden de Compra con
+    es_consignacion=True alimente esto en vivo, esta misma funcion es el
+    lugar donde conectarlo."""
+    nombre = (proveedor.nombre or "").strip().upper()
+    filas = (
+        CompraHistorica.query
+        .filter(CompraHistorica.factura == "CONSIGNACION")
+        .filter(CompraHistorica.factura_generada_id.is_(None))
+        .order_by(CompraHistorica.codigo_interno, CompraHistorica.fecha_factura)
+        .all()
+    )
+    return [c for c in filas if _proveedor_canonico_historico(c.proveedor_original).strip().upper() == nombre]
+
+
+@app.route("/pagos-proveedores/facturar-consignacion", methods=["GET", "POST"])
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_facturar_consignacion():
+    """Ronda AK (2026-09-19, punto 1 del pedido del usuario): reemplaza la
+    carga manual generica de facturas -- la UNICA factura que se registra a
+    mano en este modulo es la de consignacion, porque el resto de las
+    facturas de proveedor viene siempre del flujo real (Orden de Compra >
+    Despacho > Costeo, ver importacion_generar_factura). Al elegir un
+    proveedor se listan los productos que Suite Logistica tiene registrados
+    como recibidos en consignacion y todavia sin facturar (ver
+    _pendientes_consignacion); el usuario marca cuales le llegaron
+    facturados, con que numero/fecha y a que precio real, y eso se convierte
+    en una FacturaProveedor (con sus lineas) -- las filas de CompraHistorica
+    usadas quedan ligadas a esa factura (factura_generada_id) para no
+    volver a ofrecerlas ni facturarlas dos veces, y pasan a contarse como
+    compra en firme en el reporte Compras Proveedor."""
+    proveedor_id = request.args.get("proveedor_id", "").strip()
+    proveedor = Proveedor.query.get(int(proveedor_id)) if proveedor_id.isdigit() else None
+    pendientes = _pendientes_consignacion(proveedor) if proveedor else []
+
     if request.method == "POST":
         proveedor_id = request.form.get("proveedor_id", "").strip()
         numero_factura = request.form.get("numero_factura", "").strip()
-        if not proveedor_id.isdigit() or not numero_factura:
-            flash("Proveedor y número de factura son obligatorios.", "danger")
-            return redirect(url_for("pagos_proveedores_nueva"))
+        ids_seleccionados = [int(i) for i in request.form.getlist("compra_id") if i.isdigit()]
+        if not proveedor_id.isdigit() or not numero_factura or not ids_seleccionados:
+            flash("Proveedor, número de factura y al menos un producto son obligatorios.", "danger")
+            return redirect(url_for("pagos_proveedores_facturar_consignacion", proveedor_id=proveedor_id))
+
+        proveedor = Proveedor.query.get_or_404(int(proveedor_id))
 
         def fecha(nombre):
             txt = request.form.get(nombre, "").strip()
@@ -8223,47 +8657,70 @@ def pagos_proveedores_nueva():
             except ValueError:
                 return None
 
-        def num(nombre):
-            try:
-                return float((request.form.get(nombre) or "0").replace(",", "."))
-            except ValueError:
-                return 0.0
+        fecha_emision = fecha("fecha_emision")
+        moneda = (request.form.get("moneda") or proveedor.moneda_default or "USD").strip().upper()
+
+        compras = CompraHistorica.query.filter(
+            CompraHistorica.id.in_(ids_seleccionados),
+            CompraHistorica.factura_generada_id.is_(None),
+        ).all()
+        if not compras:
+            flash("Esos productos ya se facturaron o ya no están pendientes -- refresca e intenta de nuevo.", "warning")
+            return redirect(url_for("pagos_proveedores_facturar_consignacion", proveedor_id=proveedor_id))
 
         factura = FacturaProveedor(
-            proveedor_id=int(proveedor_id),
+            proveedor_id=proveedor.id,
             numero_factura=numero_factura,
-            fecha_emision=fecha("fecha_emision"),
-            moneda=request.form.get("moneda", "USD").strip().upper() or "USD",
-            valor_factura=num("valor_factura"),
-            fecha_vencimiento=fecha("fecha_vencimiento"),
-            valor_clp_referencial=num("valor_clp_referencial"),
+            fecha_emision=fecha_emision,
+            moneda=moneda,
+            fecha_vencimiento=_calcular_fecha_vencimiento(proveedor, fecha_emision, fecha("fecha_vencimiento")),
             estado="pendiente",
+            origen="consignacion",
             notas=request.form.get("notas", "").strip(),
         )
         db.session.add(factura)
+        db.session.flush()
+
+        valor_total = 0.0
+        for compra in compras:
+            try:
+                precio_unitario = float((request.form.get(f"precio_{compra.id}") or "0").replace(",", "."))
+            except ValueError:
+                precio_unitario = 0.0
+            cantidad = compra.unidades or 0
+            valor_linea = round(cantidad * precio_unitario, 2)
+            valor_total += valor_linea
+
+            db.session.add(FacturaProveedorLinea(
+                factura_id=factura.id,
+                codigo_producto=compra.codigo_proveedor or compra.codigo_interno,
+                descripcion=compra.descripcion,
+                cantidad=cantidad,
+                precio_unitario=precio_unitario,
+                valor_total=valor_linea,
+                compra_historica_id=compra.id,
+            ))
+            # La linea historica pasa de "en consignacion" a compra en firme
+            # -- factura/fecha reales, y queda ligada para no reofrecerla.
+            compra.factura = numero_factura
+            compra.fecha_factura = fecha_emision
+            compra.factura_generada_id = factura.id
+
+        factura.valor_factura = round(valor_total, 2)
         db.session.commit()
-        flash(f"Factura {factura.numero_factura} cargada en Pago Proveedores.", "success")
+        flash(
+            f"Factura {factura.numero_factura} de consignación creada con {len(compras)} producto(s), "
+            f"{valor_total:,.2f} {moneda}. Esas líneas ya se cuentan como compra en firme en Compras Proveedor.",
+            "success",
+        )
         return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
 
     return render_template(
-        "pagos_proveedores/nueva.html",
+        "pagos_proveedores/facturar_consignacion.html",
         proveedores=Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all(),
+        proveedor=proveedor,
+        pendientes=pendientes,
     )
-
-
-@app.route("/proveedores/<int:proveedor_id>/credito", methods=["POST"])
-@requiere_permiso("pagos_proveedores")
-def proveedor_actualizar_credito(proveedor_id):
-    """Guarda el plazo de crédito (días) y si el proveedor exige pago previo
-    al despacho -- editable desde el propio listado de Pago Proveedores
-    (no hay una pantalla de edición de Proveedor separada para esto)."""
-    proveedor = Proveedor.query.get_or_404(proveedor_id)
-    plazo_txt = request.form.get("plazo_credito_dias", "").strip()
-    proveedor.plazo_credito_dias = int(plazo_txt) if plazo_txt.isdigit() else None
-    proveedor.requiere_pago_previo = bool(request.form.get("requiere_pago_previo"))
-    db.session.commit()
-    flash(f"Condiciones de crédito de {proveedor.nombre} actualizadas.", "success")
-    return redirect(url_for("pagos_proveedores_list", **request.args.to_dict()))
 
 
 if __name__ == "__main__":

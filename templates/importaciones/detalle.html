@@ -68,6 +68,20 @@
     </form>
     <button class="btn btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#modalCargaLotesImportacion">Carga Lotes</button>
     <button class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarImportacion">Editar datos</button>
+    {% if current_user.tiene_permiso('pagos_proveedores') or current_user.tiene_permiso('generar_costeo') %}
+      {% if imp.factura_pago %}
+      <a href="{{ url_for('pagos_proveedores_detalle', factura_id=imp.factura_pago.id) }}" class="btn btn-outline-success">
+        Ver factura en Pago Proveedores
+      </a>
+      {% else %}
+      <form method="post" action="{{ url_for('importacion_generar_factura', importacion_id=imp.id) }}"
+            onsubmit="return confirm('¿Generar la cuenta por pagar de esta importación en Pago Proveedores? Usa el N° y fecha de factura ya cargados aquí.');">
+        <button class="btn btn-outline-success" {{ 'disabled title=Carga primero N° y fecha de factura' if not imp.numero_factura or not imp.fecha_factura }}>
+          Generar factura
+        </button>
+      </form>
+      {% endif %}
+    {% endif %}
     <form method="post" action="{{ url_for('importaciones_eliminar', importacion_id=imp.id) }}" onsubmit="return confirm('¿Eliminar esta importación y todo su costeo?');">
       <button class="btn btn-outline-danger">Eliminar</button>
     </form>
