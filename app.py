@@ -2056,11 +2056,23 @@ def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, pr
     otra vez como su propia fila suelta con precio 0 (el resto viejo).
 
     Esta función resuelve ese duplicado apenas se detecta: si el producto
-    suelto nunca se usó en ninguna Orden de Compra ni Costeo, se ELIMINA (ya
-    quedó reemplazado por la variante); si ya se usó, se DESACTIVA en su
-    lugar (mismo criterio que la ruta /productos/<id>/eliminar) para no
-    perder ese historial. Nunca toca el producto padre real (producto_padre_id)
-    ni nada que ya tenga sus propias variantes."""
+    suelto nunca se usó en ninguna Orden de Compra, Costeo, Homologación de
+    Stock ni Existencia de Stock, se ELIMINA (ya quedó reemplazado por la
+    variante); si ya se usó en cualquiera de esos, se DESACTIVA en su lugar
+    (mismo criterio que la ruta /productos/<id>/eliminar) para no perder ese
+    historial ni violar ninguna llave foránea. Nunca toca el producto padre
+    real (producto_padre_id) ni nada que ya tenga sus propias variantes.
+
+    IMPORTANTE (incidente 2026-09-23): la primera versión de esta función
+    solo revisaba OrdenCompraLinea/ParcialLinea antes de decidir ELIMINAR, y
+    no revisaba HomologacionStock ni StockExistencia -- otras dos tablas que
+    también tienen una llave foránea hacia productos.id. Como varios de los
+    13 códigos 677MTYP duplicados SÍ estaban referenciados desde Homologación/
+    Existencia de Stock (por eso existían sueltos en primer lugar: venían de
+    un reporte de Ergopyme), el DELETE chocó con esa llave foránea y tumbó el
+    despliegue completo en producción. Por eso aquí se revisan TODAS las
+    tablas que referencian productos.id, sin excepción -- nunca asumir que
+    "no se usó en una orden" significa "no se usó en ningún lado"."""
     dup = Producto.query.filter(
         Producto.proveedor_id == proveedor_id,
         Producto.id != producto_padre_id,
@@ -2069,13 +2081,15 @@ def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, pr
     ).first()
     if not dup:
         return None
-    tiene_variantes_propias = ProductoVariante.query.filter_by(producto_id=dup.id).count() > 0
     en_uso = (
-        OrdenCompraLinea.query.filter_by(producto_id=dup.id).count() > 0
+        ProductoVariante.query.filter_by(producto_id=dup.id).count() > 0
+        or OrdenCompraLinea.query.filter_by(producto_id=dup.id).count() > 0
         or ParcialLinea.query.filter_by(producto_id=dup.id).count() > 0
+        or HomologacionStock.query.filter_by(producto_id=dup.id).count() > 0
+        or StockExistencia.query.filter_by(producto_id=dup.id).count() > 0
     )
     codigo = dup.codigo
-    if en_uso or tiene_variantes_propias:
+    if en_uso:
         dup.activo = False
     else:
         db.session.delete(dup)
@@ -2664,6 +2678,27 @@ def seed_administrador_inicial():
     )
 
 
+def _paso_arranque_seguro(nombre, funcion):
+    """Ronda AN (2026-09-23, incidente en producción): antes, un error
+    dentro de CUALQUIERA de estos pasos de arranque (seed_*/reparar_*) hacía
+    caer todo el proceso -- exactamente lo que tumbó producción cuando
+    _consolidar_producto_duplicado_en_variante intentó borrar un producto
+    que todavía tenía referencias desde otra tabla (violación de llave
+    foránea) y el worker de gunicorn nunca llegó a levantar. De ahora en
+    adelante, si un paso individual falla, se revierte SU transacción, se
+    imprime el error completo en el log de Railway (para poder
+    diagnosticarlo sin necesidad de reproducirlo aparte) y el arranque
+    CONTINÚA con el resto de los pasos -- un bug en un paso puntual ya no
+    puede dejar el sitio completo caído para todos los usuarios."""
+    try:
+        funcion()
+    except Exception:
+        db.session.rollback()
+        import traceback
+        print(f"[ARRANQUE] ERROR en '{nombre}' -- se omite este paso, el resto del arranque continúa normalmente:")
+        traceback.print_exc()
+
+
 with app.app_context():
     os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
     os.makedirs(DOCUMENTOS_DIR, exist_ok=True)
@@ -2671,20 +2706,20 @@ with app.app_context():
     os.makedirs(PDF_OC_DIR, exist_ok=True)
     os.makedirs(REPORTES_DIR, exist_ok=True)
     db.create_all()
-    ensure_schema_migrations()
-    seed_from_excel(app)
-    seed_empresas_compradoras()
-    seed_variantes_lentes_medicontur()
-    seed_variantes_lentes_physiol()
-    seed_homologacion_y_stock_inicial()
-    seed_administrador_inicial()
-    reparar_datos_ronda_w()
-    reparar_variantes_medicontur_ronda_ae()
-    reparar_variantes_medicontur_ronda_ag()
-    reparar_variantes_physiol_ronda_ae()
-    seed_codigos_ergopyme()
-    seed_compras_historicas()
-    seed_facturas_proveedor_pendientes()
+    _paso_arranque_seguro("ensure_schema_migrations", ensure_schema_migrations)
+    _paso_arranque_seguro("seed_from_excel", lambda: seed_from_excel(app))
+    _paso_arranque_seguro("seed_empresas_compradoras", seed_empresas_compradoras)
+    _paso_arranque_seguro("seed_variantes_lentes_medicontur", seed_variantes_lentes_medicontur)
+    _paso_arranque_seguro("seed_variantes_lentes_physiol", seed_variantes_lentes_physiol)
+    _paso_arranque_seguro("seed_homologacion_y_stock_inicial", seed_homologacion_y_stock_inicial)
+    _paso_arranque_seguro("seed_administrador_inicial", seed_administrador_inicial)
+    _paso_arranque_seguro("reparar_datos_ronda_w", reparar_datos_ronda_w)
+    _paso_arranque_seguro("reparar_variantes_medicontur_ronda_ae", reparar_variantes_medicontur_ronda_ae)
+    _paso_arranque_seguro("reparar_variantes_medicontur_ronda_ag", reparar_variantes_medicontur_ronda_ag)
+    _paso_arranque_seguro("reparar_variantes_physiol_ronda_ae", reparar_variantes_physiol_ronda_ae)
+    _paso_arranque_seguro("seed_codigos_ergopyme", seed_codigos_ergopyme)
+    _paso_arranque_seguro("seed_compras_historicas", seed_compras_historicas)
+    _paso_arranque_seguro("seed_facturas_proveedor_pendientes", seed_facturas_proveedor_pendientes)
 
 
 # ---------------------------------------------------------------------------
