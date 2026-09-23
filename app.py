@@ -2110,6 +2110,75 @@ def _filtro_ordenar_variantes(variantes):
     return _ordenar_variantes(variantes)
 
 
+def _migrar_historial_producto_a_variante(dup, variante, padre):
+    """Ronda AN (2026-09-23, mejora, a pedido del usuario): en vez de dejar
+    un producto duplicado DESACTIVADO para siempre nada más porque tiene
+    historial (se ve "suelto" y feo en el catálogo aunque esté en gris), se
+    traslada ese historial hacia la variante que lo reemplaza -- así el
+    duplicado puede eliminarse de verdad.
+
+    - HomologacionStock y StockExistencia: se re-apuntan de forma segura a
+      (producto_id=padre.id, variante_id=variante.id) -- exactamente el
+      mismo patrón que ya usa seed_homologacion_y_stock_inicial() para
+      cualquier código homologado por variante. Estas dos tablas no
+      calculan nada a partir de Producto.empaque, así que no hay ningún
+      riesgo de alterar un valor ya mostrado.
+    - OrdenCompraLinea y ParcialLinea: el código/descripción que se
+      muestra en pantalla NO cambia (quedan guardados como snapshot,
+      variante_codigo/variante_descripcion o codigo/descripcion según la
+      tabla), PERO OrdenCompraLinea.cantidad_unidades se calcula EN VIVO a
+      partir de producto.empaque -- si el duplicado y el padre real
+      tuvieran un empaque distinto, mover la línea cambiaría en silencio
+      una cantidad ya facturada en el pasado. Por seguridad, esas líneas
+      SOLO se mueven cuando el empaque coincide exactamente; si no
+      coincide, se dejan intactas (el producto seguirá sin poder
+      eliminarse del todo, pero nunca se corrompe un historial ya
+      guardado)."""
+    HomologacionStock.query.filter_by(producto_id=dup.id).update(
+        {"producto_id": padre.id, "variante_id": variante.id}
+    )
+    StockExistencia.query.filter_by(producto_id=dup.id).update(
+        {"producto_id": padre.id, "variante_id": variante.id}
+    )
+    if dup.empaque == padre.empaque:
+        for linea in OrdenCompraLinea.query.filter_by(producto_id=dup.id).all():
+            if not linea.variante_codigo:
+                linea.variante_codigo = dup.codigo
+                linea.variante_descripcion = dup.descripcion
+            linea.producto_id = padre.id
+        ParcialLinea.query.filter_by(producto_id=dup.id).update({"producto_id": padre.id})
+
+
+def _resolver_producto_posible_duplicado(producto):
+    """Ronda AN (2026-09-23, mejora): true (y lo elimina) si `producto` es en
+    realidad un código "suelto" que ya existe como ProductoVariante de OTRO
+    producto padre en este mismo proveedor -- el patrón exacto de los 13
+    códigos 677MTYP*: quedaron cargados como su propio Producto
+    independiente en vez de como variante, y al homologarse (ver
+    reparar_variantes_medicontur_ronda_ag/reparar_variantes_physiol_ronda_ae)
+    quedaron duplicados en el catálogo. Traslada su historial con
+    _migrar_historial_producto_a_variante() y lo elimina de verdad. Devuelve
+    False (sin tocar nada) si no hay una variante correspondiente, si el
+    propio "duplicado" tiene sus propias variantes (no es un caso simple), o
+    si todavía queda historial que no se pudo trasladar de forma segura --
+    en ese caso el llamador sigue el flujo normal (desactivar)."""
+    if ProductoVariante.query.filter_by(producto_id=producto.id).count() > 0:
+        return False
+    variante = ProductoVariante.query.join(Producto).filter(
+        Producto.proveedor_id == producto.proveedor_id,
+        ProductoVariante.producto_id != producto.id,
+        db.func.upper(ProductoVariante.codigo) == (producto.codigo or "").strip().upper(),
+    ).first()
+    if not variante:
+        return False
+    padre = variante.producto
+    _migrar_historial_producto_a_variante(producto, variante, padre)
+    if _producto_en_uso(producto.id):
+        return False
+    db.session.delete(producto)
+    return True
+
+
 def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, producto_padre_id):
     """Ronda AN (2026-09-23, mejora): cuando una variante se homologa bajo su
     código padre (ver reparar_variantes_medicontur_ronda_ag / reparar_variantes_
@@ -2123,13 +2192,15 @@ def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, pr
     DUPLICADO en el catálogo: una vez como variante (correcto, agrupado) y
     otra vez como su propia fila suelta con precio 0 (el resto viejo).
 
-    Esta función resuelve ese duplicado apenas se detecta: si el producto
-    suelto nunca se usó en ninguna Orden de Compra, Costeo, Homologación de
-    Stock ni Existencia de Stock, se ELIMINA (ya quedó reemplazado por la
-    variante); si ya se usó en cualquiera de esos, se DESACTIVA en su lugar
-    (mismo criterio que la ruta /productos/<id>/eliminar) para no perder ese
-    historial ni violar ninguna llave foránea. Nunca toca el producto padre
-    real (producto_padre_id) ni nada que ya tenga sus propias variantes.
+    Esta función resuelve ese duplicado apenas se detecta, intentando primero
+    trasladar su historial hacia la variante (_resolver_producto_posible_
+    duplicado) para poder ELIMINARLO de verdad; si todavía queda algo de
+    historial que no se pudo trasladar de forma segura, se DESACTIVA en su
+    lugar (mismo criterio que la ruta /productos/<id>/eliminar) para no
+    perder ese historial ni violar ninguna llave foránea. No filtra por
+    Producto.activo: así, un duplicado que quedó desactivado en un
+    despliegue anterior se vuelve a intentar eliminar en cada arranque, sin
+    necesidad de ningún script aparte.
 
     IMPORTANTE (incidente 2026-09-23): la primera versión de esta función
     solo revisaba OrdenCompraLinea/ParcialLinea antes de decidir ELIMINAR, y
@@ -2145,16 +2216,13 @@ def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, pr
         Producto.proveedor_id == proveedor_id,
         Producto.id != producto_padre_id,
         db.func.upper(Producto.codigo) == codigo_variante.strip().upper(),
-        Producto.activo.is_(True),
     ).first()
     if not dup:
         return None
     codigo = dup.codigo
-    tiene_variantes_propias = ProductoVariante.query.filter_by(producto_id=dup.id).count() > 0
-    if tiene_variantes_propias or _producto_en_uso(dup.id):
-        dup.activo = False
-    else:
-        db.session.delete(dup)
+    if _resolver_producto_posible_duplicado(dup):
+        return codigo
+    dup.activo = False
     return codigo
 
 
@@ -3697,20 +3765,35 @@ def productos_eliminar(producto_id):
     ParcialLinea, no Homologación/Existencia de Stock, así que un usuario
     podía toparse con el mismo error de llave foránea (Internal Server
     Error) al intentar eliminar un producto ya vinculado a Homologación.
-    Ahora usa _producto_en_uso(), que revisa las 5 tablas."""
+    Ahora usa _producto_en_uso(), que revisa las 5 tablas.
+
+    Mejora (mismo día, a pedido del usuario): si este producto es en
+    realidad un código "suelto" que ya existe como variante de otro código
+    padre (el patrón de los 13 códigos 677MTYP*), primero se intenta
+    trasladar su historial hacia esa variante y eliminarlo de verdad, en
+    vez de dejarlo desactivado para siempre viéndose "suelto" en el
+    catálogo -- ver _resolver_producto_posible_duplicado()."""
     producto = Producto.query.get_or_404(producto_id)
     proveedor_id = producto.proveedor_id
+    codigo = producto.codigo
+    if _resolver_producto_posible_duplicado(producto):
+        db.session.commit()
+        flash(
+            f"'{codigo}' era un código suelto que ya existía como variante agrupada -- se trasladó su "
+            "historial a esa variante y se eliminó del catálogo.",
+            "success",
+        )
+        return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
     if _producto_en_uso(producto.id):
         producto.activo = False
         db.session.commit()
         flash(
-            f"'{producto.codigo}' ya se usó en alguna orden o costeo: no se puede eliminar sin perder "
-            "ese historial, así que se desactivó en su lugar.",
+            f"'{codigo}' ya tiene historial vinculado (Orden de Compra, Costeo, Homologación o Existencia "
+            "de Stock): no se puede eliminar sin perder ese historial, así que se desactivó en su lugar.",
             "warning",
         )
     else:
         ProductoVariante.query.filter_by(producto_id=producto.id).delete()
-        codigo = producto.codigo
         db.session.delete(producto)
         db.session.commit()
         flash(f"Producto '{codigo}' eliminado del catálogo.", "success")
