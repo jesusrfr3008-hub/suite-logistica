@@ -23,6 +23,10 @@
      class="btn btn-sm {{ 'btn-brand' if ver == 'todos' else 'btn-outline-secondary' }}">
     Todos
   </a>
+  <a href="{{ url_for('stock_homologacion', ver='sin_codigo_interno') }}"
+     class="btn btn-sm {{ 'btn-brand' if ver == 'sin_codigo_interno' else 'btn-outline-secondary' }}">
+    Sin código Ergopyme <span class="badge bg-light text-dark">{{ total_sin_codigo_interno }}</span>
+  </a>
 </div>
 <div class="text-muted small mb-3">
   {% if ver == 'pendiente' %}
@@ -32,12 +36,75 @@
   {% elif ver == 'sin_marca' %}
   Mostrando solo los códigos ya clasificados como <strong>"Sin Marca"</strong> (genéricos, sin
   proveedor asignado).
+  {% elif ver == 'sin_codigo_interno' %}
+  Mostrando los productos/variantes de <strong>nuestro catálogo</strong> que todavía NO tienen su
+  propio código interno Ergopyme asignado -- dirección inversa a las otras pestañas: acá el código
+  interno es el que falta, no el producto. Sin asignarlo, el código queda afuera de la planilla de
+  Costeo que se sube a Ergopyme.
   {% else %}
   Mostrando <strong>todos</strong>: pendientes y "Sin Marca".
   {% endif %}
 </div>
 
-{% if not pendientes %}
+{% if ver == 'sin_codigo_interno' %}
+  {% if not sin_codigo_productos and not sin_codigo_variantes %}
+  <div class="alert alert-success">Todos los productos y variantes activos ya tienen código interno Ergopyme asignado.</div>
+  {% else %}
+  <div class="card p-3">
+    <div class="table-responsive" style="max-height: 560px; overflow-y: auto;">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead class="sticky-top bg-white">
+          <tr>
+            <th>Tipo</th>
+            <th>Proveedor</th>
+            <th>Código</th>
+            <th>Descripción</th>
+            <th>Código interno Ergopyme</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in sin_codigo_productos %}
+          <tr>
+            <td><span class="badge bg-secondary">Producto</span></td>
+            <td>{{ p.proveedor.nombre }}</td>
+            <td>{{ p.codigo }}</td>
+            <td style="max-width: 320px;">{{ p.descripcion }}</td>
+            <td colspan="2">
+              <form method="post" action="{{ url_for('stock_homologacion_asignar_codigo_interno') }}" class="d-flex gap-2">
+                <input type="hidden" name="ver" value="sin_codigo_interno">
+                <input type="hidden" name="producto_id" value="{{ p.id }}">
+                <input type="text" class="form-control form-control-sm" name="codigo_interno" placeholder="Código interno Ergopyme" required>
+                <button type="submit" class="btn btn-sm btn-brand text-nowrap">Asignar</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          {% for v in sin_codigo_variantes %}
+          <tr>
+            <td><span class="badge bg-info text-dark">Variante</span></td>
+            <td>{{ v.producto.proveedor.nombre }}</td>
+            <td>{{ v.codigo }} <span class="text-muted small">(padre: {{ v.producto.codigo }})</span></td>
+            <td style="max-width: 320px;">{{ v.descripcion }}</td>
+            <td colspan="2">
+              <form method="post" action="{{ url_for('stock_homologacion_asignar_codigo_interno') }}" class="d-flex gap-2">
+                <input type="hidden" name="ver" value="sin_codigo_interno">
+                <input type="hidden" name="producto_id" value="{{ v.producto_id }}">
+                <input type="hidden" name="variante_id" value="{{ v.id }}">
+                <input type="text" class="form-control form-control-sm" name="codigo_interno" placeholder="Código interno Ergopyme" required>
+                <button type="submit" class="btn btn-sm btn-brand text-nowrap">Asignar</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+{% endif %}
+
+{% if ver != 'sin_codigo_interno' and not pendientes %}
 <div class="alert alert-success">
   {% if ver == 'pendiente' %}No hay códigos pendientes por resolver.
   {% elif ver == 'sin_marca' %}No hay códigos "Sin Marca" cargados.

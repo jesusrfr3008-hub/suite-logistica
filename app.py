@@ -469,6 +469,7 @@ def ensure_schema_migrations():
         ],
         "productos": [
             ("codigo_interno_inventario", "VARCHAR(40)"),
+            ("unidad_medida", "VARCHAR(30)"),
         ],
         "producto_variantes": [
             ("codigo_interno_inventario", "VARCHAR(40)"),
@@ -3372,20 +3373,53 @@ def proveedores_detalle(proveedor_id):
 @app.route("/proveedores/<int:proveedor_id>/productos/nuevo", methods=["POST"])
 @requiere_permiso("crear_orden", "generar_costeo")
 def productos_nuevo(proveedor_id):
+    """Ronda AN (2026-09-23): a pedido del usuario, esta pantalla antes solo
+    permitia crear un Producto ("codigo padre") independiente -- si el
+    codigo nuevo era en realidad una VARIANTE de un codigo padre ya
+    existente (ej. una dioptria especifica de un lente), quedaba cargado
+    suelto, sin la asociacion, y no podia elegirse "por la variante" al
+    armar una Orden de Compra. Ahora el formulario permite marcar "Es una
+    variante de un codigo padre existente": en ese caso se crea una fila en
+    ProductoVariante (ligada al Producto padre elegido, sin precio propio --
+    usa siempre el del padre, mismo mecanismo ya usado para MEDICONTUR/
+    PHYSIOL) en vez de un Producto nuevo."""
     prov = Proveedor.query.get_or_404(proveedor_id)
-    producto = Producto(
-        proveedor_id=prov.id,
-        codigo=request.form["codigo"].strip(),
-        descripcion=request.form["descripcion"].strip(),
-        empaque=int(request.form.get("empaque") or 1),
-        moneda=request.form.get("moneda", prov.moneda_default or "USD"),
-        precio_caja=float(request.form.get("precio_caja") or 0),
-        precio_unitario=float(request.form.get("precio_unitario") or 0),
-        activo=True,
-    )
-    db.session.add(producto)
-    db.session.commit()
-    flash(f"Producto '{producto.codigo}' agregado al catalogo de {prov.nombre}.", "success")
+    codigo = request.form["codigo"].strip()
+    descripcion = request.form["descripcion"].strip()
+    es_variante = request.form.get("es_variante") == "1"
+
+    if es_variante:
+        padre_id = request.form.get("producto_padre_id") or None
+        if not padre_id:
+            flash("Selecciona el código padre del que este código es variante.", "warning")
+            return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+        padre = Producto.query.get_or_404(padre_id)
+        if padre.proveedor_id != prov.id:
+            flash("El código padre debe pertenecer a este mismo proveedor.", "danger")
+            return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+        variante = ProductoVariante(producto_id=padre.id, codigo=codigo, descripcion=descripcion)
+        db.session.add(variante)
+        db.session.commit()
+        flash(
+            f"Variante '{codigo}' agregada bajo el código padre '{padre.codigo}' -- ya puede elegirse "
+            "por esta variante al armar una Orden de Compra (usa el precio del código padre).",
+            "success",
+        )
+    else:
+        producto = Producto(
+            proveedor_id=prov.id,
+            codigo=codigo,
+            descripcion=descripcion,
+            empaque=int(request.form.get("empaque") or 1),
+            moneda=request.form.get("moneda", prov.moneda_default or "USD"),
+            precio_caja=float(request.form.get("precio_caja") or 0),
+            precio_unitario=float(request.form.get("precio_unitario") or 0),
+            unidad_medida=(request.form.get("unidad_medida") or "").strip() or None,
+            activo=True,
+        )
+        db.session.add(producto)
+        db.session.commit()
+        flash(f"Producto '{producto.codigo}' agregado al catalogo de {prov.nombre}.", "success")
     return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
 
 
@@ -3399,6 +3433,7 @@ def productos_editar(producto_id):
     producto.moneda = request.form.get("moneda", "USD")
     producto.precio_caja = float(request.form.get("precio_caja") or 0)
     producto.precio_unitario = float(request.form.get("precio_unitario") or 0)
+    producto.unidad_medida = (request.form.get("unidad_medida") or "").strip() or None
     producto.activo = "activo" in request.form
     db.session.commit()
     flash(f"Producto '{producto.codigo}' actualizado.", "success")
@@ -3435,6 +3470,172 @@ def productos_eliminar(producto_id):
         db.session.commit()
         flash(f"Producto '{codigo}' eliminado del catálogo.", "success")
     return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+
+
+_ENCABEZADOS_CATALOGO_PROVEEDOR = [
+    "Código", "Descripción", "Empaque", "Moneda", "Precio/Caja", "Precio/Unidad",
+    "Unidad de medida", "Activo",
+]
+
+
+@app.route("/proveedores/<int:proveedor_id>/productos/exportar")
+@requiere_permiso("crear_orden", "generar_costeo")
+def productos_exportar(proveedor_id):
+    """Ronda AN (2026-09-23): descarga el catalogo completo (Producto, no
+    incluye ProductoVariante) de un proveedor a Excel -- codigo, descripcion,
+    empaque, moneda, precios y unidad de medida -- para que el usuario pueda
+    revisar/actualizar precios fuera del sistema y volver a cargar el mismo
+    archivo con /productos/importar."""
+    prov = Proveedor.query.get_or_404(proveedor_id)
+    productos = prov.productos.order_by(Producto.codigo).all()
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Catalogo"
+    for col, titulo in enumerate(_ENCABEZADOS_CATALOGO_PROVEEDOR, start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True)
+    for fila, p in enumerate(productos, start=2):
+        ws.cell(row=fila, column=1, value=p.codigo)
+        ws.cell(row=fila, column=2, value=p.descripcion)
+        ws.cell(row=fila, column=3, value=p.empaque)
+        ws.cell(row=fila, column=4, value=p.moneda)
+        ws.cell(row=fila, column=5, value=p.precio_caja)
+        ws.cell(row=fila, column=6, value=p.precio_unitario)
+        ws.cell(row=fila, column=7, value=p.unidad_medida or "")
+        ws.cell(row=fila, column=8, value="Sí" if p.activo else "No")
+    ws.auto_filter.ref = f"A1:H{max(len(productos) + 1, 1)}"
+    for col in range(1, 9):
+        ws.column_dimensions[get_column_letter(col)].width = 22
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    nombre_archivo = f"Catalogo_{prov.nombre}.xlsx".replace("/", "-").replace(" ", "_")
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre_archivo,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/proveedores/<int:proveedor_id>/productos/importar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
+def productos_importar(proveedor_id):
+    """Ronda AN (2026-09-23): carga masiva de precios/productos nuevos para
+    UN proveedor, desde un Excel con las mismas columnas de /productos/
+    exportar (no hace falta que vengan todas -- si falta Unidad de medida u
+    otra opcional, se ignora). Comportamiento confirmado por el usuario:
+    actualiza (por Código, sin distinguir mayúsculas/minúsculas) los
+    productos que ya existen y agrega como nuevos los códigos que no estén
+    en el catálogo -- NUNCA desactiva ni borra un producto que no venga en
+    el archivo (a diferencia de la carga de Stock, que sí reemplaza todo).
+    Un código que aparece más de una vez en el archivo usa la ÚLTIMA fila."""
+    prov = Proveedor.query.get_or_404(proveedor_id)
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona un archivo Excel para cargar.", "warning")
+        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls"):
+        flash("El archivo debe ser Excel (.xlsx o .xls).", "warning")
+        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+
+    try:
+        wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
+        ws = wb.worksheets[0]
+    except Exception:
+        flash("No se pudo leer el archivo -- confirma que sea un Excel válido.", "danger")
+        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+
+    # Encabezado por NOMBRE de columna (no por posicion fija), tolerante a
+    # mayusculas/acentos, para que no se rompa si el usuario reordena
+    # columnas al editar el archivo descargado.
+    def _norm(s):
+        s = str(s or "").strip().lower()
+        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+        return s
+
+    filas = list(ws.iter_rows(values_only=True))
+    if not filas:
+        flash("El archivo está vacío.", "warning")
+        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+
+    encabezado = {_norm(v): i for i, v in enumerate(filas[0]) if v}
+    col_codigo = encabezado.get("codigo")
+    if col_codigo is None:
+        flash("El archivo debe tener una columna 'Código'.", "danger")
+        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+    col_desc = encabezado.get("descripcion")
+    col_empaque = encabezado.get("empaque")
+    col_moneda = encabezado.get("moneda")
+    col_precio_caja = encabezado.get("precio/caja") or encabezado.get("precio caja")
+    col_precio_unidad = encabezado.get("precio/unidad") or encabezado.get("precio unidad")
+    col_unidad_medida = encabezado.get("unidad de medida")
+
+    def _valor(row, col):
+        if col is None or col >= len(row):
+            return None
+        return row[col]
+
+    productos_actuales = {p.codigo.strip().upper(): p for p in prov.productos}
+    actualizados = 0
+    creados = 0
+    omitidos = 0
+    for row in filas[1:]:
+        if not row or _valor(row, col_codigo) in (None, ""):
+            continue
+        codigo = str(_valor(row, col_codigo)).strip()
+        if not codigo:
+            continue
+        descripcion = str(_valor(row, col_desc)).strip() if _valor(row, col_desc) not in (None, "") else None
+        empaque = _valor(row, col_empaque)
+        moneda = str(_valor(row, col_moneda)).strip() if _valor(row, col_moneda) not in (None, "") else None
+        precio_caja = _valor(row, col_precio_caja)
+        precio_unitario = _valor(row, col_precio_unidad)
+        unidad_medida = str(_valor(row, col_unidad_medida)).strip() if _valor(row, col_unidad_medida) not in (None, "") else None
+
+        existente = productos_actuales.get(codigo.upper())
+        try:
+            if existente:
+                if descripcion:
+                    existente.descripcion = descripcion
+                if empaque not in (None, ""):
+                    existente.empaque = int(empaque)
+                if moneda:
+                    existente.moneda = moneda
+                if precio_caja not in (None, ""):
+                    existente.precio_caja = float(precio_caja)
+                if precio_unitario not in (None, ""):
+                    existente.precio_unitario = float(precio_unitario)
+                if unidad_medida:
+                    existente.unidad_medida = unidad_medida
+                actualizados += 1
+            else:
+                nuevo = Producto(
+                    proveedor_id=prov.id,
+                    codigo=codigo,
+                    descripcion=descripcion or codigo,
+                    empaque=int(empaque) if empaque not in (None, "") else 1,
+                    moneda=moneda or prov.moneda_default or "USD",
+                    precio_caja=float(precio_caja) if precio_caja not in (None, "") else 0,
+                    precio_unitario=float(precio_unitario) if precio_unitario not in (None, "") else 0,
+                    unidad_medida=unidad_medida,
+                    activo=True,
+                )
+                db.session.add(nuevo)
+                db.session.flush()
+                productos_actuales[codigo.upper()] = nuevo
+                creados += 1
+        except (TypeError, ValueError):
+            omitidos += 1
+            continue
+
+    db.session.commit()
+    mensaje = f"Catálogo de {prov.nombre}: {actualizados} código(s) actualizado(s), {creados} código(s) nuevo(s) agregado(s)."
+    if omitidos:
+        mensaje += f" {omitidos} fila(s) se omitieron por datos inválidos (precio/empaque no numérico)."
+    flash(mensaje, "success" if not omitidos else "warning")
+    return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
 
 
 # ---------------------------------------------------------------------------
@@ -7945,24 +8146,52 @@ def stock_homologacion():
     NO viéndolos por defecto (le ensucian la pantalla de códigos realmente
     nuevos por resolver). Por defecto ahora solo se muestran los
     'pendiente' -- ?ver=sin_marca (o ?ver=todos) trae de vuelta los otros
-    dos casos para cuando sí quiera revisarlos/reasignarlos."""
+    dos casos para cuando sí quiera revisarlos/reasignarlos.
+
+    Ronda AN (2026-09-23): ?ver=sin_codigo_interno muestra la dirección
+    INVERSA -- productos/variantes de NUESTRO catálogo que todavía no
+    tienen su propio código interno Ergopyme asignado (nunca aparecieron en
+    un reporte de Inventarios, así que HomologacionStock no los conoce).
+    Sin ese código quedan afuera de la planilla de Costeo que se sube a
+    Ergopyme (columna CODIGO vacía) -- a pedido del usuario, para poder
+    encontrarlos y asignarlos proactivamente en vez de descubrirlos recién
+    al armar el Costeo."""
     ver = request.args.get("ver", "pendiente").strip().lower()
     if ver == "todos":
         estados = ["pendiente", "sin_marca"]
     elif ver == "sin_marca":
         estados = ["sin_marca"]
+    elif ver == "sin_codigo_interno":
+        estados = []
     else:
         ver = "pendiente"
         estados = ["pendiente"]
-    pendientes = HomologacionStock.query.filter(
-        HomologacionStock.estado.in_(estados)
-    ).order_by(HomologacionStock.estado, HomologacionStock.codigo_interno).all()
+    pendientes = (
+        HomologacionStock.query.filter(HomologacionStock.estado.in_(estados))
+        .order_by(HomologacionStock.estado, HomologacionStock.codigo_interno)
+        .all()
+        if estados else []
+    )
     total_sin_marca = HomologacionStock.query.filter_by(estado="sin_marca").count()
     total_pendiente = HomologacionStock.query.filter_by(estado="pendiente").count()
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
+
+    sin_codigo_productos = (
+        Producto.query.filter(Producto.activo.is_(True), Producto.codigo_interno_inventario.is_(None))
+        .order_by(Producto.codigo).all()
+    )
+    sin_codigo_variantes = (
+        ProductoVariante.query.join(Producto)
+        .filter(Producto.activo.is_(True), ProductoVariante.codigo_interno_inventario.is_(None))
+        .order_by(ProductoVariante.codigo).all()
+    )
+    total_sin_codigo_interno = len(sin_codigo_productos) + len(sin_codigo_variantes)
+
     return render_template(
         "stock/homologacion.html", pendientes=pendientes, proveedores=proveedores,
         ver=ver, total_sin_marca=total_sin_marca, total_pendiente=total_pendiente,
+        sin_codigo_productos=sin_codigo_productos, sin_codigo_variantes=sin_codigo_variantes,
+        total_sin_codigo_interno=total_sin_codigo_interno,
     )
 
 

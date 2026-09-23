@@ -211,6 +211,15 @@ class Producto(db.Model):
     precio_unitario = db.Column(db.Float, default=0)
     activo = db.Column(db.Boolean, default=True)
 
+    # Ronda AN (2026-09-23): unidad de medida del producto (ej. "Unidad",
+    # "Caja", "Par", "Kit") -- a pedido del usuario, para la exportacion/
+    # importacion masiva de productos por proveedor (ver /proveedores/
+    # <id>/productos/exportar e /importar en app.py). Queda en blanco hasta
+    # que se completa a mano o via esa carga masiva -- no afecta ningun
+    # calculo existente (precio_caja/precio_unitario siguen siendo la fuente
+    # de verdad para costos).
+    unidad_medida = db.Column(db.String(30))
+
     # Ronda V (2026-09-12): codigo interno con el que este producto se
     # identifica en el OTRO sistema de la empresa (ventas/inventario,
     # "Ergopyme") -- se homologa una vez (ver seed_homologacion_y_stock_
