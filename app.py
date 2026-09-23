@@ -2179,6 +2179,41 @@ def _resolver_producto_posible_duplicado(producto):
     return True
 
 
+def _migrar_historial_producto_a_producto(origen, destino):
+    """Ronda AN (2026-09-23, mejora, a pedido del usuario): fusión MANUAL de
+    dos códigos de un mismo proveedor que en realidad son el mismo ítem
+    (ej. '8685' con descripción mal cargada "0008685 WECK-CEL SPEAR 10
+    PACK" vs '0008685', el código correcto del catálogo, con un costeo
+    reciente). A diferencia de _migrar_historial_producto_a_variante (que
+    resuelve automáticamente el caso "código suelto == código de una
+    variante ya agrupada"), este caso no se puede detectar solo -- dos
+    Producto independientes con textos de código distintos -- así que lo
+    dispara un administrador desde "Editar producto > Fusionar con otro
+    código". Mismo mecanismo y mismos resguardos que la migración a
+    variante:
+
+    - Si `origen` tenía sus propias ProductoVariante, se re-asignan a
+      `destino` (quedan igual, solo cambia su padre).
+    - HomologacionStock y StockExistencia se re-apuntan siempre a
+      `destino` -- no dependen de nada calculado en vivo.
+    - OrdenCompraLinea y ParcialLinea SOLO se mueven cuando el empaque de
+      `origen` y `destino` coincide exactamente (OrdenCompraLinea.
+      cantidad_unidades se calcula en vivo a partir de producto.empaque;
+      moverla con un empaque distinto alteraría en silencio una cantidad
+      ya facturada). Si no coincide, esas líneas quedan intactas y
+      `origen` no podrá eliminarse del todo (el llamador lo desactiva)."""
+    ProductoVariante.query.filter_by(producto_id=origen.id).update({"producto_id": destino.id})
+    HomologacionStock.query.filter_by(producto_id=origen.id).update({"producto_id": destino.id})
+    StockExistencia.query.filter_by(producto_id=origen.id).update({"producto_id": destino.id})
+    if origen.empaque == destino.empaque:
+        for linea in OrdenCompraLinea.query.filter_by(producto_id=origen.id).all():
+            if not linea.variante_codigo:
+                linea.variante_codigo = origen.codigo
+                linea.variante_descripcion = origen.descripcion
+            linea.producto_id = destino.id
+        ParcialLinea.query.filter_by(producto_id=origen.id).update({"producto_id": destino.id})
+
+
 def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, producto_padre_id):
     """Ronda AN (2026-09-23, mejora): cuando una variante se homologa bajo su
     código padre (ver reparar_variantes_medicontur_ronda_ag / reparar_variantes_
@@ -3800,6 +3835,58 @@ def productos_eliminar(producto_id):
     return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
 
 
+@app.route("/productos/<int:producto_id>/fusionar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
+def productos_fusionar(producto_id):
+    """Ronda AN (2026-09-23, mejora, a pedido del usuario): fusión MANUAL de
+    dos códigos de un mismo proveedor que en realidad son el mismo ítem
+    (ej. '8685', con una descripción mal cargada, vs '0008685', el código
+    correcto que ya tiene un costeo reciente). A diferencia del caso
+    automático 677MTYP* (donde el código duplicado coincide EXACTO con una
+    variante ya agrupada), acá los dos textos de código son distintos y
+    nadie más que un administrador puede confirmar que son el mismo
+    producto -- por eso esta acción es manual, desde "Editar producto >
+    Fusionar con otro código" (ver modal en proveedores/detalle.html).
+
+    `producto_id` es el código que se quiere ELIMINAR (el duplicado/mal
+    cargado); `producto_destino_id` (del formulario) es el código
+    CORRECTO que se queda con todo el historial. Ver
+    _migrar_historial_producto_a_producto() para el detalle de qué se
+    traslada y qué resguardo de empaque aplica."""
+    origen = Producto.query.get_or_404(producto_id)
+    destino_id = request.form.get("producto_destino_id", type=int)
+    destino = Producto.query.get(destino_id) if destino_id else None
+    if not destino or destino.id == origen.id:
+        flash("Selecciona un código destino válido (distinto del que se va a fusionar).", "danger")
+        return redirect(url_for("proveedores_detalle", proveedor_id=origen.proveedor_id))
+    if destino.proveedor_id != origen.proveedor_id:
+        flash("Solo se puede fusionar con un código del mismo proveedor.", "danger")
+        return redirect(url_for("proveedores_detalle", proveedor_id=origen.proveedor_id))
+
+    codigo_origen = origen.codigo
+    codigo_destino = destino.codigo
+    proveedor_id = origen.proveedor_id
+    _migrar_historial_producto_a_producto(origen, destino)
+    if _producto_en_uso(origen.id) or ProductoVariante.query.filter_by(producto_id=origen.id).count() > 0:
+        origen.activo = False
+        db.session.commit()
+        flash(
+            f"Se trasladó lo que se pudo del historial de '{codigo_origen}' hacia '{codigo_destino}', pero "
+            f"quedó algo sin poder moverse (probablemente el empaque no coincide) -- '{codigo_origen}' quedó "
+            "desactivado en vez de eliminado, para no alterar una cantidad ya facturada.",
+            "warning",
+        )
+    else:
+        db.session.delete(origen)
+        db.session.commit()
+        flash(
+            f"'{codigo_origen}' se fusionó con '{codigo_destino}': su historial (Homologación, Existencia de "
+            "Stock, Órdenes de Compra/Costeo) quedó trasladado y el código duplicado se eliminó del catálogo.",
+            "success",
+        )
+    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+
+
 _ENCABEZADOS_CATALOGO_PROVEEDOR = [
     "Código", "Descripción", "Empaque", "Moneda", "Precio/Caja", "Precio/Unidad",
     "Unidad de medida", "Activo",
@@ -3971,7 +4058,7 @@ def productos_importar(proveedor_id):
 # ---------------------------------------------------------------------------
 
 @app.route("/ordenes")
-@requiere_permiso("crear_orden", "aprobar_orden")
+@requiere_permiso("crear_orden", "aprobar_orden", "actualizar_despacho")
 def ordenes_list():
     estado = request.args.get("estado", "")
     proveedor_id = request.args.get("proveedor_id", "")
@@ -4646,8 +4733,18 @@ def api_producto_variantes(producto_id):
 
 
 @app.route("/ordenes/<int:orden_id>")
-@requiere_permiso("crear_orden", "aprobar_orden")
+@requiere_permiso("crear_orden", "aprobar_orden", "actualizar_despacho")
 def ordenes_detalle(orden_id):
+    # Ronda AN (2026-09-23, corrección, a pedido del usuario): esta pantalla
+    # (y el listado /ordenes) estaban SOLO bajo crear_orden/aprobar_orden --
+    # un usuario con únicamente actualizar_despacho no podía ni siquiera
+    # VER una Orden de Compra ya aprobada, así que nunca llegaba a ver el
+    # botón "Confirmar" (el paso que la deja lista para asociarse a un
+    # Despacho), aunque esa acción específica sí le está permitida (ver
+    # ordenes_linea_confirmar / puede_confirmar_linea en el template). El
+    # resto de acciones de esta pantalla (editar, aprobar, agregar producto,
+    # anular, etc.) siguen exclusivas de crear_orden/aprobar_orden -- el
+    # template ya las gatea por separado con puede_crear/puede_aprobar.
     orden = OrdenCompra.query.get_or_404(orden_id)
     lineas = orden.lineas.all()
     documentos = orden.documentos.all()
@@ -4933,8 +5030,15 @@ def ordenes_lineas_fecha_masiva(orden_id):
 # --- Etapas por linea ---
 
 @app.route("/ordenes/<int:orden_id>/linea/<int:linea_id>/confirmar", methods=["POST"])
-@requiere_permiso("aprobar_orden")
+@requiere_permiso("aprobar_orden", "actualizar_despacho")
 def ordenes_linea_confirmar(orden_id, linea_id):
+    # Ronda AN (2026-09-23, corrección, a pedido del usuario): este paso
+    # ("Confirmar", el que deja la línea lista para asociarse a un Despacho)
+    # estaba SOLO bajo aprobar_orden -- un usuario con el permiso
+    # actualizar_despacho, sin aprobar_orden, no podía pasar una orden ya
+    # aprobada a despacho porque nunca veía la opción de confirmar. Ahora
+    # cualquiera de los dos permisos alcanza (ver también templates/ordenes/
+    # detalle.html, puede_confirmar_linea).
     linea = OrdenCompraLinea.query.get_or_404(linea_id)
     orden = linea.orden
     if not _orden_aprobada(orden):
@@ -4958,7 +5062,7 @@ def ordenes_linea_confirmar(orden_id, linea_id):
 
 
 @app.route("/ordenes/<int:orden_id>/lineas/confirmar-masivo", methods=["POST"])
-@requiere_permiso("aprobar_orden")
+@requiere_permiso("aprobar_orden", "actualizar_despacho")
 def ordenes_lineas_confirmar_masivo(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     if not _orden_aprobada(orden):
@@ -6125,7 +6229,18 @@ def _guardar_lotes_linea(linea, form):
     edicion (boton '+' para agregar filas, ronda J punto 2). Filas
     completamente vacias se ignoran. codigo_lote y fecha_vencimiento de la
     linea se actualizan como resumen (compatibilidad hacia atras) con los
-    datos del lote de vencimiento mas proximo."""
+    datos del lote de vencimiento mas proximo.
+
+    Ronda AN (2026-09-23, corrección, a pedido del usuario): antes solo
+    existía una validación "suave" en JS (ver actualizarSumaLotes() en
+    importaciones/detalle.html) que pintaba en rojo la suma cuando no
+    coincidía con el total, pero NO impedía guardar -- se podía terminar
+    con más unidades desglosadas en lotes que las realmente recibidas en
+    esa línea. Ahora, si la suma de los lotes SUPERA la cantidad total de
+    la línea, esta función no aplica ningún cambio y devuelve un mensaje
+    de error para que el caller lo muestre y no guarde nada (no valida
+    que sea MENOR, para no romper el flujo de ir cargando lotes de a
+    poco antes de completar el total)."""
     codigos = form.getlist("lote_codigo")
     fechas = form.getlist("lote_fecha")
     cantidades = form.getlist("lote_cantidad")
@@ -6139,11 +6254,21 @@ def _guardar_lotes_linea(linea, form):
             continue
         nuevos.append(ParcialLineaLote(codigo_lote=codigo, fecha_vencimiento=fecha, cantidad_unidades=cantidad))
 
+    if nuevos:
+        suma = sum(lo.cantidad_unidades or 0 for lo in nuevos)
+        total = linea.cantidad_unidades or 0
+        if suma > total:
+            return (
+                f"La suma de las unidades por lote ({suma:g}) supera la cantidad total de la línea "
+                f"({total:g}) -- corrige las cantidades antes de guardar."
+            )
+
     linea.lotes = nuevos
     if nuevos:
         primero = min(nuevos, key=lambda lo: (lo.fecha_vencimiento is None, lo.fecha_vencimiento or date.max))
         linea.codigo_lote = ", ".join(sorted({lo.codigo_lote for lo in nuevos if lo.codigo_lote}))
         linea.fecha_vencimiento = primero.fecha_vencimiento
+    return None
 
 
 @app.route("/parciales/<int:parcial_id>/lineas/nueva", methods=["POST"])
@@ -6185,7 +6310,11 @@ def parcial_lineas_editar(linea_id):
     linea.descripcion = request.form.get("descripcion", "").strip()
     linea.cantidad_unidades = parse_int(request.form.get("cantidad_unidades"), default=linea.cantidad_unidades)
     linea.valor_unitario_moneda = float(request.form.get("valor_unitario_moneda") or 0)
-    _guardar_lotes_linea(linea, request.form)
+    error_lotes = _guardar_lotes_linea(linea, request.form)
+    if error_lotes:
+        db.session.rollback()
+        flash(error_lotes, "danger")
+        return redirect(url_for("importaciones_detalle", importacion_id=linea.parcial.importacion_id))
     db.session.commit()
     flash("Línea actualizada.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=linea.parcial.importacion_id))
@@ -6453,12 +6582,23 @@ def importacion_lotes_cargar(importacion_id):
         conteo_por_linea[linea.id][clave_lote] += cantidad
 
     lineas_por_parcial = {}
+    # Ronda AN (2026-09-23, corrección): mismo resguardo que la edición
+    # manual de lotes (_guardar_lotes_linea) -- si la suma de unidades por
+    # lote de una línea SUPERA su cantidad total, esa línea puntual se
+    # omite (no se le tocan los lotes) en vez de guardar de todos modos una
+    # cantidad mayor a la realmente recibida; se informa al final cuántas
+    # se omitieron por este motivo.
+    excedidas = []
     for linea_id, grupos in conteo_por_linea.items():
         linea = ParcialLinea.query.get(linea_id)
         nuevos = [
             ParcialLineaLote(codigo_lote=lote, fecha_vencimiento=fecha, cantidad_unidades=cantidad)
             for (lote, fecha), cantidad in grupos.items()
         ]
+        suma = sum(lo.cantidad_unidades or 0 for lo in nuevos)
+        if suma > (linea.cantidad_unidades or 0):
+            excedidas.append(f"{linea.codigo or linea.descripcion} ({suma:g} > {linea.cantidad_unidades or 0:g})")
+            continue
         linea.lotes = nuevos
         primero = min(nuevos, key=lambda lo: (lo.fecha_vencimiento is None, lo.fecha_vencimiento or date.max))
         linea.codigo_lote = ", ".join(sorted({lo.codigo_lote for lo in nuevos if lo.codigo_lote}))
@@ -6479,6 +6619,11 @@ def importacion_lotes_cargar(importacion_id):
         mensaje += (
             f" {len(ambiguos_encontrados)} producto(s) aparecen repetidos en más de un parcial "
             "(mismo código o descripción) y no se pudieron asignar automáticamente -- revísalos a mano."
+        )
+    if excedidas:
+        mensaje += (
+            f" {len(excedidas)} producto(s) se omitieron porque la suma de sus lotes superaba la cantidad "
+            f"total de la línea: {', '.join(excedidas)}."
         )
     flash(mensaje, "success" if lineas_por_parcial else "warning")
     return redirect(url_for("importaciones_detalle", importacion_id=imp.id))

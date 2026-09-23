@@ -1277,20 +1277,39 @@ crearPanelSeleccion({
 })();
 
 // Ronda J, punto 2: filas de lotes dinámicas en el modal "Editar producto"
-// (botón + para agregar, x para quitar) con validación suave (no bloquea
-// el guardado) comparando la suma de unidades por lote contra el total.
+// (botón + para agregar, x para quitar), comparando la suma de unidades
+// por lote contra el total.
+//
+// Ronda AN (2026-09-23, corrección, a pedido del usuario): antes esta
+// validación era puramente visual (pintaba en rojo) pero NO impedía
+// guardar -- se podía terminar con más unidades en lotes que el total
+// real de la línea. El bloqueo de verdad ahora vive en el servidor
+// (_guardar_lotes_linea en app.py, que rechaza el guardado si la suma
+// supera el total); esto de acá solo deshabilita el botón Guardar como
+// ayuda visual inmediata para no depender de que el usuario intente
+// guardar y reciba el error.
 function actualizarSumaLotes(modalContent) {
   if (!modalContent) return;
   const campoTotal = modalContent.querySelector('.campo-cantidad-total');
   const camposLote = modalContent.querySelectorAll('.campo-cantidad-lote');
   const texto = modalContent.querySelector('.texto-suma-lotes');
-  if (!texto || !camposLote.length) { if (texto) texto.textContent = ''; return; }
+  const form = modalContent.querySelector('form[id^="formLineaImp"]');
+  const btnGuardar = form ? document.querySelector('button[form="' + form.id + '"]') : null;
+  if (!texto || !camposLote.length) {
+    if (texto) texto.textContent = '';
+    if (btnGuardar) btnGuardar.disabled = false;
+    return;
+  }
   const total = parseFloat((campoTotal && campoTotal.value) || '0') || 0;
   let suma = 0;
   camposLote.forEach(inp => { suma += parseFloat(inp.value || '0') || 0; });
-  texto.textContent = `Suma de lotes: ${suma} de ${total} unidades en total`;
+  const excede = suma > total;
+  texto.textContent = excede
+    ? `Suma de lotes: ${suma} de ${total} unidades en total -- supera el total, no se podrá guardar así.`
+    : `Suma de lotes: ${suma} de ${total} unidades en total`;
   texto.classList.toggle('text-danger', suma !== total);
   texto.classList.toggle('text-success', suma === total);
+  if (btnGuardar) btnGuardar.disabled = excede;
 }
 
 document.addEventListener('click', function (e) {

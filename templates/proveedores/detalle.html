@@ -171,6 +171,26 @@
             <input type="checkbox" class="form-check-input" name="activo" id="activo{{ p.id }}" {% if p.activo %}checked{% endif %}>
             <label class="form-check-label" for="activo{{ p.id }}">Activo en catálogo</label>
           </div>
+          <div class="col-12 mt-2">
+            <button type="button" class="btn btn-sm btn-link p-0 btnMostrarFusion" data-target="fusion{{ p.id }}">
+              ¿Este código está duplicado? Fusionarlo con otro código del catálogo...
+            </button>
+            <div class="d-none border rounded p-2 mt-2 bg-light" id="fusion{{ p.id }}">
+              <p class="small text-muted mb-1">
+                Traslada TODO el historial (Homologación, Existencia de Stock, Órdenes de Compra/Costeo) de
+                <strong>'{{ p.codigo }}'</strong> hacia el código correcto que elijas abajo, y elimina
+                '{{ p.codigo }}' del catálogo -- útil cuando el mismo producto quedó cargado dos veces con
+                textos de código distintos (ej. sin ceros a la izquierda).
+              </p>
+              <input type="text" class="form-control form-control-sm mb-1 buscadorFusion" placeholder="Buscar el código correcto (destino)..." data-target="fusion{{ p.id }}">
+              <select class="form-select form-select-sm selectFusion" data-target="fusion{{ p.id }}">
+                <option value="">Escribe arriba para buscar...</option>
+              </select>
+              <button type="submit" form="formFusionarProducto{{ p.id }}" class="btn btn-sm btn-outline-warning mt-2 btnFusionar" data-target="fusion{{ p.id }}" disabled>
+                Fusionar y eliminar '{{ p.codigo }}'
+              </button>
+            </div>
+          </div>
         </div>
         <div class="modal-footer d-flex justify-content-between">
           <button type="submit" form="formEliminarProducto{{ p.id }}" class="btn btn-outline-danger">Eliminar</button>
@@ -179,6 +199,10 @@
       </form>
       <form method="post" id="formEliminarProducto{{ p.id }}" action="{{ url_for('productos_eliminar', producto_id=p.id) }}"
             onsubmit="return confirm('¿Eliminar \'{{ p.codigo }}\' del catálogo de {{ proveedor.nombre }}? Si ya se usó en alguna Orden de Compra o Costeo, no se puede eliminar sin perder ese historial -- en ese caso quedará desactivado en su lugar.');">
+      </form>
+      <form method="post" id="formFusionarProducto{{ p.id }}" action="{{ url_for('productos_fusionar', producto_id=p.id) }}"
+            onsubmit="return confirm('¿Fusionar \'{{ p.codigo }}\' con el código elegido? Todo su historial se trasladará y \'{{ p.codigo }}\' se eliminará del catálogo. Esta acción no se puede deshacer.');">
+        <input type="hidden" name="producto_destino_id" class="inputDestinoFusion" data-target="fusion{{ p.id }}">
       </form>
     </div>
   </div>
@@ -300,6 +324,58 @@
           });
         });
     }, 300);
+  });
+})();
+</script>
+
+<script>
+(function () {
+  // Ronda AN (2026-09-23, mejora): panel "Fusionar con otro código" dentro
+  // de cada modal Editar producto -- reusa la misma API de búsqueda que ya
+  // usa el selector de código padre (api_productos_por_proveedor).
+  document.querySelectorAll('.btnMostrarFusion').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const panel = document.getElementById(btn.dataset.target);
+      if (panel) panel.classList.toggle('d-none');
+    });
+  });
+
+  let timeoutFusion = null;
+  document.querySelectorAll('.buscadorFusion').forEach(function (input) {
+    input.addEventListener('input', function () {
+      clearTimeout(timeoutFusion);
+      const q = input.value.trim();
+      const targetId = input.dataset.target;
+      const select = document.querySelector('.selectFusion[data-target="' + targetId + '"]');
+      const hiddenInput = document.querySelector('.inputDestinoFusion[data-target="' + targetId + '"]');
+      const btnFusionar = document.querySelector('.btnFusionar[data-target="' + targetId + '"]');
+      if (!select || q.length < 2) return;
+      timeoutFusion = setTimeout(function () {
+        fetch('{{ url_for("api_productos_por_proveedor", proveedor_id=proveedor.id) }}?q=' + encodeURIComponent(q))
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            select.innerHTML = '<option value="">Selecciona el código correcto (destino)...</option>';
+            data.forEach(function (p) {
+              const opt = document.createElement('option');
+              opt.value = p.id;
+              opt.textContent = p.codigo + ' -- ' + p.descripcion + (p.activo ? '' : ' (inactivo)');
+              select.appendChild(opt);
+            });
+            if (hiddenInput) hiddenInput.value = '';
+            if (btnFusionar) btnFusionar.disabled = true;
+          });
+      }, 300);
+    });
+  });
+
+  document.querySelectorAll('.selectFusion').forEach(function (select) {
+    select.addEventListener('change', function () {
+      const targetId = select.dataset.target;
+      const hiddenInput = document.querySelector('.inputDestinoFusion[data-target="' + targetId + '"]');
+      const btnFusionar = document.querySelector('.btnFusionar[data-target="' + targetId + '"]');
+      if (hiddenInput) hiddenInput.value = select.value;
+      if (btnFusionar) btnFusionar.disabled = !select.value;
+    });
   });
 })();
 </script>

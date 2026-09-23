@@ -4,6 +4,16 @@
 
 {% set puede_crear = current_user.tiene_permiso('crear_orden') %}
 {% set puede_aprobar = current_user.tiene_permiso('aprobar_orden') %}
+{# Ronda AN (2026-09-23, corrección, a pedido del usuario): "Confirmar" (el
+   paso que deja una línea lista para asociarse a un Despacho) solo estaba
+   disponible con el permiso de aprobar_orden -- un usuario con el permiso
+   actualizar_despacho, pero sin aprobar_orden, no veía la opción para nada,
+   aunque su trabajo es justamente pasar la orden a despacho. Ahora ambos
+   permisos habilitan Confirmar (individual y masivo); el resto de acciones
+   de esta página (aprobar, retroceder de etapa, anular) siguen exclusivas
+   de aprobar_orden/crear_orden como hasta ahora. #}
+{% set puede_despachar = current_user.tiene_permiso('actualizar_despacho') %}
+{% set puede_confirmar_linea = puede_aprobar or puede_despachar %}
 {% set orden_aprobada = orden.estado_aprobacion in (none, 'Aprobada') %}
 
 {% if orden.estado_aprobacion == 'Por Aprobar' %}
@@ -269,7 +279,7 @@
         <i class="bi bi-list-check"></i> Acciones sobre seleccionadas
       </button>
       <ul class="dropdown-menu">
-        {% if puede_aprobar and orden_aprobada %}
+        {% if puede_confirmar_linea and orden_aprobada %}
         <li><button type="button" class="dropdown-item" data-bs-toggle="modal" data-bs-target="#modalAccionConfirmar"><i class="bi bi-check2-circle me-1"></i> Confirmado</button></li>
         {% endif %}
         {% if puede_crear %}
@@ -435,13 +445,13 @@
                  gestiona en bloque desde "Acciones sobre seleccionadas" arriba, no linea
                  por linea -- no hay ninguna accion individual que tenga sentido aqui. #}
               <span class="text-muted small">—</span>
-              {% elif puede_crear or puede_aprobar %}
+              {% elif puede_crear or puede_aprobar or puede_despachar %}
               <div class="dropdown">
                 <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">
                   Acciones
                 </button>
                 <ul class="dropdown-menu dropdown-menu-end">
-                  {% if puede_aprobar and orden_aprobada and l.etapa == 'Emisión de Orden' %}
+                  {% if puede_confirmar_linea and orden_aprobada and l.etapa == 'Emisión de Orden' %}
                   <li><button type="button" class="dropdown-item" data-bs-toggle="modal" data-bs-target="#modalConfirmar{{ l.id }}">Confirmar</button></li>
                   {% endif %}
                   {% if puede_aprobar and orden_aprobada and l.etapa_anterior %}
