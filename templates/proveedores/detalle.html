@@ -112,12 +112,19 @@
         <tr class="collapse" id="variantes{{ p.id }}">
           <td></td>
           <td colspan="7">
-            <div class="small text-muted mb-1">Variantes de {{ p.codigo }} (sin precio propio -- usan el del código padre):</div>
-            <ul class="mb-0 small">
+            <div class="small text-muted mb-1">Variantes de {{ p.codigo }} (sin precio propio -- usan el del código padre). Edita cualquier campo y presiona Guardar:</div>
+            <div class="border rounded p-2" style="max-height: 260px; overflow-y: auto;">
               {% for v in variantes_p %}
-              <li>{{ v.codigo }} -- {{ v.descripcion }}</li>
+              <form method="post" action="{{ url_for('productos_variante_editar', variante_id=v.id) }}"
+                    class="d-flex align-items-center gap-1 flex-wrap mb-1 pb-1 {% if not loop.last %}border-bottom{% endif %}">
+                <input class="form-control form-control-sm" style="max-width:150px" name="codigo" value="{{ v.codigo }}" required>
+                <input class="form-control form-control-sm flex-grow-1" style="min-width:220px" name="descripcion" value="{{ v.descripcion }}" required>
+                <input class="form-control form-control-sm" style="max-width:150px" name="codigo_interno_inventario"
+                       value="{{ v.codigo_interno_inventario or '' }}" placeholder="Código Ergopyme">
+                <button type="submit" class="btn btn-sm btn-outline-primary">Guardar</button>
+              </form>
               {% endfor %}
-            </ul>
+            </div>
           </td>
         </tr>
         {% endif %}

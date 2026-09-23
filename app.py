@@ -2042,6 +2042,46 @@ def reparar_variantes_medicontur_ronda_ae():
         print(f"[reparar_ronda_ae] MEDICONTUR: {len(renombres)} código(s) de variante renombrado(s): {renombres}")
 
 
+def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, producto_padre_id):
+    """Ronda AN (2026-09-23, mejora): cuando una variante se homologa bajo su
+    código padre (ver reparar_variantes_medicontur_ronda_ag / reparar_variantes_
+    physiol_ronda_ae), a veces ese mismo texto de código ya existía ANTES como
+    un Producto ("código padre") suelto e independiente en el catálogo -- por
+    ejemplo, los 13 códigos 677MTYP* que el usuario reportó "sin agrupar" en
+    esta ronda: estaban cargados como productos propios, con precio 0, en vez
+    de como variante de 677MTYP. Como esas funciones de reparación son
+    puramente ADITIVAS (nunca tocan lo que ya existe), agregar la variante
+    correcta dejaba el producto suelto viejo dando vueltas -- se veía
+    DUPLICADO en el catálogo: una vez como variante (correcto, agrupado) y
+    otra vez como su propia fila suelta con precio 0 (el resto viejo).
+
+    Esta función resuelve ese duplicado apenas se detecta: si el producto
+    suelto nunca se usó en ninguna Orden de Compra ni Costeo, se ELIMINA (ya
+    quedó reemplazado por la variante); si ya se usó, se DESACTIVA en su
+    lugar (mismo criterio que la ruta /productos/<id>/eliminar) para no
+    perder ese historial. Nunca toca el producto padre real (producto_padre_id)
+    ni nada que ya tenga sus propias variantes."""
+    dup = Producto.query.filter(
+        Producto.proveedor_id == proveedor_id,
+        Producto.id != producto_padre_id,
+        db.func.upper(Producto.codigo) == codigo_variante.strip().upper(),
+        Producto.activo.is_(True),
+    ).first()
+    if not dup:
+        return None
+    tiene_variantes_propias = ProductoVariante.query.filter_by(producto_id=dup.id).count() > 0
+    en_uso = (
+        OrdenCompraLinea.query.filter_by(producto_id=dup.id).count() > 0
+        or ParcialLinea.query.filter_by(producto_id=dup.id).count() > 0
+    )
+    codigo = dup.codigo
+    if en_uso or tiene_variantes_propias:
+        dup.activo = False
+    else:
+        db.session.delete(dup)
+    return codigo
+
+
 def reparar_variantes_medicontur_ronda_ag():
     """Ronda AG (2026-09-15, punto 3): el usuario reportó 6 códigos MEDICONTUR
     (lentes "ADDON" -- familias A45DT, A45RD2, A46R, 690MY, 860PAY, 860PEY)
@@ -2081,6 +2121,7 @@ def reparar_variantes_medicontur_ronda_ag():
 
     creadas = 0
     padres_creados = set()
+    duplicados_resueltos = []
     vistos = set()
     for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
         codigo_padre, codigo_variante, descripcion = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, None)
@@ -2106,19 +2147,26 @@ def reparar_variantes_medicontur_ronda_ag():
             padres_creados.add(codigo_padre)
 
         if (producto.id, codigo_variante.upper()) in variantes_existentes:
+            dup = _consolidar_producto_duplicado_en_variante(medicontur.id, codigo_variante, producto.id)
+            if dup:
+                duplicados_resueltos.append(dup)
             continue
         db.session.add(ProductoVariante(
             producto_id=producto.id, codigo=codigo_variante, descripcion=descripcion or codigo_variante,
         ))
         variantes_existentes.add((producto.id, codigo_variante.upper()))
         creadas += 1
+        dup = _consolidar_producto_duplicado_en_variante(medicontur.id, codigo_variante, producto.id)
+        if dup:
+            duplicados_resueltos.append(dup)
 
-    if creadas or padres_creados:
+    if creadas or padres_creados or duplicados_resueltos:
         db.session.commit()
         print(
             f"[reparar_ronda_ag] MEDICONTUR: {creadas} variante(s) nueva(s) agregada(s) "
             f"({len(padres_creados)} código(s) padre nuevo(s) creados, precio 0 a completar por el usuario: "
-            f"{sorted(padres_creados)})."
+            f"{sorted(padres_creados)}). {len(duplicados_resueltos)} producto(s) suelto(s) duplicado(s) "
+            f"consolidados dentro de su variante: {sorted(set(duplicados_resueltos))}."
         )
 
 
@@ -2165,6 +2213,7 @@ def reparar_variantes_physiol_ronda_ae():
 
     creadas = 0
     padres_creados = set()
+    duplicados_resueltos = []
     vistos = set()
     for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
         codigo_padre, codigo_variante, descripcion = (row[0], row[1], row[2]) if len(row) >= 3 else (None, None, None)
@@ -2197,18 +2246,26 @@ def reparar_variantes_physiol_ronda_ae():
             padres_creados.add(codigo_padre)
 
         if (producto.id, codigo_variante.upper()) in variantes_existentes:
+            dup = _consolidar_producto_duplicado_en_variante(physiol.id, codigo_variante, producto.id)
+            if dup:
+                duplicados_resueltos.append(dup)
             continue
         db.session.add(ProductoVariante(
             producto_id=producto.id, codigo=codigo_variante, descripcion=descripcion or codigo_variante,
         ))
         variantes_existentes.add((producto.id, codigo_variante.upper()))
         creadas += 1
+        dup = _consolidar_producto_duplicado_en_variante(physiol.id, codigo_variante, producto.id)
+        if dup:
+            duplicados_resueltos.append(dup)
 
-    if creadas or padres_creados:
+    if creadas or padres_creados or duplicados_resueltos:
         db.session.commit()
         print(
             f"[reparar_ronda_ae] BVI PHYSIOL: {creadas} variante(s) nueva(s) agregada(s) desde el archivo de "
-            f"ajuste ({len(padres_creados)} código(s) padre nuevo(s) creados: {sorted(padres_creados)})."
+            f"ajuste ({len(padres_creados)} código(s) padre nuevo(s) creados: {sorted(padres_creados)}). "
+            f"{len(duplicados_resueltos)} producto(s) suelto(s) duplicado(s) consolidados dentro de su variante: "
+            f"{sorted(set(duplicados_resueltos))}."
         )
 
 
@@ -3438,6 +3495,27 @@ def productos_editar(producto_id):
     db.session.commit()
     flash(f"Producto '{producto.codigo}' actualizado.", "success")
     return redirect(url_for("proveedores_detalle", proveedor_id=producto.proveedor_id))
+
+
+@app.route("/variantes/<int:variante_id>/editar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
+def productos_variante_editar(variante_id):
+    """Ronda AN (2026-09-23, mejora): el usuario reportó que al editar un
+    producto con código padre no había forma de editar las variantes de ese
+    código -- el modal 'Editar' de la tabla de catálogo solo aplicaba al
+    Producto (código padre), nunca a ProductoVariante. Esta ruta hace lo
+    mismo para una variante puntual: como nunca tiene precio propio (siempre
+    usa el del código padre), solo se edita su código, descripción y,
+    opcionalmente, su código interno de Ergopyme (mismo campo que usa
+    Homologación de Stock -- editarlo aquí es equivalente a asignarlo desde
+    ahí)."""
+    variante = ProductoVariante.query.get_or_404(variante_id)
+    variante.codigo = request.form["codigo"].strip()
+    variante.descripcion = request.form["descripcion"].strip()
+    variante.codigo_interno_inventario = (request.form.get("codigo_interno_inventario") or "").strip() or None
+    db.session.commit()
+    flash(f"Variante '{variante.codigo}' actualizada.", "success")
+    return redirect(url_for("proveedores_detalle", proveedor_id=variante.producto.proveedor_id))
 
 
 @app.route("/productos/<int:producto_id>/eliminar", methods=["POST"])
