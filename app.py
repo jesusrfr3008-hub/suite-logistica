@@ -35,7 +35,7 @@ from models import (
     CargoAdicionalImportacion, TipoCambioMensual,
     Usuario, Rol, PERMISOS_DISPONIBLES,
     HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
-    CodigoErgopyme, CompraHistorica,
+    CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
     FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
 )
@@ -2110,6 +2110,37 @@ def _filtro_ordenar_variantes(variantes):
     return _ordenar_variantes(variantes)
 
 
+def _registrar_alias_codigo_proveedor(proveedor_id, codigo_alias, producto_destino=None, variante_destino=None):
+    """Ronda AO (2026-09-23, a pedido del usuario): deja constancia de que
+    `codigo_alias` (tal como aparece en CodigoErgopyme/el histórico de
+    compras) en realidad es el mismo producto que `producto_destino` (o su
+    `variante_destino`, si aplica) -- ver AliasCodigoProveedor en models.py
+    para el porqué hace falta esta tabla aparte (CodigoErgopyme se
+    resincroniza completa desde un Excel externo en cada arranque, así que
+    no se puede simplemente editarla ahí). Se llama automáticamente cada vez
+    que se fusiona/consolida un producto duplicado (ver
+    _migrar_historial_producto_a_producto y _migrar_historial_producto_a_
+    variante) para que los reportes queden consistentes con el catálogo sin
+    tener que arreglarlos a mano cada vez. Upsert por (proveedor, código):
+    si ya existía un alias con ese texto, se actualiza el destino."""
+    codigo_alias = (codigo_alias or "").strip().upper()
+    if not codigo_alias:
+        return
+    existente = AliasCodigoProveedor.query.filter_by(
+        proveedor_id=proveedor_id, codigo_alias=codigo_alias
+    ).first()
+    if existente:
+        existente.producto_destino_id = producto_destino.id if producto_destino else None
+        existente.variante_destino_id = variante_destino.id if variante_destino else None
+    else:
+        db.session.add(AliasCodigoProveedor(
+            proveedor_id=proveedor_id,
+            codigo_alias=codigo_alias,
+            producto_destino_id=producto_destino.id if producto_destino else None,
+            variante_destino_id=variante_destino.id if variante_destino else None,
+        ))
+
+
 def _migrar_historial_producto_a_variante(dup, variante, padre):
     """Ronda AN (2026-09-23, mejora, a pedido del usuario): en vez de dejar
     un producto duplicado DESACTIVADO para siempre nada más porque tiene
@@ -2133,7 +2164,20 @@ def _migrar_historial_producto_a_variante(dup, variante, padre):
       SOLO se mueven cuando el empaque coincide exactamente; si no
       coincide, se dejan intactas (el producto seguirá sin poder
       eliminarse del todo, pero nunca se corrompe un historial ya
-      guardado)."""
+      guardado).
+
+    Ronda AO (2026-09-23, corrección, a pedido del usuario): esta migración
+    por sí sola NO alcanzaba para que el reporte "Compras Proveedor" (ni
+    Consulta de Stock) dejaran de mostrar `dup` como un código aparte -- ese
+    reporte resuelve el código de las líneas históricas vía CodigoErgopyme,
+    una tabla ajena al catálogo (ver _construir_homologador_ergopyme). Por
+    eso ahora también: (a) deja un AliasCodigoProveedor para que ese
+    homologador traduzca `dup.codigo` hacia la variante/padre real de aquí
+    en adelante, y (b) actualiza el codigo/descripcion snapshot de
+    ParcialLinea (a diferencia de OrdenCompraLinea, ParcialLinea no calcula
+    nada a partir de esos dos campos -- son puro texto para mostrar -- así
+    que no hay ningún riesgo en igualarlos al de la variante real)."""
+    _registrar_alias_codigo_proveedor(dup.proveedor_id, dup.codigo, producto_destino=padre, variante_destino=variante)
     HomologacionStock.query.filter_by(producto_id=dup.id).update(
         {"producto_id": padre.id, "variante_id": variante.id}
     )
@@ -2146,7 +2190,10 @@ def _migrar_historial_producto_a_variante(dup, variante, padre):
                 linea.variante_codigo = dup.codigo
                 linea.variante_descripcion = dup.descripcion
             linea.producto_id = padre.id
-        ParcialLinea.query.filter_by(producto_id=dup.id).update({"producto_id": padre.id})
+        for linea in ParcialLinea.query.filter_by(producto_id=dup.id).all():
+            linea.producto_id = padre.id
+            linea.codigo = variante.codigo
+            linea.descripcion = variante.descripcion
 
 
 def _resolver_producto_posible_duplicado(producto):
@@ -2201,7 +2248,17 @@ def _migrar_historial_producto_a_producto(origen, destino):
       cantidad_unidades se calcula en vivo a partir de producto.empaque;
       moverla con un empaque distinto alteraría en silencio una cantidad
       ya facturada). Si no coincide, esas líneas quedan intactas y
-      `origen` no podrá eliminarse del todo (el llamador lo desactiva)."""
+      `origen` no podrá eliminarse del todo (el llamador lo desactiva).
+
+    Ronda AO (2026-09-23, corrección, a pedido del usuario): igual que en
+    _migrar_historial_producto_a_variante, esta fusión por sí sola NO
+    alcanzaba para que "Compras Proveedor" (ni Consulta de Stock) dejaran de
+    mostrar `origen` por separado, porque esos reportes resuelven el código
+    de las líneas históricas vía CodigoErgopyme (tabla externa, ver
+    _construir_homologador_ergopyme), no vía el catálogo. Ahora también deja
+    un AliasCodigoProveedor y sincroniza el codigo/descripcion snapshot de
+    ParcialLinea con el de `destino`."""
+    _registrar_alias_codigo_proveedor(origen.proveedor_id, origen.codigo, producto_destino=destino)
     ProductoVariante.query.filter_by(producto_id=origen.id).update({"producto_id": destino.id})
     HomologacionStock.query.filter_by(producto_id=origen.id).update({"producto_id": destino.id})
     StockExistencia.query.filter_by(producto_id=origen.id).update({"producto_id": destino.id})
@@ -2211,7 +2268,10 @@ def _migrar_historial_producto_a_producto(origen, destino):
                 linea.variante_codigo = origen.codigo
                 linea.variante_descripcion = origen.descripcion
             linea.producto_id = destino.id
-        ParcialLinea.query.filter_by(producto_id=origen.id).update({"producto_id": destino.id})
+        for linea in ParcialLinea.query.filter_by(producto_id=origen.id).all():
+            linea.producto_id = destino.id
+            linea.codigo = destino.codigo
+            linea.descripcion = destino.descripcion
 
 
 def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, producto_padre_id):
@@ -2843,6 +2903,37 @@ def seed_administrador_inicial():
     )
 
 
+def reparar_alias_codigo_proveedor_ronda_ao():
+    """Ronda AO (2026-09-23, a pedido del usuario): backfill puntual para el
+    caso real reportado -- el proveedor BVI BEAVER, código de producto
+    '8685' (el Excel "2da Revisión códigos ergopyme" trae ese número SIN los
+    ceros a la izquierda en la columna Código Proveedor, mientras el
+    catálogo real usa '0008685') aparecía como una fila aparte en "Compras
+    Proveedor" del código correcto '0008685', incluso después de fusionar
+    los dos Producto en el catálogo (ver productos_fusionar) -- porque ese
+    reporte resuelve el código vía CodigoErgopyme, no vía el catálogo (ver
+    AliasCodigoProveedor y _construir_homologador_ergopyme).
+
+    Como el Producto '8685' YA fue eliminado por el usuario (usó el botón
+    "Fusionar" antes de que existiera este mecanismo de alias), no hay un
+    `origen` del que partir -- por eso este paso crea el alias directo, sin
+    pasar por _registrar_alias_codigo_proveedor a través de una migración.
+    Idempotente: no hace nada si el alias ya existe o si el catálogo no
+    tiene el proveedor/código esperado."""
+    proveedor = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "BVI BEAVER").first()
+    if not proveedor:
+        return
+    ya_existe = AliasCodigoProveedor.query.filter_by(proveedor_id=proveedor.id, codigo_alias="8685").first()
+    if ya_existe:
+        return
+    destino = Producto.query.filter_by(proveedor_id=proveedor.id, codigo="0008685").first()
+    if not destino:
+        return
+    _registrar_alias_codigo_proveedor(proveedor.id, "8685", producto_destino=destino)
+    db.session.commit()
+    print(f"[reparar_ronda_ao] BVI BEAVER: alias '8685' -> '{destino.codigo}' creado para los reportes.")
+
+
 def _paso_arranque_seguro(nombre, funcion):
     """Ronda AN (2026-09-23, incidente en producción): antes, un error
     dentro de CUALQUIERA de estos pasos de arranque (seed_*/reparar_*) hacía
@@ -2883,6 +2974,7 @@ with app.app_context():
     _paso_arranque_seguro("reparar_variantes_medicontur_ronda_ag", reparar_variantes_medicontur_ronda_ag)
     _paso_arranque_seguro("reparar_variantes_physiol_ronda_ae", reparar_variantes_physiol_ronda_ae)
     _paso_arranque_seguro("seed_codigos_ergopyme", seed_codigos_ergopyme)
+    _paso_arranque_seguro("reparar_alias_codigo_proveedor_ronda_ao", reparar_alias_codigo_proveedor_ronda_ao)
     _paso_arranque_seguro("seed_compras_historicas", seed_compras_historicas)
     _paso_arranque_seguro("seed_facturas_proveedor_pendientes", seed_facturas_proveedor_pendientes)
 
@@ -3620,8 +3712,17 @@ def proveedores_detalle(proveedor_id):
         )
     productos = productos_query.order_by(Producto.codigo).all()
     ordenes = prov.ordenes.order_by(OrdenCompra.id.desc()).limit(10).all()
+    # Ronda AO (2026-09-23, a pedido del usuario): alias de código para
+    # reportes de este proveedor -- ver AliasCodigoProveedor en models.py y
+    # el panel "Alias de código para reportes" en esta plantilla.
+    alias_codigo = (
+        AliasCodigoProveedor.query.filter_by(proveedor_id=prov.id)
+        .order_by(AliasCodigoProveedor.codigo_alias)
+        .all()
+    )
     return render_template(
-        "proveedores/detalle.html", proveedor=prov, productos=productos, q=q, ordenes=ordenes
+        "proveedores/detalle.html", proveedor=prov, productos=productos, q=q, ordenes=ordenes,
+        alias_codigo=alias_codigo,
     )
 
 
@@ -3884,6 +3985,46 @@ def productos_fusionar(producto_id):
             "Stock, Órdenes de Compra/Costeo) quedó trasladado y el código duplicado se eliminó del catálogo.",
             "success",
         )
+    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+
+
+@app.route("/proveedores/<int:proveedor_id>/alias-codigo/nuevo", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
+def alias_codigo_nuevo(proveedor_id):
+    """Ronda AO (2026-09-23, a pedido del usuario): registra a mano un
+    AliasCodigoProveedor para el caso en que el Producto duplicado YA se
+    eliminó (con "Fusionar con otro código" o borrado directo) ANTES de que
+    existiera este mecanismo, o cuando el texto que aparece mal en los
+    reportes ni siquiera corresponde a un Producto que haya existido nunca
+    en este catálogo (viene tal cual de un archivo externo, ver
+    CodigoErgopyme/seed_codigos_ergopyme). No requiere que `codigo_alias`
+    exista como Producto -- es solo el TEXTO que hoy se ve mal en el
+    reporte."""
+    prov = Proveedor.query.get_or_404(proveedor_id)
+    codigo_alias = request.form.get("codigo_alias", "").strip()
+    destino_id = request.form.get("producto_destino_id", type=int)
+    destino = Producto.query.get(destino_id) if destino_id else None
+    if not codigo_alias or not destino or destino.proveedor_id != prov.id:
+        flash("Indica el código tal como aparece en el reporte y selecciona el producto correcto de este proveedor.", "danger")
+        return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+    _registrar_alias_codigo_proveedor(prov.id, codigo_alias, producto_destino=destino)
+    db.session.commit()
+    flash(
+        f"Alias creado: '{codigo_alias}' ahora se mostrará en los reportes como '{destino.codigo}'.",
+        "success",
+    )
+    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+
+
+@app.route("/alias-codigo/<int:alias_id>/eliminar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
+def alias_codigo_eliminar(alias_id):
+    alias = AliasCodigoProveedor.query.get_or_404(alias_id)
+    proveedor_id = alias.proveedor_id
+    codigo = alias.codigo_alias
+    db.session.delete(alias)
+    db.session.commit()
+    flash(f"Alias '{codigo}' eliminado -- los reportes volverán a mostrarlo tal como venga homologado.", "success")
     return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
 
 
@@ -6801,9 +6942,23 @@ def _construir_homologador_ergopyme():
     cada arranque desde el archivo de mapeo, ver seed_codigos_ergopyme).
     No hay que confiar en los campos "congelados" que quedaron grabados en
     CompraHistorica al momento de la carga histórica (esos quedan
-    desactualizados apenas el usuario corrige el archivo de mapeo)."""
+    desactualizados apenas el usuario corrige el archivo de mapeo).
+
+    Ronda AO (2026-09-23, corrección, a pedido del usuario): DESPUÉS de
+    resolver por CodigoErgopyme, el código de proveedor resultante se
+    revisa contra AliasCodigoProveedor -- si hay un alias para ese
+    proveedor+código, se reemplaza por el código/descripción VIVOS del
+    producto (o variante) real del catálogo. Esto es necesario porque
+    CodigoErgopyme se resincroniza completa desde un archivo Excel externo
+    en cada arranque (ver seed_codigos_ergopyme): si ese archivo trae un
+    texto distinto al del catálogo real (caso real: la columna "Código
+    Proveedor" traía el número 8685 sin ceros a la izquierda, mientras el
+    catálogo usa '0008685'), no hay forma de "corregir" CodigoErgopyme de
+    forma permanente -- el alias vive en nuestra propia tabla y nunca se
+    pisa solo."""
     codigo_ergopyme_map = {c.codigo_interno: c for c in CodigoErgopyme.query.all()}
     proveedores_por_nombre = {p.nombre.strip().upper(): p for p in Proveedor.query.all()}
+    alias_map = {(a.proveedor_id, a.codigo_alias): a for a in AliasCodigoProveedor.query.all()}
 
     def _homologar(codigo_interno):
         """Devuelve (proveedor_nombre, proveedor_id, codigo_proveedor,
@@ -6818,11 +6973,24 @@ def _construir_homologador_ergopyme():
         if not prov_nombre or prov_nombre.upper() == "#N/A":
             return None
         prov_real = proveedores_por_nombre.get(prov_nombre.upper())
+        codigo_proveedor = (homolog.codigo_proveedor or "").strip() or None
+        descripcion = (homolog.descripcion or "").strip() or None
+
+        if prov_real and codigo_proveedor:
+            alias = alias_map.get((prov_real.id, codigo_proveedor.strip().upper()))
+            if alias:
+                if alias.variante_destino:
+                    codigo_proveedor = alias.variante_destino.codigo or codigo_proveedor
+                    descripcion = alias.variante_destino.descripcion or descripcion
+                elif alias.producto_destino:
+                    codigo_proveedor = alias.producto_destino.codigo or codigo_proveedor
+                    descripcion = alias.producto_destino.descripcion or descripcion
+
         return (
             prov_nombre,
             prov_real.id if prov_real else None,
-            (homolog.codigo_proveedor or "").strip() or None,
-            (homolog.descripcion or "").strip() or None,
+            codigo_proveedor,
+            descripcion,
         )
     return _homologar
 

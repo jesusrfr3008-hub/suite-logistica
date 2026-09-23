@@ -456,6 +456,60 @@ class CodigoErgopyme(db.Model):
         return f"<CodigoErgopyme {self.codigo_interno} -> {self.proveedor_nombre}>"
 
 
+class AliasCodigoProveedor(db.Model):
+    """Ronda AO (2026-09-23, a pedido del usuario): registro de que un texto
+    de "código de proveedor" que aparece en los reportes (Compras Proveedor,
+    Consulta de Stock) en realidad corresponde a un Producto/ProductoVariante
+    YA EXISTENTE del catálogo, con un texto de código distinto.
+
+    Por qué hace falta esto y no alcanza con fusionar los Producto en el
+    catálogo (ver _migrar_historial_producto_a_producto en app.py): el texto
+    que se ve en esos reportes para una línea histórica NO sale del
+    catálogo, sale de CodigoErgopyme.codigo_proveedor -- una tabla que se
+    RESINCRONIZA COMPLETA desde el archivo externo "2da Revisión códigos
+    ergopyme" en cada arranque (ver seed_codigos_ergopyme). Si esa fila del
+    archivo trae un texto distinto al del catálogo (caso real: la columna
+    "Código Proveedor" del Excel traía el número 8685 sin los ceros a la
+    izquierda, mientras el catálogo real usa '0008685'), fusionar los
+    Producto en el catálogo no cambia nada en el reporte -- al siguiente
+    arranque CodigoErgopyme.codigo_proveedor vuelve a valer '8685' porque
+    así sigue estando en el archivo del usuario, que esta app no controla.
+
+    Esta tabla es la solución: _construir_homologador_ergopyme() (app.py)
+    consulta este alias DESPUÉS de resolver por CodigoErgopyme, y si hay
+    coincidencia (proveedor + texto), reemplaza el código/descripción por
+    los del producto/variante destino -- sin tocar nunca CodigoErgopyme, así
+    que sobrevive cualquier resincronización futura del archivo.
+
+    Se completa sola cada vez que se usa "Fusionar con otro código" o que la
+    reparación automática de variantes consolida un código suelto (ver
+    _registrar_alias_codigo_proveedor en app.py), y también se puede crear a
+    mano desde Proveedores > "Alias de código para reportes" para el caso en
+    que el Producto duplicado YA se eliminó antes de que existiera este
+    mecanismo (ej. el caso real de '8685')."""
+    __tablename__ = "alias_codigo_proveedor"
+
+    id = db.Column(db.Integer, primary_key=True)
+    proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False)
+    # Guardado siempre en MAYÚSCULA y sin espacios sobrantes -- la
+    # comparación en _construir_homologador_ergopyme es case-insensitive.
+    codigo_alias = db.Column(db.String(120), nullable=False)
+    producto_destino_id = db.Column(db.Integer, db.ForeignKey("productos.id"), nullable=True)
+    variante_destino_id = db.Column(db.Integer, db.ForeignKey("producto_variantes.id"), nullable=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    proveedor = db.relationship("Proveedor")
+    producto_destino = db.relationship("Producto", foreign_keys=[producto_destino_id])
+    variante_destino = db.relationship("ProductoVariante", foreign_keys=[variante_destino_id])
+
+    __table_args__ = (
+        db.UniqueConstraint("proveedor_id", "codigo_alias", name="uq_alias_codigo_proveedor"),
+    )
+
+    def __repr__(self):
+        return f"<AliasCodigoProveedor {self.codigo_alias}>"
+
+
 class CompraHistorica(db.Model):
     """Ronda AA (2026-09-13): histórico "congelado" de compras/importaciones
     a proveedores anteriores a este sistema, cargado UNA SOLA VEZ desde el

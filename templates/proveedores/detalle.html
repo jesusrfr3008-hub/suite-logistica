@@ -56,6 +56,9 @@
       <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalNuevoProducto">
         <i class="bi bi-plus-lg"></i> Agregar producto
       </button>
+      <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#modalAliasCodigo">
+        <i class="bi bi-signpost-split"></i> Alias de código para reportes
+      </button>
     </div>
   </div>
 
@@ -280,6 +283,67 @@
   </div>
 </div>
 
+<div class="modal fade" id="modalAliasCodigo" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Alias de código para reportes -- {{ proveedor.nombre }}</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="small text-muted">
+          Úsalo cuando un mismo producto aparece con DOS textos de código distintos en los reportes
+          (Compras Proveedor, Consulta de Stock) -- por ejemplo porque el archivo de homologación
+          Ergopyme trae un código distinto al del catálogo (ej. '8685' en vez de '0008685'). Esto NO
+          toca el catálogo ni elimina nada: solo le indica a los reportes que ese texto de código debe
+          mostrarse como el producto correcto que elijas. Si el producto duplicado todavía existe en el
+          catálogo, usa primero "Editar producto &gt; Fusionar con otro código" -- eso ya crea este alias
+          solo. Usa esto cuando el duplicado ya no existe o nunca existió como Producto propio.
+        </p>
+        <form method="post" action="{{ url_for('alias_codigo_nuevo', proveedor_id=proveedor.id) }}" class="row g-2 align-items-end border rounded p-2 mb-3 bg-light">
+          <div class="col-md-4">
+            <label class="form-label small mb-0">Código tal como aparece mal en el reporte</label>
+            <input type="text" class="form-control form-control-sm" name="codigo_alias" placeholder="Ej. 8685" required>
+          </div>
+          <div class="col-md-5">
+            <label class="form-label small mb-0">Producto correcto (destino)</label>
+            <input type="text" class="form-control form-control-sm mb-1" id="buscadorAliasDestino" placeholder="Buscar código o descripción...">
+            <select class="form-select form-select-sm" name="producto_destino_id" id="selectAliasDestino" required>
+              <option value="">Escribe arriba para buscar...</option>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <button type="submit" class="btn btn-sm btn-brand w-100">Crear alias</button>
+          </div>
+        </form>
+
+        {% if alias_codigo %}
+        <table class="table table-sm">
+          <thead><tr><th>Código (alias)</th><th>Se muestra como</th><th></th></tr></thead>
+          <tbody>
+            {% for a in alias_codigo %}
+            <tr>
+              <td>{{ a.codigo_alias }}</td>
+              <td>
+                {% if a.variante_destino %}{{ a.variante_destino.codigo }}{% elif a.producto_destino %}{{ a.producto_destino.codigo }}{% else %}<span class="text-muted">(producto eliminado)</span>{% endif %}
+              </td>
+              <td class="text-end">
+                <form method="post" action="{{ url_for('alias_codigo_eliminar', alias_id=a.id) }}" onsubmit="return confirm('¿Eliminar este alias? Los reportes volverán a mostrar el código sin corregir.');">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">Eliminar</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="text-muted small mb-0">Todavía no hay alias registrados para este proveedor.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 (function () {
   const check = document.getElementById('checkEsVariante');
@@ -376,6 +440,36 @@
       if (hiddenInput) hiddenInput.value = select.value;
       if (btnFusionar) btnFusionar.disabled = !select.value;
     });
+  });
+})();
+</script>
+
+<script>
+(function () {
+  // Ronda AO (2026-09-23): buscador de producto destino en el modal "Alias
+  // de código para reportes" -- mismo patron/API que el resto de buscadores
+  // de esta pagina.
+  const buscador = document.getElementById('buscadorAliasDestino');
+  if (!buscador) return;
+  const select = document.getElementById('selectAliasDestino');
+  let timeoutId = null;
+  buscador.addEventListener('input', function () {
+    clearTimeout(timeoutId);
+    const q = buscador.value.trim();
+    if (q.length < 2) return;
+    timeoutId = setTimeout(function () {
+      fetch('{{ url_for("api_productos_por_proveedor", proveedor_id=proveedor.id) }}?q=' + encodeURIComponent(q))
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          select.innerHTML = '<option value="">Selecciona el producto correcto...</option>';
+          data.forEach(function (p) {
+            const opt = document.createElement('option');
+            opt.value = p.id;
+            opt.textContent = p.codigo + ' -- ' + p.descripcion + (p.activo ? '' : ' (inactivo)');
+            select.appendChild(opt);
+          });
+        });
+    }, 300);
   });
 })();
 </script>
