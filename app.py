@@ -473,6 +473,7 @@ def ensure_schema_migrations():
         ],
         "producto_variantes": [
             ("codigo_interno_inventario", "VARCHAR(40)"),
+            ("activo", "BOOLEAN DEFAULT 1"),
         ],
         "roles": [
             ("permiso_consultar_stock", "BOOLEAN DEFAULT 0"),
@@ -2042,6 +2043,73 @@ def reparar_variantes_medicontur_ronda_ae():
         print(f"[reparar_ronda_ae] MEDICONTUR: {len(renombres)} código(s) de variante renombrado(s): {renombres}")
 
 
+def _producto_en_uso(producto_id):
+    """Ronda AN (2026-09-23, incidente): true si este Producto, o alguna de
+    sus variantes, está referenciado desde CUALQUIERA de las tablas que
+    tienen llave foránea hacia productos.id / producto_variantes.id --
+    Orden de Compra, Costeo, Homologación de Stock o Existencia de Stock.
+    Revisar esto ANTES de intentar un DELETE es obligatorio: el incidente
+    de producción del 2026-09-23 (sitio completo caído) fue exactamente por
+    no revisar Homologación/Existencia acá. Se usa tanto para decidir si un
+    producto duplicado puede eliminarse de verdad como para la ruta manual
+    /productos/<id>/eliminar."""
+    if OrdenCompraLinea.query.filter_by(producto_id=producto_id).count() > 0:
+        return True
+    if ParcialLinea.query.filter_by(producto_id=producto_id).count() > 0:
+        return True
+    if HomologacionStock.query.filter_by(producto_id=producto_id).count() > 0:
+        return True
+    if StockExistencia.query.filter_by(producto_id=producto_id).count() > 0:
+        return True
+    variantes_ids = [
+        v.id for v in ProductoVariante.query.filter_by(producto_id=producto_id).with_entities(ProductoVariante.id)
+    ]
+    if variantes_ids:
+        if HomologacionStock.query.filter(HomologacionStock.variante_id.in_(variantes_ids)).count() > 0:
+            return True
+        if StockExistencia.query.filter(StockExistencia.variante_id.in_(variantes_ids)).count() > 0:
+            return True
+    return False
+
+
+def _variante_en_uso(variante_id):
+    """Mismo criterio que _producto_en_uso(), a nivel de una sola
+    ProductoVariante -- las variantes no aparecen en Orden de Compra/Costeo
+    como llave foránea (ahí se guarda solo el código como texto, ver
+    OrdenCompraLinea.variante_codigo), así que solo hace falta revisar
+    Homologación de Stock y Existencia de Stock."""
+    return (
+        HomologacionStock.query.filter_by(variante_id=variante_id).count() > 0
+        or StockExistencia.query.filter_by(variante_id=variante_id).count() > 0
+    )
+
+
+def _clave_orden_variante(v):
+    """Ronda AN (2026-09-23, mejora): las variantes de lentes (MEDICONTUR,
+    BVI PHYSIOL) se listaban ordenadas alfabéticamente por el TEXTO del
+    código (ej. '677MTYP170P' antes que '677MTYP320C' por puro orden de
+    caracteres, cuando en realidad 17.0 debería ir antes que 32.0), lo que
+    confundía al usuario tanto en el catálogo como al elegir la variante
+    para una Orden de Compra. La descripción de cada variante SÍ trae esos
+    números en el orden correcto (dioptría primero, cilindro después -- ej.
+    'TRIFOCAL TORIC BI-FLEX LIBERTY 17.0 CYL 2'), así que se ordena por la
+    secuencia de números que aparecen ahí -- funciona igual para MEDICONTUR
+    y BVI PHYSIOL sin necesitar dos lógicas distintas, y cualquier producto
+    sin números en la descripción simplemente cae de vuelta al orden
+    alfabético del código (no rompe nada para el resto del catálogo)."""
+    numeros = [float(n) for n in re.findall(r"\d+\.?\d*", v.descripcion or "")]
+    return (numeros, (v.codigo or "").strip().upper())
+
+
+def _ordenar_variantes(variantes):
+    return sorted(variantes, key=_clave_orden_variante)
+
+
+@app.template_filter("ordenar_variantes")
+def _filtro_ordenar_variantes(variantes):
+    return _ordenar_variantes(variantes)
+
+
 def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, producto_padre_id):
     """Ronda AN (2026-09-23, mejora): cuando una variante se homologa bajo su
     código padre (ver reparar_variantes_medicontur_ronda_ag / reparar_variantes_
@@ -2081,15 +2149,9 @@ def _consolidar_producto_duplicado_en_variante(proveedor_id, codigo_variante, pr
     ).first()
     if not dup:
         return None
-    en_uso = (
-        ProductoVariante.query.filter_by(producto_id=dup.id).count() > 0
-        or OrdenCompraLinea.query.filter_by(producto_id=dup.id).count() > 0
-        or ParcialLinea.query.filter_by(producto_id=dup.id).count() > 0
-        or HomologacionStock.query.filter_by(producto_id=dup.id).count() > 0
-        or StockExistencia.query.filter_by(producto_id=dup.id).count() > 0
-    )
     codigo = dup.codigo
-    if en_uso:
+    tiene_variantes_propias = ProductoVariante.query.filter_by(producto_id=dup.id).count() > 0
+    if tiene_variantes_propias or _producto_en_uso(dup.id):
         dup.activo = False
     else:
         db.session.delete(dup)
@@ -3480,6 +3542,26 @@ def productos_nuevo(proveedor_id):
     descripcion = request.form["descripcion"].strip()
     es_variante = request.form.get("es_variante") == "1"
 
+    # Ronda AN (2026-09-23, mejora): el usuario reportó haber podido crear
+    # dos veces la misma variante (mismo código repetido dos veces bajo el
+    # mismo código padre) -- nada validaba que el código no existiera ya en
+    # este proveedor, ni como Producto (código padre) ni como otra
+    # ProductoVariante. Se rechaza ANTES de crear nada, para el código
+    # nuevo sea Producto o variante.
+    ya_existe_como_producto = Producto.query.filter(
+        Producto.proveedor_id == prov.id, db.func.upper(Producto.codigo) == codigo.upper()
+    ).first()
+    ya_existe_como_variante = ProductoVariante.query.join(Producto).filter(
+        Producto.proveedor_id == prov.id, db.func.upper(ProductoVariante.codigo) == codigo.upper()
+    ).first()
+    if ya_existe_como_producto or ya_existe_como_variante:
+        donde = (
+            f"como código padre ('{ya_existe_como_producto.codigo}')" if ya_existe_como_producto
+            else f"como variante de '{ya_existe_como_variante.producto.codigo}'"
+        )
+        flash(f"El código '{codigo}' ya existe en el catálogo de {prov.nombre} {donde} -- no se puede repetir.", "danger")
+        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+
     if es_variante:
         padre_id = request.form.get("producto_padre_id") or None
         if not padre_id:
@@ -3543,14 +3625,60 @@ def productos_variante_editar(variante_id):
     usa el del código padre), solo se edita su código, descripción y,
     opcionalmente, su código interno de Ergopyme (mismo campo que usa
     Homologación de Stock -- editarlo aquí es equivalente a asignarlo desde
-    ahí)."""
+    ahí). También permite reactivarla/desactivarla a mano (checkbox
+    'Activo') -- por ejemplo, para reactivar una que la consolidación
+    automática de duplicados desactivó por error de criterio."""
     variante = ProductoVariante.query.get_or_404(variante_id)
-    variante.codigo = request.form["codigo"].strip()
+    proveedor_id = variante.producto.proveedor_id
+    nuevo_codigo = request.form["codigo"].strip()
+
+    if nuevo_codigo.upper() != (variante.codigo or "").strip().upper():
+        choca_con_producto = Producto.query.filter(
+            Producto.proveedor_id == proveedor_id, db.func.upper(Producto.codigo) == nuevo_codigo.upper()
+        ).first()
+        choca_con_variante = ProductoVariante.query.join(Producto).filter(
+            Producto.proveedor_id == proveedor_id,
+            ProductoVariante.id != variante.id,
+            db.func.upper(ProductoVariante.codigo) == nuevo_codigo.upper(),
+        ).first()
+        if choca_con_producto or choca_con_variante:
+            flash(f"El código '{nuevo_codigo}' ya existe en este catálogo -- no se puede repetir.", "danger")
+            return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+
+    variante.codigo = nuevo_codigo
     variante.descripcion = request.form["descripcion"].strip()
     variante.codigo_interno_inventario = (request.form.get("codigo_interno_inventario") or "").strip() or None
+    variante.activo = "activo" in request.form
     db.session.commit()
     flash(f"Variante '{variante.codigo}' actualizada.", "success")
-    return redirect(url_for("proveedores_detalle", proveedor_id=variante.producto.proveedor_id))
+    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+
+
+@app.route("/variantes/<int:variante_id>/eliminar", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
+def productos_variante_eliminar(variante_id):
+    """Ronda AN (2026-09-23, mejora): el usuario reportó no tener forma de
+    eliminar una variante creada por error o duplicada -- solo existía
+    creación y edición. Mismo criterio que /productos/<id>/eliminar: si
+    está referenciada desde Homologación de Stock o Existencia de Stock, se
+    DESACTIVA (ProductoVariante.activo) para no perder ese historial ni
+    violar la llave foránea; si no, se elimina de verdad."""
+    variante = ProductoVariante.query.get_or_404(variante_id)
+    proveedor_id = variante.producto.proveedor_id
+    codigo = variante.codigo
+    if _variante_en_uso(variante.id):
+        variante.activo = False
+        db.session.commit()
+        flash(
+            f"La variante '{codigo}' ya está vinculada a Homologación/Existencia de Stock: no se puede "
+            "eliminar sin perder ese historial, así que se desactivó en su lugar.",
+            "warning",
+        )
+    else:
+        db.session.delete(variante)
+        db.session.commit()
+        flash(f"Variante '{codigo}' eliminada.", "success")
+    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
 
 
 @app.route("/productos/<int:producto_id>/eliminar", methods=["POST"])
@@ -3558,17 +3686,21 @@ def productos_variante_editar(variante_id):
 def productos_eliminar(producto_id):
     """Ronda U (2026-09-12, punto 2): elimina el producto DE VERDAD del
     catálogo (antes esta ruta existía pero no estaba conectada a ningún
-    botón, y solo desactivaba). Solo se permite si el producto nunca se usó
-    en ninguna Orden de Compra ni en ningún Parcial de Costeo -- si tiene
-    historial, se desactiva en su lugar (igual que el checkbox 'Activo en
-    catálogo' del modal Editar) para no romper ningún dato ya guardado."""
+    botón, y solo desactivaba). Solo se permite si el producto (o alguna de
+    sus variantes) nunca se usó en ninguna Orden de Compra, Costeo,
+    Homologación de Stock ni Existencia de Stock -- si tiene historial, se
+    desactiva en su lugar (igual que el checkbox 'Activo en catálogo' del
+    modal Editar) para no romper ningún dato ya guardado.
+
+    IMPORTANTE (incidente 2026-09-23): esta ruta tenía el MISMO problema que
+    causó la caída de producción -- solo revisaba OrdenCompraLinea/
+    ParcialLinea, no Homologación/Existencia de Stock, así que un usuario
+    podía toparse con el mismo error de llave foránea (Internal Server
+    Error) al intentar eliminar un producto ya vinculado a Homologación.
+    Ahora usa _producto_en_uso(), que revisa las 5 tablas."""
     producto = Producto.query.get_or_404(producto_id)
     proveedor_id = producto.proveedor_id
-    en_uso = (
-        OrdenCompraLinea.query.filter_by(producto_id=producto.id).count() > 0
-        or ParcialLinea.query.filter_by(producto_id=producto.id).count() > 0
-    )
-    if en_uso:
+    if _producto_en_uso(producto.id):
         producto.activo = False
         db.session.commit()
         flash(
@@ -4417,7 +4549,14 @@ def api_producto_variantes(producto_id):
     orden. El precio NUNCA viene de aquí, siempre es el del producto
     padre."""
     producto = Producto.query.get_or_404(producto_id)
-    variantes = producto.variantes.order_by(ProductoVariante.codigo).all()
+    # Ronda AN (2026-09-23, mejora): antes ordenaba alfabeticamente por el
+    # TEXTO del codigo (ver _clave_orden_variante) -- ahora usa el mismo
+    # orden numerico (dioptria/cilindro) que el catalogo de Proveedores,
+    # para que la lista de variantes al armar una Orden de Compra coincida
+    # con lo que el usuario ve ahi. Tambien deja afuera las inactivas (ver
+    # ProductoVariante.activo) -- no deberian poder elegirse para una OC
+    # nueva.
+    variantes = _ordenar_variantes(producto.variantes.filter_by(activo=True).all())
     return jsonify(
         [{"id": v.id, "codigo": v.codigo, "descripcion": v.descripcion} for v in variantes]
     )

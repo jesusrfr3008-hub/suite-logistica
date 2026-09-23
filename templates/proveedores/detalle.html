@@ -88,7 +88,7 @@
         <tr class="{% if not p.activo %}text-muted{% endif %}">
           <td>
             {{ p.codigo }}
-            {% set variantes_p = p.variantes.all() %}
+            {% set variantes_p = p.variantes.all() | ordenar_variantes %}
             {% if variantes_p %}
             <button type="button" class="btn btn-link btn-sm p-0 ms-1" data-bs-toggle="collapse" data-bs-target="#variantes{{ p.id }}">
               <span class="badge bg-info text-dark">{{ variantes_p|length }} variante(s)</span>
@@ -115,14 +115,24 @@
             <div class="small text-muted mb-1">Variantes de {{ p.codigo }} (sin precio propio -- usan el del código padre). Edita cualquier campo y presiona Guardar:</div>
             <div class="border rounded p-2" style="max-height: 260px; overflow-y: auto;">
               {% for v in variantes_p %}
-              <form method="post" action="{{ url_for('productos_variante_editar', variante_id=v.id) }}"
-                    class="d-flex align-items-center gap-1 flex-wrap mb-1 pb-1 {% if not loop.last %}border-bottom{% endif %}">
-                <input class="form-control form-control-sm" style="max-width:150px" name="codigo" value="{{ v.codigo }}" required>
-                <input class="form-control form-control-sm flex-grow-1" style="min-width:220px" name="descripcion" value="{{ v.descripcion }}" required>
-                <input class="form-control form-control-sm" style="max-width:150px" name="codigo_interno_inventario"
-                       value="{{ v.codigo_interno_inventario or '' }}" placeholder="Código Ergopyme">
-                <button type="submit" class="btn btn-sm btn-outline-primary">Guardar</button>
-              </form>
+              <div class="d-flex align-items-center gap-1 flex-wrap mb-1 pb-1 {% if not loop.last %}border-bottom{% endif %} {% if not v.activo %}text-muted{% endif %}">
+                <form method="post" action="{{ url_for('productos_variante_editar', variante_id=v.id) }}"
+                      class="d-flex align-items-center gap-1 flex-wrap flex-grow-1">
+                  <input class="form-control form-control-sm" style="max-width:150px" name="codigo" value="{{ v.codigo }}" required>
+                  <input class="form-control form-control-sm flex-grow-1" style="min-width:220px" name="descripcion" value="{{ v.descripcion }}" required>
+                  <input class="form-control form-control-sm" style="max-width:150px" name="codigo_interno_inventario"
+                         value="{{ v.codigo_interno_inventario or '' }}" placeholder="Código Ergopyme">
+                  <span class="form-check form-check-inline mb-0" title="Activo (aparece para elegir al armar una OC)">
+                    <input type="checkbox" class="form-check-input" name="activo" id="varActivo{{ v.id }}" {% if v.activo %}checked{% endif %}>
+                    <label class="form-check-label small" for="varActivo{{ v.id }}">Activo</label>
+                  </span>
+                  <button type="submit" class="btn btn-sm btn-outline-primary">Guardar</button>
+                </form>
+                <form method="post" action="{{ url_for('productos_variante_eliminar', variante_id=v.id) }}"
+                      onsubmit="return confirm('¿Eliminar la variante \'{{ v.codigo }}\'? Si ya está vinculada a Homologación o Existencia de Stock, no se puede eliminar sin perder ese historial -- en ese caso quedará desactivada en su lugar.');">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">Eliminar</button>
+                </form>
+              </div>
               {% endfor %}
             </div>
           </td>

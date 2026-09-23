@@ -270,6 +270,13 @@ class ProductoVariante(db.Model):
     # producto "padre" de nuestro catalogo no es una unidad fisica real).
     codigo_interno_inventario = db.Column(db.String(40))
 
+    # Ronda AN (2026-09-23, mejora): antes una variante no podía "eliminarse"
+    # de verdad si ya estaba referenciada desde Homologación de Stock o
+    # Existencia de Stock (violaría esa llave foránea) -- ahora, igual que
+    # Producto.activo, se desactiva en vez de romper esas referencias. Una
+    # variante inactiva no aparece para elegir al armar una Orden de Compra.
+    activo = db.Column(db.Boolean, default=True)
+
     producto = db.relationship("Producto", backref=db.backref("variantes", lazy="dynamic"))
 
     def __repr__(self):
