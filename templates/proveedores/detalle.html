@@ -132,11 +132,32 @@
                   </span>
                   <button type="submit" class="btn btn-sm btn-outline-primary">Guardar</button>
                 </form>
+                <button type="button" class="btn btn-sm btn-outline-secondary btnMostrarReasignarPadre" data-target="reasignarPadre{{ v.id }}">
+                  Cambiar código padre
+                </button>
                 <form method="post" action="{{ url_for('productos_variante_eliminar', variante_id=v.id) }}"
                       onsubmit="return confirm('¿Eliminar la variante \'{{ v.codigo }}\'? Si ya está vinculada a Homologación o Existencia de Stock, no se puede eliminar sin perder ese historial -- en ese caso quedará desactivada en su lugar.');">
                   <input type="hidden" name="q" value="{{ q }}">
                   <button type="submit" class="btn btn-sm btn-outline-danger">Eliminar</button>
                 </form>
+                <div class="d-none border rounded p-2 mt-1 bg-light w-100" id="reasignarPadre{{ v.id }}">
+                  <div class="small text-muted mb-1">
+                    Mueve esta variante (código, descripción, código Ergopyme e historial de Homologación/Stock
+                    intactos) a otro código padre <strong>ya existente</strong> de este proveedor -- útil cuando
+                    quedó cargada bajo el código padre equivocado. Padre actual: <strong>{{ p.codigo }}</strong>.
+                  </div>
+                  <input type="text" class="form-control form-control-sm mb-1 buscadorReasignarPadre" placeholder="Buscar el código padre correcto..." data-target="reasignarPadre{{ v.id }}">
+                  <select class="form-select form-select-sm selectReasignarPadre" data-target="reasignarPadre{{ v.id }}">
+                    <option value="">Escribe arriba para buscar...</option>
+                  </select>
+                  <form method="post" action="{{ url_for('productos_variante_reasignar_padre', variante_id=v.id) }}" class="mt-2">
+                    <input type="hidden" name="q" value="{{ q }}">
+                    <input type="hidden" name="producto_padre_id" class="inputPadreReasignar" data-target="reasignarPadre{{ v.id }}">
+                    <button type="submit" class="btn btn-sm btn-outline-warning btnReasignarPadre" data-target="reasignarPadre{{ v.id }}" disabled>
+                      Reasignar a este código padre
+                    </button>
+                  </form>
+                </div>
               </div>
               {% endfor %}
             </div>
@@ -448,6 +469,57 @@
       const btnFusionar = document.querySelector('.btnFusionar[data-target="' + targetId + '"]');
       if (hiddenInput) hiddenInput.value = select.value;
       if (btnFusionar) btnFusionar.disabled = !select.value;
+    });
+  });
+})();
+</script>
+
+<script>
+(function () {
+  // Ronda AU (2026-09-24, a pedido del usuario): "Cambiar código padre" de
+  // una variante -- mismo patron/API que el buscador de Fusión de arriba.
+  document.querySelectorAll('.btnMostrarReasignarPadre').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const panel = document.getElementById(btn.dataset.target);
+      if (panel) panel.classList.toggle('d-none');
+    });
+  });
+
+  let timeoutReasignar = null;
+  document.querySelectorAll('.buscadorReasignarPadre').forEach(function (input) {
+    input.addEventListener('input', function () {
+      clearTimeout(timeoutReasignar);
+      const q = input.value.trim();
+      const targetId = input.dataset.target;
+      const select = document.querySelector('.selectReasignarPadre[data-target="' + targetId + '"]');
+      const hiddenInput = document.querySelector('.inputPadreReasignar[data-target="' + targetId + '"]');
+      const btnReasignar = document.querySelector('.btnReasignarPadre[data-target="' + targetId + '"]');
+      if (!select || q.length < 2) return;
+      timeoutReasignar = setTimeout(function () {
+        fetch('{{ url_for("api_productos_por_proveedor", proveedor_id=proveedor.id) }}?q=' + encodeURIComponent(q))
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            select.innerHTML = '<option value="">Selecciona el código padre correcto...</option>';
+            data.forEach(function (p) {
+              const opt = document.createElement('option');
+              opt.value = p.id;
+              opt.textContent = p.codigo + ' -- ' + p.descripcion + (p.activo ? '' : ' (inactivo)');
+              select.appendChild(opt);
+            });
+            if (hiddenInput) hiddenInput.value = '';
+            if (btnReasignar) btnReasignar.disabled = true;
+          });
+      }, 300);
+    });
+  });
+
+  document.querySelectorAll('.selectReasignarPadre').forEach(function (select) {
+    select.addEventListener('change', function () {
+      const targetId = select.dataset.target;
+      const hiddenInput = document.querySelector('.inputPadreReasignar[data-target="' + targetId + '"]');
+      const btnReasignar = document.querySelector('.btnReasignarPadre[data-target="' + targetId + '"]');
+      if (hiddenInput) hiddenInput.value = select.value;
+      if (btnReasignar) btnReasignar.disabled = !select.value;
     });
   });
 })();

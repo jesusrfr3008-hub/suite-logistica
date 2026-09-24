@@ -2847,6 +2847,45 @@ def reparar_variantes_physiol_ronda_ae():
         )
 
 
+def reparar_codigo_padre_ankoris_ronda_au():
+    """Ronda AU (2026-09-24, a pedido del usuario): 2 variantes de ANKORIS
+    (lentes BVI PHYSIOL) habían quedado cargadas bajo el código padre
+    'Podeye' -- el usuario indicó mal el padre al pedir la carga masiva en
+    una ronda anterior. El catálogo ya tiene su propio código padre
+    'ANKORIS' correcto (con otras variantes ya bien asignadas), así que se
+    mueven ahí. Mismo mecanismo de fondo que el botón "Cambiar código
+    padre" agregado en esta misma ronda a la pantalla de catálogo (ver
+    productos_variante_reasignar_padre) -- esto es lo mismo pero automático,
+    para no depender de que el usuario entre a hacerlo a mano.
+
+    No gateada (corre en cada arranque) e idempotente: busca variantes que
+    TODAVÍA estén bajo 'Podeye' con estos códigos exactos -- una vez
+    movidas (por acá o a mano desde el catálogo), la búsqueda no encuentra
+    nada más y no hace nada en los arranques siguientes."""
+    CODIGOS_A_MOVER_A_ANKORIS = ["ANKORIS 21.5D 3.00C", "ANKORIS 25.0D 1.50C"]
+    variantes_mal_ubicadas = ProductoVariante.query.join(Producto).filter(
+        db.func.upper(Producto.codigo) == "PODEYE",
+        db.func.upper(ProductoVariante.codigo).in_([c.upper() for c in CODIGOS_A_MOVER_A_ANKORIS]),
+    ).all()
+    if not variantes_mal_ubicadas:
+        return
+
+    movidas = 0
+    for variante in variantes_mal_ubicadas:
+        proveedor_id = variante.producto.proveedor_id
+        ankoris = Producto.query.filter(
+            Producto.proveedor_id == proveedor_id, db.func.upper(Producto.codigo) == "ANKORIS",
+        ).first()
+        if not ankoris:
+            continue
+        variante.producto_id = ankoris.id
+        movidas += 1
+
+    if movidas:
+        db.session.commit()
+        print(f"[reparar_ronda_au] ANKORIS: {movidas} variante(s) reasignada(s) de código padre 'Podeye' a 'ANKORIS'.")
+
+
 def _normalizar_codigo_ergopyme(valor):
     """Ronda AA (2026-09-13): normaliza un código interno del sistema de
     Inventarios (Ergopyme) tal como viene en los archivos de Reportes --
@@ -3387,6 +3426,7 @@ with app.app_context():
     _paso_arranque_seguro("reparar_variantes_medicontur_ronda_ag", reparar_variantes_medicontur_ronda_ag)
     _paso_arranque_seguro("reparar_codigos_877pety_ronda_aq", reparar_codigos_877pety_ronda_aq)
     _paso_arranque_seguro("reparar_variantes_physiol_ronda_ae", reparar_variantes_physiol_ronda_ae)
+    _paso_arranque_seguro("reparar_codigo_padre_ankoris_ronda_au", reparar_codigo_padre_ankoris_ronda_au)
     _paso_arranque_seguro("seed_codigos_ergopyme", seed_codigos_ergopyme)
     _paso_arranque_seguro("reparar_alias_codigo_proveedor_ronda_ao", reparar_alias_codigo_proveedor_ronda_ao)
     _paso_arranque_seguro("seed_compras_historicas", seed_compras_historicas)
@@ -4305,6 +4345,43 @@ def productos_variante_editar(variante_id):
         _registrar_alias_codigo_proveedor(proveedor_id, codigo_anterior, variante_destino=variante)
     db.session.commit()
     flash(f"Variante '{variante.codigo}' actualizada.", "success")
+    return _redirect_proveedor_detalle(proveedor_id)
+
+
+@app.route("/variantes/<int:variante_id>/reasignar-padre", methods=["POST"])
+@requiere_permiso("crear_orden", "generar_costeo")
+def productos_variante_reasignar_padre(variante_id):
+    """Ronda AU (2026-09-24, a pedido del usuario): reportó 2 variantes de
+    ANKORIS cargadas por error bajo el código padre 'Podeye' (le indicó mal
+    el padre al pedir la carga) -- y no había forma de corregir el código
+    padre de una variante ya creada, solo borrarla y crearla de nuevo a
+    mano perdiendo su historial. Esta ruta la reasigna a otro Producto
+    (código padre) YA EXISTENTE del mismo proveedor sin tocar su código,
+    descripción, código interno de Ergopyme, ni ningún vínculo de
+    Homologación de Stock/Existencia de Stock (esos apuntan a la
+    ProductoVariante por su id, que no cambia) -- de ahí en adelante
+    aparece agrupada bajo el código padre correcto en catálogo, al armar
+    una Orden de Compra, y en los reportes."""
+    variante = ProductoVariante.query.get_or_404(variante_id)
+    proveedor_id = variante.producto.proveedor_id
+    nuevo_padre_id = request.form.get("producto_padre_id", type=int)
+    if not nuevo_padre_id:
+        flash("Selecciona el código padre correcto antes de reasignar.", "warning")
+        return _redirect_proveedor_detalle(proveedor_id)
+    nuevo_padre = Producto.query.get_or_404(nuevo_padre_id)
+    if nuevo_padre.proveedor_id != proveedor_id:
+        flash("El código padre debe ser del mismo proveedor.", "danger")
+        return _redirect_proveedor_detalle(proveedor_id)
+    if nuevo_padre.id == variante.producto_id:
+        flash(f"'{variante.codigo}' ya pertenece al código padre '{nuevo_padre.codigo}'.", "info")
+        return _redirect_proveedor_detalle(proveedor_id)
+    padre_anterior = variante.producto.codigo
+    variante.producto_id = nuevo_padre.id
+    db.session.commit()
+    flash(
+        f"Variante '{variante.codigo}' reasignada de código padre '{padre_anterior}' a '{nuevo_padre.codigo}'.",
+        "success",
+    )
     return _redirect_proveedor_detalle(proveedor_id)
 
 
