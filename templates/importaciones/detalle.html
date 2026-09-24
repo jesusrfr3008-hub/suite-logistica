@@ -331,12 +331,12 @@
                 <div class="collapse small mt-1" id="lotes-{{ l.id }}">
                   <ul class="list-unstyled mb-0 ps-0">
                     {% for lo in l.lotes %}
-                    <li>{{ lo.codigo_lote or '(sin código)' }} — {{ lo.fecha_vencimiento.strftime('%d-%m-%Y') if lo.fecha_vencimiento else 'sin fecha' }} · {{ lo.cantidad_unidades }} un.</li>
+                    <li>{{ lo.codigo_lote or '(sin código)' }} · {{ lo.cantidad_unidades }} un.</li>
                     {% endfor %}
                   </ul>
                 </div>
                 {% elif l.lotes|length == 1 %}
-                {{ l.lotes[0].codigo_lote or '-' }}{% if l.lotes[0].fecha_vencimiento %} <span class="text-muted small">({{ l.lotes[0].fecha_vencimiento.strftime('%d-%m-%Y') }})</span>{% endif %}
+                {{ l.lotes[0].codigo_lote or '-' }}
                 {% else %}
                 {{ l.codigo_lote or '-' }}
                 {% endif %}
