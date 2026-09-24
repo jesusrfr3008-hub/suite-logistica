@@ -7043,6 +7043,49 @@ def _normalizar_desc(texto):
 _normalizar_codigo = _normalizar_desc
 
 
+def _clave_flexible(texto):
+    """Clave de comparación todavía más tolerante que _normalizar_codigo /
+    _normalizar_desc -- se usa solo como ÚLTIMO recurso, cuando ni el código
+    ni la descripción calzan de forma exacta (ya normalizada).
+
+    Ronda AU (3ra corrección, 2026-09-24, a pedido del usuario): en el
+    catálogo real de un proveedor (lentes MicroPure) el mismo producto quedó
+    escrito de formas ligeramente distintas entre el archivo de lotes y el
+    catálogo -- "MicroPure 123 +12.0 D" en el archivo vs "MICROPURE 123
+    +12.00D" en el catálogo (un decimal de más/menos, y un espacio antes de
+    la letra de sufijo que en el catálogo no está); o "SINGLE-USE INJECTOR
+    1.2.3. PREMIUM" vs "Single Use Injector 1.2.3 Premium" (un guion y un
+    punto de más). _normalizar_codigo (mayúsculas/espacios) no alcanza para
+    estos casos, así que se agrega, solo como respaldo, esta clave más
+    agresiva en dos pasos sobre el texto ya normalizado:
+
+    1) en cada número decimal (ej. "12.00", "20.5") se recortan los ceros
+       finales de la parte decimal (12.00 -> 12, 14.50 -> 14.5, 20.5 sigue
+       20.5) para que la misma medida escrita con distinta cantidad de
+       decimales se compare igual;
+    2) se elimina todo lo que no sea letra o número (espacios, guiones,
+       puntos, signos +) para que un espacio, guion o punto de más/menos no
+       impida el cruce.
+
+    Se usa solo como respaldo (después de intentar el cruce normal por
+    código y por descripción), y solo si el resultado es único entre las
+    líneas del costeo -- si dos productos distintos del mismo costeo
+    terminan con la misma clave flexible, ninguno se asigna por acá (quedan
+    como "no encontrado" en el informe, igual que antes, en vez de
+    arriesgar una asignación equivocada)."""
+    texto = _normalizar_desc(texto)
+    if not texto:
+        return ""
+
+    def _recortar_decimales(m):
+        entero, decimales = m.group(1), m.group(2).rstrip("0")
+        return f"{entero}.{decimales}" if decimales else entero
+
+    texto = re.sub(r"(\d+)\.(\d+)", _recortar_decimales, texto)
+    texto = re.sub(r"[^a-z0-9áéíóúñ]", "", texto)
+    return texto
+
+
 def _buscar_columna_prioridad(encabezado, *listas_claves):
     """Busca una columna probando listas de claves en orden de prioridad
     (todas las columnas contra la lista más específica antes de pasar a la
@@ -7147,10 +7190,15 @@ def _indexar_lineas_importacion(importacion):
     parciales distintos del mismo costeo, confirmado por el usuario). Si
     una clave aparece en más de una línea (dato real inesperado), se marca
     como ambigua y se excluye de los diccionarios en vez de adivinar a
-    cuál asignarla."""
-    por_codigo, por_descripcion = {}, {}
-    vistos_codigo, vistos_descripcion = set(), set()
-    ambiguos_codigo, ambiguos_descripcion = set(), set()
+    cuál asignarla.
+
+    Ronda AU (3ra corrección, 2026-09-24): además arma un tercer diccionario
+    "flexible" (ver _clave_flexible) combinando código y descripción de cada
+    línea, para usarlo como último respaldo cuando el cruce exacto (por
+    código o por descripción, ya normalizados) no encuentra nada."""
+    por_codigo, por_descripcion, por_flexible = {}, {}, {}
+    vistos_codigo, vistos_descripcion, vistos_flexible = set(), set(), set()
+    ambiguos_codigo, ambiguos_descripcion, ambiguos_flexible = set(), set(), set()
     for parcial in importacion.parciales:
         for linea in parcial.lineas:
             clave_cod = _normalizar_codigo(linea.codigo)
@@ -7165,11 +7213,20 @@ def _indexar_lineas_importacion(importacion):
                     ambiguos_descripcion.add(clave_desc)
                 vistos_descripcion.add(clave_desc)
                 por_descripcion[clave_desc] = linea
+            for clave_flex in {_clave_flexible(linea.codigo), _clave_flexible(linea.descripcion)}:
+                if not clave_flex:
+                    continue
+                if clave_flex in vistos_flexible and por_flexible.get(clave_flex) is not linea:
+                    ambiguos_flexible.add(clave_flex)
+                vistos_flexible.add(clave_flex)
+                por_flexible[clave_flex] = linea
     for clave in ambiguos_codigo:
         por_codigo.pop(clave, None)
     for clave in ambiguos_descripcion:
         por_descripcion.pop(clave, None)
-    return por_codigo, por_descripcion, ambiguos_codigo, ambiguos_descripcion
+    for clave in ambiguos_flexible:
+        por_flexible.pop(clave, None)
+    return por_codigo, por_descripcion, por_flexible, ambiguos_codigo, ambiguos_descripcion, ambiguos_flexible
 
 
 def _generar_informe_errores_carga_lotes(no_encontrados, ambiguos_encontrados, excedidas):
@@ -7289,7 +7346,10 @@ def importacion_lotes_cargar(importacion_id):
     # detalle técnico queda en el log del servidor para poder diagnosticarlo
     # si se repite.
     try:
-        por_codigo, por_descripcion, ambiguos_codigo, ambiguos_descripcion = _indexar_lineas_importacion(imp)
+        (
+            por_codigo, por_descripcion, por_flexible,
+            ambiguos_codigo, ambiguos_descripcion, ambiguos_flexible,
+        ) = _indexar_lineas_importacion(imp)
 
         conteo_por_linea = defaultdict(lambda: defaultdict(int))
         # Antes estas dos eran sets de un solo texto (código o descripción)
@@ -7313,6 +7373,22 @@ def importacion_lotes_cargar(importacion_id):
                 linea = por_descripcion.get(desc_key)
                 if linea is None and desc_key in ambiguos_descripcion:
                     motivo_ambiguo = motivo_ambiguo or "descripción"
+            # Ronda AU (3ra corrección, 2026-09-24): si ni el código ni la
+            # descripción calzaron de forma exacta (normalizada), se intenta
+            # un último cruce con la clave flexible (tolera diferencias de
+            # decimales -- "+12.0" vs "+12.00" -- y de puntuación -- guiones,
+            # puntos, espacios de más) antes de darlo por "no encontrado".
+            if linea is None:
+                clave_flex_cod = _clave_flexible(fila["codigo"]) if fila["codigo"] else ""
+                clave_flex_desc = _clave_flexible(fila["descripcion"]) if fila["descripcion"] else ""
+                for clave_flex in (clave_flex_cod, clave_flex_desc):
+                    if not clave_flex:
+                        continue
+                    linea = por_flexible.get(clave_flex)
+                    if linea is not None:
+                        break
+                    if clave_flex in ambiguos_flexible:
+                        motivo_ambiguo = motivo_ambiguo or "código/descripción (comparación flexible)"
             if linea is None:
                 if motivo_ambiguo:
                     ambiguos_encontrados.append({**fila, "motivo": motivo_ambiguo})
