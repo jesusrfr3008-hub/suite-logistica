@@ -7322,17 +7322,24 @@ def importacion_lotes_cargar(importacion_id):
             lineas_por_parcial[nombre_parcial] = lineas_por_parcial.get(nombre_parcial, 0) + 1
 
         db.session.commit()
-    except Exception:
+    except Exception as e:
         db.session.rollback()
         app.logger.exception(
             f"Error inesperado cargando lotes para la importación {imp.id} "
             f"(archivo '{archivo.filename}')"
         )
+        # Ronda AU (2da corrección, 2026-09-24): la primera versión de este
+        # aviso solo decía "error inesperado" y dejaba el detalle técnico
+        # únicamente en el log del servidor -- inútil para el usuario, que
+        # no tiene acceso a ese log, así que no podía contarnos MÁS que "me
+        # dio el mismo error". Ahora el propio mensaje en pantalla incluye el
+        # tipo y texto de la excepción, para poder diagnosticar de una sola
+        # vez sin ir y volver pidiendo el archivo.
         flash(
             "No se pudo completar la carga de lotes por un error inesperado -- no se guardó ningún cambio. "
             "Verifica que el archivo tenga las columnas 'Código' o 'Descripción', 'Lote' y 'Vencimiento', "
             "sin filas de totales u otras celdas fuera de la tabla. Si el problema sigue, avísale al soporte "
-            "técnico con este mismo archivo.",
+            f"técnico con este mismo archivo y este detalle técnico: {type(e).__name__}: {e}",
             "danger",
         )
         return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
@@ -7360,12 +7367,24 @@ def importacion_lotes_cargar(importacion_id):
     flash(mensaje, "success" if lineas_por_parcial else "warning")
 
     if no_encontrados or ambiguos_encontrados or excedidas:
-        informe = _generar_informe_errores_carga_lotes(no_encontrados, ambiguos_encontrados, excedidas)
-        nombre_informe = f"Informe_errores_lotes_{imp.numero_factura or imp.id}.xlsx".replace("/", "-").replace(" ", "_")
-        return send_file(
-            informe, as_attachment=True, download_name=nombre_informe,
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        # Ronda AU (2da corrección): la carga en sí YA quedó guardada y
+        # comiteada arriba -- si algo falla generando el Excel del informe
+        # (no debería, pero es una segunda operación separada), no hay que
+        # perder esa confirmación ni volver a mostrar un error en blanco.
+        try:
+            informe = _generar_informe_errores_carga_lotes(no_encontrados, ambiguos_encontrados, excedidas)
+            nombre_informe = f"Informe_errores_lotes_{imp.numero_factura or imp.id}.xlsx".replace("/", "-").replace(" ", "_")
+            return send_file(
+                informe, as_attachment=True, download_name=nombre_informe,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            app.logger.exception(f"Error generando el informe de errores de carga de lotes (importación {imp.id})")
+            flash(
+                "La carga ya se guardó (ver mensaje anterior), pero no se pudo generar el informe descargable "
+                f"con el detalle de lo no encontrado -- detalle técnico: {type(e).__name__}: {e}",
+                "warning",
+            )
     return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
 
