@@ -9,7 +9,7 @@
       Stock que sigue siendo del proveedor (todavía no se compró), lote por lote, tal como lo
       reporta el proveedor -- alimenta el toggle Propio/Consignación de Stock Valorizado y el
       Reporte de Consignación para enviarle al proveedor.
-      {% if ultima_carga %}Última actualización: {{ ultima_carga.strftime('%d-%m-%Y %H:%M') }}.{% else %}Todavía no se ha cargado ningún archivo de consignación.{% endif %}
+      {% if ultima_carga %}Última actualización: {{ ultima_carga | hora_cl }} (hora de Chile).{% else %}Todavía no se ha cargado ningún archivo de consignación.{% endif %}
     </div>
   </div>
   <div class="d-flex gap-2">

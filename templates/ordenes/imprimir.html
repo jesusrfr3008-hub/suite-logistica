@@ -146,6 +146,6 @@
   <div class="notas-oc"><strong>Notas:</strong> {{ orden.notas }}</div>
   {% endif %}
 
-  <div class="pie-documento">Documento generado por Suite Logística el {{ orden.creado_en.strftime('%Y-%m-%d %H:%M') }}.</div>
+  <div class="pie-documento">Documento generado por Suite Logística el {{ orden.creado_en | hora_cl }} (hora de Chile).</div>
 </body>
 </html>

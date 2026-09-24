@@ -57,8 +57,8 @@
     <h3 class="section-title mb-0">Consulta de Stock</h3>
     <div class="text-muted small">
       Saldos de existencias del sistema de Inventarios (Accuvision y Accumedical juntas -- filtra por empresa o proveedor abajo).
-      {% if ultima_carga %}Última actualización de Stock: {{ ultima_carga.strftime('%d-%m-%Y %H:%M') }}.{% else %}Todavía no se ha cargado ningún reporte de Stock.{% endif %}
-      {% if ultima_carga_bodegas %}Última actualización de Stock Comprometido por Bodegas: {{ ultima_carga_bodegas.strftime('%d-%m-%Y %H:%M') }}.{% elif ultima_carga_pedidos %}Última actualización de Notas de pedido: {{ ultima_carga_pedidos.strftime('%d-%m-%Y %H:%M') }}.{% endif %}
+      {% if ultima_carga %}Última actualización de Stock: {{ ultima_carga | hora_cl }} (hora de Chile).{% else %}Todavía no se ha cargado ningún reporte de Stock.{% endif %}
+      {% if ultima_carga_bodegas %}Última actualización de Stock Comprometido por Bodegas: {{ ultima_carga_bodegas | hora_cl }} (hora de Chile).{% elif ultima_carga_pedidos %}Última actualización de Notas de pedido: {{ ultima_carga_pedidos | hora_cl }} (hora de Chile).{% endif %}
     </div>
   </div>
   {% if current_user.tiene_permiso('inventarios') %}

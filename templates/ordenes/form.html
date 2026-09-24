@@ -87,18 +87,27 @@
 
   <!-- Ronda M (2026-09-10, punto 1): elegir variante (ej. dioptria de un
        lente MEDICONTUR) antes de agregar la linea -- el precio siempre es
-       el del codigo padre, no de la variante. -->
+       el del codigo padre, no de la variante. Ronda AS (2026-09-24):
+       selección MÚLTIPLE -- se puede marcar más de una variante y
+       agregarlas todas de una vez a la orden. -->
   <div class="modal fade" id="modalElegirVarianteForm" tabindex="-1">
     <div class="modal-dialog">
       <div class="modal-content">
         <div class="modal-header">
-          <h5 class="modal-title">Elige la variante</h5>
+          <h5 class="modal-title">Elige la(s) variante(s)</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
           <p class="text-muted small mb-1" id="tituloProductoVarianteForm"></p>
-          <input type="text" class="form-control form-control-sm mb-2" id="buscarVarianteForm" placeholder="Filtrar por código o descripción...">
+          <div class="d-flex justify-content-between align-items-center mb-1">
+            <input type="text" class="form-control form-control-sm" id="buscarVarianteForm" placeholder="Filtrar por código o descripción..." style="max-width:260px;">
+            <button type="button" class="btn btn-sm btn-link p-0" id="btnLimpiarVariantesForm">Limpiar selección</button>
+          </div>
           <div class="list-group" id="listaVariantesForm" style="max-height:280px; overflow-y:auto;"></div>
+        </div>
+        <div class="modal-footer">
+          <span class="text-muted small me-auto" id="contadorVariantesForm">Ninguna variante marcada.</span>
+          <button type="button" class="btn btn-brand" id="btnAgregarVariantesForm" disabled>Agregar</button>
         </div>
       </div>
     </div>
@@ -142,9 +151,15 @@
     </div>
   </div>
 
-  <div class="d-flex gap-2">
-    <button type="submit" class="btn btn-brand">Crear orden de compra</button>
+  <div class="d-flex gap-2 align-items-center flex-wrap">
+    <button type="submit" name="accion" value="finalizar" class="btn btn-brand">Crear orden de compra</button>
+    <!-- Ronda AS (2026-09-24): "guardar y continuar después" -- guarda lo
+         que haya hasta ahora (aunque todavía no se haya agregado ninguna
+         línea) como borrador 'Sin Emitir', visible solo para quien la creó,
+         para retomarlo más tarde sin perder el avance. -->
+    <button type="submit" name="accion" value="guardar_borrador" class="btn btn-outline-brand">Guardar y continuar después</button>
     <a href="{{ url_for('ordenes_list') }}" class="btn btn-outline-secondary">Cancelar</a>
+    <span class="text-muted small">"Guardar y continuar después" deja la orden como borrador (solo vos la ves, en "Por Aprobar") para que sigas agregando productos cuando quieras.</span>
   </div>
 </form>
 
@@ -229,16 +244,31 @@ async function cargarCatalogo(q) {
   });
 }
 
+// Ronda AS (2026-09-24): selección múltiple de variantes -- código ->
+// objeto variante, de las marcadas con el checkbox en el modal actual.
+let variantesFormSeleccionadas = new Map();
+const btnAgregarVariantesForm = document.getElementById('btnAgregarVariantesForm');
+const contadorVariantesForm = document.getElementById('contadorVariantesForm');
+
 async function abrirModalVariante(producto) {
   productoPendienteVariante = producto;
+  variantesFormSeleccionadas = new Map();
   document.getElementById('tituloProductoVarianteForm').textContent = `${producto.codigo} — ${producto.descripcion}`;
   document.getElementById('buscarVarianteForm').value = '';
   const lista = document.getElementById('listaVariantesForm');
   lista.innerHTML = '<p class="text-muted small px-2">Cargando variantes...</p>';
+  actualizarContadorVariantesForm();
   modalVarianteForm.show();
   const resp = await fetch(`/api/productos/${producto.id}/variantes`);
   producto._variantes = await resp.json();
   renderListaVariantesForm('');
+}
+
+function actualizarContadorVariantesForm() {
+  const n = variantesFormSeleccionadas.size;
+  contadorVariantesForm.textContent = n === 0 ? 'Ninguna variante marcada.' : `${n} variante(s) marcada(s).`;
+  btnAgregarVariantesForm.disabled = n === 0;
+  btnAgregarVariantesForm.textContent = n > 1 ? `Agregar ${n} variantes` : 'Agregar';
 }
 
 function renderListaVariantesForm(filtro) {
@@ -250,22 +280,38 @@ function renderListaVariantesForm(filtro) {
     .slice(0, 60)
     .forEach(v => {
       const yaAgregada = !!lineasAgregadas[claveLinea(productoPendienteVariante.id, v.codigo)];
-      const item = document.createElement('button');
-      item.type = 'button';
-      item.className = 'list-group-item list-group-item-action py-1 small' + (yaAgregada ? ' text-muted' : '');
-      item.textContent = yaAgregada ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`;
-      item.addEventListener('click', () => {
-        if (yaAgregada) {
-          alert(`'${v.codigo}' ya fue agregado a esta orden. Ajusta la cantidad en su fila en vez de agregarlo de nuevo.`);
-          return;
+      const item = document.createElement('label');
+      item.className = 'list-group-item list-group-item-action py-1 small d-flex align-items-center gap-2' + (yaAgregada ? ' text-muted' : '');
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.className = 'form-check-input mt-0 flex-shrink-0';
+      check.disabled = yaAgregada;
+      check.checked = variantesFormSeleccionadas.has(v.codigo);
+      check.addEventListener('change', () => {
+        if (check.checked) {
+          variantesFormSeleccionadas.set(v.codigo, v);
+        } else {
+          variantesFormSeleccionadas.delete(v.codigo);
         }
-        agregarLinea(productoPendienteVariante, v);
-        modalVarianteForm.hide();
+        actualizarContadorVariantesForm();
       });
+      const texto = document.createElement('span');
+      texto.textContent = yaAgregada ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`;
+      item.appendChild(check);
+      item.appendChild(texto);
       lista.appendChild(item);
     });
 }
 document.getElementById('buscarVarianteForm').addEventListener('input', (e) => renderListaVariantesForm(e.target.value));
+document.getElementById('btnLimpiarVariantesForm').addEventListener('click', () => {
+  variantesFormSeleccionadas = new Map();
+  renderListaVariantesForm(document.getElementById('buscarVarianteForm').value);
+  actualizarContadorVariantesForm();
+});
+btnAgregarVariantesForm.addEventListener('click', () => {
+  variantesFormSeleccionadas.forEach(v => agregarLinea(productoPendienteVariante, v));
+  modalVarianteForm.hide();
+});
 
 function agregarLinea(producto, variante) {
   const varianteCodigo = variante ? variante.codigo : null;

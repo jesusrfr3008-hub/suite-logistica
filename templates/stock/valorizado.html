@@ -36,7 +36,7 @@
     <div class="text-muted small">
       Costo y valor de inventario por código (Accuvision, Accumedical y total combinado) --
       información de costos, visible solo con permiso de Reportes. No aparece en Consulta de Stock.
-      {% if ultima_carga %}Última actualización: {{ ultima_carga.strftime('%d-%m-%Y %H:%M') }}.{% else %}Todavía no se ha cargado ningún reporte de Stock Valorizado.{% endif %}
+      {% if ultima_carga %}Última actualización: {{ ultima_carga | hora_cl }} (hora de Chile).{% else %}Todavía no se ha cargado ningún reporte de Stock Valorizado.{% endif %}
     </div>
   </div>
   <div class="d-flex gap-2">

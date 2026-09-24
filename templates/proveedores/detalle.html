@@ -71,7 +71,7 @@
     </div>
   </form>
 
-  <div class="table-responsive" style="max-height: 480px; overflow-y: auto;">
+  <div class="table-responsive" id="catalogoScroll" style="max-height: 480px; overflow-y: auto;">
     <table class="table table-sm table-hover align-middle mb-0">
       <thead class="sticky-top bg-white">
         <tr>
@@ -121,6 +121,7 @@
               <div class="d-flex align-items-center gap-1 flex-wrap mb-1 pb-1 {% if not loop.last %}border-bottom{% endif %} {% if not v.activo %}text-muted{% endif %}">
                 <form method="post" action="{{ url_for('productos_variante_editar', variante_id=v.id) }}"
                       class="d-flex align-items-center gap-1 flex-wrap flex-grow-1">
+                  <input type="hidden" name="q" value="{{ q }}">
                   <input class="form-control form-control-sm" style="max-width:150px" name="codigo" value="{{ v.codigo }}" required>
                   <input class="form-control form-control-sm flex-grow-1" style="min-width:220px" name="descripcion" value="{{ v.descripcion }}" required>
                   <input class="form-control form-control-sm" style="max-width:150px" name="codigo_interno_inventario"
@@ -133,6 +134,7 @@
                 </form>
                 <form method="post" action="{{ url_for('productos_variante_eliminar', variante_id=v.id) }}"
                       onsubmit="return confirm('¿Eliminar la variante \'{{ v.codigo }}\'? Si ya está vinculada a Homologación o Existencia de Stock, no se puede eliminar sin perder ese historial -- en ese caso quedará desactivada en su lugar.');">
+                  <input type="hidden" name="q" value="{{ q }}">
                   <button type="submit" class="btn btn-sm btn-outline-danger">Eliminar</button>
                 </form>
               </div>
@@ -154,6 +156,7 @@
   <div class="modal-dialog">
     <div class="modal-content">
       <form method="post" action="{{ url_for('productos_editar', producto_id=p.id) }}">
+        <input type="hidden" name="q" value="{{ q }}">
         <div class="modal-header">
           <h5 class="modal-title">Editar producto</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
@@ -202,10 +205,12 @@
       </form>
       <form method="post" id="formEliminarProducto{{ p.id }}" action="{{ url_for('productos_eliminar', producto_id=p.id) }}"
             onsubmit="return confirm('¿Eliminar \'{{ p.codigo }}\' del catálogo de {{ proveedor.nombre }}? Si ya se usó en alguna Orden de Compra o Costeo, no se puede eliminar sin perder ese historial -- en ese caso quedará desactivado en su lugar.');">
+        <input type="hidden" name="q" value="{{ q }}">
       </form>
       <form method="post" id="formFusionarProducto{{ p.id }}" action="{{ url_for('productos_fusionar', producto_id=p.id) }}"
             onsubmit="return confirm('¿Fusionar \'{{ p.codigo }}\' con el código elegido? Todo su historial se trasladará y \'{{ p.codigo }}\' se eliminará del catálogo. Esta acción no se puede deshacer.');">
         <input type="hidden" name="producto_destino_id" class="inputDestinoFusion" data-target="fusion{{ p.id }}">
+        <input type="hidden" name="q" value="{{ q }}">
       </form>
     </div>
   </div>
@@ -216,6 +221,7 @@
   <div class="modal-dialog">
     <div class="modal-content">
       <form method="post" action="{{ url_for('productos_nuevo', proveedor_id=proveedor.id) }}" id="formNuevoProducto">
+        <input type="hidden" name="q" value="{{ q }}">
         <div class="modal-header">
           <h5 class="modal-title">Agregar producto a {{ proveedor.nombre }}</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
@@ -262,6 +268,7 @@
   <div class="modal-dialog">
     <div class="modal-content">
       <form method="post" action="{{ url_for('productos_importar', proveedor_id=proveedor.id) }}" enctype="multipart/form-data">
+        <input type="hidden" name="q" value="{{ q }}">
         <div class="modal-header">
           <h5 class="modal-title">Cargar actualización de productos -- {{ proveedor.nombre }}</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
@@ -301,6 +308,7 @@
           solo. Usa esto cuando el duplicado ya no existe o nunca existió como Producto propio.
         </p>
         <form method="post" action="{{ url_for('alias_codigo_nuevo', proveedor_id=proveedor.id) }}" class="row g-2 align-items-end border rounded p-2 mb-3 bg-light">
+          <input type="hidden" name="q" value="{{ q }}">
           <div class="col-md-4">
             <label class="form-label small mb-0">Código tal como aparece mal en el reporte</label>
             <input type="text" class="form-control form-control-sm" name="codigo_alias" placeholder="Ej. 8685" required>
@@ -329,6 +337,7 @@
               </td>
               <td class="text-end">
                 <form method="post" action="{{ url_for('alias_codigo_eliminar', alias_id=a.id) }}" onsubmit="return confirm('¿Eliminar este alias? Los reportes volverán a mostrar el código sin corregir.');">
+                  <input type="hidden" name="q" value="{{ q }}">
                   <button type="submit" class="btn btn-sm btn-outline-danger">Eliminar</button>
                 </form>
               </td>
@@ -471,6 +480,40 @@
         });
     }, 300);
   });
+})();
+</script>
+
+<script>
+(function () {
+  // Ronda AT (2026-09-24, a pedido del usuario): antes, guardar cualquier
+  // cambio del catalogo (editar/eliminar/fusionar un producto o variante,
+  // cargar productos, crear/eliminar un alias) recargaba esta pagina desde
+  // arriba -- si el usuario venia editando varios productos seguidos mas
+  // abajo en la lista (o dentro de la tabla con scroll propio), tenia que
+  // volver a bajar cada vez para llegar al siguiente. Se guarda la posicion
+  // de scroll (de la pagina y de la tabla de catalogo) justo antes de
+  // enviar cualquier formulario de esta pantalla, y se restaura al volver.
+  const CLAVE_VENTANA = 'scrollProveedor{{ proveedor.id }}';
+  const CLAVE_TABLA = 'scrollProveedorTabla{{ proveedor.id }}';
+  const tabla = document.getElementById('catalogoScroll');
+
+  const scrollVentana = sessionStorage.getItem(CLAVE_VENTANA);
+  if (scrollVentana !== null) {
+    window.scrollTo(0, parseInt(scrollVentana, 10) || 0);
+    sessionStorage.removeItem(CLAVE_VENTANA);
+  }
+  const scrollTabla = sessionStorage.getItem(CLAVE_TABLA);
+  if (scrollTabla !== null && tabla) {
+    tabla.scrollTop = parseInt(scrollTabla, 10) || 0;
+    sessionStorage.removeItem(CLAVE_TABLA);
+  }
+
+  document.addEventListener('submit', function () {
+    try {
+      sessionStorage.setItem(CLAVE_VENTANA, String(window.scrollY));
+      if (tabla) sessionStorage.setItem(CLAVE_TABLA, String(tabla.scrollTop));
+    } catch (e) {}
+  }, true);
 })();
 </script>
 

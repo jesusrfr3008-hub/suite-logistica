@@ -163,11 +163,13 @@
       {% if h.estado != 'sin_marca' %}
       <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}">
         <input type="hidden" name="accion" value="sin_marca">
+        <input type="hidden" name="ver" value="{{ ver }}">
         <button type="submit" class="btn btn-sm btn-outline-secondary">Marcar "sin marca"</button>
       </form>
       {% endif %}
       <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}" onsubmit="return confirm('¿Excluir este código? No volverá a aparecer en el Stock.');">
         <input type="hidden" name="accion" value="excluido">
+        <input type="hidden" name="ver" value="{{ ver }}">
         <button type="submit" class="btn btn-sm btn-outline-danger">Excluir</button>
       </form>
     </div>
@@ -179,6 +181,7 @@
         <div class="small fw-semibold mb-2">Vincular a producto/variante ya existente</div>
         <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}" class="row g-2">
           <input type="hidden" name="accion" value="vincular_existente">
+          <input type="hidden" name="ver" value="{{ ver }}">
           <div class="col-12">
             <input type="text" class="form-control form-control-sm buscador-producto" placeholder="Buscar código o descripción..." data-target="{{ h.id }}">
           </div>
@@ -203,6 +206,7 @@
         <div class="small fw-semibold mb-2">Crear producto nuevo</div>
         <form method="post" action="{{ url_for('stock_homologacion_resolver', homolog_id=h.id) }}" class="row g-2">
           <input type="hidden" name="accion" value="crear_producto">
+          <input type="hidden" name="ver" value="{{ ver }}">
           <div class="col-12">
             <select class="form-select form-select-sm" name="proveedor_id_nuevo" required>
               <option value="">Proveedor...</option>
@@ -265,6 +269,26 @@ document.querySelectorAll('.buscador-producto').forEach(function (input) {
     }
   });
 });
+</script>
+
+<script>
+(function () {
+  // Ronda AT (2026-09-24, a pedido del usuario): esta pantalla resuelve
+  // codigos "uno por uno" bajando por una lista larga -- al guardar cada
+  // resolucion, la pagina se recargaba desde arriba y el usuario tenia que
+  // volver a bajar hasta donde estaba para seguir con el siguiente codigo.
+  // Se guarda la posicion de scroll justo antes de enviar cualquier
+  // formulario de esta pantalla y se restaura al volver.
+  const CLAVE = 'scrollHomologacion:{{ ver }}';
+  const guardado = sessionStorage.getItem(CLAVE);
+  if (guardado !== null) {
+    window.scrollTo(0, parseInt(guardado, 10) || 0);
+    sessionStorage.removeItem(CLAVE);
+  }
+  document.addEventListener('submit', function () {
+    try { sessionStorage.setItem(CLAVE, String(window.scrollY)); } catch (e) {}
+  }, true);
+})();
 </script>
 
 {% endblock %}

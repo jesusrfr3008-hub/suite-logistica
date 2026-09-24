@@ -14,3 +14,10 @@ pywin32>=306; sys_platform == "win32"
 # si trae wheel para esa version, se sube sin compilar nada.
 psycopg2-binary==2.9.10
 gunicorn==23.0.0
+# Ronda AS (2026-09-24): "hora de Chile" en las pantallas de "última
+# actualización" (ver filtro hora_cl / zoneinfo en app.py) -- zoneinfo ya es
+# parte de Python 3.9+, pero busca la base de datos de husos horarios del
+# sistema operativo, que puede faltar en la imagen mínima de Railway. tzdata
+# la trae como paquete Python, sin depender de lo que tenga instalado el
+# contenedor.
+tzdata==2024.2

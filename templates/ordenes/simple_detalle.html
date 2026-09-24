@@ -178,7 +178,7 @@
         <tr>
           <td><span class="badge bg-secondary">{{ d.tipo }}</span></td>
           <td><a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener">{{ d.nombre_original }}</a></td>
-          <td>{{ d.fecha_subida.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td>{{ d.fecha_subida | hora_cl }}</td>
           <td class="text-end">
             <a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline-secondary">Ver</a>
             <a href="{{ url_for('ordenes_documento_descargar', orden_id=orden.id, doc_id=d.id) }}" class="btn btn-sm btn-outline-primary">Descargar</a>

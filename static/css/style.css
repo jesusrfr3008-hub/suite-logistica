@@ -71,6 +71,21 @@ body {
   color: #fff;
 }
 
+/* Ronda AS (2026-09-24): version "outline" de btn-brand, para una accion
+   secundaria (ej. "Guardar y continuar despues") que no deba competir
+   visualmente con el boton principal de la misma pantalla. */
+.btn-outline-brand {
+  background-color: transparent;
+  border-color: var(--brand);
+  color: var(--brand-dark);
+}
+
+.btn-outline-brand:hover {
+  background-color: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+
 @media print {
   .no-print {
     display: none !important;

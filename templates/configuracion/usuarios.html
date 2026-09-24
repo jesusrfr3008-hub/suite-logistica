@@ -41,7 +41,7 @@
           <td>
             {% if u.activo %}<span class="badge text-bg-success">Activo</span>{% else %}<span class="badge text-bg-secondary">Desactivado</span>{% endif %}
           </td>
-          <td class="text-muted small">{{ u.ultimo_acceso.strftime('%d-%m-%Y %H:%M') if u.ultimo_acceso else 'Nunca' }}</td>
+          <td class="text-muted small">{{ (u.ultimo_acceso | hora_cl) if u.ultimo_acceso else 'Nunca' }}</td>
           <td class="text-end">
             <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarUsuario{{ u.id }}">Editar</button>
             {% if u.id != current_user.id %}

@@ -1,15 +1,17 @@
 import csv
 import glob
 import io
+import json
 import os
 import re
 import shutil
 import unicodedata
 import uuid
 from collections import defaultdict, Counter
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from functools import wraps
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill
@@ -409,6 +411,35 @@ def filtro_clp(valor):
 @app.template_filter("moneda")
 def filtro_moneda(valor, decimales=2):
     return _formatear_numero(valor, decimales)
+
+
+ZONA_CHILE = ZoneInfo("America/Santiago")
+
+
+def _a_hora_chile(dt):
+    """Ronda AS (2026-09-24): todos los timestamps de 'cargado_en'/'creado_en'
+    del sistema se guardan con datetime.utcnow() (hora UTC, sin tzinfo) --
+    mostrados tal cual confundían al usuario ("última actualización
+    24-09-2026 12:41" cuando en su reloj eran las 09:41). Se convierte acá a
+    hora de Chile (America/Santiago, con horario de verano automático via
+    zoneinfo/tzdata) antes de mostrarla. Si el datetime ya viene con tzinfo
+    (no debería pasar hoy, pero por las dudas) se respeta tal cual en vez de
+    asumir UTC de nuevo."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZONA_CHILE)
+
+
+@app.template_filter("hora_cl")
+def filtro_hora_cl(dt, formato="%d-%m-%Y %H:%M"):
+    """Filtro de plantilla: {{ algun_datetime_utc | hora_cl }} -- convierte a
+    hora de Chile y formatea en 24 horas (ver _a_hora_chile). Devuelve
+    cadena vacía si `dt` es None, para poder seguir usando `{% if %}`
+    alrededor del filtro igual que antes."""
+    convertido = _a_hora_chile(dt)
+    return convertido.strftime(formato) if convertido else ""
 
 
 @app.template_filter("numero_flex")
@@ -4030,6 +4061,23 @@ def proveedores_reactivar(proveedor_id):
     return redirect(url_for("proveedores_list"))
 
 
+def _redirect_proveedor_detalle(proveedor_id):
+    """Ronda AT (2026-09-24, a pedido del usuario): todas las acciones de
+    edicion del catalogo (editar/eliminar/fusionar un producto o variante,
+    cargar productos, crear/eliminar un alias de codigo) volvian siempre a
+    '/proveedores/<id>' SIN el filtro de busqueda (?q=...) que el usuario
+    tenia activo -- si estaba revisando/editando varios productos de una
+    busqueda puntual, cada guardado lo mandaba de vuelta a la lista COMPLETA
+    sin filtrar, obligandolo a volver a escribir la busqueda para llegar al
+    siguiente producto que queria tocar. Todos los formularios de esa
+    pantalla mandan ahora un campo oculto 'q' con el filtro activo al
+    momento de enviar, para que el redirect lo mantenga."""
+    q = (request.form.get("q") or "").strip()
+    if q:
+        return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id, q=q))
+    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+
+
 @app.route("/proveedores/<int:proveedor_id>")
 @requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_detalle(proveedor_id):
@@ -4094,17 +4142,17 @@ def productos_nuevo(proveedor_id):
             else f"como variante de '{ya_existe_como_variante.producto.codigo}'"
         )
         flash(f"El código '{codigo}' ya existe en el catálogo de {prov.nombre} {donde} -- no se puede repetir.", "danger")
-        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+        return _redirect_proveedor_detalle(prov.id)
 
     if es_variante:
         padre_id = request.form.get("producto_padre_id") or None
         if not padre_id:
             flash("Selecciona el código padre del que este código es variante.", "warning")
-            return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+            return _redirect_proveedor_detalle(prov.id)
         padre = Producto.query.get_or_404(padre_id)
         if padre.proveedor_id != prov.id:
             flash("El código padre debe pertenecer a este mismo proveedor.", "danger")
-            return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+            return _redirect_proveedor_detalle(prov.id)
         variante = ProductoVariante(producto_id=padre.id, codigo=codigo, descripcion=descripcion)
         db.session.add(variante)
         db.session.commit()
@@ -4128,7 +4176,7 @@ def productos_nuevo(proveedor_id):
         db.session.add(producto)
         db.session.commit()
         flash(f"Producto '{producto.codigo}' agregado al catalogo de {prov.nombre}.", "success")
-    return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+    return _redirect_proveedor_detalle(prov.id)
 
 
 @app.route("/productos/<int:producto_id>/editar", methods=["POST"])
@@ -4154,7 +4202,7 @@ def productos_editar(producto_id):
         _registrar_alias_codigo_proveedor(producto.proveedor_id, codigo_anterior, producto_destino=producto)
     db.session.commit()
     flash(f"Producto '{producto.codigo}' actualizado.", "success")
-    return redirect(url_for("proveedores_detalle", proveedor_id=producto.proveedor_id))
+    return _redirect_proveedor_detalle(producto.proveedor_id)
 
 
 @app.route("/variantes/<int:variante_id>/editar", methods=["POST"])
@@ -4186,7 +4234,7 @@ def productos_variante_editar(variante_id):
         ).first()
         if choca_con_producto or choca_con_variante:
             flash(f"El código '{nuevo_codigo}' ya existe en este catálogo -- no se puede repetir.", "danger")
-            return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+            return _redirect_proveedor_detalle(proveedor_id)
 
     # Ronda AQ (2026-09-24): mismo caso que se corrigió para el reporte
     # Compras Proveedor en la ronda AO/AP -- si acá se corrige a mano el
@@ -4204,7 +4252,7 @@ def productos_variante_editar(variante_id):
         _registrar_alias_codigo_proveedor(proveedor_id, codigo_anterior, variante_destino=variante)
     db.session.commit()
     flash(f"Variante '{variante.codigo}' actualizada.", "success")
-    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+    return _redirect_proveedor_detalle(proveedor_id)
 
 
 @app.route("/variantes/<int:variante_id>/eliminar", methods=["POST"])
@@ -4231,7 +4279,7 @@ def productos_variante_eliminar(variante_id):
         db.session.delete(variante)
         db.session.commit()
         flash(f"Variante '{codigo}' eliminada.", "success")
-    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+    return _redirect_proveedor_detalle(proveedor_id)
 
 
 @app.route("/productos/<int:producto_id>/eliminar", methods=["POST"])
@@ -4268,7 +4316,7 @@ def productos_eliminar(producto_id):
             "historial a esa variante y se eliminó del catálogo.",
             "success",
         )
-        return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+        return _redirect_proveedor_detalle(proveedor_id)
     if _producto_en_uso(producto.id):
         producto.activo = False
         db.session.commit()
@@ -4282,7 +4330,7 @@ def productos_eliminar(producto_id):
         db.session.delete(producto)
         db.session.commit()
         flash(f"Producto '{codigo}' eliminado del catálogo.", "success")
-    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+    return _redirect_proveedor_detalle(proveedor_id)
 
 
 @app.route("/productos/<int:producto_id>/fusionar", methods=["POST"])
@@ -4308,10 +4356,10 @@ def productos_fusionar(producto_id):
     destino = Producto.query.get(destino_id) if destino_id else None
     if not destino or destino.id == origen.id:
         flash("Selecciona un código destino válido (distinto del que se va a fusionar).", "danger")
-        return redirect(url_for("proveedores_detalle", proveedor_id=origen.proveedor_id))
+        return _redirect_proveedor_detalle(origen.proveedor_id)
     if destino.proveedor_id != origen.proveedor_id:
         flash("Solo se puede fusionar con un código del mismo proveedor.", "danger")
-        return redirect(url_for("proveedores_detalle", proveedor_id=origen.proveedor_id))
+        return _redirect_proveedor_detalle(origen.proveedor_id)
 
     codigo_origen = origen.codigo
     codigo_destino = destino.codigo
@@ -4334,7 +4382,7 @@ def productos_fusionar(producto_id):
             "Stock, Órdenes de Compra/Costeo) quedó trasladado y el código duplicado se eliminó del catálogo.",
             "success",
         )
-    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+    return _redirect_proveedor_detalle(proveedor_id)
 
 
 @app.route("/proveedores/<int:proveedor_id>/alias-codigo/nuevo", methods=["POST"])
@@ -4355,14 +4403,14 @@ def alias_codigo_nuevo(proveedor_id):
     destino = Producto.query.get(destino_id) if destino_id else None
     if not codigo_alias or not destino or destino.proveedor_id != prov.id:
         flash("Indica el código tal como aparece en el reporte y selecciona el producto correcto de este proveedor.", "danger")
-        return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+        return _redirect_proveedor_detalle(proveedor_id)
     _registrar_alias_codigo_proveedor(prov.id, codigo_alias, producto_destino=destino)
     db.session.commit()
     flash(
         f"Alias creado: '{codigo_alias}' ahora se mostrará en los reportes como '{destino.codigo}'.",
         "success",
     )
-    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+    return _redirect_proveedor_detalle(proveedor_id)
 
 
 @app.route("/alias-codigo/<int:alias_id>/eliminar", methods=["POST"])
@@ -4374,7 +4422,7 @@ def alias_codigo_eliminar(alias_id):
     db.session.delete(alias)
     db.session.commit()
     flash(f"Alias '{codigo}' eliminado -- los reportes volverán a mostrarlo tal como venga homologado.", "success")
-    return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
+    return _redirect_proveedor_detalle(proveedor_id)
 
 
 _ENCABEZADOS_CATALOGO_PROVEEDOR = [
@@ -4439,18 +4487,18 @@ def productos_importar(proveedor_id):
     archivo = request.files.get("archivo")
     if not archivo or not archivo.filename:
         flash("Selecciona un archivo Excel para cargar.", "warning")
-        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+        return _redirect_proveedor_detalle(prov.id)
     extension = os.path.splitext(archivo.filename)[1].lower()
     if extension not in (".xlsx", ".xls"):
         flash("El archivo debe ser Excel (.xlsx o .xls).", "warning")
-        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+        return _redirect_proveedor_detalle(prov.id)
 
     try:
         wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
         ws = wb.worksheets[0]
     except Exception:
         flash("No se pudo leer el archivo -- confirma que sea un Excel válido.", "danger")
-        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+        return _redirect_proveedor_detalle(prov.id)
 
     # Encabezado por NOMBRE de columna (no por posicion fija), tolerante a
     # mayusculas/acentos, para que no se rompa si el usuario reordena
@@ -4463,13 +4511,13 @@ def productos_importar(proveedor_id):
     filas = list(ws.iter_rows(values_only=True))
     if not filas:
         flash("El archivo está vacío.", "warning")
-        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+        return _redirect_proveedor_detalle(prov.id)
 
     encabezado = {_norm(v): i for i, v in enumerate(filas[0]) if v}
     col_codigo = encabezado.get("codigo")
     if col_codigo is None:
         flash("El archivo debe tener una columna 'Código'.", "danger")
-        return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+        return _redirect_proveedor_detalle(prov.id)
     col_desc = encabezado.get("descripcion")
     col_empaque = encabezado.get("empaque")
     col_moneda = encabezado.get("moneda")
@@ -4540,7 +4588,7 @@ def productos_importar(proveedor_id):
     if omitidos:
         mensaje += f" {omitidos} fila(s) se omitieron por datos inválidos (precio/empaque no numérico)."
     flash(mensaje, "success" if not omitidos else "warning")
-    return redirect(url_for("proveedores_detalle", proveedor_id=prov.id))
+    return _redirect_proveedor_detalle(prov.id)
 
 
 # ---------------------------------------------------------------------------
@@ -4712,6 +4760,23 @@ def ordenes_nueva():
             return redirect(url_for("ordenes_nueva", proveedor_id=proveedor_id))
         Empresa.query.get_or_404(int(empresa_id))
 
+        # Ronda AS (2026-09-24): "Guardar y continuar después" -- el usuario
+        # pidió poder guardar el avance de una orden a medio armar (por
+        # ejemplo si lo interrumpen) y retomarla más tarde, en vez de perder
+        # todo lo ya cargado (proveedor, empresa, líneas agregadas) si no
+        # llega a terminarla en una sola sesión -- hasta ahora la orden
+        # entera vivía solo en el navegador (JS) hasta el clic final en
+        # "Crear orden de compra", que además exigía al menos 1 línea.
+        # Ahora un 2do botón (accion=guardar_borrador) permite guardar con
+        # 0 o más líneas, dejando la orden 'Sin Emitir' -- el mismo estado
+        # que ya se usaba para una orden devuelta por un aprobador, visible
+        # solo para quien la creó en 'Por Aprobar' (que funciona como 'Mis
+        # órdenes'), donde puede seguir agregando productos (ver
+        # ordenes_linea_nueva) cuando quiera, y reenviarla a aprobación
+        # cuando esté lista (ver ordenes_reenviar_aprobacion, ya existía).
+        accion = request.form.get("accion") or "finalizar"
+        es_borrador = accion == "guardar_borrador"
+
         orden = OrdenCompra(
             numero_po=siguiente_numero_po(int(empresa_id) if empresa_id else None),
             proveedor_id=prov.id,
@@ -4721,7 +4786,7 @@ def ordenes_nueva():
             estado=ETAPAS_LINEA[0],
             notas=request.form.get("notas", "").strip(),
             creado_por_usuario_id=current_user.id,
-            estado_aprobacion="Por Aprobar",
+            estado_aprobacion="Sin Emitir" if es_borrador else "Por Aprobar",
             # Ronda AH (2026-09-16): consignación es por ORDEN COMPLETA.
             es_consignacion=request.form.get("es_consignacion") == "on",
         )
@@ -4758,7 +4823,7 @@ def ordenes_nueva():
             db.session.add(linea)
             lineas_creadas += 1
 
-        if lineas_creadas == 0:
+        if lineas_creadas == 0 and not es_borrador:
             db.session.rollback()
             flash("Debes agregar al menos una linea con cantidad mayor a 0.", "danger")
             return redirect(url_for("ordenes_nueva", proveedor_id=proveedor_id))
@@ -4774,7 +4839,15 @@ def ordenes_nueva():
                 reactivados += 1
 
         db.session.commit()
-        mensaje = f"Orden {orden.numero_po} creada con {lineas_creadas} lineas. Queda 'Por Aprobar' -- no aparecera en el listado general hasta que alguien con permiso de Aprobacion la apruebe."
+        if es_borrador:
+            mensaje = (
+                f"Orden {orden.numero_po} guardada como borrador"
+                + (f" con {lineas_creadas} línea(s)" if lineas_creadas else " (todavía sin líneas)")
+                + ". Solo tú la ves, en 'Por Aprobar' → tus órdenes 'Sin Emitir' -- volvé cuando quieras a seguir "
+                "agregando productos, y usá 'Reenviar a aprobación' cuando esté lista."
+            )
+        else:
+            mensaje = f"Orden {orden.numero_po} creada con {lineas_creadas} lineas. Queda 'Por Aprobar' -- no aparecera en el listado general hasta que alguien con permiso de Aprobacion la apruebe."
         if reactivados:
             mensaje += f" Se reactivaron {reactivados} producto(s) que estaban inactivos en el catálogo."
         flash(mensaje, "success")
@@ -5365,10 +5438,25 @@ def ordenes_reactivar(orden_id):
 @app.route("/ordenes/<int:orden_id>/lineas/nueva", methods=["POST"])
 @requiere_permiso("crear_orden")
 def ordenes_linea_nueva(orden_id):
-    """Agrega un producto nuevo a una orden YA CREADA -- antes solo se
-    podian agregar productos al momento de crear la orden; una vez emitida
-    solo se podia modificar o eliminar lo existente (pedido del usuario,
-    2026-08-26)."""
+    """Agrega uno o más productos/variantes nuevos a una orden YA CREADA --
+    antes solo se podian agregar productos al momento de crear la orden; una
+    vez emitida solo se podia modificar o eliminar lo existente (pedido del
+    usuario, 2026-08-26).
+
+    Ronda AS (2026-09-24): el usuario pidió poder elegir VARIAS variantes de
+    un mismo código padre de una sola vez (antes el modal solo dejaba elegir
+    una por una, cada una con su propio viaje de ida y vuelta). El
+    front-end (ver bloqueVarianteOrden en templates/ordenes/detalle.html)
+    ahora manda, cuando hay más de una variante marcada,
+    `variantes_seleccionadas` (JSON: lista de {codigo, descripcion}) además
+    de los `variante_codigo`/`variante_descripcion` de siempre (que quedan
+    con la PRIMERA marcada, por compatibilidad si algo todavía los lee
+    solos). Si viene esa lista, se crea UNA línea por cada variante --
+    todas con la misma cantidad/precio/fecha tipeados una sola vez en el
+    modal (después se puede ajustar cada línea por separado, como
+    siempre). Si una variante puntual ya está en la orden, esa se salta
+    (se avisa cuáles) en vez de abortar toda la carga por una sola
+    duplicada."""
     orden = OrdenCompra.query.get_or_404(orden_id)
     if orden.estado in ("Cancelada", "Anulada"):
         flash("No se pueden agregar productos a una orden cancelada o anulada.", "warning")
@@ -5379,66 +5467,100 @@ def ordenes_linea_nueva(orden_id):
         flash("Selecciona un producto del catálogo antes de agregar.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden.id))
     producto_id = int(producto_id)
-    # Variante elegida (ronda M, 2026-09-10, punto 1) -- si el producto tiene
-    # variantes (ej. dioptrias de lentes MEDICONTUR), el modal del front-end
-    # manda aca el codigo/descripcion especifico elegido.
-    variante_codigo = (request.form.get("variante_codigo") or "").strip() or None
-    variante_descripcion = (request.form.get("variante_descripcion") or "").strip() or None
 
-    # Evitar duplicar la misma linea activa en la orden (punto 9): si ya
-    # esta como linea activa CON LA MISMA VARIANTE (o ninguna variante en
-    # ambos casos), se avisa y no se crea una segunda linea -- hay que
-    # ajustar la cantidad en la linea existente en su lugar. Dos variantes
-    # DISTINTAS del mismo producto padre (ej. dos dioptrias distintas de un
-    # mismo lente) SI pueden convivir como lineas separadas.
-    filtro_duplicado = [OrdenCompraLinea.producto_id == producto_id, OrdenCompraLinea.anulada == False]  # noqa: E712
-    if variante_codigo:
-        filtro_duplicado.append(OrdenCompraLinea.variante_codigo == variante_codigo)
-    else:
-        filtro_duplicado.append(OrdenCompraLinea.variante_codigo.is_(None))
-    ya_existe = orden.lineas.filter(*filtro_duplicado).first()
-    if ya_existe:
-        flash(
-            f"'{ya_existe.codigo_mostrar}' ya está en esta orden — ajusta la cantidad en esa línea "
-            "en vez de agregarla de nuevo.",
-            "warning",
-        )
-        return redirect(url_for("ordenes_detalle", orden_id=orden.id))
+    # Variante(s) elegida(s) -- ver docstring. `variantes` queda como lista
+    # de (codigo, descripcion); una sola entrada (None, None) para un
+    # producto sin variantes o con una sola variante elegida a la manera
+    # vieja.
+    variantes_json = (request.form.get("variantes_seleccionadas") or "").strip()
+    variantes = []
+    if variantes_json:
+        try:
+            crudo = json.loads(variantes_json)
+        except (TypeError, ValueError):
+            crudo = []
+        for item in crudo:
+            codigo = (item.get("codigo") or "").strip() if isinstance(item, dict) else ""
+            if not codigo:
+                continue
+            descripcion = (item.get("descripcion") or "").strip() if isinstance(item, dict) else ""
+            variantes.append((codigo, descripcion or None))
+    if not variantes:
+        variante_codigo = (request.form.get("variante_codigo") or "").strip() or None
+        variante_descripcion = (request.form.get("variante_descripcion") or "").strip() or None
+        variantes = [(variante_codigo, variante_descripcion)]
 
     cant = parse_int(request.form.get("cantidad_cajas"), default=0)
     if cant <= 0:
         flash("Ingresa una cantidad de cajas mayor a 0.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden.id))
+    precio = float(request.form.get("precio_unitario_pactado") or 0)
+    fecha_despacho = parse_date(request.form.get("fecha_estimada_despacho"))
 
-    linea = OrdenCompraLinea(
-        orden_id=orden.id,
-        producto_id=producto_id,
-        cantidad_cajas=cant,
-        precio_unitario_pactado=float(request.form.get("precio_unitario_pactado") or 0),
-        fecha_estimada_despacho=parse_date(request.form.get("fecha_estimada_despacho")),
-        etapa=ETAPAS_LINEA[0],
-        variante_codigo=variante_codigo,
-        variante_descripcion=variante_descripcion,
-    )
-    db.session.add(linea)
-    db.session.flush()
-    # Ronda U (2026-09-12, punto 4): el catálogo ahora tambien deja elegir un
-    # producto inactivo (el front-end lo muestra sombreado y pide
-    # confirmacion antes) -- si se confirmo y se llego hasta aca, se
-    # reactiva de una.
+    creadas = []
+    duplicadas = []
     reactivado = False
-    if linea.producto and not linea.producto.activo:
-        linea.producto.activo = True
-        reactivado = True
+    for variante_codigo, variante_descripcion in variantes:
+        # Evitar duplicar la misma linea activa en la orden (punto 9): si ya
+        # esta como linea activa CON LA MISMA VARIANTE (o ninguna variante en
+        # ambos casos), se avisa y no se crea una segunda linea -- hay que
+        # ajustar la cantidad en la linea existente en su lugar. Dos
+        # variantes DISTINTAS del mismo producto padre (ej. dos dioptrias
+        # distintas de un mismo lente) SI pueden convivir como lineas
+        # separadas.
+        filtro_duplicado = [OrdenCompraLinea.producto_id == producto_id, OrdenCompraLinea.anulada == False]  # noqa: E712
+        if variante_codigo:
+            filtro_duplicado.append(OrdenCompraLinea.variante_codigo == variante_codigo)
+        else:
+            filtro_duplicado.append(OrdenCompraLinea.variante_codigo.is_(None))
+        ya_existe = orden.lineas.filter(*filtro_duplicado).first()
+        if ya_existe:
+            duplicadas.append(ya_existe.codigo_mostrar)
+            continue
+
+        linea = OrdenCompraLinea(
+            orden_id=orden.id,
+            producto_id=producto_id,
+            cantidad_cajas=cant,
+            precio_unitario_pactado=precio,
+            fecha_estimada_despacho=fecha_despacho,
+            etapa=ETAPAS_LINEA[0],
+            variante_codigo=variante_codigo,
+            variante_descripcion=variante_descripcion,
+        )
+        db.session.add(linea)
+        db.session.flush()
+        # Ronda U (2026-09-12, punto 4): el catálogo ahora tambien deja elegir
+        # un producto inactivo (el front-end lo muestra sombreado y pide
+        # confirmacion antes) -- si se confirmo y se llego hasta aca, se
+        # reactiva de una.
+        if linea.producto and not linea.producto.activo:
+            linea.producto.activo = True
+            reactivado = True
+        creadas.append(linea.codigo_mostrar)
+
+    if not creadas:
+        flash(
+            "'" + "', '".join(duplicadas) + "' ya está(n) en esta orden -- ajusta la cantidad en esa(s) "
+            "línea(s) en vez de agregarla(s) de nuevo.",
+            "warning",
+        )
+        return redirect(url_for("ordenes_detalle", orden_id=orden.id))
+
     recalcular_estado_orden(orden)
     # Si la orden ya tenia lineas mas avanzadas (ej. despachada) esta linea
     # nueva en "Emision de Orden" quedaria mezclando cohortes -- se separa
     # igual que al confirmar/despachar.
     nuevas_ordenes = dividir_orden_si_corresponde(orden)
     db.session.commit()
-    mensaje = f"'{linea.codigo_mostrar}' agregado a la orden.{_mensaje_division(nuevas_ordenes)}"
+    if len(creadas) == 1:
+        mensaje = f"'{creadas[0]}' agregado a la orden.{_mensaje_division(nuevas_ordenes)}"
+    else:
+        mensaje = f"{len(creadas)} variante(s) agregadas a la orden: {', '.join(creadas)}.{_mensaje_division(nuevas_ordenes)}"
+    if duplicadas:
+        mensaje += f" (Ya estaba(n) en la orden, no se repitieron: {', '.join(duplicadas)}.)"
     if reactivado:
-        mensaje += " Estaba inactivo en el catálogo -- se reactivó."
+        mensaje += " Estaba(n) inactivo(s) en el catálogo -- se reactivó."
     flash(mensaje, "success")
     return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
@@ -9503,8 +9625,19 @@ def stock_homologacion_asignar_codigo_interno():
 @app.route("/stock/homologacion/<int:homolog_id>/resolver", methods=["POST"])
 @requiere_permiso("inventarios")
 def stock_homologacion_resolver(homolog_id):
+    """Ronda AT (2026-09-24, a pedido del usuario): esta pantalla resuelve
+    codigos 'uno por uno' bajando por la lista -- pero antes, CUALQUIER
+    resolucion (marcar 'sin marca', excluir, vincular o crear producto)
+    redirigia siempre a la vista por defecto (?ver=pendiente), sin importar
+    en que filtro estaba el usuario (ej. 'Todos' o 'Sin código Ergopyme').
+    Si estaba resolviendo codigos dentro de un filtro distinto al default,
+    cada guardado lo sacaba de ese filtro, obligandolo a volver a elegirlo
+    para seguir con el siguiente codigo. Ahora se lee 'ver' del propio
+    formulario (agregado como campo oculto en cada accion de esta pantalla)
+    y se mantiene en todos los redirects."""
     homolog = HomologacionStock.query.get_or_404(homolog_id)
     accion = request.form.get("accion")
+    ver = request.form.get("ver", "pendiente")
 
     if accion == "sin_marca":
         homolog.estado = "sin_marca"
@@ -9520,7 +9653,7 @@ def stock_homologacion_resolver(homolog_id):
         variante_id = request.form.get("variante_id") or None
         if not producto_id:
             flash("Selecciona un producto del catálogo para vincular.", "warning")
-            return redirect(url_for("stock_homologacion"))
+            return redirect(url_for("stock_homologacion", ver=ver))
         producto = Producto.query.get_or_404(producto_id)
         variante = ProductoVariante.query.get(variante_id) if variante_id else None
         homolog.estado = "vinculado"
@@ -9538,7 +9671,7 @@ def stock_homologacion_resolver(homolog_id):
         codigo_nuevo = (request.form.get("codigo_nuevo") or "").strip()
         if not proveedor_id or not codigo_nuevo:
             flash("Indica proveedor y código para crear el producto nuevo.", "warning")
-            return redirect(url_for("stock_homologacion"))
+            return redirect(url_for("stock_homologacion", ver=ver))
         nuevo = Producto(
             proveedor_id=proveedor_id,
             codigo=codigo_nuevo,
@@ -9553,11 +9686,11 @@ def stock_homologacion_resolver(homolog_id):
         StockExistencia.query.filter_by(codigo_interno=homolog.codigo_interno).update({"producto_id": nuevo.id})
     else:
         flash("Acción no reconocida.", "danger")
-        return redirect(url_for("stock_homologacion"))
+        return redirect(url_for("stock_homologacion", ver=ver))
 
     db.session.commit()
     flash(f"Código interno '{homolog.codigo_interno}' resuelto.", "success")
-    return redirect(url_for("stock_homologacion"))
+    return redirect(url_for("stock_homologacion", ver=ver))
 
 
 # ---------------------------------------------------------------------------

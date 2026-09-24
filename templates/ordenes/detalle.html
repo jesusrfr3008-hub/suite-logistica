@@ -373,13 +373,20 @@
               <input type="hidden" name="producto_id" id="campoProductoIdOrden" required>
               <input type="hidden" name="variante_codigo" id="campoVarianteCodigoOrden">
               <input type="hidden" name="variante_descripcion" id="campoVarianteDescripcionOrden">
+              <!-- Ronda AS (2026-09-24): cuando se marca mas de 1 variante,
+                   viajan todas aca (JSON [{codigo,descripcion}, ...]) -- ver
+                   ordenes_linea_nueva en app.py. -->
+              <input type="hidden" name="variantes_seleccionadas" id="campoVariantesSeleccionadasOrden">
               <div class="col-4"><label class="form-label">Código</label><input class="form-control" id="campoCodigoOrden" disabled></div>
               <div class="col-8"><label class="form-label">Descripción</label><input class="form-control" id="campoDescripcionOrden" disabled></div>
             </div>
             <div class="mt-2" id="bloqueVarianteOrden" hidden>
-              <label class="form-label small mb-1">Este producto tiene variantes — elige la que corresponde (el precio es siempre el del código padre):</label>
-              <input type="text" class="form-control form-control-sm mb-1" id="buscarVarianteOrden" placeholder="Filtrar por código o descripción...">
-              <div class="list-group" id="listaVariantesOrden" style="max-height:180px; overflow-y:auto;"></div>
+              <label class="form-label small mb-1">Este producto tiene variantes — marca una o varias (el precio pactado abajo se aplica igual a todas; después se puede ajustar cada línea por separado):</label>
+              <div class="d-flex justify-content-between align-items-center mb-1">
+                <input type="text" class="form-control form-control-sm" id="buscarVarianteOrden" placeholder="Filtrar por código o descripción..." style="max-width:260px;">
+                <button type="button" class="btn btn-sm btn-link p-0" id="btnLimpiarVariantesOrden">Limpiar selección</button>
+              </div>
+              <div class="list-group" id="listaVariantesOrden" style="max-height:220px; overflow-y:auto;"></div>
               <p class="text-muted small mb-0 mt-1" id="varianteElegidaOrden"></p>
             </div>
             <div class="row g-2 mt-1">
@@ -526,7 +533,7 @@
           <td>
             <a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener">{{ d.nombre_original }}</a>
           </td>
-          <td>{{ d.fecha_subida.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td>{{ d.fecha_subida | hora_cl }}</td>
           <td class="text-end">
             <a href="{{ url_for('ordenes_documento_ver', orden_id=orden.id, doc_id=d.id) }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline-secondary">Ver</a>
             <a href="{{ url_for('ordenes_documento_descargar', orden_id=orden.id, doc_id=d.id) }}" class="btn btn-sm btn-outline-primary">Descargar</a>
@@ -661,6 +668,7 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
   const campoProductoId = document.getElementById('campoProductoIdOrden');
   const campoVarianteCodigo = document.getElementById('campoVarianteCodigoOrden');
   const campoVarianteDescripcion = document.getElementById('campoVarianteDescripcionOrden');
+  const campoVariantesSeleccionadas = document.getElementById('campoVariantesSeleccionadasOrden');
   const campoCodigo = document.getElementById('campoCodigoOrden');
   const campoDescripcion = document.getElementById('campoDescripcionOrden');
   const campoCantidad = document.getElementById('campoCantidadOrden');
@@ -671,8 +679,13 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
   const buscarVariante = document.getElementById('buscarVarianteOrden');
   const listaVariantes = document.getElementById('listaVariantesOrden');
   const varianteElegida = document.getElementById('varianteElegidaOrden');
+  const btnLimpiarVariantes = document.getElementById('btnLimpiarVariantesOrden');
 
   let variantesProductoActual = [];
+  // Ronda AS (2026-09-24): selección MÚLTIPLE de variantes (antes solo se
+  // podia elegir una a la vez) -- mapa código -> descripción de las
+  // marcadas con el checkbox.
+  let variantesSeleccionadas = new Map();
 
   function productoYaEnOrden(productoId, varianteCodigo) {
     return [...document.querySelectorAll('tr[data-producto-id]')].some(
@@ -689,7 +702,43 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
     varianteElegida.textContent = '';
     campoVarianteCodigo.value = '';
     campoVarianteDescripcion.value = '';
+    campoVariantesSeleccionadas.value = '';
     variantesProductoActual = [];
+    variantesSeleccionadas = new Map();
+    btnGuardar.textContent = 'Agregar producto';
+  }
+
+  function actualizarSeleccionVariantes() {
+    const items = [...variantesSeleccionadas.entries()].map(([codigo, descripcion]) => ({ codigo, descripcion }));
+    campoVariantesSeleccionadas.value = items.length ? JSON.stringify(items) : '';
+    // Los campos "de siempre" quedan con la primera marcada, por si algo
+    // todavía los mira solos (compatibilidad hacia atrás).
+    if (items.length) {
+      campoVarianteCodigo.value = items[0].codigo;
+      campoVarianteDescripcion.value = items[0].descripcion;
+      campoCodigo.value = items.length === 1 ? items[0].codigo : campoCodigo.value;
+      campoDescripcion.value = items.length === 1 ? items[0].descripcion : campoDescripcion.value;
+    } else {
+      campoVarianteCodigo.value = '';
+      campoVarianteDescripcion.value = '';
+    }
+    if (items.length === 0) {
+      varianteElegida.textContent = 'Marca una o varias variantes de la lista de abajo.';
+      varianteElegida.className = 'text-muted small mb-0 mt-1';
+      btnGuardar.disabled = true;
+      btnGuardar.textContent = 'Agregar producto';
+    } else if (items.length === 1) {
+      varianteElegida.innerHTML = `Variante elegida: <strong>${items[0].codigo}</strong> — ${items[0].descripcion}`;
+      varianteElegida.className = 'text-success small mb-0 mt-1';
+      btnGuardar.disabled = false;
+      btnGuardar.textContent = 'Agregar producto';
+    } else {
+      varianteElegida.innerHTML = `<strong>${items.length} variantes elegidas:</strong> ${items.map(i => i.codigo).join(', ')}`;
+      varianteElegida.className = 'text-success small mb-0 mt-1';
+      btnGuardar.disabled = false;
+      btnGuardar.textContent = `Agregar ${items.length} variantes`;
+    }
+    aviso.textContent = '';
   }
 
   function renderListaVariantes(filtro) {
@@ -699,29 +748,35 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
       .filter(v => !f || v.codigo.toLowerCase().includes(f) || v.descripcion.toLowerCase().includes(f))
       .slice(0, 60)
       .forEach(v => {
-        const item = document.createElement('button');
-        item.type = 'button';
-        item.className = 'list-group-item list-group-item-action py-1 small';
-        item.textContent = `${v.codigo} — ${v.descripcion}`;
-        item.addEventListener('click', () => elegirVariante(v));
+        const yaEnOrden = productoYaEnOrden(campoProductoId.value, v.codigo);
+        const item = document.createElement('label');
+        item.className = 'list-group-item list-group-item-action py-1 small d-flex align-items-center gap-2' + (yaEnOrden ? ' text-muted' : '');
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.className = 'form-check-input mt-0 flex-shrink-0';
+        check.checked = variantesSeleccionadas.has(v.codigo);
+        check.disabled = yaEnOrden;
+        check.addEventListener('change', () => {
+          if (check.checked) {
+            variantesSeleccionadas.set(v.codigo, v.descripcion);
+          } else {
+            variantesSeleccionadas.delete(v.codigo);
+          }
+          actualizarSeleccionVariantes();
+        });
+        const texto = document.createElement('span');
+        texto.textContent = yaEnOrden ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`;
+        item.appendChild(check);
+        item.appendChild(texto);
         listaVariantes.appendChild(item);
       });
   }
 
-  function elegirVariante(v) {
-    if (productoYaEnOrden(campoProductoId.value, v.codigo)) {
-      alert(`'${v.codigo}' ya está en esta orden. Ajusta la cantidad en esa línea en vez de agregarla de nuevo.`);
-      return;
-    }
-    campoVarianteCodigo.value = v.codigo;
-    campoVarianteDescripcion.value = v.descripcion;
-    campoCodigo.value = v.codigo;
-    campoDescripcion.value = v.descripcion;
-    varianteElegida.innerHTML = `Variante elegida: <strong>${v.codigo}</strong> — ${v.descripcion}`;
-    varianteElegida.className = 'text-success small mb-0 mt-1';
-    aviso.textContent = '';
-    btnGuardar.disabled = false;
-  }
+  btnLimpiarVariantes.addEventListener('click', () => {
+    variantesSeleccionadas = new Map();
+    renderListaVariantes(buscarVariante.value);
+    actualizarSeleccionVariantes();
+  });
 
   async function seleccionarProducto(p) {
     limpiarVariante();
@@ -737,7 +792,7 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
     if (p.tiene_variantes) {
       btnGuardar.disabled = true;
       bloqueVariante.hidden = false;
-      varianteElegida.textContent = 'Elige una variante de la lista de abajo.';
+      varianteElegida.textContent = 'Marca una o varias variantes de la lista de abajo.';
       varianteElegida.className = 'text-muted small mb-0 mt-1';
       const resp = await fetch(`/api/productos/${p.id}/variantes`);
       variantesProductoActual = await resp.json();
