@@ -210,7 +210,27 @@ _ENDPOINTS_PUBLICOS = {"login", "static"}
 # Quedan afuera del control de sesion de _requerir_login a proposito, pero
 # cada vista de este grupo hace su propio chequeo de la clave antes de
 # hacer nada -- no es una puerta abierta.
-_ENDPOINTS_API_KEY = {"api_stock_cargar_auto"}
+_ENDPOINTS_API_KEY = {
+    "api_stock_cargar_auto",
+    "api_stock_valorizado_cargar_auto",
+    "api_notas_pedido_cargar_auto",
+    "api_stock_comprometido_bodegas_cargar_auto",
+}
+# BUG encontrado el 24/09/2026: cuando se agregaron api_stock_valorizado_
+# cargar_auto (ronda AM), api_notas_pedido_cargar_auto y ahora
+# api_stock_comprometido_bodegas_cargar_auto (ronda AR), NINGUNO de los 3 se
+# agregó a este set -- quedó solo el original de ronda AI. Como
+# _requerir_login() corta ANTES de que la vista llegue a revisar su propia
+# X-Api-Key, esos 3 endpoints venían redirigiendo a /login en cada llamada
+# de la automatización (sin sesión de navegador), sin que el script de
+# AutoHotkey se diera cuenta: Invoke-RestMethod sigue el redirect solo, y
+# como la respuesta ya no es el JSON esperado, el resultado fue, según el
+# caso, un "OK" vacío (sin datos realmente cargados -- el caso de Stock
+# Comprometido por Bodegas, cuyo "Pedido" seguía en 0) o un error de
+# conexión cortada a mitad de la subida (el caso de Stock Valorizado, con
+# un archivo más pesado). Que el "Cód.Producto"/"Comprometido" de Bodegas
+# ya estuviera bien armado (ver _procesar_filas_stock_comprometido_bodegas)
+# no servía de nada si la petición ni siquiera llegaba a esa función.
 
 # Clave compartida para /api/stock/cargar-auto -- se genera una vez (ej.
 # `python -c "import secrets; print(secrets.token_hex(32))"`) y se guarda
@@ -1529,39 +1549,85 @@ def _guardar_notas_pedido(empresa, nuevas_filas):
 
 
 def _procesar_filas_stock_comprometido_bodegas(filas_excel):
-    """Ronda AR (2026-09-24): reporte "Excel Saldos Por Bodegas" (Stock de
-    productos en bodegas) -- reemplaza a Notas de Pedido como fuente de la
-    columna "Pedido". A diferencia de Notas de Pedido (una fila por línea
-    de pedido de cliente), acá cada código aparece UNA sola vez con el
-    TOTAL ya comprometido en la columna "Comprometido" -- no hay detalle de
-    pedido/cliente/fecha.
+    """Ronda AR (2026-09-24), 2da corrección (mismo día): reporte "Excel
+    Saldos Por Bodegas" (Stock de productos en bodegas) -- reemplaza a
+    Notas de Pedido como fuente de la columna "Pedido". A diferencia de
+    Notas de Pedido (una fila por línea de pedido de cliente), acá cada
+    código aparece UNA sola vez con el TOTAL ya comprometido en la columna
+    "Comprometido" -- no hay detalle de pedido/cliente/fecha.
 
-    El archivo trae, antes del encabezado real: fila 1 = nombre de empresa,
-    2-3 = título/fecha, 4 = números de bodega ("..01..", "..02.."...), y
-    recién la fila 5 los encabezados de columna de verdad ("Linea", "Marca",
-    "Cód.Producto", "Descripción", ... "Comprometido", ...). El número y
-    orden de columnas de bodegas puede variar con el tiempo (si se abre o
-    cierra una bodega), así que NO se hardcodea la posición de "Cód.
-    Producto" ni de "Comprometido" -- se busca su texto en cualquier
-    columna de las primeras 10 filas, igual de robusto que si Ergopyme
-    agrega/saca una bodega en el medio.
+    BUG encontrado el 24/09/2026 con el archivo real generado por la
+    automatización: el archivo trae, en uno solo, un BLOQUE POR EMPRESA
+    (ACCUVISION primero, ACCUMEDICAL SPA después) -- cada bloque repite su
+    propio nombre de empresa, título "STOCK DE PRODUCTOS EN BODEGAS",
+    fecha, y ENCABEZADO de columnas (que puede variar de orden/nombre entre
+    un bloque y otro, cada empresa tiene sus propias bodegas). La 1ra
+    versión de este parser asumía UNA sola empresa por archivo: leía el
+    nombre de la fila 1, buscaba UN encabezado, y procesaba TODO lo que
+    seguía como si fuera de esa misma empresa -- mezclando los datos reales
+    de la 2da empresa dentro de la 1ra (y dejando a la 2da sin ningún dato
+    cargado). Confirmado con el archivo real del 24/09/2026 (993 filas:
+    bloque Accuvision filas 0-841, bloque Accumedical SPA filas 842-992).
+
+    Ahora se detectan los bloques primero (cualquier fila donde la columna
+    0 es la ÚNICA celda no vacía y su texto matchea una Empresa conocida --
+    ver _empresa_por_nombre_reporte) y se procesa cada bloque por separado,
+    con su propio encabezado.
 
     El código de producto viene con espacios y un punto de relleno al
-    final (ej. "201010100001  ." en vez de "201010100001") -- se limpia acá."""
-    if not filas_excel:
-        return None, [], "El archivo está vacío -- no se cambió nada."
+    final (ej. "201010100001  ." en vez de "201010100001") -- se limpia
+    dentro de _leer_bloque_stock_comprometido_bodegas.
 
-    nombre_empresa_reporte = str(filas_excel[0][0]).strip() if filas_excel[0] and filas_excel[0][0] else ""
-    empresa = _empresa_por_nombre_reporte(nombre_empresa_reporte, {})
-    if not empresa:
-        return None, [], (
-            f"No se pudo identificar a qué empresa pertenece este archivo (fila 1 dice "
-            f"'{nombre_empresa_reporte or '(vacío)'}') -- no se cambió nada."
+    Devuelve (resultados, error): `resultados` es una lista de
+    `(empresa, nuevas_filas)`, una entrada por cada bloque de empresa leído
+    con éxito (0, 1 o más). `error` es texto para mostrar/loguear (puede
+    venir junto con `resultados` no vacío, si algún bloque en particular
+    falló pero otro sí se pudo leer bien)."""
+    if not filas_excel:
+        return [], "El archivo está vacío -- no se cambió nada."
+
+    cache_empresas = {}
+    bloques = []  # [(empresa, fila_inicio), ...]
+    for i, row in enumerate(filas_excel):
+        if not row:
+            continue
+        primera = row[0] if len(row) > 0 else None
+        resto_vacio = all(c in (None, "") for c in row[1:])
+        if not resto_vacio or primera in (None, ""):
+            continue
+        empresa = _empresa_por_nombre_reporte(str(primera).strip(), cache_empresas)
+        if empresa:
+            bloques.append((empresa, i))
+
+    if not bloques:
+        return [], (
+            "No se pudo identificar ninguna empresa en el archivo (revisa la primera fila de "
+            "cada bloque) -- no se cambió nada."
         )
 
+    resultados = []
+    errores = []
+    for j, (empresa, inicio) in enumerate(bloques):
+        fin = bloques[j + 1][1] if j + 1 < len(bloques) else len(filas_excel)
+        nuevas_filas, error_bloque = _leer_bloque_stock_comprometido_bodegas(filas_excel[inicio:fin], empresa)
+        if error_bloque:
+            errores.append(f"{empresa.nombre}: {error_bloque}")
+        if nuevas_filas:
+            resultados.append((empresa, nuevas_filas))
+
+    return resultados, ("; ".join(errores) if errores else None)
+
+
+def _leer_bloque_stock_comprometido_bodegas(filas_bloque, empresa):
+    """Busca el encabezado ("Cód.Producto" / "Descripción" / "Comprometido")
+    y arma las filas de UN SOLO bloque de empresa (ver
+    _procesar_filas_stock_comprometido_bodegas) -- columnas buscadas por
+    texto en las primeras 10 filas del bloque, no por posición fija, porque
+    el orden/cantidad de columnas de bodega puede diferir entre un bloque
+    de empresa y otro (cada empresa tiene sus propias bodegas)."""
     fila_encabezado = None
     col_codigo = col_descripcion = col_comprometido = None
-    for i, row in enumerate(filas_excel[:10]):
+    for i, row in enumerate(filas_bloque[:10]):
         if not row:
             continue
         for j, celda in enumerate(row):
@@ -1577,13 +1643,10 @@ def _procesar_filas_stock_comprometido_bodegas(filas_excel):
             break
 
     if fila_encabezado is None:
-        return empresa, [], (
-            "No se encontraron los encabezados 'Cód.Producto' y 'Comprometido' en el archivo -- "
-            "¿cambió el formato del reporte en Ergopyme? No se cambió nada."
-        )
+        return [], "no se encontraron los encabezados 'Cód.Producto' y 'Comprometido' (¿cambió el formato del reporte en Ergopyme?)"
 
     nuevas_filas = []
-    for row in filas_excel[fila_encabezado + 1:]:
+    for row in filas_bloque[fila_encabezado + 1:]:
         if not row or col_codigo >= len(row):
             continue
         codigo_crudo = row[col_codigo]
@@ -1610,8 +1673,8 @@ def _procesar_filas_stock_comprometido_bodegas(filas_excel):
         ))
 
     if not nuevas_filas:
-        return empresa, [], "El archivo no tiene filas con unidades comprometidas (>0) reconocibles -- no se cambió nada."
-    return empresa, nuevas_filas, None
+        return [], "no tiene filas con unidades comprometidas (>0) reconocibles"
+    return nuevas_filas, None
 
 
 def _guardar_stock_comprometido_bodegas(empresa, nuevas_filas):
@@ -9202,22 +9265,27 @@ def stock_comprometido_bodegas_cargar():
         flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
         return redirect(url_for("stock_list"))
 
-    empresa, nuevas_filas, error = _procesar_filas_stock_comprometido_bodegas(filas_excel)
-    if error:
-        flash(error, "danger" if empresa is None else "warning")
+    resultados, error = _procesar_filas_stock_comprometido_bodegas(filas_excel)
+    if not resultados:
+        flash(error or "El archivo no tiene filas con unidades comprometidas (>0) reconocibles -- no se cambió nada.", "danger")
         return redirect(url_for("stock_list"))
 
-    total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas)
-
     os.makedirs(REPORTES_DIR, exist_ok=True)
-    nombre_archivo = f"stock_comprometido_bodegas_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
-    archivo.stream.seek(0)
-    archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
+    partes = []
+    total_unidades_general = 0
+    for empresa, nuevas_filas in resultados:
+        total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas)
+        total_unidades_general += total_unidades
+        partes.append(f"{empresa.nombre}: {len(nuevas_filas)} código(s), {total_unidades} unidad(es)")
+        nombre_archivo = f"stock_comprometido_bodegas_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
+        archivo.stream.seek(0)
+        archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
 
-    flash(
-        f"Stock Comprometido por Bodegas de {empresa.nombre} actualizado: {len(nuevas_filas)} código(s), "
-        f"{total_unidades} unidad(es) comprometidas en total.", "success",
-    )
+    mensaje = "Stock Comprometido por Bodegas actualizado -- " + "; ".join(partes) + "."
+    if error:
+        flash(mensaje + f" (Aviso: {error})", "warning")
+    else:
+        flash(mensaje, "success")
     return redirect(url_for("stock_list"))
 
 
@@ -9251,22 +9319,33 @@ def api_stock_comprometido_bodegas_cargar_auto():
     except Exception as exc:
         return jsonify(ok=False, error=f"No se pudo leer el archivo: {exc}"), 400
 
-    empresa, nuevas_filas, error = _procesar_filas_stock_comprometido_bodegas(filas_excel)
+    resultados, error = _procesar_filas_stock_comprometido_bodegas(filas_excel)
+    if not resultados:
+        return jsonify(ok=False, error=error or "El archivo no tiene filas con unidades comprometidas (>0) reconocibles."), 422
+
+    detalle = []
+    total_lineas = 0
+    total_unidades_general = 0
+    for empresa, nuevas_filas in resultados:
+        total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas)
+        total_lineas += len(nuevas_filas)
+        total_unidades_general += total_unidades
+        detalle.append({"empresa": empresa.nombre, "lineas": len(nuevas_filas), "unidades": total_unidades})
+        if extension != ".csv":
+            os.makedirs(REPORTES_DIR, exist_ok=True)
+            nombre_archivo = f"stock_comprometido_bodegas_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
+            archivo.stream.seek(0)
+            archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
+
+    mensaje = "Stock Comprometido por Bodegas actualizado -- " + "; ".join(
+        f"{d['empresa']}: {d['lineas']} código(s), {d['unidades']} unidad(es)" for d in detalle
+    ) + "."
     if error:
-        return jsonify(ok=False, error=error), (400 if empresa is None else 422)
-
-    total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas)
-
-    if extension != ".csv":
-        os.makedirs(REPORTES_DIR, exist_ok=True)
-        nombre_archivo = f"stock_comprometido_bodegas_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
-        archivo.stream.seek(0)
-        archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
+        mensaje += f" (Aviso: {error})"
 
     return jsonify(
-        ok=True,
-        mensaje=f"Stock Comprometido por Bodegas de {empresa.nombre} actualizado: {len(nuevas_filas)} código(s), {total_unidades} unidad(es).",
-        empresa=empresa.nombre, lineas=len(nuevas_filas), unidades=total_unidades,
+        ok=True, mensaje=mensaje, empresas=detalle,
+        lineas=total_lineas, unidades=total_unidades_general,
     ), 200
 
 
