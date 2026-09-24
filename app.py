@@ -563,6 +563,36 @@ def ensure_schema_migrations():
                     conn.execute(db.text(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {ddl_final}"))
                     conn.commit()
 
+    # Ronda AU (2da corrección, 2026-09-24): codigo_lote en parcial_lineas y
+    # facturas_proveedor_lineas era VARCHAR(80) -- guarda un RESUMEN
+    # (", ".join() de todos los codigos de lote de la linea), asi que un
+    # producto con muchos lotes distintos superaba los 80 caracteres.
+    # SQLite nunca impuso ese limite (no lo valida), por eso el problema
+    # jamas aparecio en pruebas locales -- recien se vio en Postgres
+    # (produccion), que lo rechaza con "StringDataRightTruncation" y aborta
+    # toda la carga de lotes. Se ensancha la columna a TEXT (sin limite) en
+    # las bases Postgres ya existentes que todavia la tengan como
+    # VARCHAR(80) -- en SQLite no hace falta (y ALTER COLUMN TYPE no
+    # funciona igual ahi), y en una base Postgres nueva ya nace como TEXT
+    # porque asi quedo definida en models.py.
+    if not es_sqlite:
+        for tabla_ancha, columna_ancha in (
+            ("parcial_lineas", "codigo_lote"),
+            ("facturas_proveedor_lineas", "codigo_lote"),
+        ):
+            if tabla_ancha not in tablas:
+                continue
+            info_columna = next(
+                (c for c in inspector.get_columns(tabla_ancha) if c["name"] == columna_ancha), None
+            )
+            if info_columna is None:
+                continue
+            tipo_actual = str(info_columna["type"]).upper()
+            if "VARCHAR" in tipo_actual or "CHARACTER VARYING" in tipo_actual:
+                with db.engine.connect() as conn:
+                    conn.execute(db.text(f"ALTER TABLE {tabla_ancha} ALTER COLUMN {columna_ancha} TYPE TEXT"))
+                    conn.commit()
+
     # Reparacion de datos (2026-08-27): "FOB" paso a llamarse "EXW" en
     # condicion_compra (mas ajustado al Incoterm real, punto 3) -- se
     # actualizan las filas ya guardadas con el nombre viejo. Y las

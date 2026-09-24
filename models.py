@@ -1256,7 +1256,19 @@ class ParcialLinea(db.Model):
 
     codigo = db.Column(db.String(120), nullable=False)
     descripcion = db.Column(db.String(500), nullable=False)
-    codigo_lote = db.Column(db.String(80))
+    # Ronda AU (2da corrección, 2026-09-24): este campo es un RESUMEN --
+    # ", ".join() de los codigos de TODOS los lotes de esta linea (ver
+    # _guardar_lotes_linea e importacion_lotes_cargar en app.py; el detalle
+    # real, autoritativo, vive en ParcialLineaLote, uno por lote). Con
+    # VARCHAR(80) un producto con muchos lotes distintos (ej. lentes
+    # intraoculares PHYSIOL, con un lote por unidad) generaba un texto de
+    # más de 80 caracteres -- SQLite lo permitía sin quejarse (no impone el
+    # límite), pero Postgres (producción, Railway) lo rechazaba con
+    # "StringDataRightTruncation" y tiraba abajo toda la carga. Se cambia a
+    # Text (sin límite) para que nunca más dependa de cuántos lotes tenga un
+    # producto -- ver migración en ensure_schema_migrations (app.py) para
+    # las bases Postgres ya existentes.
+    codigo_lote = db.Column(db.Text)
     fecha_vencimiento = db.Column(db.Date, nullable=True)
 
     cantidad_unidades = db.Column(db.Integer, default=0)
@@ -1588,7 +1600,11 @@ class FacturaProveedorLinea(db.Model):
     factura_id = db.Column(db.Integer, db.ForeignKey("facturas_proveedor.id"), nullable=False)
     codigo_producto = db.Column(db.String(120))
     descripcion = db.Column(db.String(500))
-    codigo_lote = db.Column(db.String(80))
+    # Ronda AU (2da corrección, 2026-09-24): copiado tal cual desde
+    # ParcialLinea.codigo_lote al generar la factura (ver
+    # importacion_generar_factura en app.py) -- mismo motivo para usar Text
+    # en vez de VARCHAR(80), ver el comentario en ParcialLinea.codigo_lote.
+    codigo_lote = db.Column(db.Text)
     cantidad = db.Column(db.Float, default=0)
     precio_unitario = db.Column(db.Float, default=0)
     valor_total = db.Column(db.Float, default=0)
