@@ -35,7 +35,7 @@ from models import (
     CargoAdicionalImportacion, TipoCambioMensual,
     Usuario, Rol, PERMISOS_DISPONIBLES,
     HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
-    StockConsignacionVigente,
+    StockConsignacionVigente, StockComprometidoBodega,
     CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
     FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
@@ -1523,6 +1523,101 @@ def _guardar_notas_pedido(empresa, nuevas_filas):
     """Reemplaza solo los registros de PedidoComprometido de `empresa` con
     `nuevas_filas` y confirma. Devuelve el total de unidades cargadas."""
     PedidoComprometido.query.filter_by(empresa_id=empresa.id).delete()
+    db.session.add_all(nuevas_filas)
+    db.session.commit()
+    return sum(f.cantidad for f in nuevas_filas)
+
+
+def _procesar_filas_stock_comprometido_bodegas(filas_excel):
+    """Ronda AR (2026-09-24): reporte "Excel Saldos Por Bodegas" (Stock de
+    productos en bodegas) -- reemplaza a Notas de Pedido como fuente de la
+    columna "Pedido". A diferencia de Notas de Pedido (una fila por línea
+    de pedido de cliente), acá cada código aparece UNA sola vez con el
+    TOTAL ya comprometido en la columna "Comprometido" -- no hay detalle de
+    pedido/cliente/fecha.
+
+    El archivo trae, antes del encabezado real: fila 1 = nombre de empresa,
+    2-3 = título/fecha, 4 = números de bodega ("..01..", "..02.."...), y
+    recién la fila 5 los encabezados de columna de verdad ("Linea", "Marca",
+    "Cód.Producto", "Descripción", ... "Comprometido", ...). El número y
+    orden de columnas de bodegas puede variar con el tiempo (si se abre o
+    cierra una bodega), así que NO se hardcodea la posición de "Cód.
+    Producto" ni de "Comprometido" -- se busca su texto en cualquier
+    columna de las primeras 10 filas, igual de robusto que si Ergopyme
+    agrega/saca una bodega en el medio.
+
+    El código de producto viene con espacios y un punto de relleno al
+    final (ej. "201010100001  ." en vez de "201010100001") -- se limpia acá."""
+    if not filas_excel:
+        return None, [], "El archivo está vacío -- no se cambió nada."
+
+    nombre_empresa_reporte = str(filas_excel[0][0]).strip() if filas_excel[0] and filas_excel[0][0] else ""
+    empresa = _empresa_por_nombre_reporte(nombre_empresa_reporte, {})
+    if not empresa:
+        return None, [], (
+            f"No se pudo identificar a qué empresa pertenece este archivo (fila 1 dice "
+            f"'{nombre_empresa_reporte or '(vacío)'}') -- no se cambió nada."
+        )
+
+    fila_encabezado = None
+    col_codigo = col_descripcion = col_comprometido = None
+    for i, row in enumerate(filas_excel[:10]):
+        if not row:
+            continue
+        for j, celda in enumerate(row):
+            texto = str(celda).strip().lower().replace("ó", "o") if celda not in (None, "") else ""
+            if texto == "cod.producto":
+                col_codigo = j
+            elif texto == "descripcion":
+                col_descripcion = j
+            elif texto == "comprometido":
+                col_comprometido = j
+        if col_codigo is not None and col_comprometido is not None:
+            fila_encabezado = i
+            break
+
+    if fila_encabezado is None:
+        return empresa, [], (
+            "No se encontraron los encabezados 'Cód.Producto' y 'Comprometido' en el archivo -- "
+            "¿cambió el formato del reporte en Ergopyme? No se cambió nada."
+        )
+
+    nuevas_filas = []
+    for row in filas_excel[fila_encabezado + 1:]:
+        if not row or col_codigo >= len(row):
+            continue
+        codigo_crudo = row[col_codigo]
+        if not codigo_crudo:
+            continue
+        codigo_interno = _normalizar_codigo_interno(codigo_crudo).rstrip(".").strip()
+        if not codigo_interno:
+            continue
+        descripcion = (
+            str(row[col_descripcion]).strip()
+            if col_descripcion is not None and col_descripcion < len(row) and row[col_descripcion] is not None
+            else ""
+        )
+        comprometido = row[col_comprometido] if col_comprometido < len(row) else 0
+        try:
+            comprometido = int(comprometido) if comprometido is not None else 0
+        except (TypeError, ValueError):
+            comprometido = 0
+        if comprometido <= 0:
+            continue
+        nuevas_filas.append(StockComprometidoBodega(
+            empresa_id=empresa.id, codigo_interno=codigo_interno, descripcion=descripcion,
+            cantidad=comprometido,
+        ))
+
+    if not nuevas_filas:
+        return empresa, [], "El archivo no tiene filas con unidades comprometidas (>0) reconocibles -- no se cambió nada."
+    return empresa, nuevas_filas, None
+
+
+def _guardar_stock_comprometido_bodegas(empresa, nuevas_filas):
+    """Reemplaza solo los registros de StockComprometidoBodega de `empresa`
+    con `nuevas_filas` y confirma. Devuelve el total de unidades cargadas."""
+    StockComprometidoBodega.query.filter_by(empresa_id=empresa.id).delete()
     db.session.add_all(nuevas_filas)
     db.session.commit()
     return sum(f.cantidad for f in nuevas_filas)
@@ -8313,9 +8408,15 @@ def _transito_por_linea():
 
 def _pedido_por_codigo():
     """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
-    clientes (columna 'Pedido'), sumadas por (empresa_id, codigo_interno) a
-    partir de PedidoComprometido -- puede haber varias filas para el mismo
-    código (un pedido de cliente distinto cada una).
+    clientes (columna 'Pedido'), sumadas por (empresa_id, codigo_interno).
+
+    Ronda AR (2026-09-24): la fuente real ahora es StockComprometidoBodega
+    (reporte "Excel Saldos Por Bodegas", con el TOTAL comprometido por
+    código) -- PedidoComprometido (Notas de Pedido / Balance de Producto)
+    queda solo como respaldo, y ÚNICAMENTE para una empresa que todavía no
+    subió el archivo nuevo (si ya lo subió, se ignora Notas de Pedido de
+    esa empresa para no sumar dos veces lo mismo con 2 fuentes distintas).
+    Ver StockComprometidoBodega en models.py.
 
     Ronda AA (2026-09-13): tambien devuelve la descripcion de cada codigo
     (la primera que encuentre) -- se usa en stock_list para poder armar una
@@ -8323,7 +8424,17 @@ def _pedido_por_codigo():
     "codigos con Pedido pero sin Stock cargado" abajo)."""
     resultado = {}
     descripciones = {}
+    empresas_con_bodegas = {
+        e_id for (e_id,) in db.session.query(StockComprometidoBodega.empresa_id).distinct().all()
+    }
+    for c in StockComprometidoBodega.query.all():
+        clave = (c.empresa_id, c.codigo_interno)
+        resultado[clave] = resultado.get(clave, 0) + (c.cantidad or 0)
+        if c.descripcion and clave not in descripciones:
+            descripciones[clave] = c.descripcion
     for p in PedidoComprometido.query.all():
+        if p.empresa_id in empresas_con_bodegas:
+            continue
         clave = (p.empresa_id, p.codigo_interno)
         resultado[clave] = resultado.get(clave, 0) + (p.cantidad or 0)
         if p.descripcion and clave not in descripciones:
@@ -8557,10 +8668,12 @@ def stock_list():
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     ultima_carga = db.session.query(db.func.max(StockExistencia.cargado_en)).scalar()
     ultima_carga_pedidos = db.session.query(db.func.max(PedidoComprometido.cargado_en)).scalar()
+    ultima_carga_bodegas = db.session.query(db.func.max(StockComprometidoBodega.cargado_en)).scalar()
     return render_template(
         "stock/list.html", grupos=resultado, empresas=empresas, proveedores=proveedores,
         empresa_sel=empresa_id, proveedor_sel=proveedor_id, q=q,
         ultima_carga=ultima_carga, ultima_carga_pedidos=ultima_carga_pedidos,
+        ultima_carga_bodegas=ultima_carga_bodegas,
     )
 
 
@@ -9060,6 +9173,99 @@ def api_notas_pedido_cargar_auto():
     return jsonify(
         ok=True,
         mensaje=f"Notas de pedido de {empresa.nombre} actualizadas: {len(nuevas_filas)} línea(s), {total_unidades} unidad(es).",
+        empresa=empresa.nombre, lineas=len(nuevas_filas), unidades=total_unidades,
+    ), 200
+
+
+@app.route("/stock/comprometido-bodegas/cargar", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_comprometido_bodegas_cargar():
+    """Ronda AR (2026-09-24): sube el reporte "Excel Saldos Por Bodegas"
+    (Stock de productos en bodegas) -- reemplaza a Notas de Pedido como
+    fuente de la columna "Pedido" de Consulta de Stock (ver
+    _pedido_por_codigo). El archivo es de UNA empresa a la vez (lo indica
+    en su primera fila) -- reemplaza solo los datos de esa empresa."""
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona el archivo de Stock Comprometido por Bodegas para cargar.", "warning")
+        return redirect(url_for("stock_list"))
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls"):
+        flash("Formato no soportado. Sube el archivo .xlsx del reporte 'Excel Saldos Por Bodegas'.", "danger")
+        return redirect(url_for("stock_list"))
+
+    try:
+        wb = openpyxl.load_workbook(archivo, data_only=True)
+        ws = wb.active
+        filas_excel = list(ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True))
+    except Exception:
+        flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
+        return redirect(url_for("stock_list"))
+
+    empresa, nuevas_filas, error = _procesar_filas_stock_comprometido_bodegas(filas_excel)
+    if error:
+        flash(error, "danger" if empresa is None else "warning")
+        return redirect(url_for("stock_list"))
+
+    total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas)
+
+    os.makedirs(REPORTES_DIR, exist_ok=True)
+    nombre_archivo = f"stock_comprometido_bodegas_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
+    archivo.stream.seek(0)
+    archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
+
+    flash(
+        f"Stock Comprometido por Bodegas de {empresa.nombre} actualizado: {len(nuevas_filas)} código(s), "
+        f"{total_unidades} unidad(es) comprometidas en total.", "success",
+    )
+    return redirect(url_for("stock_list"))
+
+
+@app.route("/api/stock-comprometido-bodegas/cargar-auto", methods=["POST"])
+def api_stock_comprometido_bodegas_cargar_auto():
+    """Ronda AR (2026-09-24): version de /stock/comprometido-bodegas/cargar
+    sin pantalla, para la automatización de Ergopyme -- mismo patrón que
+    /api/notas-pedido/cargar-auto: autenticación por X-Api-Key
+    (STOCK_UPLOAD_API_KEY), nunca con sesión de usuario."""
+    if not STOCK_UPLOAD_API_KEY:
+        return jsonify(ok=False, error="Endpoint no configurado (falta STOCK_UPLOAD_API_KEY en el servidor)."), 503
+    clave_recibida = request.headers.get("X-Api-Key", "")
+    if not clave_recibida or clave_recibida != STOCK_UPLOAD_API_KEY:
+        return jsonify(ok=False, error="Clave de acceso inválida o ausente."), 401
+
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        return jsonify(ok=False, error="Falta el archivo ('archivo') en el POST."), 400
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls", ".csv"):
+        return jsonify(ok=False, error="Formato no soportado -- sube .xlsx o .csv."), 400
+
+    try:
+        if extension == ".csv":
+            texto = archivo.read().decode("utf-8-sig", errors="replace")
+            filas_excel = list(csv.reader(texto.splitlines(), delimiter=";"))
+        else:
+            wb = openpyxl.load_workbook(archivo, data_only=True)
+            ws = wb.active
+            filas_excel = list(ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True))
+    except Exception as exc:
+        return jsonify(ok=False, error=f"No se pudo leer el archivo: {exc}"), 400
+
+    empresa, nuevas_filas, error = _procesar_filas_stock_comprometido_bodegas(filas_excel)
+    if error:
+        return jsonify(ok=False, error=error), (400 if empresa is None else 422)
+
+    total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas)
+
+    if extension != ".csv":
+        os.makedirs(REPORTES_DIR, exist_ok=True)
+        nombre_archivo = f"stock_comprometido_bodegas_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
+        archivo.stream.seek(0)
+        archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
+
+    return jsonify(
+        ok=True,
+        mensaje=f"Stock Comprometido por Bodegas de {empresa.nombre} actualizado: {len(nuevas_filas)} código(s), {total_unidades} unidad(es).",
         empresa=empresa.nombre, lineas=len(nuevas_filas), unidades=total_unidades,
     ), 200
 

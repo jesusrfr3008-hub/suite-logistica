@@ -472,6 +472,40 @@ class PedidoComprometido(db.Model):
         return f"<PedidoComprometido {self.codigo_interno} x{self.cantidad}>"
 
 
+class StockComprometidoBodega(db.Model):
+    """Ronda AR (2026-09-24): reemplazo de PedidoComprometido como fuente de
+    la columna "Pedido" de Consulta de Stock -- viene del reporte "Excel
+    Saldos Por Bodegas" (Stock de productos en bodegas) del sistema de
+    Inventarios, que trae, por código, el TOTAL ya comprometido con
+    clientes en la columna "Comprometido" (una sola cifra por código, sin
+    el detalle de pedido/cliente/fecha que traía Notas de Pedido -- el
+    usuario confirmó que no lo necesita, solo el total).
+
+    Se recarga POR EMPRESA cada vez que se sube un archivo nuevo (mismo
+    criterio que PedidoComprometido): se borran solo las filas de la
+    empresa que trae ESE archivo y se insertan las nuevas.
+
+    Convive con PedidoComprometido a propósito, en vez de reemplazarla de
+    golpe: _pedido_por_codigo() en app.py usa esta tabla para cualquier
+    empresa que YA tenga datos acá, y sigue usando PedidoComprometido (el
+    mecanismo viejo, Notas de Pedido) solo para una empresa que todavía no
+    subió este archivo nuevo -- así la transición no rompe nada mientras se
+    calibra la automatización de este reporte."""
+    __tablename__ = "stock_comprometido_bodega"
+
+    id = db.Column(db.Integer, primary_key=True)
+    empresa_id = db.Column(db.Integer, db.ForeignKey("empresas.id"), nullable=False, index=True)
+    codigo_interno = db.Column(db.String(40), nullable=False, index=True)
+    descripcion = db.Column(db.String(300))
+    cantidad = db.Column(db.Integer, default=0)
+    cargado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    empresa = db.relationship("Empresa")
+
+    def __repr__(self):
+        return f"<StockComprometidoBodega {self.codigo_interno} x{self.cantidad}>"
+
+
 class CodigoErgopyme(db.Model):
     """Ronda AA (2026-09-13): tabla maestra de homologación Proveedor +
     Código Proveedor + Descripción para cada "código interno" del sistema
