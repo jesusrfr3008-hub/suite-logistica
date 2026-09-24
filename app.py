@@ -7904,36 +7904,91 @@ def _construir_homologador_ergopyme():
     Proveedor" traía el número 8685 sin ceros a la izquierda, mientras el
     catálogo usa '0008685'), no hay forma de "corregir" CodigoErgopyme de
     forma permanente -- el alias vive en nuestra propia tabla y nunca se
-    pisa solo."""
+    pisa solo.
+
+    Ronda AV (2026-09-24, corrección, a pedido del usuario): había 2 casos
+    reales en que el alias creado por el usuario NO se aplicaba nunca,
+    porque el chequeo de arriba solo se hacía cuando el mapeo Ergopyme SÍ
+    traía un código de proveedor con proveedor válido:
+    1) El mapeo trae al código interno con proveedor válido, pero la
+       columna "Código Proveedor" viene EN BLANCO (caso real: varios
+       códigos DORC, donde el código de proveedor de verdad -- ej.
+       '1286.JD' -- quedó escrito dentro de la descripción en vez de en su
+       propia columna). `_fila_historica_dict` termina mostrando el CÓDIGO
+       INTERNO como si fuera el código de producto (único valor
+       disponible), y el usuario -- viendo ese código interno "mal" en el
+       reporte -- crea el alias con ESE mismo texto, tal como pide el
+       propio formulario ("Código tal como aparece mal en el reporte").
+    2) El código interno NO tiene ninguna fila en el mapeo Ergopyme (queda
+       "sin homologar" -- ver seed_compras_historicas). Acá tampoco había
+       ningún chequeo de alias -- la función retornaba None de inmediato.
+    Ahora, en ambos casos, se busca el alias con el mismo texto que
+    efectivamente se vería en el reporte si no hubiera alias -- usando
+    como proveedor el que el propio reporte usa para agrupar y mostrar esa
+    línea (`proveedor_canonico_nombre`, el mismo que ve el usuario cuando
+    crea el alias desde esa pantalla), no necesariamente el proveedor que
+    trae el mapeo Ergopyme (pueden diferir -- ver
+    _proveedor_canonico_historico)."""
     codigo_ergopyme_map = {c.codigo_interno: c for c in CodigoErgopyme.query.all()}
     proveedores_por_nombre = {p.nombre.strip().upper(): p for p in Proveedor.query.all()}
     alias_map = {(a.proveedor_id, a.codigo_alias): a for a in AliasCodigoProveedor.query.all()}
 
-    def _homologar(codigo_interno):
+    def _buscar_alias(proveedor_id, codigo_texto):
+        if not proveedor_id or not codigo_texto:
+            return None
+        alias = alias_map.get((proveedor_id, codigo_texto.strip().upper()))
+        if not alias:
+            return None
+        if alias.variante_destino:
+            return alias.variante_destino.codigo, alias.variante_destino.descripcion
+        if alias.producto_destino:
+            return alias.producto_destino.codigo, alias.producto_destino.descripcion
+        return None
+
+    def _homologar(codigo_interno, proveedor_canonico_nombre=None):
         """Devuelve (proveedor_nombre, proveedor_id, codigo_proveedor,
         descripcion) si el código interno está en el mapeo Ergopyme con un
-        proveedor real (no '#N/A'), o None si no se pudo resolver."""
+        proveedor real (no '#N/A'), o si no hay mapeo pero existe un alias
+        creado a mano sobre `proveedor_canonico_nombre` (ver docstring de
+        más arriba, Ronda AV) -- o None si no se pudo resolver de ninguna
+        forma."""
         if not codigo_interno:
             return None
+        prov_canonico = (
+            proveedores_por_nombre.get(proveedor_canonico_nombre.strip().upper())
+            if proveedor_canonico_nombre else None
+        )
         homolog = codigo_ergopyme_map.get(codigo_interno)
         if not homolog:
+            if prov_canonico:
+                resultado_alias = _buscar_alias(prov_canonico.id, codigo_interno)
+                if resultado_alias:
+                    codigo_alias, descripcion_alias = resultado_alias
+                    return (proveedor_canonico_nombre, prov_canonico.id, codigo_alias, descripcion_alias)
             return None
         prov_nombre = (homolog.proveedor_nombre or "").strip()
         if not prov_nombre or prov_nombre.upper() == "#N/A":
+            if prov_canonico:
+                resultado_alias = _buscar_alias(prov_canonico.id, codigo_interno)
+                if resultado_alias:
+                    codigo_alias, descripcion_alias = resultado_alias
+                    return (proveedor_canonico_nombre, prov_canonico.id, codigo_alias, descripcion_alias)
             return None
         prov_real = proveedores_por_nombre.get(prov_nombre.upper())
         codigo_proveedor = (homolog.codigo_proveedor or "").strip() or None
         descripcion = (homolog.descripcion or "").strip() or None
 
-        if prov_real and codigo_proveedor:
-            alias = alias_map.get((prov_real.id, codigo_proveedor.strip().upper()))
-            if alias:
-                if alias.variante_destino:
-                    codigo_proveedor = alias.variante_destino.codigo or codigo_proveedor
-                    descripcion = alias.variante_destino.descripcion or descripcion
-                elif alias.producto_destino:
-                    codigo_proveedor = alias.producto_destino.codigo or codigo_proveedor
-                    descripcion = alias.producto_destino.descripcion or descripcion
+        # Busca el alias con el mismo código que efectivamente se vería en
+        # el reporte si no hubiera alias (codigo_proveedor si existe, o si
+        # no el propio codigo_interno) -- probando primero el proveedor
+        # real del mapeo Ergopyme y, si no hay alias ahí, el proveedor
+        # canónico que ve el usuario en pantalla (pueden ser distintos).
+        codigo_para_buscar_alias = codigo_proveedor or codigo_interno
+        resultado_alias = _buscar_alias(prov_real.id if prov_real else None, codigo_para_buscar_alias)
+        if not resultado_alias and prov_canonico and (not prov_real or prov_canonico.id != prov_real.id):
+            resultado_alias = _buscar_alias(prov_canonico.id, codigo_para_buscar_alias)
+        if resultado_alias:
+            codigo_proveedor, descripcion = resultado_alias[0] or codigo_proveedor, resultado_alias[1] or descripcion
 
         return (
             prov_nombre,
@@ -10386,7 +10441,7 @@ def _fila_historica_dict(c, homologar):
     # cuando existe (es confiable y necesario para la agrupación por
     # código padre) -- solo el nombre del proveedor dejó de depender de él.
     proveedor = _proveedor_canonico_historico(c.proveedor_original)
-    resuelto = homologar(c.codigo_interno)
+    resuelto = homologar(c.codigo_interno, proveedor_canonico_nombre=proveedor)
     if resuelto:
         _prov_ergopyme, _prov_id, codigo_prov_resuelto, descripcion_resuelta = resuelto
         codigo_producto = codigo_prov_resuelto or c.codigo_proveedor or c.codigo_interno
