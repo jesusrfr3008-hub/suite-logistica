@@ -3997,6 +3997,81 @@ def reparar_facturacion_consignacion_medicontur():
     )
 
 
+def reparar_consignacion_y_codigo_interno_ronda_au():
+    """Ronda AU (2026-09-24, a pedido del usuario): 4 líneas del histórico
+    de compras (compras_historicas) habían quedado registradas con
+    factura == "CONSIGNACION" (pendiente de facturar) por error de carga --
+    en realidad ya tenían un número de factura real, lo que las hacía
+    aparecer incorrectamente como consignación en los reportes Compras
+    Proveedor y Stock Valorizado. Además, una línea de TRIFOCAL TORIC
+    BI-FLEX LIBERTY tenía mal el código interno de Ergopyme (registrado
+    como 4010210020, que en realidad corresponde a otro producto -- VISCO
+    BIOVIS 1.6, de una fecha de factura distinta) y su categoría.
+
+    El usuario confirmó las 5 correcciones exactas: comparando el archivo
+    original 'historico_compras_proveedores.xlsx' contra la versión que
+    él mismo corrigió y volvió a adjuntar, solo difieren estas 5 filas.
+
+    Cada fila se identifica por fecha_factura + codigo_interno (el valor
+    VIEJO, tal como quedó cargado originalmente) + factura actual -- y
+    solo se corrige si el cruce da EXACTAMENTE 1 fila (si da 0 --porque ya
+    se corrigió antes-- o más de 1 --porque los datos no son los
+    esperados--, no se toca nada, y si son varias se deja constancia en el
+    log para revisar a mano). Como criterio de seguridad extra, además se
+    verifica que la descripción de la fila encontrada coincida con la
+    esperada antes de aplicar el cambio.
+
+    No gateada (corre en cada arranque) e idempotente: una vez aplicada la
+    corrección, la búsqueda por el valor VIEJO ya no encuentra nada, así
+    que correr esto de nuevo no vuelve a hacer nada."""
+    correcciones = [
+        # (fecha_factura, codigo_interno_viejo, factura_actual_esperada, descripcion_esperada, cambios_a_aplicar)
+        (date(2024, 2, 1), "4010210027", "CONSIGNACION", "CAPSULAR TENSION RING 11ACB", {"factura": "ZK240538"}),
+        (date(2024, 2, 1), "4010210024", "CONSIGNACION", "CAPSULAR TENSION RING 12ACB", {"factura": "ZK240538"}),
+        (date(2024, 10, 22), "4010210030", "CONSIGNACION", "VISCO MC VK-MC-V13", {"factura": "ZK245605"}),
+        (date(2024, 10, 22), "4010210020", "CONSIGNACION", "VISCO BIOVIS 1.6", {"factura": "ZK243068"}),
+        (
+            date(2026, 8, 14), "4010210020", "CONSIGNACION", "TRIFOCAL  TORIC BI-FLEX LIBERTY 24.0 CYL 1",
+            {"codigo_interno": "20102112240100", "categoria": "LENTES"},
+        ),
+    ]
+    aplicadas = 0
+    for fecha, codigo_viejo, factura_esperada, descripcion_esperada, cambios in correcciones:
+        candidatos = CompraHistorica.query.filter(
+            CompraHistorica.fecha_factura == fecha,
+            CompraHistorica.codigo_interno == codigo_viejo,
+            CompraHistorica.factura == factura_esperada,
+        ).all()
+        if len(candidatos) != 1:
+            if candidatos:
+                print(
+                    f"[reparar_ronda_au] Consignación: se esperaba 1 fila para '{descripcion_esperada}' "
+                    f"({fecha}, código {codigo_viejo}) y se encontraron {len(candidatos)} -- se omite por "
+                    "seguridad, revisar a mano."
+                )
+            continue
+        fila = candidatos[0]
+        descripcion_actual = re.sub(r"\s+", " ", (fila.descripcion or "").strip()).upper()
+        descripcion_esperada_norm = re.sub(r"\s+", " ", descripcion_esperada.strip()).upper()
+        if descripcion_actual != descripcion_esperada_norm:
+            print(
+                f"[reparar_ronda_au] Consignación: la fila encontrada para {fecha}/{codigo_viejo} tiene "
+                f"descripción '{fila.descripcion}', distinta de la esperada '{descripcion_esperada}' -- se omite "
+                "por seguridad, revisar a mano."
+            )
+            continue
+        for campo, valor in cambios.items():
+            setattr(fila, campo, valor)
+        aplicadas += 1
+
+    if aplicadas:
+        db.session.commit()
+        print(
+            f"[reparar_ronda_au] Consignación/código interno: {aplicadas} fila(s) del histórico de compras "
+            "corregida(s) (ya no aparecen como consignación pendiente, o quedaron con su código interno correcto)."
+        )
+
+
 with app.app_context():
     reparar_ordenes_mezcladas()
     limpiar_ordenes_canceladas()
@@ -4004,6 +4079,7 @@ with app.app_context():
     reparar_paridad_eur_historica()
     reparar_costeo_topi_ex20260720()
     reparar_facturacion_consignacion_medicontur()
+    reparar_consignacion_y_codigo_interno_ronda_au()
 
 
 def _mensaje_division(ordenes_destino):
