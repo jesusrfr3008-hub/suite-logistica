@@ -548,6 +548,25 @@ def ensure_schema_migrations():
         "facturas_proveedor": [
             ("origen", "VARCHAR(20) DEFAULT 'manual'"),
         ],
+        # Ronda AU (2026-09-24, a pedido del usuario -- documentos de Orden,
+        # Gasto y Legajo que "desaparecían" tras cada despliegue): el disco
+        # del servidor en Railway no es permanente entre despliegues, asi
+        # que los archivos guardados solo en disco se perdian aunque el
+        # registro siguiera en la base de datos. Se agrega una columna para
+        # guardar el CONTENIDO del archivo directo en la base de datos (que
+        # si es permanente) -- ver OrdenDocumento.contenido en models.py.
+        "ordenes_documentos": [
+            ("contenido", "BYTEA"),
+            ("content_type", "VARCHAR(100)"),
+        ],
+        "gastos_documentos": [
+            ("contenido", "BYTEA"),
+            ("content_type", "VARCHAR(100)"),
+        ],
+        "importacion_documentos": [
+            ("contenido", "BYTEA"),
+            ("content_type", "VARCHAR(100)"),
+        ],
     }
 
     for tabla, columnas_nuevas in migraciones.items():
@@ -559,6 +578,10 @@ def ensure_schema_migrations():
                 ddl_final = ddl
                 if not es_sqlite and "BOOLEAN" in ddl.upper():
                     ddl_final = ddl_final.replace("DEFAULT 0", "DEFAULT FALSE").replace("DEFAULT 1", "DEFAULT TRUE")
+                if es_sqlite and "BYTEA" in ddl_final.upper():
+                    # SQLite no tiene el tipo BYTEA (especifico de Postgres)
+                    # -- BLOB es su equivalente para datos binarios.
+                    ddl_final = ddl_final.replace("BYTEA", "BLOB")
                 with db.engine.connect() as conn:
                     conn.execute(db.text(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {ddl_final}"))
                     conn.commit()
@@ -5887,11 +5910,47 @@ def _extension_valida(nombre_archivo):
     return ext in EXTENSIONES_PERMITIDAS
 
 
+def _servir_documento(doc, carpeta_disco, forzar_descarga):
+    """Sirve un documento adjunto (Orden/Gasto/Legajo), usado por las 3
+    rutas 'ver'/'descargar' de cada uno.
+
+    Ronda AU (2026-09-24, a pedido del usuario -- reportó un documento ya
+    cargado que daba "Not Found" al intentar verlo): el disco del servidor
+    en Railway NO es permanente entre despliegues -- cada actualización del
+    sistema (cada 'railway up') arranca el contenedor de nuevo y borra
+    cualquier archivo que solo viviera en disco, aunque el registro del
+    documento siga intacto en la base de datos (esa sí es permanente). Por
+    eso un documento subido antes de una actualización posterior terminaba
+    con un link que "existe" pero apunta a un archivo que ya no está.
+
+    Desde este fix, el contenido del archivo se guarda directo en la base
+    de datos (columna 'contenido') y de ahí se sirve siempre que esté
+    disponible. Para documentos viejos que solo llegaron a guardarse en
+    disco (antes de este fix), se intenta igual el disco como respaldo por
+    si el servidor no se ha reiniciado todavía. Si ninguno de los dos está
+    disponible, devuelve None para que el caller avise con un mensaje claro
+    en vez de la pantalla en blanco de Flask ("Not Found")."""
+    if doc.contenido:
+        return send_file(
+            io.BytesIO(doc.contenido),
+            mimetype=doc.content_type or "application/octet-stream",
+            download_name=doc.nombre_original,
+            as_attachment=forzar_descarga,
+        )
+    ruta = os.path.join(carpeta_disco, doc.nombre_archivo)
+    if os.path.exists(ruta):
+        return send_from_directory(
+            carpeta_disco, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=forzar_descarga,
+        )
+    return None
+
+
 def _guardar_documento_orden(orden, archivo, tipo):
-    """Guarda un archivo adjunto de una orden en disco + su fila
-    OrdenDocumento (sin hacer commit -- lo hace el caller). Devuelve None si
-    no hay archivo o la extension no es valida, para que el caller decida
-    que flash mostrar. Reutilizada por la subida manual (crear_orden/
+    """Guarda un archivo adjunto de una orden -- su contenido va directo a
+    la base de datos (ver _servir_documento) -- y su fila OrdenDocumento
+    (sin hacer commit -- lo hace el caller). Devuelve None si no hay
+    archivo o la extension no es valida, para que el caller decida que
+    flash mostrar. Reutilizada por la subida manual (crear_orden/
     orden_simple) y por la creacion de una orden 'simple' con Cotización/
     Orden de Compra adjuntas desde el mismo formulario (ronda S,
     2026-09-12)."""
@@ -5899,16 +5958,15 @@ def _guardar_documento_orden(orden, archivo, tipo):
         return None
     if not _extension_valida(archivo.filename):
         return None
-    carpeta_orden = os.path.join(DOCUMENTOS_DIR, str(orden.id))
-    os.makedirs(carpeta_orden, exist_ok=True)
     _, ext = os.path.splitext(archivo.filename)
     nombre_disco = f"{uuid.uuid4().hex}{ext.lower()}"
-    archivo.save(os.path.join(carpeta_orden, nombre_disco))
     doc = OrdenDocumento(
         orden_id=orden.id,
         tipo=tipo if tipo in TIPOS_DOCUMENTO_ORDEN else "Otro",
         nombre_original=archivo.filename,
         nombre_archivo=nombre_disco,
+        contenido=archivo.read(),
+        content_type=archivo.mimetype or None,
     )
     db.session.add(doc)
     return doc
@@ -5951,9 +6009,16 @@ def ordenes_documento_ver(orden_id, doc_id):
         flash("No tienes acceso a los documentos de esta orden.", "danger")
         return redirect(url_for("ordenes_simple_list"))
     carpeta_orden = os.path.join(DOCUMENTOS_DIR, str(doc.orden_id))
-    return send_from_directory(
-        carpeta_orden, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=False
-    )
+    respuesta = _servir_documento(doc, carpeta_orden, forzar_descarga=False)
+    if respuesta is None:
+        flash(
+            "Este documento ya no está disponible -- se perdió en una actualización del sistema "
+            "anterior a este fix (los documentos ahora se guardan de forma permanente). Vuelve a "
+            "subirlo desde aquí mismo.",
+            "warning",
+        )
+        return redirect(_destino_detalle_orden(orden))
+    return respuesta
 
 
 @app.route("/ordenes/<int:orden_id>/documentos/<int:doc_id>/descargar")
@@ -5967,9 +6032,16 @@ def ordenes_documento_descargar(orden_id, doc_id):
         flash("No tienes acceso a los documentos de esta orden.", "danger")
         return redirect(url_for("ordenes_simple_list"))
     carpeta_orden = os.path.join(DOCUMENTOS_DIR, str(doc.orden_id))
-    return send_from_directory(
-        carpeta_orden, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=True
-    )
+    respuesta = _servir_documento(doc, carpeta_orden, forzar_descarga=True)
+    if respuesta is None:
+        flash(
+            "Este documento ya no está disponible -- se perdió en una actualización del sistema "
+            "anterior a este fix (los documentos ahora se guardan de forma permanente). Vuelve a "
+            "subirlo desde aquí mismo.",
+            "warning",
+        )
+        return redirect(_destino_detalle_orden(orden))
+    return respuesta
 
 
 @app.route("/ordenes/<int:orden_id>/documentos/<int:doc_id>/eliminar", methods=["POST"])
@@ -8237,18 +8309,16 @@ def gastos_documento_subir(gasto_id):
         flash("Solo se permiten archivos PDF, Word, Excel o imagenes (JPG, PNG).", "danger")
         return redirect(url_for("importaciones_detalle", importacion_id=gasto.importacion_id))
 
-    carpeta_gasto = os.path.join(DOCUMENTOS_GASTOS_DIR, str(gasto.id))
-    os.makedirs(carpeta_gasto, exist_ok=True)
-
     _, ext = os.path.splitext(archivo.filename)
     nombre_disco = f"{uuid.uuid4().hex}{ext.lower()}"
-    archivo.save(os.path.join(carpeta_gasto, nombre_disco))
 
     doc = GastoDocumento(
         gasto_id=gasto.id,
         tipo=tipo if tipo in TIPOS_DOCUMENTO_GASTO else "Otro",
         nombre_original=archivo.filename,
         nombre_archivo=nombre_disco,
+        contenido=archivo.read(),
+        content_type=archivo.mimetype or None,
     )
     db.session.add(doc)
     db.session.commit()
@@ -8262,10 +8332,18 @@ def gastos_documento_ver(gasto_id, doc_id):
     doc = GastoDocumento.query.get_or_404(doc_id)
     if doc.gasto_id != gasto_id:
         abort(404)
+    gasto = GastoImportacion.query.get_or_404(gasto_id)
     carpeta_gasto = os.path.join(DOCUMENTOS_GASTOS_DIR, str(doc.gasto_id))
-    return send_from_directory(
-        carpeta_gasto, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=False
-    )
+    respuesta = _servir_documento(doc, carpeta_gasto, forzar_descarga=False)
+    if respuesta is None:
+        flash(
+            "Este documento ya no está disponible -- se perdió en una actualización del sistema "
+            "anterior a este fix (los documentos ahora se guardan de forma permanente). Vuelve a "
+            "subirlo desde aquí mismo.",
+            "warning",
+        )
+        return redirect(url_for("importaciones_detalle", importacion_id=gasto.importacion_id))
+    return respuesta
 
 
 @app.route("/gastos/<int:gasto_id>/documentos/<int:doc_id>/descargar")
@@ -8274,10 +8352,18 @@ def gastos_documento_descargar(gasto_id, doc_id):
     doc = GastoDocumento.query.get_or_404(doc_id)
     if doc.gasto_id != gasto_id:
         abort(404)
+    gasto = GastoImportacion.query.get_or_404(gasto_id)
     carpeta_gasto = os.path.join(DOCUMENTOS_GASTOS_DIR, str(doc.gasto_id))
-    return send_from_directory(
-        carpeta_gasto, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=True
-    )
+    respuesta = _servir_documento(doc, carpeta_gasto, forzar_descarga=True)
+    if respuesta is None:
+        flash(
+            "Este documento ya no está disponible -- se perdió en una actualización del sistema "
+            "anterior a este fix (los documentos ahora se guardan de forma permanente). Vuelve a "
+            "subirlo desde aquí mismo.",
+            "warning",
+        )
+        return redirect(url_for("importaciones_detalle", importacion_id=gasto.importacion_id))
+    return respuesta
 
 
 @app.route("/gastos/<int:gasto_id>/documentos/<int:doc_id>/eliminar", methods=["POST"])
@@ -8323,18 +8409,16 @@ def importacion_legajo_subir(importacion_id):
         flash("Solo se permiten archivos PDF, Word, Excel o imagenes (JPG, PNG).", "danger")
         return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
-    carpeta = os.path.join(DOCUMENTOS_LEGAJO_DIR, str(imp.id))
-    os.makedirs(carpeta, exist_ok=True)
-
     _, ext = os.path.splitext(archivo.filename)
     nombre_disco = f"{uuid.uuid4().hex}{ext.lower()}"
-    archivo.save(os.path.join(carpeta, nombre_disco))
 
     doc = ImportacionDocumento(
         importacion_id=imp.id,
         descripcion=descripcion,
         nombre_original=archivo.filename,
         nombre_archivo=nombre_disco,
+        contenido=archivo.read(),
+        content_type=archivo.mimetype or None,
     )
     db.session.add(doc)
     db.session.commit()
@@ -8349,9 +8433,16 @@ def importacion_legajo_ver(importacion_id, doc_id):
     if doc.importacion_id != importacion_id:
         abort(404)
     carpeta = os.path.join(DOCUMENTOS_LEGAJO_DIR, str(doc.importacion_id))
-    return send_from_directory(
-        carpeta, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=False
-    )
+    respuesta = _servir_documento(doc, carpeta, forzar_descarga=False)
+    if respuesta is None:
+        flash(
+            "Este documento ya no está disponible -- se perdió en una actualización del sistema "
+            "anterior a este fix (los documentos ahora se guardan de forma permanente). Vuelve a "
+            "subirlo desde aquí mismo.",
+            "warning",
+        )
+        return redirect(url_for("importaciones_detalle", importacion_id=importacion_id))
+    return respuesta
 
 
 @app.route("/importaciones/<int:importacion_id>/legajo/<int:doc_id>/descargar")
@@ -8361,9 +8452,16 @@ def importacion_legajo_descargar(importacion_id, doc_id):
     if doc.importacion_id != importacion_id:
         abort(404)
     carpeta = os.path.join(DOCUMENTOS_LEGAJO_DIR, str(doc.importacion_id))
-    return send_from_directory(
-        carpeta, doc.nombre_archivo, download_name=doc.nombre_original, as_attachment=True
-    )
+    respuesta = _servir_documento(doc, carpeta, forzar_descarga=True)
+    if respuesta is None:
+        flash(
+            "Este documento ya no está disponible -- se perdió en una actualización del sistema "
+            "anterior a este fix (los documentos ahora se guardan de forma permanente). Vuelve a "
+            "subirlo desde aquí mismo.",
+            "warning",
+        )
+        return redirect(url_for("importaciones_detalle", importacion_id=importacion_id))
+    return respuesta
 
 
 @app.route("/importaciones/<int:importacion_id>/legajo/<int:doc_id>/eliminar", methods=["POST"])

@@ -452,8 +452,11 @@
         <div class="d-flex gap-1 align-items-center">
           <button class="btn btn-sm btn-brand" data-bs-toggle="modal" data-bs-target="#modalNuevoGasto">+ Agregar gasto</button>
           <div class="dropdown">
-            <button class="btn btn-sm btn-outline-secondary btn-engranaje" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="Opciones">
+            <button class="btn btn-sm btn-outline-secondary btn-engranaje position-relative" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="Opciones{% if imp.legajos.count() %} -- {{ imp.legajos.count() }} documento(s) de legajo cargado(s){% endif %}">
               <i class="bi bi-gear-fill"></i>
+              {% if imp.legajos.count() %}
+              <i class="bi bi-paperclip position-absolute top-0 start-100 translate-middle text-primary bg-white rounded-circle" style="font-size:0.85rem;"></i>
+              {% endif %}
             </button>
             <ul class="dropdown-menu dropdown-menu-end">
               <li><h6 class="dropdown-header-adjuntar mb-0">Adjuntar</h6></li>

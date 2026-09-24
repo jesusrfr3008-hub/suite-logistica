@@ -938,8 +938,18 @@ class OrdenDocumento(db.Model):
     orden_id = db.Column(db.Integer, db.ForeignKey("ordenes_compra.id"), nullable=False)
     tipo = db.Column(db.String(60), default="Otro")
     nombre_original = db.Column(db.String(255), nullable=False)
-    nombre_archivo = db.Column(db.String(255), nullable=False)  # nombre en disco
+    nombre_archivo = db.Column(db.String(255), nullable=False)  # nombre en disco (legado, ver 'contenido')
     fecha_subida = db.Column(db.DateTime, default=datetime.utcnow)
+    # Ronda AU (2026-09-24, a pedido del usuario -- documentos que "desaparecían"
+    # tras cada actualización del sistema): el disco del servidor NO es
+    # permanente entre despliegues, así que guardar el archivo solo en disco
+    # (como se hacía antes, en 'nombre_archivo') hacía que el documento se
+    # perdiera en el próximo despliegue aunque el registro siguiera en la
+    # base de datos. Ahora el contenido real del archivo se guarda AQUÍ,
+    # dentro de la base de datos (que sí es permanente), y sobrevive a
+    # cualquier actualización.
+    contenido = db.Column(db.LargeBinary)
+    content_type = db.Column(db.String(100))
 
 
 # ---------------------------------------------------------------------------
@@ -1353,8 +1363,12 @@ class GastoDocumento(db.Model):
     gasto_id = db.Column(db.Integer, db.ForeignKey("gastos_importacion.id"), nullable=False)
     tipo = db.Column(db.String(60), default="Otro")
     nombre_original = db.Column(db.String(255), nullable=False)
-    nombre_archivo = db.Column(db.String(255), nullable=False)  # nombre en disco
+    nombre_archivo = db.Column(db.String(255), nullable=False)  # nombre en disco (legado, ver 'contenido')
     fecha_subida = db.Column(db.DateTime, default=datetime.utcnow)
+    # Ronda AU (2026-09-24): ver el comentario en OrdenDocumento.contenido --
+    # mismo motivo (el disco del servidor se borra en cada despliegue).
+    contenido = db.Column(db.LargeBinary)
+    content_type = db.Column(db.String(100))
 
 
 class ImportacionDocumento(db.Model):
@@ -1370,8 +1384,12 @@ class ImportacionDocumento(db.Model):
     importacion_id = db.Column(db.Integer, db.ForeignKey("importaciones.id"), nullable=False)
     descripcion = db.Column(db.String(150))
     nombre_original = db.Column(db.String(255), nullable=False)
-    nombre_archivo = db.Column(db.String(255), nullable=False)  # nombre en disco
+    nombre_archivo = db.Column(db.String(255), nullable=False)  # nombre en disco (legado, ver 'contenido')
     fecha_subida = db.Column(db.DateTime, default=datetime.utcnow)
+    # Ronda AU (2026-09-24): ver el comentario en OrdenDocumento.contenido --
+    # mismo motivo (el disco del servidor se borra en cada despliegue).
+    contenido = db.Column(db.LargeBinary)
+    content_type = db.Column(db.String(100))
 
 
 gasto_parcial_aplicable = db.Table(
