@@ -14,7 +14,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import openpyxl
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image as ExcelImage
 from flask import (
@@ -7002,6 +7002,17 @@ def _normalizar_desc(texto):
     return texto
 
 
+# Ronda AU (2026-09-24, a pedido del usuario): antes el CODIGO del archivo de
+# lotes solo se normalizaba con .strip().lower() -- suficiente para codigos
+# alfanumericos cortos, pero varios proveedores (ej. BVI/PHYSIOL) usan como
+# "codigo" un texto largo tipo descripcion, con espacios internos ("MicroPure
+# 123 +2.0 D") -- ahi un espacio doble, un espacio "duro" (\\xa0, comun al
+# copiar/pegar desde otro Excel) o una diferencia de mayusculas/minusculas
+# alcanzaba para que el cruce contra el catalogo fallara en silencio. Se usa
+# el mismo criterio de normalizacion que ya se usaba para la Descripcion.
+_normalizar_codigo = _normalizar_desc
+
+
 def _buscar_columna_prioridad(encabezado, *listas_claves):
     """Busca una columna probando listas de claves en orden de prioridad
     (todas las columnas contra la lista más específica antes de pasar a la
@@ -7112,7 +7123,7 @@ def _indexar_lineas_importacion(importacion):
     ambiguos_codigo, ambiguos_descripcion = set(), set()
     for parcial in importacion.parciales:
         for linea in parcial.lineas:
-            clave_cod = (linea.codigo or "").strip().lower()
+            clave_cod = _normalizar_codigo(linea.codigo)
             if clave_cod:
                 if clave_cod in vistos_codigo:
                     ambiguos_codigo.add(clave_cod)
@@ -7129,6 +7140,75 @@ def _indexar_lineas_importacion(importacion):
     for clave in ambiguos_descripcion:
         por_descripcion.pop(clave, None)
     return por_codigo, por_descripcion, ambiguos_codigo, ambiguos_descripcion
+
+
+def _generar_informe_errores_carga_lotes(no_encontrados, ambiguos_encontrados, excedidas):
+    """Ronda AU (2026-09-24, a pedido del usuario): informe descargable
+    (.xlsx) con el detalle de cada problema encontrado al cargar un archivo
+    de lotes -- una fila por cada código/descripción del archivo que no se
+    pudo asignar a ninguna línea del costeo, que quedó ambiguo entre varios
+    parciales, o cuya suma de lotes superó la cantidad de la línea. Antes
+    esto solo se resumía en un conteo dentro del mensaje flash ("N
+    producto(s) no se encontraron"), sin decir CUÁLES ni por qué -- el
+    usuario tenía que adivinar y revisar el archivo entero a mano."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Errores carga de lotes"
+    encabezados = [
+        "Problema", "Código (archivo)", "Descripción (archivo)", "Lote", "Vencimiento",
+        "Cantidad", "Cómo solucionarlo",
+    ]
+    for col, titulo in enumerate(encabezados, start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True)
+
+    fila_actual = 2
+
+    def _escribir(problema, fila_datos, solucion):
+        nonlocal fila_actual
+        ws.cell(row=fila_actual, column=1, value=problema)
+        ws.cell(row=fila_actual, column=2, value=fila_datos.get("codigo") or "")
+        ws.cell(row=fila_actual, column=3, value=fila_datos.get("descripcion") or "")
+        ws.cell(row=fila_actual, column=4, value=fila_datos.get("lote") or "")
+        fecha = fila_datos.get("fecha")
+        ws.cell(row=fila_actual, column=5, value=fecha.strftime("%d-%m-%Y") if fecha else "")
+        ws.cell(row=fila_actual, column=6, value=fila_datos.get("cantidad"))
+        ws.cell(row=fila_actual, column=7, value=solucion)
+        fila_actual += 1
+
+    for fila in no_encontrados:
+        _escribir(
+            "No se encontró en ningún parcial de este costeo", fila,
+            "Revisa que el Código (o la Descripción) exista EXACTAMENTE en alguna línea de este costeo -- "
+            "un espacio de más, un típeo, o que sea un producto de otro costeo, hacen que no se encuentre. "
+            "Si el producto no está en este costeo, esta fila no aplica y se puede ignorar.",
+        )
+    for fila in ambiguos_encontrados:
+        _escribir(
+            f"Repetido en más de un parcial (mismo {fila.get('motivo', 'código/descripción')})", fila,
+            "Este código/descripción aparece en más de una línea de este costeo -- el sistema no puede "
+            "adivinar a cuál asignarlo. Carga el lote a mano en la línea correcta desde el detalle del costeo.",
+        )
+    for item in excedidas:
+        _escribir(
+            "La suma de lotes supera la cantidad de la línea",
+            {"codigo": item.get("codigo"), "descripcion": item.get("descripcion"), "lote": "", "fecha": None, "cantidad": item.get("suma")},
+            f"El archivo trae {item.get('suma'):g} unidad(es) en lotes para este producto, pero la línea del "
+            f"costeo solo tiene {item.get('cantidad_linea'):g} -- revisa la cantidad cargada en el costeo o "
+            "corrige el archivo (puede haber una fila de más, o un lote repetido).",
+        )
+
+    for col, ancho in zip(range(1, 8), [40, 30, 34, 14, 13, 10, 70]):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+    ws.auto_filter.ref = f"A1:G{fila_actual - 1}"
+    for row in ws.iter_rows(min_row=1, max_row=fila_actual - 1):
+        for celda in row:
+            celda.alignment = Alignment(vertical="top", wrap_text=(celda.column in (3, 7)))
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
 
 
 @app.route("/importaciones/<int:importacion_id>/lotes/cargar", methods=["POST"])
@@ -7167,58 +7247,95 @@ def importacion_lotes_cargar(importacion_id):
         flash("El archivo no tiene filas para cargar.", "warning")
         return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
-    por_codigo, por_descripcion, ambiguos_codigo, ambiguos_descripcion = _indexar_lineas_importacion(imp)
+    # Ronda AU (2026-09-24, a pedido del usuario): esta carga masiva le
+    # estaba devolviendo un Internal Server Error al usuario ante algún dato
+    # inesperado del archivo (no se pudo aislar un caso puntual que lo
+    # reproduzca con certeza, pero el archivo real de este proveedor usa
+    # como "Código" un texto largo tipo descripción, con mayúsculas variables
+    # y una fila de totales al final -- terreno fértil para un caso no
+    # contemplado). Se envuelve todo el cruce+guardado en un try/except
+    # amplio: si algo inesperado revienta, se hace rollback y se avisa con
+    # un mensaje claro en vez de una pantalla de error en blanco, y el
+    # detalle técnico queda en el log del servidor para poder diagnosticarlo
+    # si se repite.
+    try:
+        por_codigo, por_descripcion, ambiguos_codigo, ambiguos_descripcion = _indexar_lineas_importacion(imp)
 
-    conteo_por_linea = defaultdict(lambda: defaultdict(int))
-    no_encontrados = set()
-    ambiguos_encontrados = set()
+        conteo_por_linea = defaultdict(lambda: defaultdict(int))
+        # Antes estas dos eran sets de un solo texto (código o descripción)
+        # por producto -- suficiente para contar, pero no para armar un
+        # informe accionable (¿qué lote? ¿qué cantidad? ¿de qué fila del
+        # archivo?). Ahora son listas de la fila completa tal como vino en
+        # el archivo, para poder volcarlas en el informe de errores.
+        no_encontrados = []
+        ambiguos_encontrados = []
 
-    for fila in filas:
-        codigo_key = fila["codigo"].strip().lower() if fila["codigo"] else ""
-        desc_key = _normalizar_desc(fila["descripcion"]) if fila["descripcion"] else ""
-        linea = None
-        if codigo_key:
-            linea = por_codigo.get(codigo_key)
-            if linea is None and codigo_key in ambiguos_codigo:
-                ambiguos_encontrados.add(fila["codigo"])
-        if linea is None and desc_key:
-            linea = por_descripcion.get(desc_key)
-            if linea is None and desc_key in ambiguos_descripcion:
-                ambiguos_encontrados.add(fila["descripcion"])
-        if linea is None:
-            if not (codigo_key and codigo_key in ambiguos_codigo) and not (desc_key and desc_key in ambiguos_descripcion):
-                no_encontrados.add(fila["codigo"] or fila["descripcion"])
-            continue
-        cantidad = fila["cantidad"] if fila["cantidad"] is not None else 1
-        clave_lote = (fila["lote"], fila["fecha"])
-        conteo_por_linea[linea.id][clave_lote] += cantidad
+        for fila in filas:
+            codigo_key = _normalizar_codigo(fila["codigo"]) if fila["codigo"] else ""
+            desc_key = _normalizar_desc(fila["descripcion"]) if fila["descripcion"] else ""
+            linea = None
+            motivo_ambiguo = None
+            if codigo_key:
+                linea = por_codigo.get(codigo_key)
+                if linea is None and codigo_key in ambiguos_codigo:
+                    motivo_ambiguo = "código"
+            if linea is None and desc_key:
+                linea = por_descripcion.get(desc_key)
+                if linea is None and desc_key in ambiguos_descripcion:
+                    motivo_ambiguo = motivo_ambiguo or "descripción"
+            if linea is None:
+                if motivo_ambiguo:
+                    ambiguos_encontrados.append({**fila, "motivo": motivo_ambiguo})
+                else:
+                    no_encontrados.append(fila)
+                continue
+            cantidad = fila["cantidad"] if fila["cantidad"] is not None else 1
+            clave_lote = (fila["lote"], fila["fecha"])
+            conteo_por_linea[linea.id][clave_lote] += cantidad
 
-    lineas_por_parcial = {}
-    # Ronda AN (2026-09-23, corrección): mismo resguardo que la edición
-    # manual de lotes (_guardar_lotes_linea) -- si la suma de unidades por
-    # lote de una línea SUPERA su cantidad total, esa línea puntual se
-    # omite (no se le tocan los lotes) en vez de guardar de todos modos una
-    # cantidad mayor a la realmente recibida; se informa al final cuántas
-    # se omitieron por este motivo.
-    excedidas = []
-    for linea_id, grupos in conteo_por_linea.items():
-        linea = ParcialLinea.query.get(linea_id)
-        nuevos = [
-            ParcialLineaLote(codigo_lote=lote, fecha_vencimiento=fecha, cantidad_unidades=cantidad)
-            for (lote, fecha), cantidad in grupos.items()
-        ]
-        suma = sum(lo.cantidad_unidades or 0 for lo in nuevos)
-        if suma > (linea.cantidad_unidades or 0):
-            excedidas.append(f"{linea.codigo or linea.descripcion} ({suma:g} > {linea.cantidad_unidades or 0:g})")
-            continue
-        linea.lotes = nuevos
-        primero = min(nuevos, key=lambda lo: (lo.fecha_vencimiento is None, lo.fecha_vencimiento or date.max))
-        linea.codigo_lote = ", ".join(sorted({lo.codigo_lote for lo in nuevos if lo.codigo_lote}))
-        linea.fecha_vencimiento = primero.fecha_vencimiento
-        nombre_parcial = linea.parcial.referencia or linea.parcial.numero_parcial or f"Parcial {linea.parcial.id}"
-        lineas_por_parcial[nombre_parcial] = lineas_por_parcial.get(nombre_parcial, 0) + 1
+        lineas_por_parcial = {}
+        # Ronda AN (2026-09-23, corrección): mismo resguardo que la edición
+        # manual de lotes (_guardar_lotes_linea) -- si la suma de unidades por
+        # lote de una línea SUPERA su cantidad total, esa línea puntual se
+        # omite (no se le tocan los lotes) en vez de guardar de todos modos una
+        # cantidad mayor a la realmente recibida; se informa al final cuántas
+        # se omitieron por este motivo.
+        excedidas = []
+        for linea_id, grupos in conteo_por_linea.items():
+            linea = ParcialLinea.query.get(linea_id)
+            nuevos = [
+                ParcialLineaLote(codigo_lote=lote, fecha_vencimiento=fecha, cantidad_unidades=cantidad)
+                for (lote, fecha), cantidad in grupos.items()
+            ]
+            suma = sum(lo.cantidad_unidades or 0 for lo in nuevos)
+            if suma > (linea.cantidad_unidades or 0):
+                excedidas.append({
+                    "codigo": linea.codigo, "descripcion": linea.descripcion,
+                    "suma": suma, "cantidad_linea": linea.cantidad_unidades or 0,
+                })
+                continue
+            linea.lotes = nuevos
+            primero = min(nuevos, key=lambda lo: (lo.fecha_vencimiento is None, lo.fecha_vencimiento or date.max))
+            linea.codigo_lote = ", ".join(sorted({lo.codigo_lote for lo in nuevos if lo.codigo_lote}))
+            linea.fecha_vencimiento = primero.fecha_vencimiento
+            nombre_parcial = linea.parcial.referencia or linea.parcial.numero_parcial or f"Parcial {linea.parcial.id}"
+            lineas_por_parcial[nombre_parcial] = lineas_por_parcial.get(nombre_parcial, 0) + 1
 
-    db.session.commit()
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception(
+            f"Error inesperado cargando lotes para la importación {imp.id} "
+            f"(archivo '{archivo.filename}')"
+        )
+        flash(
+            "No se pudo completar la carga de lotes por un error inesperado -- no se guardó ningún cambio. "
+            "Verifica que el archivo tenga las columnas 'Código' o 'Descripción', 'Lote' y 'Vencimiento', "
+            "sin filas de totales u otras celdas fuera de la tabla. Si el problema sigue, avísale al soporte "
+            "técnico con este mismo archivo.",
+            "danger",
+        )
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
     if lineas_por_parcial:
         detalle = ", ".join(f"{n} en {parcial}" for parcial, n in lineas_por_parcial.items())
@@ -7226,18 +7343,29 @@ def importacion_lotes_cargar(importacion_id):
     else:
         mensaje = "No se encontró ningún producto del archivo en este costeo."
     if no_encontrados:
-        mensaje += f" {len(no_encontrados)} producto(s) del archivo no se encontraron en ningún parcial y se ignoraron."
+        mensaje += (
+            f" {len(no_encontrados)} fila(s) del archivo no se encontraron en ningún parcial y se ignoraron "
+            "-- se descargó un informe detallado con el motivo de cada una."
+        )
     if ambiguos_encontrados:
         mensaje += (
-            f" {len(ambiguos_encontrados)} producto(s) aparecen repetidos en más de un parcial "
-            "(mismo código o descripción) y no se pudieron asignar automáticamente -- revísalos a mano."
+            f" {len(ambiguos_encontrados)} fila(s) tienen un código/descripción repetido en más de un parcial "
+            "y no se pudieron asignar automáticamente -- revísalas a mano (ver informe descargado)."
         )
     if excedidas:
         mensaje += (
             f" {len(excedidas)} producto(s) se omitieron porque la suma de sus lotes superaba la cantidad "
-            f"total de la línea: {', '.join(excedidas)}."
+            "total de la línea (ver informe descargado)."
         )
     flash(mensaje, "success" if lineas_por_parcial else "warning")
+
+    if no_encontrados or ambiguos_encontrados or excedidas:
+        informe = _generar_informe_errores_carga_lotes(no_encontrados, ambiguos_encontrados, excedidas)
+        nombre_informe = f"Informe_errores_lotes_{imp.numero_factura or imp.id}.xlsx".replace("/", "-").replace(" ", "_")
+        return send_file(
+            informe, as_attachment=True, download_name=nombre_informe,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
 
