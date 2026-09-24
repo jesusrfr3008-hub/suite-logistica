@@ -402,6 +402,47 @@ class StockValorizado(db.Model):
         return f"<StockValorizado {self.codigo_interno}>"
 
 
+class StockConsignacionVigente(db.Model):
+    """Ronda AQ (2026-09-24): stock en consignación VIGENTE (todavía en
+    poder de Accuvision/Accumedical, sin comprar), por LOTE -- reemplaza la
+    aproximación parcial que usaba Stock Valorizado hasta ahora (códigos
+    "en consignación" inferidos de CompraHistorica con factura pendiente,
+    ver _codigos_en_consignacion), con el archivo real que el proveedor
+    reporta ("Stock Consignación [Proveedor] [fecha].xlsx" -- una fila por
+    lote, con su vencimiento y costo PMP).
+
+    A diferencia de StockValorizado (consolidado por código, sin lote) y
+    StockExistencia (stock físico total, sin distinguir propio de
+    consignación), esta tabla es la ÚNICA que sabe, lote por lote, qué es
+    de verdad consignación hoy -- por eso alimenta tanto el toggle
+    Propio/Consignación de Stock Valorizado (por código, agregando sus
+    lotes) como el nuevo Reporte de Consignación para informarle al
+    proveedor la foto actual de su stock en nuestro poder.
+
+    Se recarga POR PROVEEDOR cada vez que se sube un archivo nuevo (se
+    borran solo las filas de ESE proveedor antes de insertar las nuevas --
+    a diferencia de StockValorizado/StockExistencia, que se recargan
+    completos, acá conviene por proveedor porque cada proveedor manda su
+    archivo en fechas distintas y no hay que perder el de los demás)."""
+    __tablename__ = "stock_consignacion_vigente"
+
+    id = db.Column(db.Integer, primary_key=True)
+    proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False, index=True)
+    codigo_proveedor = db.Column(db.String(120))
+    codigo_interno_ergopyme = db.Column(db.String(40), index=True)
+    descripcion = db.Column(db.String(300))
+    lote = db.Column(db.String(80))
+    fecha_vencimiento = db.Column(db.Date, nullable=True)
+    cantidad = db.Column(db.Integer, default=0)
+    costo_pmp = db.Column(db.Float, nullable=True)
+    cargado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    proveedor = db.relationship("Proveedor")
+
+    def __repr__(self):
+        return f"<StockConsignacionVigente {self.codigo_proveedor} lote={self.lote}>"
+
+
 class PedidoComprometido(db.Model):
     """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
     clientes (OC de clientes, no de nosotros a los proveedores), tal como

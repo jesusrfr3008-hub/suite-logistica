@@ -35,6 +35,7 @@ from models import (
     CargoAdicionalImportacion, TipoCambioMensual,
     Usuario, Rol, PERMISOS_DISPONIBLES,
     HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
+    StockConsignacionVigente,
     CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
     FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
@@ -110,6 +111,14 @@ AJUSTE_PADRE_PHYSIOL_EXCEL = os.path.join(BASE_DIR, "Ajuste de cuentas padre Phy
 # extranjeros (facturas de compras anteriores a este modulo, ya emitidas y
 # pendientes de pago) -- ver seed_facturas_proveedor_pendientes() abajo.
 CUENTAS_POR_PAGAR_EXCEL = os.path.join(BASE_DIR, "cuentas_por_pagar_proveedores.xlsx")
+# Ronda AQ (2026-09-24): el usuario detectó que 20 variantes MEDICONTUR de la
+# familia de código padre "877PETY" (TRIFOCAL TORIC ELON, todas terminadas en
+# "CYL 1") habían quedado cargadas con una letra "O" al final del código en
+# vez del dígito "0" (ej. '877PETYP120O' en vez de '877PETYP1200') -- mismo
+# tipo de confusión que ya se había corregido antes para otro grupo (ver
+# reparar_variantes_medicontur_ronda_ae). El usuario entregó el listado
+# CORRECTO/ERRADO -- ver reparar_codigos_877pety_ronda_aq() abajo.
+CORRECCION_CODIGOS_877PETY_EXCEL = os.path.join(BASE_DIR, "Correccion codigo 877PETY.xlsx")
 
 # Ronda AE (2026-09-14): algunos proveedores extranjeros aparecen en el
 # histórico de compras (columna "Proveedor" original del archivo) con un
@@ -1328,17 +1337,28 @@ def _cargar_stock_valorizado(filas):
 
 
 def _codigos_en_consignacion():
-    """Ronda AM (2026-09-19): códigos internos (Ergopyme) que HOY sabemos
-    que están en consignación -- por ahora, únicamente lo que ya
-    rastreamos en Pago Proveedores para Medicontur (CompraHistorica con
-    factura == "CONSIGNACION" y todavía sin facturar, ver
-    _pendientes_consignacion). Es una APROXIMACIÓN PARCIAL a propósito: el
-    usuario confirmó usar esto mientras no suba el archivo maestro de
-    códigos+lotes en consignación de todos los proveedores (pendiente,
-    ligado al diseño de "Reposición Consignación" de la ronda AL). Cuando
-    ese archivo exista, este es el único lugar que hay que tocar para
-    ampliar/reemplazar la fuente de este toggle -- el resto de Stock
-    Valorizado (vista, filtros) no cambia."""
+    """Ronda AM (2026-09-19), reemplazada en la ronda AQ (2026-09-24) por el
+    archivo real de stock en consignación vigente por lote (ver
+    StockConsignacionVigente / _cargar_stock_consignacion): si YA se cargó
+    ese archivo para al menos un proveedor, se usa esa foto real (código
+    interno Ergopyme de cada lote vigente) en vez de la aproximación
+    anterior. Mientras no se cargue ningún archivo real (tabla vacía), se
+    mantiene la aproximación parcial original -- CompraHistorica con
+    factura == "CONSIGNACION" y todavía sin facturar (hoy, únicamente
+    Medicontur) -- para no perder la funcionalidad de golpe. Este sigue
+    siendo el único lugar que hay que tocar para ampliar la fuente del
+    toggle Propio/Consignación de Stock Valorizado."""
+    reales = (
+        StockConsignacionVigente.query
+        .filter(StockConsignacionVigente.codigo_interno_ergopyme.isnot(None))
+        .filter(StockConsignacionVigente.codigo_interno_ergopyme != "")
+        .with_entities(StockConsignacionVigente.codigo_interno_ergopyme)
+        .distinct()
+        .all()
+    )
+    if reales:
+        return {c[0] for c in reales}
+
     filas = (
         CompraHistorica.query
         .filter(CompraHistorica.factura == "CONSIGNACION")
@@ -1350,6 +1370,83 @@ def _codigos_en_consignacion():
         .all()
     )
     return {c[0] for c in filas}
+
+
+def _leer_filas_stock_consignacion(ws):
+    """Ronda AQ (2026-09-24): hoja "stock de consignación vigente" que el
+    proveedor (hoy Medicontur) reporta por lote -- columnas PROVEEDOR,
+    CODIGO, CODIGO INTERNO ERGOPYME, DESCRIPTION, LONG SN (lote), EXPIRY
+    DATE, QTY, COSTO PMP, en ese orden, con encabezados en la fila 1 (se
+    busca la fila de encabezado por si el archivo trae alguna fila vacía
+    arriba, igual que el resto de los parsers de este archivo)."""
+    filas_crudas = list(ws.iter_rows(min_row=1, values_only=True))
+    fila_inicio = 0
+    for i, row in enumerate(filas_crudas[:10]):
+        primera = str(row[0]).strip().upper() if row and row[0] else ""
+        if primera == "PROVEEDOR":
+            fila_inicio = i + 1
+            break
+
+    resultado = []
+    for row in filas_crudas[fila_inicio:]:
+        if not row or all(v is None for v in row):
+            continue
+        proveedor_nombre, codigo, cod_erg, descripcion, lote, vencimiento, qty, pmp = (list(row) + [None] * 8)[:8]
+        proveedor_nombre = str(proveedor_nombre).strip() if proveedor_nombre else ""
+        codigo = str(codigo).strip() if codigo else ""
+        if not proveedor_nombre or not codigo:
+            continue
+        codigo_interno = str(int(cod_erg)) if isinstance(cod_erg, (int, float)) else (str(cod_erg).strip() if cod_erg else "")
+        fecha_vto = vencimiento.date() if isinstance(vencimiento, datetime) else vencimiento
+        resultado.append({
+            "proveedor_nombre": proveedor_nombre,
+            "codigo_proveedor": codigo,
+            "codigo_interno_ergopyme": codigo_interno,
+            "descripcion": str(descripcion).strip() if descripcion else "",
+            "lote": str(lote).strip() if lote else "",
+            "fecha_vencimiento": fecha_vto,
+            "cantidad": int(qty) if isinstance(qty, (int, float)) else 0,
+            "costo_pmp": float(pmp) if isinstance(pmp, (int, float)) else None,
+        })
+    return resultado
+
+
+def _cargar_stock_consignacion(filas):
+    """Reemplaza el stock de consignación vigente SOLO de los proveedores
+    presentes en `filas` (no toca el de otros proveedores que se hayan
+    cargado antes por separado) -- ver StockConsignacionVigente. Devuelve
+    un resumen para el flash y, si algún proveedor del archivo no existe en
+    el catálogo, lo informa para que el usuario lo revise (no se inventa un
+    proveedor nuevo acá)."""
+    por_proveedor = defaultdict(list)
+    no_encontrados = set()
+    for fila in filas:
+        prov = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == fila["proveedor_nombre"].upper()).first()
+        if not prov:
+            no_encontrados.add(fila["proveedor_nombre"])
+            continue
+        por_proveedor[prov.id].append(fila)
+
+    total_cargadas = 0
+    for proveedor_id, filas_prov in por_proveedor.items():
+        StockConsignacionVigente.query.filter_by(proveedor_id=proveedor_id).delete()
+        for fila in filas_prov:
+            db.session.add(StockConsignacionVigente(
+                proveedor_id=proveedor_id,
+                codigo_proveedor=fila["codigo_proveedor"],
+                codigo_interno_ergopyme=fila["codigo_interno_ergopyme"] or None,
+                descripcion=fila["descripcion"],
+                lote=fila["lote"],
+                fecha_vencimiento=fila["fecha_vencimiento"],
+                cantidad=fila["cantidad"],
+                costo_pmp=fila["costo_pmp"],
+            ))
+        total_cargadas += len(filas_prov)
+    return {
+        "proveedores": len(por_proveedor),
+        "lotes": total_cargadas,
+        "no_encontrados": sorted(no_encontrados),
+    }
 
 
 def _procesar_filas_notas_pedido(filas_excel):
@@ -2934,6 +3031,80 @@ def reparar_alias_codigo_proveedor_ronda_ao():
     print(f"[reparar_ronda_ao] BVI BEAVER: alias '8685' -> '{destino.codigo}' creado para los reportes.")
 
 
+def reparar_codigos_877pety_ronda_aq():
+    """Ronda AQ (2026-09-24, a pedido del usuario): 20 variantes MEDICONTUR
+    de la familia de código padre '877PETY' (TRIFOCAL TORIC ELON ... CYL 1)
+    habían quedado con una letra "O" al final del código en vez del dígito
+    "0" (ej. '877PETYP120O' en vez de '877PETYP1200') -- ver
+    CORRECCION_CODIGOS_877PETY_EXCEL, con columnas CODIGO CORRECTO / CODIGO
+    ERRADO / DESCRIPCION que trajo el usuario.
+
+    Por cada fila del archivo:
+    1) Si la variante todavía tiene el código ERRADO, se renombra al
+       CORRECTO (y se actualiza la descripción si cambió) -- igual criterio
+       que reparar_variantes_medicontur_ronda_ae: HomologacionStock/
+       StockExistencia enlazan por variante_id, así que renombrar es seguro.
+    2) Se registra SIEMPRE un AliasCodigoProveedor (código ERRADO -> esa
+       variante), sin importar si el paso 1 corrió en esta pasada o ya se
+       había corregido a mano antes (como '877PETYP120O', que el usuario ya
+       había renombrado manualmente antes de que existiera este mecanismo) --
+       así el histórico/Ergopyme, que todavía trae el texto viejo con "O",
+       sigue resolviendo al código correcto y agrupándose bajo el padre
+       877PETY en los reportes (ver AliasCodigoProveedor y
+       _construir_homologador_ergopyme).
+
+    No gateada (corre en cada arranque) e idempotente: si ya no hay nada
+    para renombrar y el alias ya existe, no hace nada."""
+    if not os.path.isfile(CORRECCION_CODIGOS_877PETY_EXCEL):
+        return
+    medicontur = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "MEDICONTUR").first()
+    if not medicontur:
+        return
+
+    import openpyxl
+    wb = openpyxl.load_workbook(CORRECCION_CODIGOS_877PETY_EXCEL, data_only=True)
+    ws = wb.worksheets[0]
+    correcciones = []
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True):
+        if not row or len(row) < 3:
+            continue
+        correcto, errado, descripcion = row[0], row[1], row[2]
+        correcto = str(correcto).strip() if correcto else ""
+        errado = str(errado).strip() if errado else ""
+        descripcion = str(descripcion).strip() if descripcion else ""
+        if not correcto or not errado or correcto.upper() == "CODIGO CORRECTO":
+            continue
+        correcciones.append((correcto, errado, descripcion))
+    if not correcciones:
+        return
+
+    renombradas = 0
+    alias_creados = 0
+    for correcto, errado, descripcion in correcciones:
+        variante = ProductoVariante.query.join(Producto).filter(
+            Producto.proveedor_id == medicontur.id,
+            db.func.upper(ProductoVariante.codigo).in_([errado.upper(), correcto.upper()]),
+        ).first()
+        if not variante:
+            continue
+        if variante.codigo.strip().upper() == errado.upper():
+            variante.codigo = correcto
+            if descripcion and variante.descripcion != descripcion:
+                variante.descripcion = descripcion
+            renombradas += 1
+        antes = AliasCodigoProveedor.query.filter_by(proveedor_id=medicontur.id, codigo_alias=errado.upper()).first()
+        _registrar_alias_codigo_proveedor(medicontur.id, errado, variante_destino=variante)
+        if not antes:
+            alias_creados += 1
+
+    if renombradas or alias_creados:
+        db.session.commit()
+        print(
+            f"[reparar_ronda_aq] MEDICONTUR 877PETY: {renombradas} código(s) de variante renombrado(s) "
+            f"de 'O' final a '0', {alias_creados} alias de reporte nuevo(s) creado(s)."
+        )
+
+
 def _paso_arranque_seguro(nombre, funcion):
     """Ronda AN (2026-09-23, incidente en producción): antes, un error
     dentro de CUALQUIERA de estos pasos de arranque (seed_*/reparar_*) hacía
@@ -2972,6 +3143,7 @@ with app.app_context():
     _paso_arranque_seguro("reparar_datos_ronda_w", reparar_datos_ronda_w)
     _paso_arranque_seguro("reparar_variantes_medicontur_ronda_ae", reparar_variantes_medicontur_ronda_ae)
     _paso_arranque_seguro("reparar_variantes_medicontur_ronda_ag", reparar_variantes_medicontur_ronda_ag)
+    _paso_arranque_seguro("reparar_codigos_877pety_ronda_aq", reparar_codigos_877pety_ronda_aq)
     _paso_arranque_seguro("reparar_variantes_physiol_ronda_ae", reparar_variantes_physiol_ronda_ae)
     _paso_arranque_seguro("seed_codigos_ergopyme", seed_codigos_ergopyme)
     _paso_arranque_seguro("reparar_alias_codigo_proveedor_ronda_ao", reparar_alias_codigo_proveedor_ronda_ao)
@@ -3804,7 +3976,14 @@ def productos_nuevo(proveedor_id):
 @app.route("/productos/<int:producto_id>/editar", methods=["POST"])
 @requiere_permiso("crear_orden", "generar_costeo")
 def productos_editar(producto_id):
+    """Ronda AQ (2026-09-24): si acá se corrige a mano el texto del código
+    (ej. un error de tipeo detectado tarde, como '877PETYP120O' -> el mismo
+    código bien escrito), el texto VIEJO puede seguir apareciendo en
+    reportes que vienen del histórico/Ergopyme (ver AliasCodigoProveedor) --
+    por eso se registra el alias código viejo -> este Producto automático,
+    sin que el usuario tenga que ir a la pantalla de alias a mano."""
     producto = Producto.query.get_or_404(producto_id)
+    codigo_anterior = (producto.codigo or "").strip()
     producto.codigo = request.form["codigo"].strip()
     producto.descripcion = request.form["descripcion"].strip()
     producto.empaque = int(request.form.get("empaque") or 1)
@@ -3813,6 +3992,8 @@ def productos_editar(producto_id):
     producto.precio_unitario = float(request.form.get("precio_unitario") or 0)
     producto.unidad_medida = (request.form.get("unidad_medida") or "").strip() or None
     producto.activo = "activo" in request.form
+    if codigo_anterior and codigo_anterior.upper() != producto.codigo.upper():
+        _registrar_alias_codigo_proveedor(producto.proveedor_id, codigo_anterior, producto_destino=producto)
     db.session.commit()
     flash(f"Producto '{producto.codigo}' actualizado.", "success")
     return redirect(url_for("proveedores_detalle", proveedor_id=producto.proveedor_id))
@@ -3849,10 +4030,20 @@ def productos_variante_editar(variante_id):
             flash(f"El código '{nuevo_codigo}' ya existe en este catálogo -- no se puede repetir.", "danger")
             return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
 
+    # Ronda AQ (2026-09-24): mismo caso que se corrigió para el reporte
+    # Compras Proveedor en la ronda AO/AP -- si acá se corrige a mano el
+    # texto del código de una variante (ej. el error real '877PETYP120O' ->
+    # '877PETYP1200'), el texto VIEJO sigue viviendo en el histórico/Ergopyme
+    # y, sin un alias, el reporte deja de agrupar esa variante bajo su código
+    # padre. Se registra el alias automático para que esto no dependa de que
+    # el usuario recuerde ir a "Alias de código para reportes" cada vez.
+    codigo_anterior = (variante.codigo or "").strip()
     variante.codigo = nuevo_codigo
     variante.descripcion = request.form["descripcion"].strip()
     variante.codigo_interno_inventario = (request.form.get("codigo_interno_inventario") or "").strip() or None
     variante.activo = "activo" in request.form
+    if codigo_anterior and codigo_anterior.upper() != nuevo_codigo.upper():
+        _registrar_alias_codigo_proveedor(proveedor_id, codigo_anterior, variante_destino=variante)
     db.session.commit()
     flash(f"Variante '{variante.codigo}' actualizada.", "success")
     return redirect(url_for("proveedores_detalle", proveedor_id=proveedor_id))
@@ -8643,6 +8834,131 @@ def api_stock_valorizado_cargar_auto():
         mensaje=f"Stock Valorizado actualizado: {resumen['cargados']} código(s), {resumen['unidades_total']} unidades.",
         **resumen,
     ), 200
+
+
+@app.route("/stock-consignacion")
+@requiere_permiso("reportes")
+def stock_consignacion_list():
+    """Ronda AQ (2026-09-24): pantalla nueva -- stock en consignación
+    VIGENTE por lote (hoy Medicontur, el primer proveedor que entregó su
+    archivo real; queda lista para cualquier otro que opere igual). Mismo
+    permiso que Stock Valorizado ("reportes") porque trae costo (PMP).
+    Sirve dos propósitos: (1) es la fuente real que ahora usa el toggle
+    Propio/Consignación de Stock Valorizado (ver _codigos_en_consignacion),
+    y (2) es la base del Reporte de Consignación para informarle al
+    proveedor su stock (ver stock_consignacion_exportar)."""
+    proveedor_sel = request.args.get("proveedor", "").strip()
+    q = request.args.get("q", "").strip()
+
+    query = StockConsignacionVigente.query
+    if proveedor_sel:
+        query = query.join(Proveedor).filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
+    if q:
+        like = f"%{q}%"
+        query = query.filter(db.or_(
+            StockConsignacionVigente.codigo_proveedor.ilike(like),
+            StockConsignacionVigente.descripcion.ilike(like),
+            StockConsignacionVigente.lote.ilike(like),
+        ))
+    filas = query.order_by(StockConsignacionVigente.codigo_proveedor, StockConsignacionVigente.fecha_vencimiento).all()
+
+    proveedores_disponibles = sorted({f.proveedor.nombre for f in StockConsignacionVigente.query.all()})
+    cantidad_total = sum(f.cantidad or 0 for f in filas)
+    valor_total = sum((f.cantidad or 0) * (f.costo_pmp or 0) for f in filas)
+    ultima_carga = db.session.query(db.func.max(StockConsignacionVigente.cargado_en)).scalar()
+    return render_template(
+        "stock/consignacion.html", filas=filas, proveedor_sel=proveedor_sel, q=q,
+        proveedores_disponibles=proveedores_disponibles, ultima_carga=ultima_carga,
+        cantidad_total=cantidad_total, valor_total=valor_total,
+    )
+
+
+@app.route("/stock-consignacion/cargar", methods=["POST"])
+@requiere_permiso("reportes")
+def stock_consignacion_cargar():
+    """Carga manual del archivo de stock de consignación vigente por lote
+    que entrega el proveedor (hoy Medicontur) -- reemplaza solo los lotes
+    del/de los proveedor(es) presentes en ESE archivo, ver
+    _cargar_stock_consignacion."""
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona el archivo de stock en consignación para cargar.", "warning")
+        return redirect(url_for("stock_consignacion_list"))
+    extension = os.path.splitext(archivo.filename)[1].lower()
+    if extension not in (".xlsx", ".xls"):
+        flash("Formato no soportado. Sube el archivo .xlsx que entrega el proveedor.", "danger")
+        return redirect(url_for("stock_consignacion_list"))
+
+    try:
+        wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
+        filas = _leer_filas_stock_consignacion(wb.worksheets[0])
+    except Exception:
+        flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
+        return redirect(url_for("stock_consignacion_list"))
+
+    if not filas:
+        flash(
+            "El archivo no tiene filas reconocibles (se esperan las columnas PROVEEDOR, CODIGO, CODIGO "
+            "INTERNO ERGOPYME, DESCRIPTION, LONG SN, EXPIRY DATE, QTY, COSTO PMP) -- no se cambió nada.",
+            "warning",
+        )
+        return redirect(url_for("stock_consignacion_list"))
+
+    resumen = _cargar_stock_consignacion(filas)
+    db.session.commit()
+    mensaje = f"Stock en consignación actualizado: {resumen['lotes']} lote(s) de {resumen['proveedores']} proveedor(es)."
+    if resumen["no_encontrados"]:
+        mensaje += (
+            f" Atención: {', '.join(resumen['no_encontrados'])} no coincide con ningún proveedor del catálogo -- "
+            "esas filas no se cargaron."
+        )
+    flash(mensaje, "warning" if resumen["no_encontrados"] else "success")
+    return redirect(url_for("stock_consignacion_list"))
+
+
+@app.route("/stock-consignacion/exportar")
+@requiere_permiso("reportes")
+def stock_consignacion_exportar():
+    """Ronda AQ (2026-09-24): 'Reporte de Consignación' para ENVIAR AL
+    PROVEEDOR -- primer paso del reporte que pidió el usuario para
+    reportarle a Medicontur la foto actual de su stock en nuestro poder.
+    A propósito NO incluye el costo/PMP (dato interno nuestro, no algo que
+    se le manda al proveedor) -- solo código, descripción, lote,
+    vencimiento y cantidad, que es lo que el proveedor necesita para
+    conciliar su propio stock en consignación."""
+    proveedor_sel = request.args.get("proveedor", "").strip()
+    query = StockConsignacionVigente.query
+    if proveedor_sel:
+        query = query.join(Proveedor).filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
+    filas = query.order_by(StockConsignacionVigente.codigo_proveedor, StockConsignacionVigente.fecha_vencimiento).all()
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Consignación vigente"
+    encabezados = ["Proveedor", "Código", "Descripción", "Lote", "Vencimiento", "Cantidad"]
+    for col, titulo in enumerate(encabezados, start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True)
+    for fila_n, f in enumerate(filas, start=2):
+        ws.cell(row=fila_n, column=1, value=f.proveedor.nombre)
+        ws.cell(row=fila_n, column=2, value=f.codigo_proveedor)
+        ws.cell(row=fila_n, column=3, value=f.descripcion)
+        ws.cell(row=fila_n, column=4, value=f.lote)
+        ws.cell(row=fila_n, column=5, value=f.fecha_vencimiento.strftime("%d-%m-%Y") if f.fecha_vencimiento else "")
+        ws.cell(row=fila_n, column=6, value=f.cantidad or 0)
+    ws.auto_filter.ref = f"A1:F{max(len(filas) + 1, 1)}"
+    for col in range(1, 7):
+        ws.column_dimensions[get_column_letter(col)].width = 22
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    sufijo = f"_{proveedor_sel}" if proveedor_sel else ""
+    nombre_archivo = f"Reporte_Consignacion{sufijo}_{date.today().isoformat()}.xlsx".replace(" ", "_")
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre_archivo,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.route("/stock/pedidos/cargar", methods=["POST"])

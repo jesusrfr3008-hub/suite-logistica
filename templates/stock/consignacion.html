@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}Consignación · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-0">Stock en Consignación</h3>
+    <div class="text-muted small">
+      Stock que sigue siendo del proveedor (todavía no se compró), lote por lote, tal como lo
+      reporta el proveedor -- alimenta el toggle Propio/Consignación de Stock Valorizado y el
+      Reporte de Consignación para enviarle al proveedor.
+      {% if ultima_carga %}Última actualización: {{ ultima_carga.strftime('%d-%m-%Y %H:%M') }}.{% else %}Todavía no se ha cargado ningún archivo de consignación.{% endif %}
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('stock_consignacion_exportar', proveedor=proveedor_sel) }}" class="btn btn-outline-secondary">
+      <i class="bi bi-download"></i> Reporte para el proveedor
+    </a>
+    <button class="btn btn-outline-brand" data-bs-toggle="modal" data-bs-target="#modalCargarConsignacion">
+      <i class="bi bi-upload"></i> Cargar archivo
+    </button>
+  </div>
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-auto">
+    <select class="form-select" name="proveedor" onchange="this.form.submit()">
+      <option value="">Todos los proveedores</option>
+      {% for p in proveedores_disponibles %}
+      <option value="{{ p }}" {% if p == proveedor_sel %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <input type="text" class="form-control" name="q" value="{{ q }}" placeholder="Buscar código, descripción o lote...">
+  </div>
+  <div class="col-auto">
+    <button class="btn btn-outline-secondary" type="submit">Buscar</button>
+  </div>
+</form>
+
+<div class="row g-2 mb-3">
+  <div class="col-auto">
+    <div class="card p-2 px-3">
+      <div class="text-muted small">Lotes en esta vista</div>
+      <div class="fs-5 fw-semibold">{{ filas|length }}</div>
+    </div>
+  </div>
+  <div class="col-auto">
+    <div class="card p-2 px-3">
+      <div class="text-muted small">Unidades totales</div>
+      <div class="fs-5 fw-semibold">{{ cantidad_total }}</div>
+    </div>
+  </div>
+  <div class="col-auto">
+    <div class="card p-2 px-3">
+      <div class="text-muted small">Valor total (costo interno)</div>
+      <div class="fs-5 fw-semibold">{{ "{:,.0f}".format(valor_total).replace(",", ".") }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive" style="max-height: 65vh; overflow-y: auto;">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead class="sticky-top bg-white">
+        <tr>
+          <th>Proveedor</th>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th>Lote</th>
+          <th>Vencimiento</th>
+          <th class="text-end">Cantidad</th>
+          <th class="text-end">Costo PMP</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in filas %}
+        <tr>
+          <td>{{ f.proveedor.nombre }}</td>
+          <td>{{ f.codigo_proveedor }}</td>
+          <td title="{{ f.descripcion }}">{{ f.descripcion }}</td>
+          <td>{{ f.lote or '-' }}</td>
+          <td>{{ f.fecha_vencimiento.strftime('%d-%m-%Y') if f.fecha_vencimiento else '-' }}</td>
+          <td class="text-end">{{ f.cantidad or 0 }}</td>
+          <td class="text-end">{{ "{:,.0f}".format(f.costo_pmp).replace(",", ".") if f.costo_pmp is not none else '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-4">Sin datos de consignación cargados todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal fade" id="modalCargarConsignacion" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('stock_consignacion_cargar') }}" enctype="multipart/form-data">
+        <div class="modal-header">
+          <h5 class="modal-title">Cargar stock en consignación vigente</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">
+            Sube el archivo .xlsx que entrega el proveedor con su stock en consignación vigente por
+            lote (columnas Proveedor, Código, Código interno Ergopyme, Descripción, Lote, Vencimiento,
+            Cantidad, Costo PMP). <strong>Reemplaza</strong> solo los lotes de el/los proveedor(es)
+            que traiga ese archivo -- los de otros proveedores cargados antes no se tocan.
+          </p>
+          <input type="file" class="form-control" name="archivo" accept=".xlsx,.xls" required>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-brand">Cargar y reemplazar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
