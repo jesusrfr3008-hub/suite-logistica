@@ -144,10 +144,24 @@ app = Flask(__name__)
 # la variable, sigue usando data/logistica.db como siempre) y en Railway.
 # Algunos proveedores entregan el URL con el esquema viejo "postgres://",
 # que SQLAlchemy 1.4+ ya no acepta -- se normaliza a "postgresql://".
+#
+# Ronda AV (2026-09-25, corrección, a pedido del usuario): el despliegue en
+# Railway quedó "Crashed" con "ModuleNotFoundError: No module named
+# 'psycopg'" -- Railway cambió el formato de la variable DATABASE_URL que
+# inyecta y ahora a veces la entrega con el driver ya indicado en el
+# esquema (ej. "postgresql+psycopg://...", que pide el driver psycopg v3).
+# Esta app SOLO tiene instalado psycopg2-binary (ver requirements.txt,
+# elegido a propósito porque sí trae wheel precompilado para la imagen de
+# Railway) -- nunca se instaló psycopg v3. Por eso, sin importar qué
+# esquema traiga la variable, se normaliza SIEMPRE a "postgresql://" a
+# secas (sin ningún "+driver"), que es justamente el que hace que
+# SQLAlchemy use psycopg2 -- el único driver que de verdad está instalado.
 _database_url = os.environ.get("DATABASE_URL")
 if _database_url:
     if _database_url.startswith("postgres://"):
         _database_url = _database_url.replace("postgres://", "postgresql://", 1)
+    if _database_url.startswith("postgresql+"):
+        _database_url = "postgresql://" + _database_url.split("://", 1)[1]
     app.config["SQLALCHEMY_DATABASE_URI"] = _database_url
 else:
     app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "data", "logistica.db")
