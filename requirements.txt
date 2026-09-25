@@ -1,5 +1,17 @@
 Flask==3.0.3
 Flask-SQLAlchemy==3.1.1
+# Ronda AV (2026-09-25, corrección, a pedido del usuario): antes no se
+# fijaba la version de SQLAlchemy (solo la de Flask-SQLAlchemy) -- un
+# despliegue nuevo en Railway instalo sola la SQLAlchemy mas nueva
+# (2.1.0), que cambio el driver Postgres POR DEFECTO de psycopg2 a
+# psycopg v3 para el esquema "postgresql://" a secas, y la app crasheo
+# ("ModuleNotFoundError: No module named 'psycopg'") sin que nadie hubiera
+# tocado el codigo. Se fija 2.0.54 (la misma con la que esta app se probo
+# de punta a punta) para que esto no vuelva a cambiar solo en un
+# despliegue futuro -- ademas, app.py ahora fuerza el driver "+psycopg2"
+# explicitamente en el esquema de conexion, como segunda capa de
+# seguridad independiente de esta version.
+SQLAlchemy==2.0.54
 Flask-Login==0.6.3
 openpyxl==3.1.5
 xhtml2pdf==0.2.16

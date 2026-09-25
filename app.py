@@ -147,21 +147,29 @@ app = Flask(__name__)
 #
 # Ronda AV (2026-09-25, corrección, a pedido del usuario): el despliegue en
 # Railway quedó "Crashed" con "ModuleNotFoundError: No module named
-# 'psycopg'" -- Railway cambió el formato de la variable DATABASE_URL que
-# inyecta y ahora a veces la entrega con el driver ya indicado en el
-# esquema (ej. "postgresql+psycopg://...", que pide el driver psycopg v3).
-# Esta app SOLO tiene instalado psycopg2-binary (ver requirements.txt,
-# elegido a propósito porque sí trae wheel precompilado para la imagen de
-# Railway) -- nunca se instaló psycopg v3. Por eso, sin importar qué
-# esquema traiga la variable, se normaliza SIEMPRE a "postgresql://" a
-# secas (sin ningún "+driver"), que es justamente el que hace que
-# SQLAlchemy use psycopg2 -- el único driver que de verdad está instalado.
+# 'psycopg'". Causa real (confirmada instalando SQLAlchemy 2.1.0 en un
+# entorno de prueba y reproduciendo el error EXACTO): SQLAlchemy 2.1
+# cambió el DRIVER POR DEFECTO para el esquema "postgresql://" a secas (sin
+# "+driver") -- versiones anteriores (2.0.x) usaban psycopg2 por defecto,
+# 2.1 pasó a usar psycopg v3. Como requirements.txt nunca fijó una versión
+# exacta de SQLAlchemy (solo de Flask-SQLAlchemy), un despliegue nuevo en
+# Railway instaló sola la versión más nueva (2.1.0) y, de la noche a la
+# mañana, el MISMO código con el MISMO esquema "postgresql://" empezó a
+# pedir un driver que esta app nunca tuvo instalado (solo tiene
+# psycopg2-binary, ver requirements.txt). El intento anterior de este
+# mismo día (normalizar a "postgresql://" a secas) no alcanzaba porque
+# daba por sentado que ese esquema seguía significando psycopg2 -- ya no
+# es así en SQLAlchemy 2.1. Ahora se fuerza EXPLÍCITAMENTE el driver
+# "+psycopg2" en el esquema, sin importar qué traiga la variable ni qué
+# versión de SQLAlchemy quede instalada en el próximo build -- y de paso
+# se fija la versión de SQLAlchemy en requirements.txt para que esto no
+# vuelva a cambiar solo en un despliegue futuro sin haberlo probado antes.
 _database_url = os.environ.get("DATABASE_URL")
 if _database_url:
     if _database_url.startswith("postgres://"):
         _database_url = _database_url.replace("postgres://", "postgresql://", 1)
-    if _database_url.startswith("postgresql+"):
-        _database_url = "postgresql://" + _database_url.split("://", 1)[1]
+    if _database_url.startswith("postgresql"):
+        _database_url = "postgresql+psycopg2://" + _database_url.split("://", 1)[1]
     app.config["SQLALCHEMY_DATABASE_URI"] = _database_url
 else:
     app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "data", "logistica.db")
