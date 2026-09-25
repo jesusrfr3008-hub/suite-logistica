@@ -319,7 +319,7 @@
             <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
           </div>
           <div class="modal-body">
-            <p class="text-muted small mb-2">Se confirmarán las líneas seleccionadas que estén en "Emisión de Orden" (las demás se omiten).</p>
+            <p class="text-muted small mb-2">Se confirmarán las líneas seleccionadas que estén en "Emisión de Orden" (las demás se omiten). Si en "Editar línea" indicaste menos "Cajas confirmadas" que el total pedido, solo esa parte se confirma -- el resto queda pendiente en "Emisión de Orden".</p>
             <label class="form-label">Fecha despacho confirmada *</label>
             <input type="date" class="form-control" name="fecha_estimada_despacho_confirmada" required>
           </div>
@@ -435,7 +435,10 @@
             {% elif l.etapa == 'Recibido' %}<span class="badge bg-success">{{ l.etapa }}</span>
             {% elif l.etapa == 'Emisión de Orden' %}<span class="badge bg-secondary">{{ l.etapa }}</span>
             {% else %}<span class="badge bg-info text-dark">{{ l.etapa }}</span>{% endif %}
-            {% if l.despacho_parcial %}<span class="badge bg-warning text-dark">Parcial {{ l.cantidad_despachada_cajas }}/{{ l.cantidad_cajas }}</span>{% endif %}
+            {% if l.despacho_parcial %}<span class="badge bg-warning text-dark">Confirmadas {{ l.cantidad_despachada_cajas }}/{{ l.cantidad_cajas }}</span>{% endif %}
+            {% if l.disponibilidad_parcial_pendiente %}
+            <span class="badge bg-warning text-dark" title="El proveedor solo confirmó parte de la cantidad pedida -- esta línea es el resto, que quedó pendiente hasta que esté disponible.">Parcial pendiente</span>
+            {% endif %}
           </td>
           <td class="text-end no-print">
             <div class="d-flex gap-1 justify-content-end">
@@ -563,7 +566,11 @@
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body row g-2">
+          {% if l.cantidad_despachada_cajas and l.cantidad_despachada_cajas > 0 and l.cantidad_despachada_cajas < l.cantidad_cajas %}
+          <p class="text-warning small mb-1"><i class="bi bi-exclamation-triangle me-1"></i>Solo hay {{ l.cantidad_despachada_cajas }} de {{ l.cantidad_cajas }} cajas confirmadas -- al confirmar, esta línea se separará: {{ l.cantidad_despachada_cajas }} pasan a "Orden Confirmada" y {{ l.cantidad_cajas - l.cantidad_despachada_cajas }} quedan pendientes en "Emisión de Orden".</p>
+          {% else %}
           <p class="text-muted small">El proveedor confirmó que este producto está disponible para despacho. Registra la fecha de despacho que te entregó.</p>
+          {% endif %}
           <div class="col-12"><label class="form-label">Fecha despacho confirmada *</label><input type="date" class="form-control" name="fecha_estimada_despacho_confirmada" required></div>
         </div>
         <div class="modal-footer">
@@ -586,7 +593,13 @@
           <div class="col-6"><label class="form-label">Cant. cajas</label><input type="number" step="1" min="0" class="form-control" name="cantidad_cajas" value="{{ l.cantidad_cajas }}"></div>
           <div class="col-6"><label class="form-label">Precio/caja pactado</label><input type="number" step="0.01" min="0" class="form-control" name="precio_unitario_pactado" value="{{ l.precio_unitario_pactado }}"></div>
           <div class="col-6"><label class="form-label">Fecha estimada despacho (planificación)</label><input type="date" class="form-control" name="fecha_estimada_despacho" value="{{ l.fecha_estimada_despacho or '' }}"></div>
-          <div class="col-6"><label class="form-label">Cajas ya despachadas</label><input type="number" step="1" min="0" max="{{ l.cantidad_cajas }}" class="form-control" name="cantidad_despachada_cajas" value="{{ l.cantidad_despachada_cajas }}"></div>
+          <div class="col-6">
+            <label class="form-label">Cajas confirmadas</label>
+            <input type="number" step="1" min="0" max="{{ l.cantidad_cajas }}" class="form-control" name="cantidad_despachada_cajas" value="{{ l.cantidad_despachada_cajas }}">
+            {% if l.etapa == 'Emisión de Orden' %}
+            <div class="form-text">Si el proveedor solo tiene disponible una parte, indica aquí cuántas cajas SÍ están confirmadas. Al presionar "Confirmar", solo esa cantidad avanzará -- el resto quedará pendiente en "Emisión de Orden". Déjalo en 0 si está disponible la totalidad.</div>
+            {% endif %}
+          </div>
           <div class="col-12"><hr><div class="text-muted small mb-1">Confirmación del proveedor</div></div>
           <div class="col-6"><label class="form-label">Fecha disponibilidad confirmada</label><input type="date" class="form-control" name="fecha_disponibilidad_confirmada" value="{{ l.fecha_disponibilidad_confirmada or '' }}"></div>
           <div class="col-6"><label class="form-label">Fecha despacho confirmada</label><input type="date" class="form-control" name="fecha_estimada_despacho_confirmada" value="{{ l.fecha_estimada_despacho_confirmada or '' }}"></div>

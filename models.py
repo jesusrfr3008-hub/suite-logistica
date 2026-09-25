@@ -831,8 +831,30 @@ class OrdenCompraLinea(db.Model):
     fecha_llegada_aduana = db.Column(db.Date, nullable=True)
     fecha_recepcion_bodega = db.Column(db.Date, nullable=True)
 
-    # Control de despacho parcial
+    # Control de despacho parcial. Ronda AV (2026-09-25, a pedido del
+    # usuario): mientras la linea sigue en "Emisión de Orden", este mismo
+    # campo pasa a usarse para "Cajas confirmadas" -- cuántas de las
+    # cantidad_cajas pedidas el proveedor SÍ tiene disponibles ahora mismo
+    # (se llena en "Editar línea" ANTES de confirmar). Al confirmar (ver
+    # _dividir_linea_por_disponibilidad_parcial en app.py), si este valor es
+    # menor a cantidad_cajas, la línea se separa en dos: la porción
+    # confirmada sigue hacia "Orden Confirmada" con su propio
+    # cantidad_despachada_cajas en 0 (todavía nada despachado de verdad), y
+    # el resto se queda en esta misma línea, en "Emisión de Orden", como
+    # remanente pendiente (ver disponibilidad_parcial_pendiente). Una vez
+    # que una línea SÍ llega a "Orden Despachada" (ver _marcar_orden_
+    # despachada), este campo vuelve a representar su sentido original:
+    # cuántas cajas de verdad ya salieron.
     cantidad_despachada_cajas = db.Column(db.Integer, default=0)
+
+    # Ronda AV (2026-09-25, a pedido del usuario): True cuando esta línea es
+    # el REMANENTE que quedó pendiente de una confirmación parcial (el
+    # proveedor no tenía disponible la totalidad pedida) -- se muestra con
+    # un indicador aparte en el listado para distinguirla de una línea que
+    # simplemente todavía no se ha intentado confirmar nunca. Se limpia
+    # sola en cuanto esta misma línea se confirma (total o parcialmente) más
+    # adelante.
+    disponibilidad_parcial_pendiente = db.Column(db.Boolean, default=False)
 
     # Linea anulada: se saca de circulacion (no cuenta como pendiente, no
     # avanza mas de etapa), pero se conserva para no perder el historial.

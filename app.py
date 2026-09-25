@@ -506,6 +506,7 @@ def ensure_schema_migrations():
             ("variante_descripcion", "VARCHAR(500)"),
             ("precio_catalogo_oculto", "BOOLEAN DEFAULT 0"),
             ("producto_creado_por_esta_orden", "BOOLEAN DEFAULT 0"),
+            ("disponibilidad_parcial_pendiente", "BOOLEAN DEFAULT 0"),
         ],
         "ordenes_compra": [
             ("despacho_id", "INTEGER"),
@@ -3632,6 +3633,129 @@ def dividir_orden_si_corresponde(orden):
     return ordenes_destino
 
 
+def _fusionar_orden_si_duplica_cohorte_hermana(orden):
+    """Ronda AV (2026-09-25): dividir_orden_si_corresponde() deja el
+    cohorte MAS avanzado de `orden` en la propia `orden` (conserva su id y
+    documentos) sin buscar si YA existe una orden hermana (mismo numero de
+    PO) que represente exactamente ese mismo cohorte -- eso está bien la
+    PRIMERA vez que una orden se divide, pero si `orden` es a su vez el
+    remanente de una división anterior (por ejemplo la porción que quedó
+    pendiente de una confirmación parcial) y se vuelve a confirmar,
+    quedaría como una SEGUNDA orden 'Orden Confirmada' separada de la que
+    ya existía, en vez de unirse a ella -- el usuario vería dos despachos
+    parciales confirmados donde debería ver uno solo acumulando cajas.
+
+    Se llama justo después de dividir_orden_si_corresponde() en los flujos
+    de confirmación de línea (hoy el único lugar donde una misma orden
+    puede recibir una segunda ronda de división sobre líneas que ya antes
+    fueron separadas). Solo actúa si, tras esa división, TODAS las líneas
+    activas que quedaron en `orden` son de un único cohorte -- si sigue
+    mezclada, no hace nada (dividir_orden_si_corresponde ya se encargó, o
+    se encargará en su próxima llamada).
+
+    Si encuentra una hermana y fusiona, `orden` queda sin líneas activas;
+    si además nunca tuvo documentos cargados (el caso normal: es una orden
+    intermedia creada por una división anterior), se borra para no dejar
+    una orden fantasma vacía dando vueltas. Devuelve la orden hermana en
+    la que se fusionó (para que el caller pueda redirigir ahí si `orden`
+    fue borrada), o None si no hizo falta fusionar nada."""
+    if orden.estado == "Cancelada":
+        return None
+    lineas_activas = [l for l in orden.lineas if not l.anulada]
+    if not lineas_activas:
+        return None
+    cohortes_presentes = set(_cohorte_etapa(l.etapa) for l in lineas_activas)
+    if len(cohortes_presentes) != 1:
+        return None
+    cohorte_unico = cohortes_presentes.pop()
+    hermana = None
+    for candidata in OrdenCompra.query.filter_by(numero_po=orden.numero_po).filter(OrdenCompra.id != orden.id):
+        if candidata.estado == "Cancelada":
+            continue
+        lineas_candidata = [l for l in candidata.lineas if not l.anulada]
+        if lineas_candidata and all(_cohorte_etapa(l.etapa) == cohorte_unico for l in lineas_candidata):
+            hermana = candidata
+            break
+    if hermana is None:
+        return None
+    for linea in lineas_activas:
+        linea.orden_id = hermana.id
+    db.session.flush()
+    recalcular_estado_orden(hermana)
+    if orden.lineas.count() == 0 and orden.documentos.count() == 0:
+        db.session.delete(orden)
+    else:
+        recalcular_estado_orden(orden)
+    return hermana
+
+
+def _dividir_linea_por_disponibilidad_parcial(linea, fecha_desp_conf):
+    """Ronda AV (2026-09-25, a pedido del usuario): al confirmar una línea,
+    el proveedor puede tener disponible solo una PARTE de lo pedido. El
+    campo "Cajas confirmadas" (cantidad_despachada_cajas mientras la línea
+    sigue en "Emisión de Orden" -- ver el comentario en models.py) se llena
+    de antemano en "Editar línea" con cuántas cajas SÍ están disponibles
+    ahora mismo.
+
+    Si ese valor cubre la totalidad (o quedó en 0, el valor por defecto de
+    toda línea que nunca usó este campo -- así ninguna orden existente
+    cambia de comportamiento sin que el usuario haya tocado nada), la línea
+    se confirma completa, como siempre. Si es una cantidad intermedia
+    (0 < confirmadas < cantidad_cajas), la línea se separa en dos:
+    - Una línea NUEVA con la cantidad confirmada, que pasa a "Orden
+      Confirmada" (segundos después, dividir_orden_si_corresponde la
+      separa a su propia orden hermana si corresponde, igual que cualquier
+      otra confirmación).
+    - La línea ORIGINAL se queda con el resto (cantidad_cajas -
+      confirmadas), sigue en "Emisión de Orden" con su misma fecha estimada
+      de despacho (planificación), y queda marcada
+      disponibilidad_parcial_pendiente=True para que el listado la
+      distinga de una línea que simplemente nunca se intentó confirmar.
+
+    Devuelve la línea que quedó "Orden Confirmada" (la misma `linea` si no
+    hubo división, o la nueva si sí la hubo) y un booleano que indica si
+    hubo división."""
+    total = linea.cantidad_cajas or 0
+    confirmadas = linea.cantidad_despachada_cajas or 0
+    confirmadas = max(0, min(confirmadas, total))
+
+    if confirmadas <= 0 or confirmadas >= total:
+        # Todo disponible (o el campo nunca se tocó): se confirma completa,
+        # comportamiento identico al que existia antes de esta ronda.
+        linea.fecha_estimada_despacho_confirmada = fecha_desp_conf
+        linea.etapa = "Orden Confirmada"
+        linea.disponibilidad_parcial_pendiente = False
+        # Todavia no salio fisicamente nada -- se limpia para que el campo
+        # vuelva a partir de 0 en su proximo uso real (ver _marcar_orden_
+        # despachada, que lo llena de verdad al asociar un Despacho).
+        linea.cantidad_despachada_cajas = 0
+        return linea, False
+
+    nueva = OrdenCompraLinea(
+        orden_id=linea.orden_id,
+        producto_id=linea.producto_id,
+        cantidad_cajas=confirmadas,
+        precio_unitario_pactado=linea.precio_unitario_pactado,
+        fecha_estimada_despacho=linea.fecha_estimada_despacho,
+        fecha_disponibilidad_confirmada=linea.fecha_disponibilidad_confirmada,
+        fecha_estimada_despacho_confirmada=fecha_desp_conf,
+        etapa="Orden Confirmada",
+        cantidad_despachada_cajas=0,
+        disponibilidad_parcial_pendiente=False,
+        variante_codigo=linea.variante_codigo,
+        variante_descripcion=linea.variante_descripcion,
+        precio_catalogo_oculto=linea.precio_catalogo_oculto,
+        producto_creado_por_esta_orden=False,
+    )
+    db.session.add(nueva)
+    db.session.flush()
+
+    linea.cantidad_cajas = total - confirmadas
+    linea.cantidad_despachada_cajas = 0
+    linea.disponibilidad_parcial_pendiente = True
+    return nueva, True
+
+
 def reparar_ordenes_mezcladas():
     """Pasada de reparacion, idempotente: aplica dividir_orden_si_corresponde
     a TODAS las ordenes existentes. Corrige ordenes que hayan quedado
@@ -5892,13 +6016,27 @@ def ordenes_linea_confirmar(orden_id, linea_id):
         flash("Debes indicar la fecha de despacho confirmada por el proveedor.", "danger")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
 
-    linea.fecha_estimada_despacho_confirmada = fecha_desp_conf
-    linea.etapa = "Orden Confirmada"
+    cantidad_total = linea.cantidad_cajas or 0
+    _linea_confirmada, hubo_division = _dividir_linea_por_disponibilidad_parcial(linea, fecha_desp_conf)
     recalcular_estado_orden(orden)
     nuevas_ordenes = dividir_orden_si_corresponde(orden)
+    # Ronda AV (2026-09-25): si `orden` era a su vez el remanente de una
+    # division anterior, puede quedar duplicando una hermana "Orden
+    # Confirmada" ya existente -- se fusionan y, si `orden` quedo vacia,
+    # se borra (ver _fusionar_orden_si_duplica_cohorte_hermana).
+    hermana_fusion = _fusionar_orden_si_duplica_cohorte_hermana(orden)
+    orden_id_redirect = hermana_fusion.id if hermana_fusion is not None else orden_id
     db.session.commit()
-    flash(f"'{linea.producto.codigo}' confirmado por el proveedor.{_mensaje_division(nuevas_ordenes)}", "success")
-    return redirect(url_for("ordenes_detalle", orden_id=orden_id))
+    if hubo_division:
+        mensaje = (
+            f"'{linea.producto.codigo}': el proveedor confirmó {_linea_confirmada.cantidad_cajas} de "
+            f"{cantidad_total} cajas -- esa parte pasa a 'Orden Confirmada' y las {linea.cantidad_cajas} "
+            "restantes quedan pendientes en 'Emisión de Orden'."
+        )
+    else:
+        mensaje = f"'{linea.producto.codigo}' confirmado por el proveedor."
+    flash(mensaje + _mensaje_division(nuevas_ordenes), "success")
+    return redirect(url_for("ordenes_detalle", orden_id=orden_id_redirect))
 
 
 @app.route("/ordenes/<int:orden_id>/lineas/confirmar-masivo", methods=["POST"])
@@ -5917,6 +6055,7 @@ def ordenes_lineas_confirmar_masivo(orden_id):
         flash("Ingresa la fecha de despacho confirmada.", "warning")
     else:
         confirmadas = 0
+        parciales = 0
         omitidas = 0
         for lid in linea_ids:
             linea = OrdenCompraLinea.query.get(int(lid))
@@ -5925,17 +6064,29 @@ def ordenes_lineas_confirmar_masivo(orden_id):
             if linea.anulada or linea.etapa != "Emisión de Orden":
                 omitidas += 1
                 continue
-            linea.fecha_estimada_despacho_confirmada = fecha_desp_conf
-            linea.etapa = "Orden Confirmada"
+            _linea_confirmada, hubo_division = _dividir_linea_por_disponibilidad_parcial(linea, fecha_desp_conf)
             confirmadas += 1
+            if hubo_division:
+                parciales += 1
         recalcular_estado_orden(orden)
         nuevas_ordenes = dividir_orden_si_corresponde(orden) if confirmadas else []
+        # Ronda AV (2026-09-25): ver _fusionar_orden_si_duplica_cohorte_hermana
+        # -- misma fusion que en la confirmacion individual, por si `orden`
+        # era a su vez el remanente de una division anterior.
+        hermana_fusion = _fusionar_orden_si_duplica_cohorte_hermana(orden) if confirmadas else None
+        orden_id_redirect = hermana_fusion.id if hermana_fusion is not None else orden.id
         db.session.commit()
         mensaje = f"{confirmadas} línea(s) confirmada(s)."
+        if parciales:
+            mensaje += (
+                f" {parciales} de ellas solo estaban disponibles en parte -- el resto quedó pendiente "
+                "en 'Emisión de Orden' (ver la marca 'Parcial pendiente' en el listado)."
+            )
         if omitidas:
             mensaje += f" {omitidas} se omitieron por no estar en 'Emisión de Orden'."
         mensaje += _mensaje_division(nuevas_ordenes)
         flash(mensaje, "success")
+        return redirect(url_for("ordenes_detalle", orden_id=orden_id_redirect))
     return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
 
