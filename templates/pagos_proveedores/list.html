@@ -4,15 +4,16 @@
 
 <div class="d-flex justify-content-between align-items-start mb-1">
   <h3 class="section-title mb-1">Pago Proveedores</h3>
-  <a href="{{ url_for('pagos_proveedores_facturar_consignacion') }}" class="btn btn-sm btn-brand">+ Facturar consignación</a>
+  <a href="{{ url_for('pagos_proveedores_facturar_consignacion') }}" class="btn btn-sm btn-brand">+ Emitir documento</a>
 </div>
 <div class="text-muted small mb-3">
   Cuentas por pagar a proveedores extranjeros: facturas pendientes, su fecha de vencimiento y el plazo de
   crédito pactado con cada proveedor (se edita desde <a href="{{ url_for('proveedores_list') }}">el catálogo
   de Proveedores</a>). Las facturas normales se generan con el botón "Generar factura" desde la Importación
-  ya costeada; la única que se carga a mano aquí es la de consignación -- ver "+ Facturar consignación"
-  arriba. El recosteo automático del FOB/CIF al marcar una factura como pagada todavía no está disponible
-  (fase 2, ver estado en el documento del proyecto).
+  ya costeada; lo que se carga a mano aquí es "+ Emitir documento" -- Factura Consignación (productos/lotes
+  detectados solos como consumidos, ver Stock) o, entrando al detalle de una factura ya cargada, Nota de
+  Crédito por valor o por cantidad. El recosteo automático del FOB/CIF al marcar una factura como pagada
+  todavía no está disponible (fase 2, ver estado en el documento del proyecto).
 </div>
 
 <form method="get" class="row g-2 align-items-end mb-3">

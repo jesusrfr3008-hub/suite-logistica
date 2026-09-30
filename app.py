@@ -37,7 +37,7 @@ from models import (
     CargoAdicionalImportacion, TipoCambioMensual,
     Usuario, Rol, PERMISOS_DISPONIBLES,
     HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
-    StockConsignacionVigente, StockComprometidoBodega,
+    StockConsignacionVigente, StockComprometidoBodega, ConsignacionPendienteLote,
     CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
     FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
@@ -522,6 +522,12 @@ def ensure_schema_migrations():
             ("seguro_total_moneda", "FLOAT DEFAULT 0"),
             ("empresa_id", "INTEGER"),
             ("numero_correlativo_inventario", "INTEGER"),
+            # Ronda AX (2026-09-30, punto 2): evita registrar dos veces la
+            # recepción en consignación de una misma Importación -- ver
+            # importacion_generar_factura. Solo hace falta cuando TODAS las
+            # líneas son de consignación (no se genera FacturaProveedor, así
+            # que el guard de "ya tiene factura" no alcanza a protegerla).
+            ("consignacion_registrada", "BOOLEAN DEFAULT 0"),
         ],
         "proveedores": [
             ("codigo_sistema_inventario", "VARCHAR(50)"),
@@ -570,6 +576,13 @@ def ensure_schema_migrations():
         ],
         "facturas_proveedor": [
             ("origen", "VARCHAR(20) DEFAULT 'manual'"),
+        ],
+        # Ronda AX (2026-09-30, a pedido del usuario): NC "solo_valor" ahora
+        # tambien indica a que producto corresponde, para poder rebajar el
+        # reporte de Compras Proveedor (antes solo bajaba el saldo pendiente
+        # en Pago Proveedores) -- ver NotaCreditoProveedor.codigo_producto.
+        "notas_credito_proveedor": [
+            ("codigo_producto", "VARCHAR(120)"),
         ],
         # Ronda AU (2026-09-24, a pedido del usuario -- documentos de Orden,
         # Gasto y Legajo que "desaparecían" tras cada despliegue): el disco
@@ -1280,6 +1293,60 @@ def _clasificar_y_cargar_stock(filas):
         elif homolog.estado == "sin_marca":
             resumen["sin_marca"] += 1
     return resumen
+
+
+def _cantidades_stock_por_lote(filas):
+    """Ronda AX (2026-09-30, punto 2): suma stock_fisico por (codigo_interno,
+    codigo_lote) a partir de las filas YA LEÍDAS de un reporte de Stock
+    (antes de clasificar/cargar), sin filtrar por empresa -- a
+    ConsignacionPendienteLote no le importa en qué empresa está físicamente
+    el lote, solo si todavía existe o no. Se usa para comparar contra la
+    foto anterior en _detectar_consumo_consignacion_por_lote."""
+    totales = defaultdict(float)
+    for fila in filas:
+        codigo = (fila.get("codigo_interno") or "").strip()
+        lote = (fila.get("codigo_lote") or "").strip() or "(sin lote)"
+        if not codigo:
+            continue
+        totales[(codigo, lote)] += fila.get("stock_fisico") or 0
+    return totales
+
+
+def _detectar_consumo_consignacion_por_lote(filas_nuevas):
+    """Ronda AX (2026-09-30, punto 2, a pedido del usuario): se llama justo
+    antes de reemplazar StockExistencia con cada Stock nuevo que llega de
+    Ergopyme (manual desde /stock, o automático vía la automatización AHK).
+    Para cada lote que ConsignacionPendienteLote todavía espera encontrar
+    en stock (cantidad_en_stock > 0), compara esa cantidad esperada contra
+    la nueva foto: si la nueva cantidad es MENOR (bajó o el lote
+    desapareció del todo), la diferencia se suma a cantidad_consumida --
+    "consumido, listo para facturarle al proveedor". Un aumento no cuenta
+    como consumo (se ignora -- solo importan las bajadas).
+
+    Ejemplo real que confirmó el usuario: el 15-09 había 4 lotes de
+    consignación con 1 unidad cada uno; el 16-09 la carga nueva solo trae 2
+    de esos 4 -- los otros 2 (que ya no aparecen, nueva cantidad = 0) pasan
+    a cantidad_consumida = 1 cada uno, es decir, quedan pendientes de
+    facturar.
+
+    No toca StockExistencia ni ninguna otra tabla de stock -- es puramente
+    el control financiero de qué consignación falta facturar."""
+    pendientes = ConsignacionPendienteLote.query.filter(
+        ConsignacionPendienteLote.cantidad_recibida > ConsignacionPendienteLote.cantidad_consumida
+    ).all()
+    if not pendientes:
+        return 0
+    nuevas_cantidades = _cantidades_stock_por_lote(filas_nuevas)
+    detectados = 0
+    for fila in pendientes:
+        clave = ((fila.codigo_interno or "").strip(), (fila.codigo_lote or "").strip() or "(sin lote)")
+        cantidad_nueva = nuevas_cantidades.get(clave, 0)
+        cantidad_esperada = fila.cantidad_en_stock
+        if cantidad_nueva < cantidad_esperada - 0.0001:
+            consumido_ahora = cantidad_esperada - cantidad_nueva
+            fila.cantidad_consumida = (fila.cantidad_consumida or 0) + consumido_ahora
+            detectados += 1
+    return detectados
 
 
 def _filas_desde_reporte_stock_valorizado(filas_crudas):
@@ -7264,6 +7331,60 @@ def importaciones_editar(importacion_id):
     return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
 
+def _es_consignacion_parcial_linea(linea):
+    """Ronda AX (2026-09-30, punto 2): una ParcialLinea viene de una OC
+    marcada consignación si su OrdenCompraLinea de origen (trazabilidad ya
+    existente desde el Despacho, ver ParcialLinea.orden_compra_linea_id)
+    pertenece a una OrdenCompra con es_consignacion=True. Una línea cargada
+    a mano en el Costeo (sin ese vínculo) nunca es consignación."""
+    ocl = linea.orden_compra_linea
+    return bool(ocl and ocl.orden and ocl.orden.es_consignacion)
+
+
+def _registrar_consignacion_recibida(proveedor_id, linea):
+    """Ronda AX (2026-09-30, punto 2, a pedido del usuario): al costear una
+    OC marcada consignación, en vez de facturarla de inmediato como compra
+    en firme, se registra cuánto entró de cada lote en
+    ConsignacionPendienteLote -- de ahí en adelante, cuando el Stock de
+    Ergopyme muestre que un lote bajó o desapareció, se detecta como
+    "consumido" y queda listo para facturarle al proveedor (ver
+    _detectar_consumo_consignacion_por_lote). No crea ninguna
+    FacturaProveedor -- todavía no hay factura real del proveedor.
+
+    Se registra por cada ParcialLineaLote de la línea (el desglose real por
+    lote); si la línea no tiene ese desglose cargado (producto que no se
+    trackea por lote individual), se usa un único "lote" con el código
+    resumen de la línea (o "(sin lote)" si ni eso tiene)."""
+    codigo_interno = _codigo_interno_homologado(linea) or ""
+    codigo_proveedor = (linea.codigo or "").strip()
+    desglose = list(linea.lotes) if linea.lotes else None
+    if not desglose:
+        lote_unico = (linea.codigo_lote or "").strip() or "(sin lote)"
+        desglose = [type("_LoteImplicito", (), {"codigo_lote": lote_unico, "cantidad_unidades": linea.cantidad_unidades or 0})()]
+
+    total_registrado = 0
+    for lote in desglose:
+        codigo_lote = (lote.codigo_lote or "").strip() or "(sin lote)"
+        cantidad = lote.cantidad_unidades or 0
+        if cantidad <= 0:
+            continue
+        fila = ConsignacionPendienteLote.query.filter_by(
+            proveedor_id=proveedor_id, codigo_interno=codigo_interno, codigo_lote=codigo_lote,
+        ).first()
+        if fila is None:
+            fila = ConsignacionPendienteLote(
+                proveedor_id=proveedor_id, codigo_interno=codigo_interno,
+                codigo_proveedor=codigo_proveedor, descripcion=linea.descripcion,
+                codigo_lote=codigo_lote, cantidad_recibida=0,
+                origen_orden_compra_linea_id=linea.orden_compra_linea_id,
+                origen_parcial_linea_id=linea.id,
+            )
+            db.session.add(fila)
+        fila.cantidad_recibida = (fila.cantidad_recibida or 0) + cantidad
+        total_registrado += cantidad
+    return total_registrado
+
+
 @app.route("/importaciones/<int:importacion_id>/generar-factura", methods=["POST"])
 @requiere_permiso("generar_costeo", "pagos_proveedores")
 def importacion_generar_factura(importacion_id):
@@ -7277,7 +7398,16 @@ def importacion_generar_factura(importacion_id):
     pantalla (nada se "confirma") -- así el usuario decide el momento exacto
     en que esa cuenta por pagar queda registrada, y nunca se duplica (una
     Importación solo puede tener una FacturaProveedor, ver
-    Importacion.factura_pago)."""
+    Importacion.factura_pago).
+
+    Ronda AX (2026-09-30, punto 2, a pedido del usuario): si esta
+    Importación trae líneas que vienen de una OC marcada consignación (ver
+    _es_consignacion_parcial_linea), esas líneas específicas NO entran a la
+    FacturaProveedor -- todavía no hay factura real del proveedor, recién
+    la habrá cuando se le informe qué se usó (ver
+    pagos_proveedores_emitir_documento). En vez de eso, sus lotes se
+    registran en ConsignacionPendienteLote. Si TODAS las líneas son de
+    consignación, no se genera ninguna FacturaProveedor."""
     imp = Importacion.query.get_or_404(importacion_id)
     if imp.factura_pago:
         flash(
@@ -7292,15 +7422,43 @@ def importacion_generar_factura(importacion_id):
         flash("Carga el número y la fecha de factura de esta importación antes de generar la cuenta por pagar.", "warning")
         return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
+    todas_las_lineas = [linea for parcial in imp.parciales for linea in parcial.lineas]
+    lineas_consignacion = [l for l in todas_las_lineas if _es_consignacion_parcial_linea(l)]
+    lineas_normales = [l for l in todas_las_lineas if l not in lineas_consignacion]
+
+    lotes_consignacion_registrados = 0
+    if lineas_consignacion and not imp.consignacion_registrada:
+        for linea in lineas_consignacion:
+            _registrar_consignacion_recibida(imp.proveedor_id, linea)
+            lotes_consignacion_registrados += 1
+        imp.consignacion_registrada = True
+    elif lineas_consignacion and imp.consignacion_registrada:
+        # Ya se registraron antes (ej. se volvió a presionar el botón
+        # porque todas las líneas eran de consignación y no quedó ninguna
+        # FacturaProveedor que bloqueara un segundo click) -- no duplicar.
+        pass
+
+    if not lineas_normales:
+        db.session.commit()
+        flash(
+            f"{len(lineas_consignacion)} línea(s) de esta importación son de consignación (OC marcada "
+            "'Consignación') -- se registraron en 'Consignación pendiente de facturar', sin generar factura "
+            "todavía. La factura real se emite desde Pago Proveedores > Emitir documento, cuando se le informe "
+            "al proveedor qué se usó.",
+            "success",
+        )
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
+
     moneda = (imp.moneda_factura or "USD").strip().upper()
     moneda = "EUR" if moneda.startswith("EUR") else moneda
+    valor_factura_normales = round(sum((l.valor_total_moneda for l in lineas_normales), 0.0), 2)
     factura = FacturaProveedor(
         proveedor_id=imp.proveedor_id,
         importacion_id=imp.id,
         numero_factura=imp.numero_factura,
         fecha_emision=imp.fecha_factura,
         moneda=moneda,
-        valor_factura=round(imp.fob_total_moneda, 2),
+        valor_factura=(valor_factura_normales if lineas_consignacion else round(imp.fob_total_moneda, 2)),
         fecha_vencimiento=_calcular_fecha_vencimiento(imp.proveedor, imp.fecha_factura),
         estado="pendiente",
         origen="costeo",
@@ -7309,25 +7467,30 @@ def importacion_generar_factura(importacion_id):
     db.session.flush()
 
     n_lineas = 0
-    for parcial in imp.parciales:
-        for linea in parcial.lineas:
-            db.session.add(FacturaProveedorLinea(
-                factura_id=factura.id,
-                codigo_producto=linea.codigo,
-                descripcion=linea.descripcion,
-                codigo_lote=linea.codigo_lote,
-                cantidad=linea.cantidad_unidades or 0,
-                precio_unitario=linea.valor_unitario_moneda or 0,
-                valor_total=round(linea.valor_total_moneda, 2),
-                parcial_linea_id=linea.id,
-            ))
-            n_lineas += 1
+    for linea in lineas_normales:
+        db.session.add(FacturaProveedorLinea(
+            factura_id=factura.id,
+            codigo_producto=linea.codigo,
+            descripcion=linea.descripcion,
+            codigo_lote=linea.codigo_lote,
+            cantidad=linea.cantidad_unidades or 0,
+            precio_unitario=linea.valor_unitario_moneda or 0,
+            valor_total=round(linea.valor_total_moneda, 2),
+            parcial_linea_id=linea.id,
+        ))
+        n_lineas += 1
     db.session.commit()
-    flash(
+    mensaje = (
         f"Factura {factura.numero_factura} generada en Pago Proveedores ({n_lineas} línea(s), "
-        f"{factura.valor_factura:,.2f} {moneda}).",
-        "success",
+        f"{factura.valor_factura:,.2f} {moneda})."
     )
+    if lineas_consignacion:
+        mensaje += (
+            f" Además, {len(lineas_consignacion)} línea(s) de consignación se registraron aparte en "
+            "'Consignación pendiente de facturar' -- no entraron a esta factura porque todavía no hay "
+            "factura real del proveedor por esas unidades."
+        )
+    flash(mensaje, "success")
     return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
 
 
@@ -9752,9 +9915,19 @@ def stock_cargar():
 
     StockExistencia.query.delete()
     resumen = _clasificar_y_cargar_stock(filas)
+    # Ronda AX (2026-09-30, punto 2): ANTES de perder de vista este Stock
+    # (es el único momento en que se puede comparar contra lo que
+    # ConsignacionPendienteLote todavía espera encontrar), se detecta qué
+    # lotes de consignación bajaron o desaparecieron.
+    lotes_consumidos = _detectar_consumo_consignacion_por_lote(filas)
     db.session.commit()
 
     mensaje, severidad = _mensaje_resumen_carga_stock(resumen)
+    if lotes_consumidos:
+        mensaje += (
+            f" {lotes_consumidos} lote(s) de consignación se detectaron como consumidos -- revísalos en "
+            "Pago Proveedores > Emitir documento."
+        )
     flash(mensaje, severidad)
     return redirect(url_for("stock_list"))
 
@@ -9855,6 +10028,11 @@ def api_stock_cargar_auto():
 
     StockExistencia.query.delete()
     resumen = _clasificar_y_cargar_stock(filas)
+    # Ronda AX (2026-09-30, punto 2): mismo detector que la carga manual --
+    # ver stock_cargar. Esta ruta es la que usa la automatización AHK
+    # (15:30/17:30), así que es el camino real por el que se va a detectar
+    # consumo de consignación día a día.
+    lotes_consumidos = _detectar_consumo_consignacion_por_lote(filas)
     db.session.commit()
 
     mensaje, severidad = _mensaje_resumen_carga_stock(resumen)
@@ -9866,6 +10044,7 @@ def api_stock_cargar_auto():
         unidades_cargadas=resumen["unidades_cargadas"],
         cargados=resumen["cargados"],
         pendientes_nuevos=resumen["pendientes_nuevos"],
+        lotes_consignacion_consumidos=lotes_consumidos,
     ), (200 if severidad != "danger" else 422)
 
 
@@ -10949,6 +11128,82 @@ def _mapa_padre_por_variante_proveedor(proveedor_nombre):
     return {v.codigo.strip().upper(): v.producto for v in variantes if v.codigo}
 
 
+def _filas_notas_credito(proveedor=None, fecha_desde=None, fecha_hasta=None):
+    """Ronda AX (2026-09-30, a pedido del usuario): las Notas de Crédito de
+    proveedor (ver NotaCreditoProveedor, ronda AK) antes solo bajaban el
+    saldo pendiente en Pago Proveedores -- el reporte de Compras Proveedor
+    ni se enteraba de que existieron. El usuario fue explícito: "estas
+    notas de creditos... afectan el reporte de compras a proveedor" -- una
+    NC "solo_valor" rebaja el monto del PERÍODO EN QUE SE EMITE sin tocar
+    unidades (por eso usa la fecha de la NC, no la de la factura original,
+    y unidades=0); una NC "cantidad_y_valor" rebaja tanto unidades como
+    valor, una fila por cada línea de producto/lote acreditada. Se
+    devuelven como filas NEGATIVAS con la MISMA forma que el resto del
+    reporte (ver _fila_historica_dict/_compras_sistema) para que se sumen
+    solas en los totales sin tocar ninguna otra función."""
+    query = (
+        NotaCreditoProveedor.query
+        .join(FacturaProveedor, NotaCreditoProveedor.factura_id == FacturaProveedor.id)
+        .join(Proveedor, FacturaProveedor.proveedor_id == Proveedor.id)
+    )
+    if proveedor:
+        query = query.filter(db.func.upper(Proveedor.nombre) == proveedor.upper())
+    if fecha_desde:
+        query = query.filter(NotaCreditoProveedor.fecha >= fecha_desde)
+    if fecha_hasta:
+        query = query.filter(NotaCreditoProveedor.fecha <= fecha_hasta)
+
+    filas = []
+    for nc in query.all():
+        factura = nc.factura
+        if not factura or not factura.proveedor:
+            continue
+        proveedor_nombre = factura.proveedor.nombre
+        moneda_factura = (factura.moneda or "USD").strip().upper()
+        moneda_operacion = "EUR" if moneda_factura.startswith("EUR") else moneda_factura
+        # NotaCreditoProveedor.monto siempre está en la moneda de la
+        # factura -- para sumarlo junto con el resto del reporte (que
+        # trabaja todo en USD por dentro, ver total_usd) hace falta una
+        # paridad: se reutiliza el tipo de cambio de la Importación si la
+        # factura vino de un Costeo (misma fuente que _compras_sistema), o
+        # 1.0 si no hay de dónde sacarlo (factura de consignación, sin
+        # tipo de cambio aduanero propio).
+        paridad = 1.0
+        if factura.importacion and factura.importacion.tipo_cambio_moneda_usd:
+            paridad = factura.importacion.tipo_cambio_moneda_usd
+
+        base = {
+            "origen": "Nota de Crédito", "fecha_factura": nc.fecha, "proveedor": proveedor_nombre,
+            "factura": f"NC {nc.numero_nc}".strip() if nc.numero_nc else f"NC / {factura.numero_factura}",
+            "codigo_interno": "", "moneda_operacion": moneda_operacion, "tipo_cambio": 0, "paridad": paridad,
+            "flete_usd": 0, "derechos_usd": 0, "derechos_moneda": 0, "otros_gastos_usd": 0, "otros_gastos_moneda": 0,
+            "empresa_compradora": "", "categoria": "", "tipo_flete": "", "homologado": True, "via_ergopyme": False,
+            "es_consignacion": False, "fue_consignacion": False,
+        }
+
+        if nc.tipo == "cantidad_y_valor":
+            for linea_nc in nc.lineas:
+                fl = linea_nc.factura_linea
+                filas.append({
+                    **base,
+                    "codigo_producto": (fl.codigo_producto if fl else None) or "(sin código)",
+                    "descripcion": (fl.descripcion if fl else None) or (nc.motivo or ""),
+                    "unidades": -(linea_nc.cantidad or 0),
+                    "total_invoice": -(linea_nc.valor or 0),
+                    "total_usd": -(linea_nc.valor or 0) / (paridad or 1.0),
+                })
+        else:
+            filas.append({
+                **base,
+                "codigo_producto": nc.codigo_producto or "(sin código)",
+                "descripcion": nc.motivo or "Nota de crédito (descuento comercial)",
+                "unidades": 0,
+                "total_invoice": -(nc.monto or 0),
+                "total_usd": -(nc.monto or 0) / (paridad or 1.0),
+            })
+    return filas
+
+
 def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha_hasta=None, homologar=None):
     """Junta histórico + sistema ya homologados y filtrados -- reutilizado
     tanto por el listado general como por la vista de un proveedor
@@ -10964,6 +11219,11 @@ def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha
     if proveedor:
         filas = [f for f in filas if (f["proveedor"] or "").upper() == proveedor.upper()]
     filas += _compras_sistema(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
+    # Ronda AX (2026-09-30, a pedido del usuario): las Notas de Crédito de
+    # proveedor (por valor o por cantidad, y también la futura Factura
+    # Consignación/NC generalizada) entran como filas NEGATIVAS con la
+    # fecha de la propia NC -- ver _filas_notas_credito.
+    filas += _filas_notas_credito(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
     if empresa:
         filas = [f for f in filas if (f["empresa_compradora"] or "").upper() == empresa.upper()]
     return filas
@@ -11458,9 +11718,22 @@ def pagos_proveedores_nota_credito(factura_id):
             if monto <= 0:
                 flash("El monto de la nota de crédito debe ser mayor a 0.", "danger")
                 return redirect(url_for("pagos_proveedores_nota_credito", factura_id=factura.id))
+            # Ronda AX (2026-09-30, a pedido del usuario): a qué producto de
+            # ESTA factura corresponde el descuento -- sin esto, el reporte
+            # de Compras Proveedor no tiene forma de saber a qué línea
+            # restarle el valor (ver _filas_reporte_compras). El usuario fue
+            # explícito: "si es por valor no requiere lote, solo codigo de
+            # producto y valor" -- por eso es obligatorio acá (a diferencia
+            # de "cantidad_y_valor", que ya trae el código de la línea de
+            # factura elegida).
+            codigo_producto_nc = request.form.get("codigo_producto_solo_valor", "").strip()
+            if not codigo_producto_nc:
+                flash("Indica el código de producto al que corresponde esta nota de crédito por valor.", "danger")
+                return redirect(url_for("pagos_proveedores_nota_credito", factura_id=factura.id))
             nc = NotaCreditoProveedor(
                 factura_id=factura.id, numero_nc=numero_nc, fecha=fecha_nc,
                 tipo="solo_valor", monto=round(monto, 2), motivo=motivo,
+                codigo_producto=codigo_producto_nc,
                 creado_por_id=current_user.id,
             )
             db.session.add(nc)
@@ -11518,15 +11791,25 @@ def pagos_proveedores_nota_credito(factura_id):
     )
 
 
+def _parse_float_seguro(texto, default=0.0):
+    """Convierte texto de un <input> a float tolerando coma decimal y
+    campos vacíos/basura, sin nunca romper con ValueError."""
+    try:
+        return float((texto or "").strip().replace(",", ".") or default)
+    except ValueError:
+        return default
+
+
 def _pendientes_consignacion(proveedor):
     """Ronda AK (2026-09-19): filas de CompraHistorica en consignacion
     (factura == "CONSIGNACION") de este proveedor que todavia no se han
-    facturado de verdad (factura_generada_id vacio) -- lo que el usuario
-    llama "productos recibidos en consignacion" en el punto 1 de su pedido.
-    Hoy esto solo existe para MEDICONTUR (ver ronda AH), cargado como
-    historico "congelado"; el dia que la Orden de Compra con
-    es_consignacion=True alimente esto en vivo, esta misma funcion es el
-    lugar donde conectarlo."""
+    facturado de verdad (factura_generada_id vacio). Esto es SOLO el
+    mecanismo viejo (histórico "congelado", hoy únicamente MEDICONTUR) --
+    ver _pendientes_consignacion_por_lote para el mecanismo nuevo (ronda
+    AX), que reemplaza a este de ahora en adelante para cualquier OC nueva
+    marcada es_consignacion. Se mantienen los dos a la vez en 'Emitir
+    documento' para no perder lo que ya estaba pendiente con el mecanismo
+    viejo."""
     nombre = (proveedor.nombre or "").strip().upper()
     filas = (
         CompraHistorica.query
@@ -11538,31 +11821,72 @@ def _pendientes_consignacion(proveedor):
     return [c for c in filas if _proveedor_canonico_historico(c.proveedor_original).strip().upper() == nombre]
 
 
+def _pendientes_consignacion_por_lote(proveedor):
+    """Ronda AX (2026-09-30, punto 2, a pedido del usuario): lotes de
+    ConsignacionPendienteLote de este proveedor con algo consumido y
+    todavía sin facturar (cantidad_pendiente_facturar > 0) -- esto es lo
+    que "Emitir documento > Factura Consignación" sugiere automáticamente,
+    detectado solo por comparar cada Stock nuevo de Ergopyme contra el
+    anterior (ver _detectar_consumo_consignacion_por_lote), sin depender de
+    que el proveedor mande ningún archivo."""
+    filas = (
+        ConsignacionPendienteLote.query
+        .filter(ConsignacionPendienteLote.proveedor_id == proveedor.id)
+        .order_by(ConsignacionPendienteLote.codigo_interno, ConsignacionPendienteLote.codigo_lote)
+        .all()
+    )
+    return [f for f in filas if f.cantidad_pendiente_facturar > 0.0001]
+
+
 @app.route("/pagos-proveedores/facturar-consignacion", methods=["GET", "POST"])
 @requiere_permiso("pagos_proveedores")
 def pagos_proveedores_facturar_consignacion():
-    """Ronda AK (2026-09-19, punto 1 del pedido del usuario): reemplaza la
+    """Ronda AK (2026-09-19, punto 1 del pedido del usuario), renombrada a
+    "Emitir documento" en ronda AX (2026-09-30, punto 3): reemplaza la
     carga manual generica de facturas -- la UNICA factura que se registra a
     mano en este modulo es la de consignacion, porque el resto de las
     facturas de proveedor viene siempre del flujo real (Orden de Compra >
-    Despacho > Costeo, ver importacion_generar_factura). Al elegir un
-    proveedor se listan los productos que Suite Logistica tiene registrados
-    como recibidos en consignacion y todavia sin facturar (ver
-    _pendientes_consignacion); el usuario marca cuales le llegaron
-    facturados, con que numero/fecha y a que precio real, y eso se convierte
-    en una FacturaProveedor (con sus lineas) -- las filas de CompraHistorica
-    usadas quedan ligadas a esa factura (factura_generada_id) para no
-    volver a ofrecerlas ni facturarlas dos veces, y pasan a contarse como
-    compra en firme en el reporte Compras Proveedor."""
+    Despacho > Costeo, ver importacion_generar_factura).
+
+    Al elegir un proveedor se sugieren 2 fuentes de "pendientes de
+    facturar": lo detectado automáticamente por lote (ver
+    _pendientes_consignacion_por_lote, ronda AX -- el mecanismo nuevo, ya
+    NO depende de que el proveedor mande un archivo) y lo que todavía
+    quedaba pendiente con el mecanismo viejo (_pendientes_consignacion,
+    CompraHistorica, hoy solo MEDICONTUR). Además hay un bloque de
+    "Agregar producto" para el caso que el usuario mencionó -- "por si hubo
+    alguno consignado y no lo consideré" -- que agrega una línea suelta a
+    mano, sin depender de ninguna detección.
+
+    El usuario marca cuáles facturar (puede ser PARCIAL -- una cantidad
+    menor a la pendiente del lote, lo que sobra queda pendiente para la
+    próxima), con qué número/fecha y a qué precio real, y eso se convierte
+    en una FacturaProveedor (con sus líneas, con código de LOTE cuando
+    viene de un lote detectado) -- las fuentes usadas quedan marcadas para
+    no volver a ofrecerlas ni facturarlas dos veces, y pasan a contarse
+    como compra en firme en el reporte Compras Proveedor. Ninguno de estos
+    movimientos toca Stock -- eso lo mueve únicamente lo que se sube de
+    Ergopyme."""
     proveedor_id = request.args.get("proveedor_id", "").strip()
     proveedor = Proveedor.query.get(int(proveedor_id)) if proveedor_id.isdigit() else None
     pendientes = _pendientes_consignacion(proveedor) if proveedor else []
+    pendientes_lote = _pendientes_consignacion_por_lote(proveedor) if proveedor else []
 
     if request.method == "POST":
         proveedor_id = request.form.get("proveedor_id", "").strip()
         numero_factura = request.form.get("numero_factura", "").strip()
-        ids_seleccionados = [int(i) for i in request.form.getlist("compra_id") if i.isdigit()]
-        if not proveedor_id.isdigit() or not numero_factura or not ids_seleccionados:
+        ids_historico = [int(i) for i in request.form.getlist("compra_id") if i.isdigit()]
+        ids_lote = [int(i) for i in request.form.getlist("lote_id") if i.isdigit()]
+        # Filas agregadas a mano (ver "Agregar producto" en el formulario) --
+        # listas paralelas, una posición por fila agregada.
+        manual_codigos = request.form.getlist("manual_codigo")
+        manual_descripciones = request.form.getlist("manual_descripcion")
+        manual_lotes = request.form.getlist("manual_lote")
+        manual_cantidades = request.form.getlist("manual_cantidad")
+        manual_precios = request.form.getlist("manual_precio")
+
+        hay_algo_manual = any((c or "").strip() and (cant or "").strip() for c, cant in zip(manual_codigos, manual_cantidades))
+        if not proveedor_id.isdigit() or not numero_factura or not (ids_historico or ids_lote or hay_algo_manual):
             flash("Proveedor, número de factura y al menos un producto son obligatorios.", "danger")
             return redirect(url_for("pagos_proveedores_facturar_consignacion", proveedor_id=proveedor_id))
 
@@ -11575,14 +11899,26 @@ def pagos_proveedores_facturar_consignacion():
             except ValueError:
                 return None
 
+        def numero(nombre_campo, default=0.0):
+            try:
+                return float((request.form.get(nombre_campo) or str(default)).replace(",", "."))
+            except ValueError:
+                return default
+
         fecha_emision = fecha("fecha_emision")
         moneda = (request.form.get("moneda") or proveedor.moneda_default or "USD").strip().upper()
 
         compras = CompraHistorica.query.filter(
-            CompraHistorica.id.in_(ids_seleccionados),
+            CompraHistorica.id.in_(ids_historico),
             CompraHistorica.factura_generada_id.is_(None),
-        ).all()
-        if not compras:
+        ).all() if ids_historico else []
+        lotes = ConsignacionPendienteLote.query.filter(
+            ConsignacionPendienteLote.id.in_(ids_lote),
+            ConsignacionPendienteLote.proveedor_id == proveedor.id,
+        ).all() if ids_lote else []
+
+        n_manual = sum(1 for c, cant in zip(manual_codigos, manual_cantidades) if (c or "").strip() and (cant or "").strip())
+        if not compras and not lotes and not n_manual:
             flash("Esos productos ya se facturaron o ya no están pendientes -- refresca e intenta de nuevo.", "warning")
             return redirect(url_for("pagos_proveedores_facturar_consignacion", proveedor_id=proveedor_id))
 
@@ -11600,14 +11936,14 @@ def pagos_proveedores_facturar_consignacion():
         db.session.flush()
 
         valor_total = 0.0
+        n_lineas = 0
+
         for compra in compras:
-            try:
-                precio_unitario = float((request.form.get(f"precio_{compra.id}") or "0").replace(",", "."))
-            except ValueError:
-                precio_unitario = 0.0
+            precio_unitario = numero(f"precio_{compra.id}")
             cantidad = compra.unidades or 0
             valor_linea = round(cantidad * precio_unitario, 2)
             valor_total += valor_linea
+            n_lineas += 1
 
             db.session.add(FacturaProveedorLinea(
                 factura_id=factura.id,
@@ -11628,10 +11964,62 @@ def pagos_proveedores_facturar_consignacion():
             # y recién ahora se factura de verdad.
             compra.fue_consignacion = True
 
+        for lote in lotes:
+            precio_unitario = numero(f"precio_lote_{lote.id}")
+            cantidad_solicitada = numero(f"cantidad_lote_{lote.id}", default=lote.cantidad_pendiente_facturar)
+            cantidad = max(0.0, min(cantidad_solicitada, lote.cantidad_pendiente_facturar))
+            if cantidad <= 0:
+                continue
+            valor_linea = round(cantidad * precio_unitario, 2)
+            valor_total += valor_linea
+            n_lineas += 1
+
+            db.session.add(FacturaProveedorLinea(
+                factura_id=factura.id,
+                codigo_producto=lote.codigo_proveedor or lote.codigo_interno,
+                descripcion=lote.descripcion,
+                codigo_lote=lote.codigo_lote,
+                cantidad=cantidad,
+                precio_unitario=precio_unitario,
+                valor_total=valor_linea,
+            ))
+            # Solo avanza cantidad_facturada -- nunca toca cantidad_recibida
+            # ni cantidad_consumida (eso lo controla únicamente el Stock de
+            # Ergopyme, ver _detectar_consumo_consignacion_por_lote). Si se
+            # facturó menos de lo consumido, el resto sigue pendiente para
+            # la próxima.
+            lote.cantidad_facturada = (lote.cantidad_facturada or 0) + cantidad
+
+        for codigo, descripcion, lote_txt, cant_txt, precio_txt in zip(
+            manual_codigos, manual_descripciones, manual_lotes, manual_cantidades, manual_precios
+        ):
+            codigo = (codigo or "").strip()
+            cantidad = _parse_float_seguro(cant_txt)
+            if not codigo or cantidad <= 0:
+                continue
+            precio_unitario = _parse_float_seguro(precio_txt)
+            valor_linea = round(cantidad * precio_unitario, 2)
+            valor_total += valor_linea
+            n_lineas += 1
+            db.session.add(FacturaProveedorLinea(
+                factura_id=factura.id,
+                codigo_producto=codigo,
+                descripcion=(descripcion or "").strip() or codigo,
+                codigo_lote=(lote_txt or "").strip() or None,
+                cantidad=cantidad,
+                precio_unitario=precio_unitario,
+                valor_total=valor_linea,
+            ))
+
+        if n_lineas == 0:
+            db.session.rollback()
+            flash("No quedó ninguna línea válida para facturar -- revisa las cantidades ingresadas.", "danger")
+            return redirect(url_for("pagos_proveedores_facturar_consignacion", proveedor_id=proveedor_id))
+
         factura.valor_factura = round(valor_total, 2)
         db.session.commit()
         flash(
-            f"Factura {factura.numero_factura} de consignación creada con {len(compras)} producto(s), "
+            f"Factura {factura.numero_factura} de consignación creada con {n_lineas} línea(s), "
             f"{valor_total:,.2f} {moneda}. Esas líneas ya se cuentan como compra en firme en Compras Proveedor.",
             "success",
         )
@@ -11642,6 +12030,7 @@ def pagos_proveedores_facturar_consignacion():
         proveedores=Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all(),
         proveedor=proveedor,
         pendientes=pendientes,
+        pendientes_lote=pendientes_lote,
     )
 
 

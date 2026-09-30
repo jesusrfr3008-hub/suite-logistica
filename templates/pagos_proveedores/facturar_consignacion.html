@@ -1,13 +1,14 @@
 {% extends "base.html" %}
-{% block title %}Facturar consignación · Pago Proveedores · Suite Logística{% endblock %}
+{% block title %}Emitir documento · Pago Proveedores · Suite Logística{% endblock %}
 {% block content %}
 
-<h3 class="section-title mb-1">Facturar consignación</h3>
+<h3 class="section-title mb-1">Emitir documento</h3>
 <div class="text-muted small mb-3">
   Convierte productos que este proveedor ya te entregó en consignación (todavía no se le deben) en una
-  factura real, ahora que te informó y facturó lo vendido. Elige el proveedor, marca los productos que llegaron
-  facturados, indica el precio real de cada uno y el número/fecha de la factura -- esas líneas dejan de
-  contarse como consignación y pasan a ser compra en firme.
+  factura real, ahora que te informó y facturó lo vendido. Elige el proveedor, marca los productos/lotes que
+  llegaron facturados (se sugieren solos, ver abajo), indica el precio real de cada uno y el número/fecha de la
+  factura -- esas líneas dejan de contarse como consignación y pasan a ser compra en firme. Ninguno de estos
+  documentos mueve Stock -- eso lo mueve únicamente lo que se sube de Ergopyme.
 </div>
 
 <div class="card p-3 mb-3">
@@ -22,16 +23,29 @@
       </select>
     </div>
   </form>
+  {% if proveedor %}
+  <div class="mt-2">
+    <a href="{{ url_for('pagos_proveedores_list', proveedor_id=proveedor.id) }}" class="btn btn-sm btn-outline-secondary">
+      Ver facturas de {{ proveedor.nombre }} (para Nota de Crédito)
+    </a>
+    <span class="text-muted small ms-2">
+      Una Nota de Crédito (por valor o por cantidad) se emite desde el detalle de la factura ya cargada en
+      Pago Proveedores -- entra a la factura correspondiente y usa el botón "Nota de crédito" ahí.
+    </span>
+  </div>
+  {% endif %}
 </div>
 
-{% if proveedor and not pendientes %}
+{% if proveedor and not pendientes and not pendientes_lote %}
 <div class="alert alert-success">
   {{ proveedor.nombre }} no tiene productos pendientes de facturar en consignación -- todo lo que se le ha
-  recibido bajo esa condición ya fue facturado, o no hay ninguno registrado.
+  recibido bajo esa condición ya fue facturado, o no hay ninguno detectado todavía. Si acabas de costear una
+  Orden de Compra en consignación, los lotes aparecerán acá recién cuando el próximo Stock de Ergopyme muestre
+  que se usó/vendió algo (ver más abajo, "Agregar producto" para cargarlo a mano mientras tanto).
 </div>
 {% endif %}
 
-{% if proveedor and pendientes %}
+{% if proveedor %}
 <form method="post">
   <input type="hidden" name="proveedor_id" value="{{ proveedor.id }}">
   <div class="card p-3 mb-3">
@@ -70,8 +84,58 @@
     </div>
   </div>
 
+  {% if pendientes_lote %}
+  <div class="card p-3 mb-3">
+    <div class="fw-semibold mb-2">
+      Detectado automáticamente -- consumido del Stock, listo para facturar por LOTE ({{ pendientes_lote|length }})
+    </div>
+    <div class="text-muted small mb-2">
+      Cada vez que se carga un Stock nuevo de Ergopyme, el sistema compara contra el anterior: si un lote de
+      consignación bajó o desapareció, aparece acá solo. Puedes facturar menos de lo sugerido si el proveedor
+      todavía no te facturó todo -- lo que sobre queda pendiente para la próxima.
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead>
+          <tr class="text-muted small">
+            <th style="width: 32px;"></th>
+            <th>Código proveedor</th>
+            <th>Descripción</th>
+            <th>Lote</th>
+            <th class="text-end">Pendiente</th>
+            <th class="text-end" style="width: 130px;">Cantidad a facturar</th>
+            <th class="text-end" style="width: 160px;">Precio unitario real</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for f in pendientes_lote %}
+          <tr>
+            <td><input type="checkbox" name="lote_id" value="{{ f.id }}" class="form-check-input chk-consig" checked></td>
+            <td>{{ f.codigo_proveedor or f.codigo_interno }}</td>
+            <td>{{ f.descripcion }}</td>
+            <td><span class="badge bg-light text-dark border">{{ f.codigo_lote }}</span></td>
+            <td class="text-end">{{ f.cantidad_pendiente_facturar }}</td>
+            <td class="text-end">
+              <input type="number" step="0.0001" min="0" max="{{ f.cantidad_pendiente_facturar }}"
+                     name="cantidad_lote_{{ f.id }}" class="form-control form-control-sm text-end"
+                     value="{{ f.cantidad_pendiente_facturar }}">
+            </td>
+            <td class="text-end">
+              <input type="number" step="0.01" min="0" name="precio_lote_{{ f.id }}"
+                     class="form-control form-control-sm text-end" placeholder="0.00">
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if pendientes %}
   <div class="card p-3 mb-3">
     <div class="fw-semibold mb-2">Productos recibidos en consignación, pendientes de facturar ({{ pendientes|length }})</div>
+    <div class="text-muted small mb-2">Mecanismo anterior (histórico, sin lote) -- se mantiene mientras quede algo pendiente con él.</div>
     <div class="table-responsive">
       <table class="table table-sm align-middle mb-0">
         <thead>
@@ -107,13 +171,56 @@
       costo de importación).
     </div>
   </div>
+  {% endif %}
 
-  <button type="submit" class="btn btn-brand">Generar factura</button>
+  <div class="card p-3 mb-3">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="fw-semibold">Agregar producto (por si algo consignado no se detectó solo)</div>
+      <button type="button" class="btn btn-sm btn-outline-brand" id="btnAgregarManual">+ Agregar producto</button>
+    </div>
+    <div class="text-muted small mb-2">
+      Úsalo si sabes que se usó/vendió un producto en consignación pero todavía no aparece arriba (por ejemplo,
+      si el Stock todavía no se ha vuelto a cargar).
+    </div>
+    <div id="filasManuales"></div>
+  </div>
+
+  <template id="plantillaFilaManual">
+    <div class="row g-2 align-items-center mb-2 fila-manual">
+      <div class="col-md-2">
+        <input type="text" class="form-control form-control-sm" name="manual_codigo" placeholder="Código">
+      </div>
+      <div class="col-md-3">
+        <input type="text" class="form-control form-control-sm" name="manual_descripcion" placeholder="Descripción">
+      </div>
+      <div class="col-md-2">
+        <input type="text" class="form-control form-control-sm" name="manual_lote" placeholder="Lote (opcional)">
+      </div>
+      <div class="col-md-2">
+        <input type="number" step="0.0001" min="0" class="form-control form-control-sm" name="manual_cantidad" placeholder="Cantidad">
+      </div>
+      <div class="col-md-2">
+        <input type="number" step="0.01" min="0" class="form-control form-control-sm" name="manual_precio" placeholder="Precio unitario">
+      </div>
+      <div class="col-md-1">
+        <button type="button" class="btn btn-sm btn-outline-danger btn-quitar-manual">Quitar</button>
+      </div>
+    </div>
+  </template>
+
+  <button type="submit" class="btn btn-brand">Emitir Factura Consignación</button>
   <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-outline-secondary">Cancelar</a>
 </form>
 
 <script>
-  // Marcar/desmarcar todo con un clic en el encabezado no es crítico -- se deja simple a propósito.
+  const filasManuales = document.getElementById('filasManuales');
+  const plantillaFilaManual = document.getElementById('plantillaFilaManual');
+  document.getElementById('btnAgregarManual').addEventListener('click', () => {
+    const fragmento = plantillaFilaManual.content.cloneNode(true);
+    const fila = fragmento.querySelector('.fila-manual');
+    fila.querySelector('.btn-quitar-manual').addEventListener('click', () => fila.remove());
+    filasManuales.appendChild(fila);
+  });
 </script>
 {% endif %}
 

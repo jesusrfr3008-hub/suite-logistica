@@ -443,6 +443,72 @@ class StockConsignacionVigente(db.Model):
         return f"<StockConsignacionVigente {self.codigo_proveedor} lote={self.lote}>"
 
 
+class ConsignacionPendienteLote(db.Model):
+    """Ronda AX (2026-09-30, puntos 2/3, a pedido del usuario): reemplaza a
+    StockConsignacionVigente como fuente para "Emitir documento > Factura
+    Consignación" -- esa tabla se cargaba a mano con el archivo real que
+    mandaba cada proveedor, pero el usuario aclaró que eso fue SOLO para
+    partir; de ahora en adelante un lote se identifica como "de
+    consignación" porque nació de una Orden de Compra marcada
+    es_consignacion (ver OrdenCompra.es_consignacion) que se costeó -- en
+    ese momento (ver importacion_generar_factura en app.py) se registra acá
+    cuánto entró de cada lote, en vez de facturarlo de inmediato como una
+    compra en firme.
+
+    De ahí en adelante, cada vez que se sube un Stock nuevo de Ergopyme
+    (ver _detectar_consumo_consignacion_por_lote en app.py, llamada desde
+    stock_cargar/api_stock_cargar_auto ANTES de reemplazar StockExistencia)
+    se compara la cantidad de cada lote todavía con saldo (cantidad_en_stock
+    > 0) contra la nueva foto de Stock: si bajó o desapareció, la
+    diferencia se suma a cantidad_consumida -- "consumido, listo para
+    facturarle al proveedor". El usuario dio el ejemplo exacto: el 15-09
+    había 4 lotes de consignación con 1 unidad cada uno; el 16-09 solo
+    quedaban 2 -- los otros 2 pasan a "pendiente de facturar" con esta
+    misma lógica.
+
+    cantidad_facturada solo avanza cuando se emite de verdad la Factura
+    Consignación (o una Nota de Crédito) -- ninguno de esos documentos
+    mueve stock, así que esta tabla NUNCA debe usarse para calcular
+    existencias: es puramente control financiero de qué falta facturar."""
+    __tablename__ = "consignacion_pendiente_lotes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False, index=True)
+    codigo_interno = db.Column(db.String(40), index=True)  # código Ergopyme homologado
+    codigo_proveedor = db.Column(db.String(120))
+    descripcion = db.Column(db.String(300))
+    codigo_lote = db.Column(db.String(80))
+
+    cantidad_recibida = db.Column(db.Float, default=0)   # total que entró en consignación (acumulado por lote)
+    cantidad_consumida = db.Column(db.Float, default=0)  # detectado como usado/vendido (acumulado, vía baja de Stock)
+    cantidad_facturada = db.Column(db.Float, default=0)  # ya facturado de verdad (Factura Consignación o NC por cantidad)
+
+    # Trazabilidad de origen (informativa, no autoritativa).
+    origen_orden_compra_linea_id = db.Column(db.Integer, db.ForeignKey("ordenes_compra_lineas.id"), nullable=True)
+    origen_parcial_linea_id = db.Column(db.Integer, db.ForeignKey("parcial_lineas.id"), nullable=True)
+
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    proveedor = db.relationship("Proveedor")
+
+    @property
+    def cantidad_en_stock(self):
+        """Cuánto de este lote el sistema todavía espera encontrar en el
+        próximo Stock de Ergopyme (no facturado ni detectado como
+        consumido todavía)."""
+        return round((self.cantidad_recibida or 0) - (self.cantidad_consumida or 0), 4)
+
+    @property
+    def cantidad_pendiente_facturar(self):
+        """Consumido pero todavía no facturado -- esto es lo que aparece
+        en "Emitir documento > Factura Consignación" como sugerencia."""
+        return round((self.cantidad_consumida or 0) - (self.cantidad_facturada or 0), 4)
+
+    def __repr__(self):
+        return f"<ConsignacionPendienteLote {self.codigo_interno} lote={self.codigo_lote}>"
+
+
 class PedidoComprometido(db.Model):
     """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
     clientes (OC de clientes, no de nosotros a los proveedores), tal como
@@ -1168,6 +1234,13 @@ class Importacion(db.Model):
     # siguiente_correlativo_inventario() en app.py sugiere el siguiente
     # (maximo ya usado por esa empresa + 1), siempre editable a mano.
     numero_correlativo_inventario = db.Column(db.Integer, nullable=True)
+    # Ronda AX (2026-09-30, punto 2): True una vez que sus líneas de
+    # consignación (si tiene) ya se registraron en ConsignacionPendienteLote
+    # -- evita duplicar cantidad_recibida si "Generar factura" se presiona
+    # más de una vez (cuando TODAS las líneas son de consignación no se
+    # crea FacturaProveedor, así que el guard normal -- imp.factura_pago --
+    # no alcanza a proteger este caso).
+    consignacion_registrada = db.Column(db.Boolean, default=False)
     numero_factura = db.Column(db.String(80))
     fecha_factura = db.Column(db.Date, nullable=True)
     moneda_factura = db.Column(db.String(10), default="EURO")  # moneda en que vienen los Valor Unitario de las lineas
@@ -1692,6 +1765,16 @@ class NotaCreditoProveedor(db.Model):
     tipo = db.Column(db.String(20), default="solo_valor")  # ver TIPOS_NC_PROVEEDOR
     monto = db.Column(db.Float, default=0)  # siempre en la moneda de la factura
     motivo = db.Column(db.Text)
+    # Ronda AX (2026-09-30, a pedido del usuario): una NC "solo_valor" (por
+    # descuento comercial, sin tocar cantidades) antes no sabía a qué
+    # producto correspondía -- solo un monto a nivel de toda la factura.
+    # El usuario pidió que igual indique el código de producto (sin lote,
+    # eso solo aplica a "cantidad_y_valor") para poder rebajar el reporte
+    # de Compras Proveedor en el producto correcto, no solo el saldo
+    # pendiente en Pago Proveedores. Opcional (nullable) para no romper las
+    # NC "solo_valor" ya cargadas antes de este cambio, que quedan sin
+    # atribuir a un producto puntual del reporte.
+    codigo_producto = db.Column(db.String(120), nullable=True)
     creado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
 
