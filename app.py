@@ -3947,6 +3947,111 @@ def reparar_costeo_topi_ex20260720():
             )
 
 
+def reparar_flete_topi_ex20260720():
+    """Ronda AX (2026-09-30, a pedido del usuario): la corrección anterior de
+    esta misma factura (reparar_costeo_topi_ex20260720, ronda AJ) dejó
+    flete_usd = 0 a propósito para las 6 filas de TOPI-EX20260720 (TOWARDPI)
+    -- en ese momento el flete de esta factura todavía no estaba costeado.
+    El usuario entregó ahora el archivo con el flete ya calculado (ver
+    'historico_compras_proveedores.xlsx' del 30/09/2026) y pidió actualizar
+    el reporte. Esta función aplica esos valores -- flete_usd, cif_usd,
+    cif_clp, otros_gastos_clp, costo_total_clp, costo_unitario_clp y
+    otros_costos_usd -- a las mismas 6 filas ya cargadas (compras_historicas
+    es insert-only, no se vuelve a sembrar sola). derechos_clp sigue en 0
+    (no cambió en el archivo nuevo).
+
+    OJO -- verificado con el usuario en el cálculo, no asumido: al costear
+    el flete de verdad, "otros_gastos_clp" bajó bastante (antes traía una
+    cifra que hacía de reemplazo del flete que todavía faltaba) y por eso el
+    costo total termina quedando un poco MÁS BAJO que antes, no más alto,
+    aunque el CIF haya subido -- son los valores tal como vienen en el
+    archivo que entregó el usuario.
+
+    Idempotente: cada grupo de filas solo se toca si todavía tiene
+    flete_usd == 0 (el estado que dejó la ronda AJ); si ya se corrigió, no
+    hace nada."""
+    FACTURA = "TOPI-EX20260720"
+    PROVEEDOR = "TOWARDPI"
+    total_corregidas = 0
+
+    # Los 3 equipos BM-400K ULTRA OCT (mismo código, 2 valores de total_usd).
+    equipos = [
+        (106150, {
+            "flete_usd": 2809.7809759589836, "cif_usd": 108959.78097595899,
+            "cif_clp": 101939502.28767796, "otros_gastos_clp": 475120.38267265225,
+            "costo_total_clp": 102414622.67035061, "costo_unitario_clp": 102414622.67035061,
+            "otros_costos_usd": 507.8405492615755,
+        }),
+        (106200, {
+            "flete_usd": 2811.1044714728596, "cif_usd": 109011.10447147286,
+            "cif_clp": 101987519.01037587, "otros_gastos_clp": 475344.1793672696,
+            "costo_total_clp": 102462863.18974315, "costo_unitario_clp": 102462863.18974315,
+            "otros_costos_usd": 508.0797581872758,
+        }),
+    ]
+    for total_usd_actual, nuevos in equipos:
+        filas = CompraHistorica.query.filter(
+            CompraHistorica.factura == FACTURA,
+            CompraHistorica.proveedor_original == PROVEEDOR,
+            CompraHistorica.codigo_interno == "3010340020",
+            CompraHistorica.total_usd == total_usd_actual,
+            CompraHistorica.flete_usd == 0,
+        ).all()
+        for f in filas:
+            for campo, valor in nuevos.items():
+                setattr(f, campo, valor)
+            total_corregidas += 1
+
+    # Los 3 accesorios (el código de "GZBM07..." ya quedó corregido a
+    # 7010340030 desde la ronda AJ).
+    accesorios = [
+        ("7010340010", "GZBM05 METAL GRID TOOL", 570, {
+            "flete_usd": 15.087848858187666, "cif_usd": 585.0878488581876,
+            "cif_clp": 547390.6387562546, "otros_gastos_clp": 2551.282318637888,
+            "costo_total_clp": 549941.9210748925, "costo_unitario_clp": 549941.9210748925,
+            "otros_costos_usd": 2.7269817529825535,
+        }),
+        ("7010340020", "GZBM06 PAPER GRID TOOL", 570, {
+            "flete_usd": 15.087848858187666, "cif_usd": 585.0878488581876,
+            "cif_clp": 547390.6387562546, "otros_gastos_clp": 2551.282318637888,
+            "costo_total_clp": 549941.9210748925, "costo_unitario_clp": 549941.9210748925,
+            "otros_costos_usd": 2.7269817529825535,
+        }),
+        ("7010340030", "GZBM07 POINT SPREAD ADJ TOOL", 636, {
+            "flete_usd": 16.83486293650413, "cif_usd": 652.8348629365041,
+            "cif_clp": 610772.7127175052, "otros_gastos_clp": 2846.6939555328013,
+            "costo_total_clp": 613619.406673038, "costo_unitario_clp": 613619.406673038,
+            "otros_costos_usd": 3.0427375349068493,
+        }),
+    ]
+    for codigo, descripcion, total_usd_actual, nuevos in accesorios:
+        filas = CompraHistorica.query.filter(
+            CompraHistorica.factura == FACTURA,
+            CompraHistorica.proveedor_original == PROVEEDOR,
+            CompraHistorica.codigo_interno == codigo,
+            CompraHistorica.descripcion == descripcion,
+            CompraHistorica.total_usd == total_usd_actual,
+            CompraHistorica.flete_usd == 0,
+        ).all()
+        for f in filas:
+            for campo, valor in nuevos.items():
+                setattr(f, campo, valor)
+            total_corregidas += 1
+
+    if total_corregidas:
+        db.session.commit()
+        print(
+            f"[reparar_ronda_ax] Flete de la factura {FACTURA} ({PROVEEDOR}) costeado en "
+            f"{total_corregidas} fila(s) históricas (antes flete_usd=0) -- CIF, otros gastos y "
+            "costo total/unitario actualizados con los valores del archivo entregado por el usuario."
+        )
+        if total_corregidas != 6:
+            print(
+                f"[reparar_ronda_ax] AVISO: se esperaban 6 filas corregidas para {FACTURA} "
+                f"y se corrigieron {total_corregidas} -- revisar a mano si no calza."
+            )
+
+
 def reparar_facturacion_consignacion_medicontur():
     """Ronda AK (2026-09-19, punto 4 del pedido del usuario): incorpora
     'facturacion_consignacion_medicontur.xlsx' (reporte que el usuario
@@ -4224,6 +4329,7 @@ with app.app_context():
     reparar_lotes_legacy()
     reparar_paridad_eur_historica()
     reparar_costeo_topi_ex20260720()
+    reparar_flete_topi_ex20260720()
     reparar_facturacion_consignacion_medicontur()
     reparar_consignacion_y_codigo_interno_ronda_au()
 
@@ -5190,6 +5296,26 @@ def ordenes_nueva():
                 l.producto.activo = True
                 reactivados += 1
 
+        # Ronda AX (2026-09-30, punto 5, a pedido del usuario): documentos de
+        # respaldo (cotizaciones u otros) adjuntados desde la misma emisión
+        # de la OC -- filas dinámicas en el form (documento_tipo/
+        # documento_archivo, listas paralelas). orden.id ya existe por el
+        # flush de más arriba, así que _guardar_documento_orden puede
+        # guardarlos ya mismo, antes del commit final (mismo patrón que
+        # ordenes_simple_nueva).
+        docs_tipos = request.form.getlist("documento_tipo")
+        docs_archivos = request.files.getlist("documento_archivo")
+        docs_adjuntados = 0
+        for i, archivo in enumerate(docs_archivos):
+            if not archivo or not archivo.filename:
+                continue
+            tipo_doc = docs_tipos[i] if i < len(docs_tipos) else "Otro"
+            if _extension_valida(archivo.filename):
+                if _guardar_documento_orden(orden, archivo, tipo_doc):
+                    docs_adjuntados += 1
+            else:
+                flash(f"'{archivo.filename}' no se adjuntó: solo se permiten PDF o imágenes (JPG, PNG).", "warning")
+
         db.session.commit()
         if es_borrador:
             mensaje = (
@@ -5202,13 +5328,15 @@ def ordenes_nueva():
             mensaje = f"Orden {orden.numero_po} creada con {lineas_creadas} lineas. Queda 'Por Aprobar' -- no aparecera en el listado general hasta que alguien con permiso de Aprobacion la apruebe."
         if reactivados:
             mensaje += f" Se reactivaron {reactivados} producto(s) que estaban inactivos en el catálogo."
+        if docs_adjuntados:
+            mensaje += f" Se adjuntaron {docs_adjuntados} documento(s)."
         flash(mensaje, "success")
         return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
     proveedor_id = request.args.get("proveedor_id", type=int)
     return render_template(
         "ordenes/form.html", proveedores=proveedores, empresas=empresas,
-        proveedor_id=proveedor_id, now=date.today()
+        proveedor_id=proveedor_id, now=date.today(), tipos_documento=TIPOS_DOCUMENTO_ORDEN
     )
 
 

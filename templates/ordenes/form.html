@@ -4,7 +4,7 @@
 
 <h3 class="section-title mb-3">Nueva Orden de Compra</h3>
 
-<form method="post" id="formOrden">
+<form method="post" id="formOrden" enctype="multipart/form-data">
   <div class="card p-3 mb-3">
     <div class="row g-3">
       <div class="col-md-3">
@@ -150,6 +150,45 @@
       </table>
     </div>
   </div>
+
+  <!-- Ronda AX (2026-09-30, punto 5, a pedido del usuario): poder adjuntar
+       documentos (cotizaciones u otros) desde la MISMA emisión de la OC, sin
+       tener que esperar a que la orden ya exista y entrar a agregarlos ahí
+       (como ya se podía en el detalle de la orden). Filas dinámicas -- "+
+       Agregar documento" clona la plantilla de abajo -- porque puede haber
+       más de una cotización u otro tipo de documento, no solo 2 fijos. Se
+       procesan en el servidor recién después de crear la orden (necesita su
+       id -- ver ordenes_nueva en app.py), así que un archivo con extensión
+       inválida no bloquea la creación de la orden, solo no se adjunta (avisa
+       con un flash). -->
+  <div class="card p-3 mb-3">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h5 class="section-title mb-0">Documentos de respaldo (opcional)</h5>
+      <button type="button" class="btn btn-sm btn-outline-brand" id="btnAgregarDocumento">+ Agregar documento</button>
+    </div>
+    <div class="text-muted small mb-2">
+      Adjunta cotizaciones, pro-forma invoice u otros documentos de respaldo de esta orden -- no
+      hace falta esperar a que la orden ya exista. Solo PDF o imágenes (JPG, PNG).
+    </div>
+    <div id="filasDocumentos"></div>
+    <p class="text-muted small mb-0" id="hintSinDocumentos">Ningún documento adjuntado todavía.</p>
+  </div>
+
+  <template id="plantillaFilaDocumento">
+    <div class="row g-2 align-items-center mb-2 fila-documento">
+      <div class="col-md-4">
+        <select class="form-select form-select-sm" name="documento_tipo">
+          {% for t in tipos_documento %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="col-md-6">
+        <input type="file" class="form-control form-control-sm" name="documento_archivo" accept=".pdf,.jpg,.jpeg,.png">
+      </div>
+      <div class="col-md-2">
+        <button type="button" class="btn btn-sm btn-outline-danger btn-quitar-documento">Quitar</button>
+      </div>
+    </div>
+  </template>
 
   <div class="d-flex gap-2 align-items-center flex-wrap">
     <button type="submit" name="accion" value="finalizar" class="btn btn-brand">Crear orden de compra</button>
@@ -361,6 +400,15 @@ function agregarLinea(producto, variante) {
 
   cantidadInput.addEventListener('input', recalcular);
   precioInput.addEventListener('input', recalcular);
+  // Ronda AX (2026-09-30, a pedido del usuario): Tab ya avanza al siguiente
+  // campo de la MISMA fila (comportamiento normal del navegador, sin tocar
+  // nada). Enter en cambio debe bajar al mismo campo de la fila SIGUIENTE
+  // (Cantidad -> Cantidad del próximo producto, Precio -> Precio del
+  // próximo) para cargar rápido una lista larga de productos sin soltar el
+  // teclado. En la última fila, Enter no hace nada especial (no hay
+  // siguiente fila a la cual bajar).
+  cantidadInput.addEventListener('keydown', (e) => enfocarMismoCampoFilaSiguiente(e, '.cantidad'));
+  precioInput.addEventListener('keydown', (e) => enfocarMismoCampoFilaSiguiente(e, '.precio'));
   tr.querySelector('.btn-quitar').addEventListener('click', () => {
     delete lineasAgregadas[clave];
     tr.remove();
@@ -371,6 +419,18 @@ function agregarLinea(producto, variante) {
   });
 
   recalcularTotal();
+}
+
+function enfocarMismoCampoFilaSiguiente(evento, selectorClase) {
+  if (evento.key !== 'Enter') return;
+  evento.preventDefault(); // no enviar el formulario ni saltar al submit por defecto
+  const filaActual = evento.target.closest('tr');
+  const filaSiguiente = filaActual ? filaActual.nextElementSibling : null;
+  const campoSiguiente = filaSiguiente ? filaSiguiente.querySelector(selectorClase) : null;
+  if (campoSiguiente) {
+    campoSiguiente.focus();
+    campoSiguiente.select();
+  }
 }
 
 function recalcularTotal() {
@@ -432,5 +492,32 @@ if (proveedorSelect.value) {
   buscarProducto.disabled = false;
   cargarCatalogo('');
 }
+
+// Ronda AX (2026-09-30, punto 5): filas dinámicas de documentos de respaldo
+// adjuntables desde la misma emisión de la OC (clona <template
+// #plantillaFilaDocumento>, que ya trae el <select> con las opciones de
+// tipo renderizadas por el servidor).
+const filasDocumentos = document.getElementById('filasDocumentos');
+const plantillaFilaDocumento = document.getElementById('plantillaFilaDocumento');
+const hintSinDocumentos = document.getElementById('hintSinDocumentos');
+const btnAgregarDocumento = document.getElementById('btnAgregarDocumento');
+
+function actualizarHintDocumentos() {
+  hintSinDocumentos.style.display = filasDocumentos.children.length ? 'none' : '';
+}
+
+function agregarFilaDocumento() {
+  const fragmento = plantillaFilaDocumento.content.cloneNode(true);
+  const fila = fragmento.querySelector('.fila-documento');
+  fila.querySelector('.btn-quitar-documento').addEventListener('click', () => {
+    fila.remove();
+    actualizarHintDocumentos();
+  });
+  filasDocumentos.appendChild(fila);
+  actualizarHintDocumentos();
+}
+
+btnAgregarDocumento.addEventListener('click', agregarFilaDocumento);
+actualizarHintDocumentos();
 </script>
 {% endblock %}
