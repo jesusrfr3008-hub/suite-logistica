@@ -4391,6 +4391,63 @@ def reparar_consignacion_y_codigo_interno_ronda_au():
         )
 
 
+ORDEN_ESTADOS_DESPACHO = {nombre: i for i, nombre in enumerate(ESTADOS_DESPACHO)}
+
+
+def _sincronizar_status_despacho(despacho):
+    """Ronda AZ (2026-10-01, a pedido del usuario): Despacho.status es el
+    campo manual del selector "Preparando envío/En tránsito/En
+    aduana/Entregado" -- hasta ahora NADA en el flujo de avance por etapas
+    (despachos_aduana_masivo/despachos_recibido_masivo) lo actualizaba
+    solo. El usuario detectó la PO-2026-0004 (BVI BEAVER) con TODAS sus
+    líneas ya 'Recibido' y su costeo ya generado, pero el despacho seguía
+    mostrando 'En tránsito' (badge azul) tanto en el detalle de la Orden
+    como en el propio despacho -- porque nadie había cambiado el campo
+    Status a mano; nada en el sistema lo hacía por sí solo.
+
+    Esta función deriva el status correcto a partir del avance REAL de las
+    líneas (misma fuente de verdad que _despacho_completo_recibido) y lo
+    escribe -- se llama automáticamente al asociar/crear con órdenes (ya
+    quedan "Orden Despachada") y al marcar "todo en aduana"/"todo
+    recibido", para que nunca más quede desincronizado. Solo avanza HACIA
+    ADELANTE en ESTADOS_DESPACHO -- nunca retrocede un status que el
+    usuario haya adelantado a mano por algún motivo puntual."""
+    lineas_activas = [l for o in despacho.ordenes for l in o.lineas if not l.anulada]
+    if not lineas_activas:
+        return
+    if all(l.etapa == "Recibido" for l in lineas_activas):
+        nuevo = "Entregado"
+    elif any(l.etapa in ("Internación Aduanas", "Recibido") for l in lineas_activas):
+        nuevo = "En aduana"
+    else:
+        nuevo = "En tránsito"
+    actual_idx = ORDEN_ESTADOS_DESPACHO.get(despacho.status, -1)
+    if ORDEN_ESTADOS_DESPACHO[nuevo] > actual_idx:
+        despacho.status = nuevo
+
+
+def reparar_status_despachos_desincronizados():
+    """Ronda AZ (2026-10-01): corrige, una sola vez al iniciar (e idempotente
+    en cada arranque siguiente, ya no encuentra nada que corregir), cualquier
+    Despacho ya existente cuyo status manual quedó atrás del avance real de
+    sus líneas -- ver _sincronizar_status_despacho. Corrige el caso concreto
+    que reportó el usuario (PO-2026-0004, BVI BEAVER) y cualquier otro
+    despacho en la misma situación."""
+    corregidos = 0
+    for despacho in Despacho.query.all():
+        antes = despacho.status
+        _sincronizar_status_despacho(despacho)
+        if despacho.status != antes:
+            corregidos += 1
+            print(f"[reparar_ronda_az] Despacho #{despacho.id} (tracking {despacho.numero_tracking or '-'}): status '{antes}' -> '{despacho.status}'.")
+    if corregidos:
+        db.session.commit()
+        print(
+            f"[reparar_ronda_az] Status de despacho corregido en {corregidos} despacho(s) que habían quedado "
+            "desincronizados del avance real de sus líneas (ej. 'En tránsito' aunque ya estaban recibidos/costeados)."
+        )
+
+
 with app.app_context():
     reparar_ordenes_mezcladas()
     limpiar_ordenes_canceladas()
@@ -4400,6 +4457,7 @@ with app.app_context():
     reparar_flete_topi_ex20260720()
     reparar_facturacion_consignacion_medicontur()
     reparar_consignacion_y_codigo_interno_ronda_au()
+    reparar_status_despachos_desincronizados()
 
 
 def _mensaje_division(ordenes_destino):
@@ -6911,6 +6969,7 @@ def despachos_nuevo():
                 orden.despacho_id = despacho.id
                 _marcar_orden_despachada(orden)
                 asociadas += 1
+        _sincronizar_status_despacho(despacho)
         db.session.commit()
         flash(f"Despacho creado con {asociadas} orden(es) asociada(s) y marcada(s) como despachadas.", "success")
         return redirect(url_for("despachos_detalle", despacho_id=despacho.id))
@@ -6965,6 +7024,7 @@ def despachos_asociar(despacho_id):
     for orden in ordenes:
         orden.despacho_id = despacho.id
         _marcar_orden_despachada(orden)
+    _sincronizar_status_despacho(despacho)
     db.session.commit()
     flash(f"{len(ordenes)} orden(es) asociada(s) al despacho y marcada(s) como despachadas.", "success")
     return redirect(url_for("despachos_detalle", despacho_id=despacho.id))
@@ -7019,6 +7079,7 @@ def despachos_aduana_masivo(despacho_id):
     marcadas = _avanzar_lineas_despacho(
         despacho, "Orden Despachada", "Internación Aduanas", "fecha_llegada_aduana"
     )
+    _sincronizar_status_despacho(despacho)
     db.session.commit()
     flash(f"{marcadas} línea(s), de todas las órdenes de este despacho, marcadas en internación de aduanas.", "success")
     return redirect(url_for("despachos_detalle", despacho_id=despacho.id))
@@ -7031,6 +7092,7 @@ def despachos_recibido_masivo(despacho_id):
     marcadas = _avanzar_lineas_despacho(
         despacho, "Internación Aduanas", "Recibido", "fecha_recepcion_bodega"
     )
+    _sincronizar_status_despacho(despacho)
     db.session.commit()
     flash(f"{marcadas} línea(s), de todas las órdenes de este despacho, marcadas como recibidas en bodega.", "success")
     return redirect(url_for("despachos_detalle", despacho_id=despacho.id))
