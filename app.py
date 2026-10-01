@@ -41,6 +41,7 @@ from models import (
     CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
     FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
+    AjusteCompraProveedor,
 )
 from seed_data import seed_from_excel
 import costing
@@ -11204,6 +11205,47 @@ def _filas_notas_credito(proveedor=None, fecha_desde=None, fecha_hasta=None):
     return filas
 
 
+def _filas_ajustes_compra_proveedor(proveedor=None, fecha_desde=None, fecha_hasta=None):
+    """Ronda AY (2026-10-01, a pedido del usuario): ajustes manuales (ver
+    AjusteCompraProveedor) sobre compras históricas que nunca tuvieron una
+    FacturaProveedor asociada -- típicamente una NC real del proveedor que
+    el usuario nunca registró porque esa factura ya estaba cerrada antes de
+    que existiera el módulo de Pago Proveedores. Se devuelven con la MISMA
+    forma de fila que el resto del reporte (ver _filas_notas_credito, que
+    sigue el mismo patrón para las NC reales) para que se sumen solas en
+    los totales -- la única diferencia de fondo es que estos ajustes jamás
+    tocan Cuentas por Pagar/Pago Proveedores (no existe ninguna relación en
+    el modelo hacia FacturaProveedor)."""
+    query = AjusteCompraProveedor.query.join(Proveedor, AjusteCompraProveedor.proveedor_id == Proveedor.id)
+    if proveedor:
+        query = query.filter(db.func.upper(Proveedor.nombre) == proveedor.upper())
+    if fecha_desde:
+        query = query.filter(AjusteCompraProveedor.fecha >= fecha_desde)
+    if fecha_hasta:
+        query = query.filter(AjusteCompraProveedor.fecha <= fecha_hasta)
+
+    filas = []
+    for a in query.all():
+        if not a.proveedor:
+            continue
+        moneda_operacion = (a.moneda or "USD").strip().upper()
+        paridad = a.tipo_cambio_moneda_usd or 1.0
+        es_cantidad = a.tipo == "cantidad_y_valor"
+        filas.append({
+            "origen": "Ajuste manual", "fecha_factura": a.fecha, "proveedor": a.proveedor.nombre,
+            "factura": f"Ajuste / {a.numero_referencia}" if a.numero_referencia else "Ajuste manual",
+            "codigo_interno": "", "codigo_producto": a.codigo_producto or "(sin código)",
+            "descripcion": a.descripcion or a.motivo or "Ajuste manual de reporte (NC histórica no registrada)",
+            "unidades": -(a.cantidad or 0) if es_cantidad else 0,
+            "total_invoice": -(a.valor or 0), "total_usd": -(a.valor or 0) / (paridad or 1.0),
+            "moneda_operacion": moneda_operacion, "tipo_cambio": 0, "paridad": paridad,
+            "flete_usd": 0, "derechos_usd": 0, "derechos_moneda": 0, "otros_gastos_usd": 0, "otros_gastos_moneda": 0,
+            "empresa_compradora": "", "categoria": "", "tipo_flete": "", "homologado": True, "via_ergopyme": False,
+            "es_consignacion": False, "fue_consignacion": False,
+        })
+    return filas
+
+
 def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha_hasta=None, homologar=None):
     """Junta histórico + sistema ya homologados y filtrados -- reutilizado
     tanto por el listado general como por la vista de un proveedor
@@ -11224,6 +11266,11 @@ def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha
     # Consignación/NC generalizada) entran como filas NEGATIVAS con la
     # fecha de la propia NC -- ver _filas_notas_credito.
     filas += _filas_notas_credito(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
+    # Ronda AY (2026-10-01, a pedido del usuario): ajustes manuales sobre
+    # compras históricas sin FacturaProveedor asociada -- ver
+    # _filas_ajustes_compra_proveedor. Mismo patrón que las NC reales de
+    # arriba, pero nunca tocan Cuentas por Pagar.
+    filas += _filas_ajustes_compra_proveedor(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
     if empresa:
         filas = [f for f in filas if (f["empresa_compradora"] or "").upper() == empresa.upper()]
     return filas
@@ -11512,14 +11559,144 @@ def reportes_compras_proveedor_detalle(proveedor):
 
     productos_lista.sort(key=lambda p: -p["total_dominante"])
 
+    # Ronda AY (2026-10-01, a pedido del usuario): panel de ajustes manuales
+    # de este proveedor (ver AjusteCompraProveedor) dentro del mismo rango
+    # de fechas que el resto de la pantalla -- el usuario los crea/edita/
+    # elimina desde acá; el valor que restan ya viene sumado en `totales` y
+    # en la tabla dinámica de arriba porque _filas_reporte_compras los
+    # agrega como una fila negativa más (ver _filas_ajustes_compra_proveedor).
+    proveedor_obj = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == proveedor.upper()).first()
+    ajustes = []
+    if proveedor_obj:
+        q_ajustes = AjusteCompraProveedor.query.filter_by(proveedor_id=proveedor_obj.id)
+        if fecha_desde:
+            q_ajustes = q_ajustes.filter(AjusteCompraProveedor.fecha >= fecha_desde)
+        if fecha_hasta:
+            q_ajustes = q_ajustes.filter(AjusteCompraProveedor.fecha <= fecha_hasta)
+        ajustes = q_ajustes.order_by(AjusteCompraProveedor.fecha.desc()).all()
+
     return render_template(
         "reportes/compras_proveedor_detalle.html",
-        proveedor=proveedor, totales=totales,
+        proveedor=proveedor, proveedor_obj=proveedor_obj, totales=totales,
         productos=productos_lista, meses_columnas=meses_columnas,
-        agrupado_por_padre=bool(mapa_padre),
+        agrupado_por_padre=bool(mapa_padre), ajustes=ajustes,
         empresas=Empresa.query.order_by(Empresa.nombre).all(),
         empresa_sel=empresa, fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
     )
+
+
+def _validar_y_leer_ajuste_compra_form():
+    """Ronda AY (2026-10-01): lee y valida los campos del formulario de
+    Ajuste de Compras Proveedor (alta y edición) -- devuelve (datos, error);
+    `error` es un texto para flashear y volver a mostrar el form si algo
+    obligatorio falta, o None si todo OK."""
+    tipo = request.form.get("tipo", "solo_valor").strip()
+    if tipo not in TIPOS_NC_PROVEEDOR:
+        tipo = "solo_valor"
+    codigo_producto = request.form.get("codigo_producto", "").strip()
+    fecha = parse_date(request.form.get("fecha", ""))
+    valor = _parse_float_seguro(request.form.get("valor"))
+    cantidad = _parse_float_seguro(request.form.get("cantidad")) if tipo == "cantidad_y_valor" else 0.0
+
+    if not codigo_producto:
+        return None, "Indica el código de producto del ajuste."
+    if not fecha:
+        return None, "Indica la fecha del ajuste."
+    if not valor or valor <= 0:
+        return None, "Indica un valor mayor a cero para el ajuste."
+    if tipo == "cantidad_y_valor" and (not cantidad or cantidad <= 0):
+        return None, "Indica una cantidad mayor a cero para un ajuste de cantidad y valor."
+
+    return {
+        "tipo": tipo, "codigo_producto": codigo_producto,
+        "descripcion": request.form.get("descripcion", "").strip(),
+        "fecha": fecha, "cantidad": cantidad, "valor": valor,
+        "moneda": (request.form.get("moneda") or "USD").strip().upper(),
+        "tipo_cambio_moneda_usd": _parse_float_seguro(request.form.get("tipo_cambio_moneda_usd"), default=1.0) or 1.0,
+        "numero_referencia": request.form.get("numero_referencia", "").strip(),
+        "motivo": request.form.get("motivo", "").strip(),
+    }, None
+
+
+def _redirigir_a_detalle_proveedor(proveedor_nombre):
+    return redirect(url_for(
+        "reportes_compras_proveedor_detalle", proveedor=proveedor_nombre,
+        fecha_desde=request.form.get("fecha_desde", ""), fecha_hasta=request.form.get("fecha_hasta", ""),
+    ))
+
+
+@app.route("/reportes/compras-proveedor/ajustes/nuevo", methods=["GET", "POST"])
+@requiere_permiso("reportes")
+def reportes_ajuste_compra_nuevo():
+    """Ronda AY (2026-10-01, a pedido del usuario): "Ajustar" una compra
+    histórica desde el reporte de Compras Proveedor -- para una Nota de
+    Crédito real que el proveedor ya emitió pero que nunca quedó registrada
+    en el sistema (típicamente porque esa factura es de antes de que
+    existiera Pago Proveedores). Ojo: esto SOLO corrige lo que se ve en
+    este reporte -- nunca toca Cuentas por Pagar (ver AjusteCompraProveedor
+    y _filas_ajustes_compra_proveedor)."""
+    proveedor_nombre = (request.form.get("proveedor") if request.method == "POST" else request.args.get("proveedor", "")).strip()
+    proveedor_obj = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == proveedor_nombre.upper()).first() if proveedor_nombre else None
+    if not proveedor_obj:
+        flash("Indica un proveedor válido para crear el ajuste.", "danger")
+        return redirect(url_for("reportes_compras_proveedor"))
+
+    if request.method == "POST":
+        datos, error = _validar_y_leer_ajuste_compra_form()
+        if error:
+            flash(error, "danger")
+            return redirect(url_for(
+                "reportes_ajuste_compra_nuevo", proveedor=proveedor_nombre,
+                fecha_desde=request.form.get("fecha_desde", ""), fecha_hasta=request.form.get("fecha_hasta", ""),
+            ))
+        ajuste = AjusteCompraProveedor(proveedor_id=proveedor_obj.id, creado_por_id=current_user.id, **datos)
+        db.session.add(ajuste)
+        db.session.commit()
+        flash(f'Ajuste registrado sobre "{datos["codigo_producto"]}" -- se descontó del reporte de Compras Proveedor de {proveedor_nombre}.', "success")
+        return _redirigir_a_detalle_proveedor(proveedor_nombre)
+
+    return render_template(
+        "reportes/ajuste_compra_proveedor.html", ajuste=None, proveedor=proveedor_obj,
+        codigo_producto_sugerido=request.args.get("codigo_producto", ""),
+        descripcion_sugerida=request.args.get("descripcion", ""),
+        fecha_desde=request.args.get("fecha_desde", ""), fecha_hasta=request.args.get("fecha_hasta", ""),
+    )
+
+
+@app.route("/reportes/compras-proveedor/ajustes/<int:ajuste_id>/editar", methods=["GET", "POST"])
+@requiere_permiso("reportes")
+def reportes_ajuste_compra_editar(ajuste_id):
+    ajuste = AjusteCompraProveedor.query.get_or_404(ajuste_id)
+    if request.method == "POST":
+        datos, error = _validar_y_leer_ajuste_compra_form()
+        if error:
+            flash(error, "danger")
+            return redirect(url_for(
+                "reportes_ajuste_compra_editar", ajuste_id=ajuste.id,
+                fecha_desde=request.form.get("fecha_desde", ""), fecha_hasta=request.form.get("fecha_hasta", ""),
+            ))
+        for campo, valor in datos.items():
+            setattr(ajuste, campo, valor)
+        ajuste.actualizado_por_id = current_user.id
+        db.session.commit()
+        flash("Ajuste actualizado.", "success")
+        return _redirigir_a_detalle_proveedor(ajuste.proveedor.nombre)
+
+    return render_template(
+        "reportes/ajuste_compra_proveedor.html", ajuste=ajuste, proveedor=ajuste.proveedor,
+        fecha_desde=request.args.get("fecha_desde", ""), fecha_hasta=request.args.get("fecha_hasta", ""),
+    )
+
+
+@app.route("/reportes/compras-proveedor/ajustes/<int:ajuste_id>/eliminar", methods=["POST"])
+@requiere_permiso("reportes")
+def reportes_ajuste_compra_eliminar(ajuste_id):
+    ajuste = AjusteCompraProveedor.query.get_or_404(ajuste_id)
+    proveedor_nombre = ajuste.proveedor.nombre
+    db.session.delete(ajuste)
+    db.session.commit()
+    flash("Ajuste eliminado.", "success")
+    return _redirigir_a_detalle_proveedor(proveedor_nombre)
 
 
 # ---------------------------------------------------------------------------

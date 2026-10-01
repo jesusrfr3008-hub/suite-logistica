@@ -1809,3 +1809,56 @@ class NotaCreditoProveedorLinea(db.Model):
         "FacturaProveedorLinea",
         backref=db.backref("notas_credito_lineas", lazy="dynamic"),
     )
+
+
+class AjusteCompraProveedor(db.Model):
+    """Ronda AY (2026-10-01, a pedido del usuario): ajuste manual que afecta
+    SOLO el reporte de Compras Proveedor, para una compra histórica (fila de
+    CompraHistorica, o una Importación/Costeo del sistema) que el proveedor
+    corrigió con una Nota de Crédito real en su momento pero que nunca quedó
+    registrada acá -- típicamente porque esa factura ya estaba cerrada/
+    pagada antes de que existiera NotaCreditoProveedor, o porque el usuario
+    simplemente no la cargó una por una.
+
+    A propósito, a diferencia de NotaCreditoProveedor, este modelo NO tiene
+    ninguna relación con FacturaProveedor ni con Pago Proveedores/Cuentas
+    por Pagar -- el usuario fue explícito en que un ajuste de estos "solo
+    afecta el reporte en sí de compras a proveedores", nunca el saldo
+    pendiente de pago, para que sea estructuralmente imposible que revivamos
+    una factura vieja ya saldada como si estuviera pendiente. Ver
+    _filas_ajustes_compra_proveedor en app.py -- entra al reporte igual que
+    una NC real (fila negativa, fechada por este propio ajuste), pero con un
+    origen distinto ("Ajuste manual") para que se note la diferencia.
+
+    A diferencia de NotaCreditoProveedor también, este SÍ se puede editar o
+    eliminar libremente -- es una corrección manual de un reporte, no un
+    documento financiero formal como una factura o una NC real."""
+
+    __tablename__ = "ajustes_compra_proveedor"
+
+    id = db.Column(db.Integer, primary_key=True)
+    proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False, index=True)
+    fecha = db.Column(db.Date, nullable=False)  # período del reporte al que se le resta
+    tipo = db.Column(db.String(20), default="solo_valor")  # ver TIPOS_NC_PROVEEDOR
+
+    codigo_producto = db.Column(db.String(120), nullable=False)
+    descripcion = db.Column(db.String(300))
+    cantidad = db.Column(db.Float, default=0)  # positivo; solo se resta si tipo=cantidad_y_valor
+    valor = db.Column(db.Float, default=0)  # positivo, en `moneda`
+    moneda = db.Column(db.String(10), default="USD")
+    tipo_cambio_moneda_usd = db.Column(db.Float, default=1.0)  # unidades de `moneda` por 1 USD -- igual criterio que Importacion.tipo_cambio_moneda_usd
+
+    numero_referencia = db.Column(db.String(120))  # N° de factura original y/o de la NC real del proveedor (texto libre)
+    motivo = db.Column(db.Text)
+
+    creado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    actualizado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    proveedor = db.relationship("Proveedor")
+    creado_por = db.relationship("Usuario", foreign_keys=[creado_por_id])
+    actualizado_por = db.relationship("Usuario", foreign_keys=[actualizado_por_id])
+
+    def __repr__(self):
+        return f"<AjusteCompraProveedor proveedor={self.proveedor_id} {self.codigo_producto} {self.valor}>"

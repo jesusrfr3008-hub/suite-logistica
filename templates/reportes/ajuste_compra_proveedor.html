@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}Ajustar Compras Proveedor · {{ proveedor.nombre }} · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="text-muted small mb-1">
+  <a href="{{ url_for('reportes_compras_proveedor_detalle', proveedor=proveedor.nombre, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}">
+    <i class="bi bi-arrow-left"></i> {{ proveedor.nombre }} · Análisis por productos
+  </a>
+</div>
+<h3 class="section-title mb-1">{{ 'Editar ajuste' if ajuste else 'Nuevo ajuste' }} -- Compras Proveedor</h3>
+<div class="alert alert-info small mb-3">
+  Esto es para una Nota de Crédito real que {{ proveedor.nombre }} ya te emitió, pero que nunca quedó registrada
+  en el sistema (ej. de una factura antigua, ya cerrada). <strong>Este ajuste solo corrige lo que se ve en el
+  reporte de Compras Proveedor</strong> -- nunca afecta Cuentas por Pagar ni el saldo pendiente de pago. Si la NC
+  es sobre una factura que SÍ está cargada en Pago Proveedores, regístrala desde ahí en vez de acá (botón
+  "Emitir documento" o "Nota de crédito" de esa factura) para que también se descuente lo que le debes pagar al
+  proveedor.
+</div>
+
+<form method="post" action="{{ url_for('reportes_ajuste_compra_editar', ajuste_id=ajuste.id) if ajuste else url_for('reportes_ajuste_compra_nuevo') }}">
+  <input type="hidden" name="proveedor" value="{{ proveedor.nombre }}">
+  <input type="hidden" name="fecha_desde" value="{{ fecha_desde }}">
+  <input type="hidden" name="fecha_hasta" value="{{ fecha_hasta }}">
+
+  <div class="card p-3 mb-3">
+    <div class="row g-3">
+      <div class="col-md-3">
+        <label class="form-label">Tipo de ajuste *</label>
+        <select class="form-select" name="tipo" id="tipo-ajuste" required>
+          <option value="cantidad_y_valor" {{ 'selected' if ajuste and ajuste.tipo == 'cantidad_y_valor' }}>Cantidad y valor (devolución de producto)</option>
+          <option value="solo_valor" {{ 'selected' if not ajuste or ajuste.tipo == 'solo_valor' }}>Solo valor (descuento comercial)</option>
+        </select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Fecha *</label>
+        <input type="date" class="form-control" name="fecha" value="{{ ajuste.fecha.isoformat() if ajuste and ajuste.fecha else '' }}" required>
+        <div class="form-text">Período del reporte al que se le va a restar -- normalmente la fecha en que el proveedor emitió la NC real.</div>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">N° de referencia</label>
+        <input type="text" class="form-control" name="numero_referencia" value="{{ ajuste.numero_referencia if ajuste else '' }}"
+               placeholder="N° de la NC del proveedor y/o de la factura original">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Código de producto *</label>
+        <input type="text" class="form-control" name="codigo_producto"
+               value="{{ ajuste.codigo_producto if ajuste else codigo_producto_sugerido }}" required>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Descripción</label>
+        <input type="text" class="form-control" name="descripcion" value="{{ ajuste.descripcion if ajuste else descripcion_sugerida }}">
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Motivo</label>
+        <input type="text" class="form-control" name="motivo" value="{{ ajuste.motivo if ajuste else '' }}"
+               placeholder="ej. NC del proveedor N° 1234 por devolución, no registrada en su momento">
+      </div>
+    </div>
+  </div>
+
+  <div class="card p-3 mb-3">
+    <div class="row g-3">
+      <div class="col-md-3" id="col-cantidad">
+        <label class="form-label">Cantidad a restar</label>
+        <input type="number" step="0.01" min="0" class="form-control" name="cantidad" value="{{ ajuste.cantidad if ajuste else '' }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Valor a restar *</label>
+        <input type="number" step="0.01" min="0" class="form-control" name="valor" value="{{ ajuste.valor if ajuste else '' }}" required>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Moneda</label>
+        <select class="form-select" name="moneda">
+          {% for m in ['USD', 'EUR', 'CLP'] %}
+          <option value="{{ m }}" {{ 'selected' if (ajuste.moneda if ajuste else 'USD') == m }}>{{ m }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Tipo de cambio a USD</label>
+        <input type="number" step="0.0001" min="0" class="form-control" name="tipo_cambio_moneda_usd"
+               value="{{ ajuste.tipo_cambio_moneda_usd if ajuste else 1.0 }}">
+        <div class="form-text">Unidades de esa moneda por 1 USD. Déjalo en 1 si la moneda ya es USD.</div>
+      </div>
+    </div>
+  </div>
+
+  <button type="submit" class="btn btn-brand">{{ 'Guardar cambios' if ajuste else 'Guardar ajuste' }}</button>
+  <a href="{{ url_for('reportes_compras_proveedor_detalle', proveedor=proveedor.nombre, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}" class="btn btn-outline-secondary">Cancelar</a>
+  {% if ajuste %}
+  <button type="button" class="btn btn-outline-danger float-end" onclick="if (confirm('¿Eliminar este ajuste? Esto solo afecta el reporte de Compras Proveedor.')) { document.getElementById('form-eliminar-ajuste').submit(); }">Eliminar ajuste</button>
+  {% endif %}
+</form>
+
+{% if ajuste %}
+<form id="form-eliminar-ajuste" method="post" action="{{ url_for('reportes_ajuste_compra_eliminar', ajuste_id=ajuste.id) }}" class="d-none">
+  <input type="hidden" name="fecha_desde" value="{{ fecha_desde }}">
+  <input type="hidden" name="fecha_hasta" value="{{ fecha_hasta }}">
+</form>
+{% endif %}
+
+<script>
+  const tipoSel = document.getElementById('tipo-ajuste');
+  const colCantidad = document.getElementById('col-cantidad');
+  function actualizarCampos() {
+    colCantidad.style.display = (tipoSel.value === 'cantidad_y_valor') ? '' : 'none';
+  }
+  tipoSel.addEventListener('change', actualizarCampos);
+  actualizarCampos();
+</script>
+
+{% endblock %}
