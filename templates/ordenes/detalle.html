@@ -88,6 +88,12 @@
       {% if orden.despacho %}
       · Despacho: <a href="{{ url_for('despachos_detalle', despacho_id=orden.despacho.id) }}">{{ orden.despacho.numero_tracking or ('#' ~ orden.despacho.id) }}</a>
       <span class="badge bg-info text-dark">{{ orden.despacho.status }}</span>
+      {% if orden.despacho.url_seguimiento %}
+      <a href="{{ orden.despacho.url_seguimiento }}" target="_blank" rel="noopener" title="Ver seguimiento online"><i class="bi bi-geo-alt"></i></a>
+      {% endif %}
+      {% if orden.despacho.awb_prefijo and orden.despacho.awb_prefijo[1] %}
+      <span class="badge bg-light text-dark border" data-bs-toggle="tooltip" title="Detectado automáticamente por el formato del número de tracking (AWB)."><i class="bi bi-airplane"></i> {{ orden.despacho.awb_prefijo[1] }}</span>
+      {% endif %}
       {% endif %}
       {% if puede_crear %}
       <button class="btn btn-sm btn-link p-0 ms-1" data-bs-toggle="modal" data-bs-target="#modalEditarOrden">Editar</button>

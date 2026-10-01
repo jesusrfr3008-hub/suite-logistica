@@ -3,6 +3,7 @@ Modelos de datos para la Suite Logística.
 Modulo actual: Proveedores + Compras (Ordenes de Compra), con seguimiento
 de etapas por línea de producto y documentos adjuntos por orden.
 """
+import re
 from datetime import datetime
 from urllib.parse import quote
 from flask_sqlalchemy import SQLAlchemy
@@ -1093,14 +1094,116 @@ class Despacho(db.Model):
         "TNT": "https://www.tnt.com/express/en_us/site/tracking.html?searchType=CON&cons={tracking}",
     }
 
+    # Ronda AZ (2026-10-01, a pedido del usuario): no todos los embarques
+    # vienen por un courier de paqueteria como los de arriba -- varios
+    # llegan directo por un embarcador/aerolinea de carga, identificados
+    # por un Air Waybill (AWB): 11 digitos = 3 digitos de PREFIJO IATA de
+    # la aerolinea + 7 digitos de serie + 1 digito verificador (modulo 7
+    # de la serie). El usuario dio el ejemplo real 72995128644 -> prefijo
+    # "729" -> Avianca Cargo. Tabla "mejor esfuerzo", tomada del directorio
+    # publico de parcelsapp.com/en/awb-prefixes (el mismo rastreador
+    # universal que sugirio el usuario) al 2026-10 -- IATA puede reasignar
+    # un prefijo con el tiempo, asi que si no calza con la aerolinea real,
+    # el usuario igual puede seguir usando 'url_tracking_manual' para pisar
+    # lo que esta tabla sugiera. Ver awb_prefijo/aerolinea_detectada abajo.
+    AWB_PREFIJOS_AEROLINEA = {
+        "000": "Moscow Cargo", "001": "American Airlines Cargo", "006": "Delta Airlines Cargo",
+        "016": "United Airlines Cargo", "018": "Juneyao Air Cargo", "020": "Lufthansa Cargo",
+        "022": "DHL Aviation Cargo", "023": "FedEx", "027": "Alaska Airlines Cargo",
+        "037": "Vnukovo Cargo", "043": "Cathay Pacific Cargo", "044": "Aerolineas Argentinas Cargo",
+        "045": "LATAM Cargo", "047": "TAP Air Portugal", "055": "Alitalia Cargo",
+        "057": "Air France Cargo", "061": "Air Seychelles Cargo", "064": "Czech Airlines Cargo",
+        "065": "Saudia Cargo", "071": "Ethiopian Airlines Cargo", "072": "Gulf Air Cargo",
+        "074": "KLM Cargo", "075": "Iberia Airlines Cargo", "076": "Middle Eastern Airlines Cargo",
+        "077": "Egypt Air Cargo", "079": "Philippine Airlines Cargo", "080": "LOT Polish Airlines Cargo",
+        "081": "DHL Aviation Cargo / Qantas Airways Cargo", "083": "South African Airways Cargo",
+        "086": "Air New Zealand Cargo", "098": "Air India Cargo", "105": "Finnair Cargo",
+        "106": "Caribbean Airlines Cargo", "108": "Icelandair Cargo", "112": "China Cargo Airlines",
+        "114": "EL AL Cargo", "115": "Air Serbia Cargo", "117": "SAS Scandinavian Airlines Cargo",
+        "118": "TAAG Angola Airlines Cargo", "124": "Air Algerie Cargo", "125": "British Airways Cargo",
+        "126": "Garuda Indonesia Cargo", "131": "JAL Japan Airlines Cargo", "132": "Aeromexico Cargo",
+        "133": "Avianca Cargo", "134": "Avianca Cargo", "139": "Aeromexico Cargo",
+        "141": "flydubai Cargo", "142": "Air Belgium Cargo", "144": "DHL Aviation Cargo",
+        "145": "LATAM Cargo", "147": "Royal Air Maroc Cargo", "155": "DHL Aviation Cargo",
+        "157": "Qatar Airways Cargo", "160": "Cathay Pacific Cargo", "172": "Cargolux",
+        "173": "Hawaiian Air Cargo", "176": "Emirates SkyCargo", "180": "Korean Air Cargo",
+        "189": "STARLUX Cargo", "195": "Moscow Cargo", "202": "Avianca Cargo",
+        "203": "Cebu Pacific Cargo", "205": "ANA Cargo", "214": "PIA Cargo",
+        "216": "Moscow Cargo", "217": "Thai Airways Cargo", "222": "Vnukovo Cargo",
+        "228": "Air Vistara Cargo", "229": "Kuwait Airways Cargo", "230": "Copa Airlines Cargo",
+        "232": "Malaysia Airlines MASKargo", "235": "Turkish Cargo", "250": "Uzbekistan Airways Cargo",
+        "260": "Fiji Airways Cargo", "262": "Ural Airlines", "263": "Moscow Cargo",
+        "272": "Kalitta Air Cargo", "281": "TAROM Cargo", "297": "China Airlines Cargo",
+        "298": "Vnukovo Cargo", "309": "Domodedovo Cargo / Moscow Cargo", "310": "Lion Air Cargo",
+        "312": "IndiGo Cargo", "316": "Moscow Cargo", "328": "Norwegian Cargo",
+        "356": "Cargolux", "358": "Sheremetyevo Cargo", "369": "Atlas Air Cargo",
+        "379": "Vnukovo Cargo", "390": "Aegean Air Cargo", "403": "Polar Air Cargo",
+        "406": "UPS Air Cargo", "410": "Sheremetyevo Cargo", "412": "Moscow Cargo",
+        "417": "Bringer Air Cargo", "421": "S7 Cargo", "425": "Vnukovo Cargo",
+        "452": "Air Arabia Cargo", "456": "TransCaribbean Cargo", "465": "Air Astana Cargo",
+        "488": "My Freighter Cargo", "490": "Air Senegal Cargo", "506": "Norse Cargo",
+        "512": "Royal Jordanian Cargo", "513": "Lion Air Cargo", "514": "Air Arabia Cargo",
+        "526": "Southwest Cargo", "549": "LATAM Cargo", "555": "Moscow Cargo",
+        "566": "Ukraine International Airlines Cargo", "575": "Coyne Airways Cargo", "577": "Azul Cargo",
+        "580": "Moscow Cargo", "599": "Myanmar Airways Cargo", "601": "Moscow Cargo",
+        "603": "SriLankan Cargo", "607": "Etihad Cargo", "612": "TUI Fly Belgium Cargo",
+        "615": "DHL Aviation Cargo", "618": "Singapore Airlines Cargo", "623": "Air Malta",
+        "643": "Air Malta Cargo", "655": "Vnukovo Cargo", "657": "Air Baltic Cargo",
+        "672": "Royal Brunei Airlines Cargo", "675": "Air Vanuatu", "695": "EVA Airways Cargo",
+        "700": "Challenge Airlines Cargo", "706": "Kenya Airways Cargo", "716": "MNG Airlines Cargo",
+        "724": "Swiss WorldCargo", "728": "Vnukovo Cargo", "729": "Avianca Cargo",
+        "731": "Xiamen Airlines", "732": "Virgin Atlantic Cargo", "738": "Vietnam Airlines Cargo",
+        "740": "Moscow Cargo", "756": "ASL Airlines Cargo", "762": "Norwegian Cargo",
+        "774": "Fly Baghdad", "781": "China Eastern Airlines Cargo", "784": "China Southern Cargo",
+        "795": "Virgin Australia Cargo", "805": "Mercury Americas", "806": "Jeju Air Cargo",
+        "807": "AirAsia Red Cargo", "810": "Amerijet Airlines Cargo", "816": "Lion Air Cargo",
+        "828": "Hong Kong Air Cargo", "838": "WestJet Cargo", "843": "AirAsia Red Cargo",
+        "849": "Vnukovo Cargo", "851": "Hong Kong Airlines", "865": "MasAir Cargo",
+        "871": "Hainan Airlines HNA Cargo", "873": "AeroUnion Air Cargo", "876": "Sichuan Airlines Cargo",
+        "880": "Hainan Airlines Cargo", "881": "Condor Airlines Cargo", "900": "AirAsia Red Cargo",
+        "905": "Pacific Coastal Airlines", "910": "Oman Air Cargo", "920": "Lion Air Cargo",
+        "923": "Corsair Cargo", "932": "Virgin Atlantic Cargo", "933": "Nippon Cargo Airlines",
+        "936": "DHL Aviation Cargo", "938": "Lion Air Cargo", "940": "AirAsia Red Cargo",
+        "946": "DHL Aviation Cargo", "947": "DHL Aviation Cargo", "975": "AirAsia Red Cargo",
+        "976": "LATAM Cargo", "978": "VietJet Cargo", "985": "LATAM Cargo",
+        "988": "Asiana Cargo", "990": "Lion Air Cargo", "992": "DHL Aviation Cargo",
+        "996": "Air Europa", "997": "Eritrean Airlines", "999": "Air China Cargo",
+    }
+    # URL universal de respaldo (sugerida por el usuario): parcelsapp.com
+    # dice cubrir mas de 1500 couriers/aerolineas, incluyendo AWB de carga
+    # aerea por numero -- se usa como ultimo recurso cuando el courier no
+    # es ninguno de los 4 de COURIER_TRACKING_URLS (ej. un embarcador/
+    # aerolinea de carga, o cualquier otro courier no mapeado a mano).
+    URL_TRACKING_UNIVERSAL = "https://parcelsapp.com/en/tracking/{tracking}"
+
+    @property
+    def awb_prefijo(self):
+        """Si numero_tracking tiene pinta de Air Waybill (11 digitos en
+        total, con o sin guion/espacios) devuelve (prefijo, aerolinea) --
+        aerolinea es None si el prefijo no esta en AWB_PREFIJOS_AEROLINEA
+        (puede ser una aerolinea nueva o reasignada que esta tabla no
+        conoce todavia). None si el numero no tiene 11 digitos (no parece
+        un AWB)."""
+        if not self.numero_tracking:
+            return None
+        solo_digitos = re.sub(r"[^0-9]", "", self.numero_tracking)
+        if len(solo_digitos) != 11:
+            return None
+        prefijo = solo_digitos[:3]
+        return prefijo, self.AWB_PREFIJOS_AEROLINEA.get(prefijo)
+
     @property
     def url_seguimiento(self):
-        """URL para hacer seguimiento online del despacho (ronda L, punto 2).
-        Prioridad: 1) URL manual cargada por el usuario, 2) URL armada
-        automaticamente si el campo 'courier' menciona a uno de los
-        couriers conocidos (comparacion flexible, sin importar mayusculas)
-        y hay numero de tracking cargado. Si nada de eso aplica, devuelve
-        None (no se puede armar un link)."""
+        """URL para hacer seguimiento online del despacho (ronda L, punto 2;
+        ronda AZ, 2026-10-01, agrega el respaldo universal). Prioridad:
+        1) URL manual cargada por el usuario, 2) URL armada automaticamente
+        si el campo 'courier' menciona a uno de los couriers de paqueteria
+        conocidos (comparacion flexible, sin importar mayusculas), 3) si no
+        calzo nada de lo anterior pero hay numero de tracking cargado (ej.
+        un AWB de un embarcador/aerolinea de carga, o cualquier otro
+        courier no mapeado), el rastreador universal de respaldo
+        (URL_TRACKING_UNIVERSAL). Solo devuelve None si no hay NADA de
+        tracking cargado todavia."""
         if self.url_tracking_manual:
             return self.url_tracking_manual
         if not self.numero_tracking:
@@ -1109,6 +1212,14 @@ class Despacho(db.Model):
         for clave, plantilla in self.COURIER_TRACKING_URLS.items():
             if clave in courier_norm:
                 return plantilla.format(tracking=quote(self.numero_tracking.strip()))
+        # Ronda AZ: a diferencia de awb_prefijo (que SÍ descarta letras para
+        # detectar el patrón numérico del AWB), acá se manda el número TAL
+        # CUAL lo cargó el usuario -- un tracking postal/alfanumérico (ej.
+        # formato S10 "RR123456785CL") pierde su prefijo/sufijo de letras
+        # si se le sacan los dígitos, y dejaría de ser válido.
+        tracking = self.numero_tracking.strip()
+        if tracking:
+            return self.URL_TRACKING_UNIVERSAL.format(tracking=quote(tracking))
         return None
 
     @property

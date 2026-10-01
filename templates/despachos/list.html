@@ -52,6 +52,9 @@
               <i class="bi bi-geo-alt"></i>
             </a>
             {% endif %}
+            {% if d.awb_prefijo and d.awb_prefijo[1] %}
+            <div class="small text-muted"><i class="bi bi-airplane"></i> {{ d.awb_prefijo[1] }} (AWB)</div>
+            {% endif %}
           </td>
           <td>{{ d.courier or '-' }}</td>
           <td><span class="badge bg-info text-dark">{{ d.status }}</span></td>

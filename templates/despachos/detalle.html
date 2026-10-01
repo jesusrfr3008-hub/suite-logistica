@@ -7,7 +7,18 @@
     <h3 class="section-title mb-1">Despacho {{ despacho.numero_tracking or ('#' ~ despacho.id) }}</h3>
     <span class="badge bg-info text-dark fs-6">{{ despacho.status }}</span>
     {% if despacho.courier %}<span class="text-muted">· {{ despacho.courier }}</span>{% endif %}
-    {% if despacho.numero_tracking and not despacho.url_seguimiento %}
+    {% if despacho.awb_prefijo %}
+    {% set prefijo, aerolinea = despacho.awb_prefijo %}
+    <div class="small mt-1">
+      <i class="bi bi-airplane"></i>
+      {% if aerolinea %}
+      Detectado por el número (AWB, prefijo {{ prefijo }}): <strong>{{ aerolinea }}</strong>
+      {% else %}
+      Tiene formato de Air Waybill (AWB, prefijo {{ prefijo }}) pero no identificamos esa aerolínea -- verifica con el embarcador.
+      {% endif %}
+      <span class="text-muted">-- detección automática por el formato del número, confírmalo con el embarcador si tienes dudas.</span>
+    </div>
+    {% elif despacho.numero_tracking and not despacho.url_seguimiento %}
     <div class="text-muted small mt-1">
       No reconocemos automáticamente este courier para armar el link de seguimiento — puedes pegar la
       URL de seguimiento a mano desde "Editar".
