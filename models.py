@@ -1077,6 +1077,13 @@ class Despacho(db.Model):
     # (por ejemplo un courier local que no esta en COURIER_TRACKING_URLS
     # abajo), esa URL manual tiene siempre prioridad -- ver url_seguimiento.
     url_tracking_manual = db.Column(db.String(500))
+    # Nuevo pedido del usuario (ronda posterior a AZ, 2026-10-02, punto 3):
+    # el "Operador Logistico" es el forwarder/agente de aduanas que gestiona
+    # la internacion del despacho -- distinto del courier/embarcador que
+    # transporta fisicamente la carga (ej. courier=DHL, operador_logistico=
+    # "Agencia de Aduanas XYZ"). Texto libre, se carga al crear el despacho
+    # o despues desde "Editar".
+    operador_logistico = db.Column(db.String(200))
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
 
     ordenes = db.relationship("OrdenCompra", backref="despacho", lazy="dynamic")

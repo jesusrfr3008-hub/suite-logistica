@@ -552,6 +552,7 @@ def ensure_schema_migrations():
         ],
         "despachos": [
             ("url_tracking_manual", "VARCHAR(500)"),
+            ("operador_logistico", "VARCHAR(200)"),
         ],
         "empresas": [
             ("plantilla_asunto_correo", "VARCHAR(200)"),
@@ -6935,12 +6936,28 @@ def _marcar_orden_despachada(orden):
     recalcular_estado_orden(orden)
 
 
+def _solo_seguimiento_despacho():
+    """Nuevo pedido del usuario (2026-10-02, punto 1): un perfil que SOLO
+    tiene el permiso 'seguimiento' (sin 'actualizar_despacho' ni
+    'generar_costeo') debe poder ver el resumen de despachos igual que
+    siempre, pero en el detalle solo le mostramos 'Ver seguimiento online'
+    -- nada de Editar/Eliminar ni los valores (totales de ordenes, Costeo).
+    Un usuario con 'actualizar_despacho' o 'generar_costeo' sigue viendo
+    todo exactamente como hasta ahora, aunque ademas tenga 'seguimiento'."""
+    return current_user.tiene_permiso("seguimiento") and not (
+        current_user.tiene_permiso("actualizar_despacho") or current_user.tiene_permiso("generar_costeo")
+    )
+
+
 @app.route("/despachos")
 @requiere_permiso("actualizar_despacho", "seguimiento", "generar_costeo")
 def despachos_list():
     despachos = Despacho.query.order_by(Despacho.id.desc()).all()
     hay_candidatas = bool(_ordenes_listas_para_despachar())
-    return render_template("despachos/list.html", despachos=despachos, hay_candidatas=hay_candidatas)
+    return render_template(
+        "despachos/list.html", despachos=despachos, hay_candidatas=hay_candidatas,
+        solo_seguimiento=_solo_seguimiento_despacho(),
+    )
 
 
 @app.route("/despachos/nuevo", methods=["GET", "POST"])
@@ -6951,6 +6968,7 @@ def despachos_nuevo():
         despacho = Despacho(
             numero_tracking=request.form.get("numero_tracking", "").strip(),
             courier=request.form.get("courier", "").strip(),
+            operador_logistico=request.form.get("operador_logistico", "").strip(),
             status=request.form.get("status") or ESTADOS_DESPACHO[0],
             fecha_envio=parse_date(request.form.get("fecha_envio")),
             fecha_estimada_llegada=parse_date(request.form.get("fecha_estimada_llegada")),
@@ -6991,6 +7009,7 @@ def despachos_detalle(despacho_id):
         candidatas=candidatas,
         estados=ESTADOS_DESPACHO,
         listo_para_costeo=_despacho_completo_recibido(despacho),
+        solo_seguimiento=_solo_seguimiento_despacho(),
     )
 
 
@@ -7000,6 +7019,7 @@ def despachos_editar(despacho_id):
     despacho = Despacho.query.get_or_404(despacho_id)
     despacho.numero_tracking = request.form.get("numero_tracking", "").strip()
     despacho.courier = request.form.get("courier", "").strip()
+    despacho.operador_logistico = request.form.get("operador_logistico", "").strip()
     despacho.status = request.form.get("status") or ESTADOS_DESPACHO[0]
     despacho.fecha_envio = parse_date(request.form.get("fecha_envio"))
     despacho.fecha_estimada_llegada = parse_date(request.form.get("fecha_estimada_llegada"))

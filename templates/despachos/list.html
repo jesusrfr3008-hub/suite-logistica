@@ -33,8 +33,10 @@
     <table class="table table-hover align-middle mb-0">
       <thead>
         <tr>
+          <th>Proveedor</th>
           <th>Tracking</th>
           <th>Courier</th>
+          <th>Operador Logístico</th>
           <th>Status</th>
           <th>Fecha envío</th>
           <th>Fecha est. llegada</th>
@@ -45,6 +47,7 @@
       <tbody>
         {% for d in despachos %}
         <tr>
+          <td>{{ d.proveedores|map(attribute='nombre')|join(', ') or '-' }}</td>
           <td>
             {{ d.numero_tracking or '-' }}
             {% if d.url_seguimiento %}
@@ -57,6 +60,7 @@
             {% endif %}
           </td>
           <td>{{ d.courier or '-' }}</td>
+          <td>{{ d.operador_logistico or '-' }}</td>
           <td><span class="badge bg-info text-dark">{{ d.status }}</span></td>
           <td>{{ d.fecha_envio or '-' }}</td>
           <td>{{ d.fecha_estimada_llegada or '-' }}</td>
@@ -64,7 +68,7 @@
           <td class="text-end"><a href="{{ url_for('despachos_detalle', despacho_id=d.id) }}" class="btn btn-sm btn-outline-primary">Ver</a></td>
         </tr>
         {% else %}
-        <tr><td colspan="7" class="text-center text-muted py-4">No hay despachos registrados todavía.</td></tr>
+        <tr><td colspan="9" class="text-center text-muted py-4">No hay despachos registrados todavía.</td></tr>
         {% endfor %}
       </tbody>
     </table>
