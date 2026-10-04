@@ -14,11 +14,13 @@ Metodologia (ajustada 2026-09-01 a pedido del usuario -- ver nota abajo):
     directamente el Dolar Aduanero (tipo_cambio_moneda_usd queda en 1).
     Cada item, ya convertido a USD, se prorratea por LINEA segun el valor
     propio de esa linea (en USD) sobre el FOB total de TODO el embarque
-    (todas las lineas, de todos los parciales). La condicion de compra
-    (EXW/CIF) es solo informativa -- NO fuerza estos campos a 0 ni los
-    oculta: el usuario aclaro que aunque la operacion sea CIF, Flete y
-    Seguro igual se cargan aparte (no vienen indexados en el precio del
-    producto para este sistema).
+    (todas las lineas, de todos los parciales) -- SALVO que el item tenga
+    "facturas_aplicables" cargado (punto 4, 2026-10-02/03, ver mas abajo),
+    en cuyo caso se prorratea solo entre el FOB de las lineas de esas
+    facturas. La condicion de compra (EXW/CIF) es solo informativa -- NO
+    fuerza estos campos a 0 ni los oculta: el usuario aclaro que aunque la
+    operacion sea CIF, Flete y Seguro igual se cargan aparte (no vienen
+    indexados en el precio del producto para este sistema).
  2. CIF de la linea = valor propio + todos los items de factura asignados
     (todo en USD), convertido a CLP con el "Dolar Aduanero" de la
     importacion, y tambien expresado en la moneda de la factura
@@ -52,6 +54,26 @@ Metodologia (ajustada 2026-09-01 a pedido del usuario -- ver nota abajo):
     convertir a mano. Esta es exactamente la cadena de conversion de la
     planilla de muestra del usuario: moneda de factura -> USD (paridad) ->
     CLP (Dolar Aduanero).
+ 6. Pedido del usuario (2026-10-02/03, punto 4, auditado y confirmado antes
+    de construir): un despacho puede traer MAS DE UNA factura real del
+    proveedor, cada una con su propia porcion de Flete/Seguro/Handling Fee
+    -- hoy el prorrateo FOB de CargoAdicionalImportacion asumia una sola
+    factura para todo el embarque. Se agrega FacturaEmbarqueImportacion
+    (independiente del Parcial/regimen aduanero -- una factura puede
+    repartirse en mas de un Parcial, o un Parcial juntar mas de una
+    factura) y ParcialLinea.factura_embarque_id para asignar cada linea a
+    su factura real. Un item de CargoAdicionalImportacion con
+    "facturas_aplicables" cargado se prorratea SOLO entre el FOB de las
+    lineas de esas facturas, en vez de entre todas las lineas de la
+    importacion. Si una Importacion no tiene ninguna FacturaEmbarqueImportacion
+    cargada (el caso normal, una sola factura) o un item no tiene
+    facturas_aplicables marcadas, el calculo es EXACTAMENTE el de siempre
+    (prorrateo entre todas las lineas) -- este mecanismo es enteramente
+    opt-in y no cambia ningun costeo ya calculado. Pago Proveedores (Cuenta
+    por Pagar) NO cambia -- a pedido explicito del usuario sigue
+    consolidando una sola factura por Importacion, sin importar cuantas
+    FacturaEmbarqueImportacion tenga cargadas (ver importacion_generar_factura
+    en app.py).
 """
 from collections import defaultdict
 
@@ -73,11 +95,30 @@ def calcular_costeo(importacion):
     tc_aduanero = importacion.tipo_cambio_aduanero or 0
     tc_moneda_usd = importacion.tipo_cambio_moneda_usd or 1
 
-    # --- Items de la factura (Flete, Seguro, Handling Fee, Otros...),
-    # cada uno ya convertido a USD con su propia moneda/tipo de cambio ---
-    items_por_concepto_usd = defaultdict(float)
+    todas_las_lineas = [linea for parcial in importacion.parciales for linea in parcial.lineas]
+
+    # --- Items de la factura (Flete, Seguro, Handling Fee, Otros...), cada
+    # uno ya convertido a USD con su propia moneda/tipo de cambio. Punto 4
+    # (2026-10-02/03): si el item tiene "facturas_aplicables" cargado, se
+    # prorratea SOLO entre el FOB de las lineas de esas facturas reales del
+    # proveedor (ver FacturaEmbarqueImportacion); si no (el caso normal, una
+    # sola factura para todo el embarque), entre TODAS las lineas de la
+    # importacion -- exactamente como antes de este cambio. ---
+    items_por_concepto_usd = defaultdict(float)  # solo para 'totales'/'usa_*' (global, sin importar el scope)
+    contribucion_por_linea = defaultdict(lambda: defaultdict(float))  # linea.id -> concepto -> usd
+
     for item in importacion.cargos_adicionales:
-        items_por_concepto_usd[item.concepto] += item.monto_usd
+        monto_usd = item.monto_usd
+        items_por_concepto_usd[item.concepto] += monto_usd
+        facturas_ids = {f.id for f in item.facturas_aplicables}
+        lineas_scope = (
+            [l for l in todas_las_lineas if l.factura_embarque_id in facturas_ids]
+            if facturas_ids else todas_las_lineas
+        )
+        fob_scope_usd = sum(l.valor_total_usd for l in lineas_scope)
+        for l in lineas_scope:
+            share = (l.valor_total_usd / fob_scope_usd) if fob_scope_usd else 0
+            contribucion_por_linea[l.id][item.concepto] += monto_usd * share
     items_total_usd = sum(items_por_concepto_usd.values())
 
     lineas_info = []
@@ -90,9 +131,8 @@ def calcular_costeo(importacion):
             valor_usd = linea.valor_total_usd
             valor_total_moneda = linea.valor_total_moneda
             fob_moneda_factura += valor_total_moneda
-            share_fob = (valor_usd / fob_total_usd) if fob_total_usd else 0
 
-            items_linea_usd = {c: share_fob * v for c, v in items_por_concepto_usd.items()}
+            items_linea_usd = contribucion_por_linea.get(linea.id, {})
             flete_usd = items_linea_usd.get(CONCEPTO_ITEM_FLETE, 0)
             seguro_usd = items_linea_usd.get(CONCEPTO_ITEM_SEGURO, 0)
             otros_items_usd = sum(
@@ -106,6 +146,7 @@ def calcular_costeo(importacion):
             info = {
                 "linea": linea,
                 "parcial": parcial,
+                "factura_embarque": linea.factura_embarque,
                 "valor_usd": valor_usd,
                 "valor_total_moneda": valor_total_moneda,
                 "flete_usd": flete_usd,
@@ -257,9 +298,45 @@ def calcular_costeo(importacion):
         "costo_total_moneda_factura": costo_total_usd * tc_moneda_usd,
     }
 
+    # --- Resumen por factura real del proveedor (punto 4, 2026-10-02/03) --
+    # solo tiene sentido mostrarlo si la importacion ya tiene mas de una
+    # factura cargada; se incluyen tambien las lineas SIN factura asignada
+    # (factura_embarque_id NULL) como "sin asignar" para que el usuario vea
+    # que todavia le falta clasificarlas si esta repartiendo por factura.
+    resumen_facturas = []
+    facturas_embarque = list(importacion.facturas_embarque)
+    if facturas_embarque:
+        lineas_sin_factura = [i for i in lineas_info if i["factura_embarque"] is None]
+        for factura in facturas_embarque:
+            info_factura = [i for i in lineas_info if i["factura_embarque"] and i["factura_embarque"].id == factura.id]
+            resumen_facturas.append({
+                "factura": factura,
+                "fob_usd": sum(i["valor_usd"] for i in info_factura),
+                "fob_moneda": sum(i["valor_total_moneda"] for i in info_factura),
+                "flete_usd": sum(i["flete_usd"] for i in info_factura),
+                "seguro_usd": sum(i["seguro_usd"] for i in info_factura),
+                "otros_items_usd": sum(i["otros_items_usd"] for i in info_factura),
+                "cif_usd": sum(i["cif_usd"] for i in info_factura),
+                "costo_total_clp": sum(i["costo_total_clp"] for i in info_factura),
+                "lineas": info_factura,
+            })
+        if lineas_sin_factura:
+            resumen_facturas.append({
+                "factura": None,
+                "fob_usd": sum(i["valor_usd"] for i in lineas_sin_factura),
+                "fob_moneda": sum(i["valor_total_moneda"] for i in lineas_sin_factura),
+                "flete_usd": sum(i["flete_usd"] for i in lineas_sin_factura),
+                "seguro_usd": sum(i["seguro_usd"] for i in lineas_sin_factura),
+                "otros_items_usd": sum(i["otros_items_usd"] for i in lineas_sin_factura),
+                "cif_usd": sum(i["cif_usd"] for i in lineas_sin_factura),
+                "costo_total_clp": sum(i["costo_total_clp"] for i in lineas_sin_factura),
+                "lineas": lineas_sin_factura,
+            })
+
     return {
         "lineas": lineas_info,
         "parciales": resumen_parciales,
+        "facturas": resumen_facturas,
         "totales": totales,
         "usa_flete_gasto": usa_flete_gasto,
         "usa_derechos": usa_derechos,

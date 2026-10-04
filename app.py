@@ -42,6 +42,7 @@ from models import (
     FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
     AjusteCompraProveedor,
+    FacturaEmbarqueImportacion,
 )
 from seed_data import seed_from_excel
 import costing
@@ -537,6 +538,7 @@ def ensure_schema_migrations():
         ],
         "parcial_lineas": [
             ("orden_compra_linea_id", "INTEGER"),
+            ("factura_embarque_id", "INTEGER"),
         ],
         "parciales": [
             ("referencia", "VARCHAR(120)"),
@@ -9257,6 +9259,11 @@ def cargos_nuevo(importacion_id):
         tipo_cambio=1 if moneda == "USD" else float(request.form.get("tipo_cambio") or 1),
         referencia=request.form.get("referencia", "").strip(),
     )
+    facturas_ids = request.form.getlist("facturas_ids")
+    if facturas_ids:
+        cargo.facturas_aplicables = FacturaEmbarqueImportacion.query.filter(
+            FacturaEmbarqueImportacion.id.in_(facturas_ids), FacturaEmbarqueImportacion.importacion_id == imp.id,
+        ).all()
     db.session.add(cargo)
     db.session.commit()
     flash(f"'{cargo.concepto}' agregado.", "success")
@@ -9273,9 +9280,123 @@ def cargos_editar(cargo_id):
     cargo.moneda = moneda
     cargo.tipo_cambio = 1 if moneda == "USD" else float(request.form.get("tipo_cambio") or 1)
     cargo.referencia = request.form.get("referencia", "").strip()
+    facturas_ids = request.form.getlist("facturas_ids")
+    cargo.facturas_aplicables = (
+        FacturaEmbarqueImportacion.query.filter(
+            FacturaEmbarqueImportacion.id.in_(facturas_ids),
+            FacturaEmbarqueImportacion.importacion_id == cargo.importacion_id,
+        ).all() if facturas_ids else []
+    )
     db.session.commit()
     flash("Actualizado.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=cargo.importacion_id))
+
+
+# --- Facturas reales del proveedor dentro de una Importacion (punto 4,
+# pedido del usuario 2026-10-02/03, auditado y confirmado antes de
+# construir): cuando el proveedor emite mas de una factura para los
+# productos de un mismo despacho, cada una con su propia porcion de
+# Flete/Seguro/Handling Fee (CargoAdicionalImportacion.facturas_aplicables
+# arriba). Independiente del Parcial (regimen aduanero/DIN) a pedido
+# explicito del usuario -- ver FacturaEmbarqueImportacion en models.py. NO
+# afecta a Pago Proveedores: la Cuenta por Pagar sigue consolidada en una
+# sola FacturaProveedor por Importacion, sin cambios (importacion_generar_factura). ---
+
+@app.route("/importaciones/<int:importacion_id>/facturas-embarque/nueva", methods=["POST"])
+@requiere_permiso("generar_costeo")
+def facturas_embarque_nueva(importacion_id):
+    imp = Importacion.query.get_or_404(importacion_id)
+    numero = request.form.get("numero_factura", "").strip()
+    if not numero:
+        flash("Ingresa el número de la factura.", "warning")
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
+    moneda = request.form.get("moneda_factura", "").strip() or None
+    tc = request.form.get("tipo_cambio_moneda_usd", "").strip()
+    factura = FacturaEmbarqueImportacion(
+        importacion_id=imp.id,
+        numero_factura=numero,
+        fecha_factura=parse_date(request.form.get("fecha_factura")),
+        moneda_factura=moneda,
+        tipo_cambio_moneda_usd=float(tc) if tc else None,
+        notas=request.form.get("notas", "").strip(),
+    )
+    db.session.add(factura)
+    db.session.commit()
+    flash(f"Factura '{factura.numero_factura}' agregada -- ahora puedes asignarle productos abajo.", "success")
+    return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
+
+
+@app.route("/facturas-embarque/<int:factura_id>/editar", methods=["POST"])
+@requiere_permiso("generar_costeo")
+def facturas_embarque_editar(factura_id):
+    factura = FacturaEmbarqueImportacion.query.get_or_404(factura_id)
+    numero = request.form.get("numero_factura", "").strip()
+    if not numero:
+        flash("Ingresa el número de la factura.", "warning")
+        return redirect(url_for("importaciones_detalle", importacion_id=factura.importacion_id))
+    moneda = request.form.get("moneda_factura", "").strip()
+    tc = request.form.get("tipo_cambio_moneda_usd", "").strip()
+    factura.numero_factura = numero
+    factura.fecha_factura = parse_date(request.form.get("fecha_factura"))
+    factura.moneda_factura = moneda or None
+    factura.tipo_cambio_moneda_usd = float(tc) if tc else None
+    factura.notas = request.form.get("notas", "").strip()
+    db.session.commit()
+    flash("Factura actualizada.", "success")
+    return redirect(url_for("importaciones_detalle", importacion_id=factura.importacion_id))
+
+
+@app.route("/facturas-embarque/<int:factura_id>/eliminar", methods=["POST"])
+@requiere_permiso("generar_costeo")
+def facturas_embarque_eliminar(factura_id):
+    factura = FacturaEmbarqueImportacion.query.get_or_404(factura_id)
+    importacion_id = factura.importacion_id
+    # Las lineas que tenia asignadas quedan "sin factura" (NULL) en vez de
+    # borrarse -- el setattr None es automatico via la FK nullable al
+    # borrar esta fila (SQLAlchemy no lo hace solo sin cascade explicito,
+    # asi que lo hacemos a mano para no dejar punteros colgando).
+    for linea in list(factura.lineas):
+        linea.factura_embarque_id = None
+    db.session.delete(factura)
+    db.session.commit()
+    flash("Factura eliminada -- sus productos quedaron sin factura asignada (no se borraron).", "success")
+    return redirect(url_for("importaciones_detalle", importacion_id=importacion_id))
+
+
+@app.route("/parcial_lineas/asignar-factura-masivo", methods=["POST"])
+@requiere_permiso("generar_costeo")
+def parcial_lineas_asignar_factura_masivo():
+    """Asigna en bloque un grupo de ParcialLinea a una factura real del
+    proveedor (o la deja 'sin factura' si no se elige ninguna) -- mismo
+    patron que parcial_lineas_mover_masivo (mover entre Parciales), pero
+    para la agrupacion por factura (punto 4, pedido del usuario)."""
+    importacion_id = request.form.get("importacion_id")
+    imp = Importacion.query.get_or_404(importacion_id)
+    factura_id = request.form.get("factura_embarque_id") or None
+    factura = None
+    if factura_id:
+        factura = FacturaEmbarqueImportacion.query.get_or_404(factura_id)
+        if factura.importacion_id != imp.id:
+            abort(404)
+    linea_ids = request.form.getlist("linea_ids")
+
+    asignadas = 0
+    for lid in linea_ids:
+        try:
+            linea = ParcialLinea.query.get(int(lid))
+        except (TypeError, ValueError):
+            continue
+        if not linea or linea.parcial.importacion_id != imp.id:
+            continue
+        linea.factura_embarque_id = factura.id if factura else None
+        asignadas += 1
+
+    db.session.commit()
+    if factura:
+        flash(f"{asignadas} producto(s) asignado(s) a la factura '{factura.numero_factura}'.", "success")
+    else:
+        flash(f"{asignadas} producto(s) quedaron sin factura asignada.", "success")
+    return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
 
 @app.route("/cargos/<int:cargo_id>/eliminar", methods=["POST"])

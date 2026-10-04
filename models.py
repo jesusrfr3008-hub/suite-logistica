@@ -1407,6 +1407,22 @@ class Importacion(db.Model):
         "ImportacionDocumento", backref="importacion", cascade="all, delete-orphan",
         lazy="dynamic", order_by="ImportacionDocumento.fecha_subida.desc()",
     )
+    # Pedido del usuario (2026-10-02/03, punto 4, auditado con el usuario
+    # antes de construir -- ver facturas_embarque abajo): un despacho puede
+    # generar UNA Importacion (costeo) pero el proveedor puede haber
+    # facturado esos mismos productos en MAS DE UNA factura real, cada una
+    # con su propia porcion de Flete/Seguro/Handling Fee. El usuario eligio
+    # explicitamente crear un concepto nuevo "Factura" (en vez de reusar el
+    # Parcial, que es la unidad de regimen aduanero/DIN -- una factura puede
+    # repartirse en mas de un Parcial, o un Parcial puede juntar mas de una
+    # factura) y mantener a Pago Proveedores SIN CAMBIOS (una sola Cuenta
+    # por Pagar consolidada por Importacion, como siempre -- ver
+    # importacion_generar_factura en app.py, que no se modifico). Ver
+    # FacturaEmbarqueImportacion abajo.
+    facturas_embarque = db.relationship(
+        "FacturaEmbarqueImportacion", backref="importacion", cascade="all, delete-orphan",
+        lazy="dynamic", order_by="FacturaEmbarqueImportacion.id",
+    )
 
     @property
     def fob_total_usd(self):
@@ -1476,6 +1492,20 @@ class ParcialLinea(db.Model):
     orden_compra_linea_id = db.Column(
         db.Integer, db.ForeignKey("ordenes_compra_lineas.id"), nullable=True
     )
+    # Pedido del usuario (2026-10-02/03, punto 4): a que factura REAL del
+    # proveedor pertenece esta linea, cuando la Importacion tiene mas de
+    # una (ver FacturaEmbarqueImportacion e Importacion.facturas_embarque
+    # arriba). NULL = "sin asignar" -- asi TODAS las lineas existentes antes
+    # de este cambio (y cualquier Importacion de una sola factura, que sigue
+    # siendo el caso normal) quedan exactamente igual que antes: el
+    # prorrateo de Flete/Seguro/Handling en costing.py solo se acota a una
+    # factura puntual cuando el usuario efectivamente carga mas de una y
+    # asigna lineas -- si no hay ninguna FacturaEmbarqueImportacion cargada,
+    # el comportamiento es byte-a-byte el de siempre (prorrateo entre TODAS
+    # las lineas de la importacion).
+    factura_embarque_id = db.Column(
+        db.Integer, db.ForeignKey("facturas_embarque_importacion.id"), nullable=True
+    )
 
     codigo = db.Column(db.String(120), nullable=False)
     descripcion = db.Column(db.String(500), nullable=False)
@@ -1499,6 +1529,7 @@ class ParcialLinea(db.Model):
 
     producto = db.relationship("Producto")
     orden_compra_linea = db.relationship("OrdenCompraLinea")
+    factura_embarque = db.relationship("FacturaEmbarqueImportacion", backref="lineas")
     lotes = db.relationship(
         "ParcialLineaLote",
         backref="linea",
@@ -1612,6 +1643,63 @@ gasto_parcial_aplicable = db.Table(
 )
 
 
+class FacturaEmbarqueImportacion(db.Model):
+    """Una factura REAL del proveedor que cubre parte (o todo) de los
+    productos de una Importacion/despacho -- pedido del usuario (2026-10-02/
+    03, punto 4): "el proveedor pudo emitir una o mas facturas que
+    contemplen todos los productos de las ordenes incluidas en el despacho
+    ... cada factura puede tener su propia porcion de flete, seguro o
+    handling fee". Auditado con el usuario antes de construir: eligio
+    explicitamente un concepto nuevo, independiente del Parcial (regimen
+    aduanero/DIN) -- una factura puede repartir sus lineas en mas de un
+    Parcial, o un Parcial puede juntar lineas de mas de una factura.
+
+    NO es lo mismo que FacturaProveedor (la Cuenta por Pagar real en Pago
+    Proveedores) -- el usuario pidio explicitamente mantener esa parte SIN
+    CAMBIOS: una sola Cuenta por Pagar consolidada por Importacion, como
+    siempre (ver importacion_generar_factura en app.py). Esta tabla es solo
+    para poder individualizar, DENTRO del costeo, que Flete/Seguro/Handling
+    Fee (CargoAdicionalImportacion) le corresponde a cada factura real --
+    ver facturas_aplicables abajo y costing.py.
+
+    Si una Importacion NO tiene ninguna fila de esta tabla (el caso normal,
+    una sola factura), o una ParcialLinea no esta asignada a ninguna
+    (factura_embarque_id es NULL), el comportamiento del costeo es
+    exactamente el de antes de este cambio -- esto es solo para el caso
+    (nuevo) de mas de una factura real por despacho."""
+
+    __tablename__ = "facturas_embarque_importacion"
+
+    id = db.Column(db.Integer, primary_key=True)
+    importacion_id = db.Column(db.Integer, db.ForeignKey("importaciones.id"), nullable=False)
+    numero_factura = db.Column(db.String(80), nullable=False)
+    fecha_factura = db.Column(db.Date, nullable=True)
+    # Si no se cargan, se usan los de la Importacion -- igual patron que un
+    # item de CargoAdicionalImportacion sin moneda propia.
+    moneda_factura = db.Column(db.String(10))
+    tipo_cambio_moneda_usd = db.Column(db.Float, nullable=True)
+    notas = db.Column(db.String(300))
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    @property
+    def moneda_efectiva(self):
+        return self.moneda_factura or self.importacion.moneda_factura
+
+    @property
+    def tipo_cambio_moneda_usd_efectivo(self):
+        return self.tipo_cambio_moneda_usd or self.importacion.tipo_cambio_moneda_usd or 1
+
+    def __repr__(self):
+        return f"<FacturaEmbarqueImportacion {self.numero_factura}>"
+
+
+cargo_factura_aplicable = db.Table(
+    "cargo_factura_aplicable",
+    db.Column("cargo_id", db.Integer, db.ForeignKey("cargos_adicionales_importacion.id"), primary_key=True),
+    db.Column("factura_embarque_id", db.Integer, db.ForeignKey("facturas_embarque_importacion.id"), primary_key=True),
+)
+
+
 class CargoAdicionalImportacion(db.Model):
     """Item de la FACTURA/embarque que se suma al CIF: Flete, Seguro,
     Handling Fee u Otros (ver CONCEPTOS_ITEM_FACTURA arriba). Hasta el
@@ -1647,6 +1735,16 @@ class CargoAdicionalImportacion(db.Model):
     moneda = db.Column(db.String(10), default="USD")
     tipo_cambio = db.Column(db.Float, default=1)
     referencia = db.Column(db.String(150))
+
+    # Pedido del usuario (2026-10-02/03, punto 4): si esta vacio, este item
+    # se prorratea por FOB entre TODAS las lineas de la importacion (el
+    # comportamiento de siempre). Si tiene facturas asociadas, se prorratea
+    # SOLO entre las lineas de esas facturas (ver
+    # FacturaEmbarqueImportacion/ParcialLinea.factura_embarque_id y
+    # costing.py) -- mismo patron que GastoImportacion.parciales_aplicables.
+    facturas_aplicables = db.relationship(
+        "FacturaEmbarqueImportacion", secondary="cargo_factura_aplicable", backref="cargos_especificos"
+    )
 
     @property
     def monto_usd(self):

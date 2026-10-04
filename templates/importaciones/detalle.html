@@ -291,6 +291,18 @@
           <button type="submit" class="btn btn-sm btn-outline-primary">Mover seleccionadas</button>
         </form>
         {% endif %}
+        {% if imp.facturas_embarque.count() %}
+        <form method="post" action="{{ url_for('parcial_lineas_asignar_factura_masivo') }}" class="d-flex align-items-center gap-2 form-asignar-factura" data-parcial="{{ parcial.id }}">
+          <input type="hidden" name="importacion_id" value="{{ imp.id }}">
+          <select class="form-select form-select-sm" name="factura_embarque_id" style="width:auto;">
+            <option value="">Asignar a factura: (sin factura)</option>
+            {% for f in imp.facturas_embarque %}
+            <option value="{{ f.id }}">Asignar a factura: {{ f.numero_factura }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit" class="btn btn-sm btn-outline-primary">Asignar seleccionadas</button>
+        </form>
+        {% endif %}
       </div>
 
       <div class="table-responsive tabla-scroll">
@@ -301,6 +313,7 @@
               <th data-sort="text">Código</th>
               <th data-sort="text">Descripción</th>
               <th data-sort="text">Lote</th>
+              {% if imp.facturas_embarque.count() %}<th data-sort="text">Factura</th>{% endif %}
               <th data-sort="num">Cant.</th>
               <th data-sort="num">Valor unit. ({{ imp.moneda_factura }})</th>
               <th data-sort="num">Total FOB ({{ imp.moneda_factura }})</th>
@@ -341,6 +354,15 @@
                 {{ l.codigo_lote or '-' }}
                 {% endif %}
               </td>
+              {% if imp.facturas_embarque.count() %}
+              <td>
+                {% if info.factura_embarque %}
+                <span class="badge bg-secondary">{{ info.factura_embarque.numero_factura }}</span>
+                {% else %}
+                <span class="text-muted small">Sin asignar</span>
+                {% endif %}
+              </td>
+              {% endif %}
               <td class="text-end">{{ l.cantidad_unidades }}</td>
               <td class="text-end">{{ l.valor_unitario_moneda|moneda }}</td>
               <td class="text-end">{{ info.valor_total_moneda|moneda }}</td>
@@ -358,7 +380,7 @@
               </td>
             </tr>
             {% else %}
-            <tr><td colspan="17" class="text-center text-muted py-3">Sin productos en este parcial.</td></tr>
+            <tr><td colspan="18" class="text-center text-muted py-3">Sin productos en este parcial.</td></tr>
             {% endfor %}
           </tbody>
           {% if pr.lineas %}
@@ -387,6 +409,160 @@
   <div class="alert alert-light border">Agrega un parcial para empezar a cargar productos.</div>
   {% endfor %}
 </div>
+
+<!-- Facturas reales del proveedor dentro de este despacho (punto 4,
+     pedido del usuario 2026-10-02/03): cuando el proveedor factura los
+     productos de este despacho en mas de un documento, cada uno con su
+     propia porcion de Flete/Seguro/Handling Fee, se carga aqui cada
+     factura y se le asignan sus productos arriba (columna "Factura" +
+     "Asignar seleccionadas"). Si el despacho tiene una sola factura, esta
+     sección puede ignorarse por completo -- todo sigue funcionando
+     exactamente igual que antes (una sola factura implícita). Pago
+     Proveedores NO cambia: sigue generando una sola Cuenta por Pagar
+     consolidada por esta Importación. -->
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <div>
+      <h5 class="section-title mb-0">Facturas de este despacho</h5>
+      <p class="text-muted small mb-0">
+        Si el proveedor emitió más de una factura para los productos de este despacho, cárgalas aquí y
+        asigna sus productos arriba (columna "Factura") para individualizar el Flete/Seguro/Handling Fee
+        de cada una. Pago Proveedores sigue generando una sola Cuenta por Pagar por esta Importación, sin
+        cambios.
+      </p>
+    </div>
+    <button class="btn btn-sm btn-brand" data-bs-toggle="modal" data-bs-target="#modalNuevaFacturaEmbarque">+ Agregar factura</button>
+  </div>
+  {% if imp.facturas_embarque.count() %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr>
+          <th>N° Factura</th>
+          <th>Fecha</th>
+          <th>Moneda / T.C.</th>
+          <th class="text-end"># Productos</th>
+          <th class="text-end">FOB (USD)</th>
+          <th class="text-end">CIF (USD)</th>
+          <th class="text-end">Costo total (CLP)</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for rf in resultado.facturas %}
+        {% if rf.factura %}
+        <tr>
+          <td>{{ rf.factura.numero_factura }}</td>
+          <td>{{ rf.factura.fecha_factura or '-' }}</td>
+          <td>{{ rf.factura.moneda_efectiva }} · {{ rf.factura.tipo_cambio_moneda_usd_efectivo|moneda(4) }}{% if not rf.factura.moneda_factura %}<span class="text-muted"> (de la importación)</span>{% endif %}</td>
+          <td class="text-end">{{ rf.lineas|length }}</td>
+          <td class="text-end">{{ rf.fob_usd|moneda }}</td>
+          <td class="text-end">{{ rf.cif_usd|moneda }}</td>
+          <td class="text-end fw-bold">{{ rf.costo_total_clp|clp }}</td>
+          <td class="text-end">
+            <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarFacturaEmbarque{{ rf.factura.id }}">Editar</button>
+          </td>
+        </tr>
+        {% else %}
+        <tr class="table-warning">
+          <td colspan="3"><em>Sin factura asignada</em></td>
+          <td class="text-end">{{ rf.lineas|length }}</td>
+          <td class="text-end">{{ rf.fob_usd|moneda }}</td>
+          <td class="text-end">{{ rf.cif_usd|moneda }}</td>
+          <td class="text-end fw-bold">{{ rf.costo_total_clp|clp }}</td>
+          <td></td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted small mb-0">Sin facturas individualizadas -- esta Importación se trata como una sola factura (la de arriba), igual que siempre.</p>
+  {% endif %}
+</div>
+
+<!-- Modal: nueva factura de embarque -->
+<div class="modal fade" id="modalNuevaFacturaEmbarque" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('facturas_embarque_nueva', importacion_id=imp.id) }}">
+        <div class="modal-header">
+          <h5 class="modal-title">Agregar factura del proveedor</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body row g-2">
+          <div class="col-6">
+            <label class="form-label">N° de factura</label>
+            <input type="text" class="form-control" name="numero_factura" required>
+          </div>
+          <div class="col-6">
+            <label class="form-label">Fecha</label>
+            <input type="date" class="form-control" name="fecha_factura">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Moneda (opcional)</label>
+            <input type="text" class="form-control" name="moneda_factura" placeholder="Si no se carga, usa {{ imp.moneda_factura }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Unid. por 1 USD (opcional)</label>
+            <input type="number" step="0.0001" class="form-control" name="tipo_cambio_moneda_usd" placeholder="Si no se carga, usa el de la importación">
+          </div>
+          <div class="col-12">
+            <label class="form-label">Notas</label>
+            <input type="text" class="form-control" name="notas">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-brand">Agregar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% for f in imp.facturas_embarque %}
+<!-- Modal: editar factura de embarque {{ f.id }} -->
+<div class="modal fade" id="modalEditarFacturaEmbarque{{ f.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('facturas_embarque_editar', factura_id=f.id) }}">
+        <div class="modal-header">
+          <h5 class="modal-title">Editar factura {{ f.numero_factura }}</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body row g-2">
+          <div class="col-6">
+            <label class="form-label">N° de factura</label>
+            <input type="text" class="form-control" name="numero_factura" value="{{ f.numero_factura }}" required>
+          </div>
+          <div class="col-6">
+            <label class="form-label">Fecha</label>
+            <input type="date" class="form-control" name="fecha_factura" value="{{ f.fecha_factura or '' }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Moneda (opcional)</label>
+            <input type="text" class="form-control" name="moneda_factura" value="{{ f.moneda_factura or '' }}" placeholder="Si no se carga, usa {{ imp.moneda_factura }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Unid. por 1 USD (opcional)</label>
+            <input type="number" step="0.0001" class="form-control" name="tipo_cambio_moneda_usd" value="{{ f.tipo_cambio_moneda_usd or '' }}" placeholder="Si no se carga, usa el de la importación">
+          </div>
+          <div class="col-12">
+            <label class="form-label">Notas</label>
+            <input type="text" class="form-control" name="notas" value="{{ f.notas or '' }}">
+          </div>
+        </div>
+        <div class="modal-footer d-flex justify-content-between">
+          <button type="submit" form="formEliminarFacturaEmbarque{{ f.id }}" class="btn btn-outline-danger">Eliminar</button>
+          <button type="submit" class="btn btn-brand">Guardar</button>
+        </div>
+      </form>
+      <form id="formEliminarFacturaEmbarque{{ f.id }}" method="post" action="{{ url_for('facturas_embarque_eliminar', factura_id=f.id) }}" onsubmit="return confirm('¿Eliminar esta factura? Los productos que tenía asignados quedarán sin factura (no se borran).');"></form>
+    </div>
+  </div>
+</div>
+{% endfor %}
 
 <div class="row g-3 mb-3">
   <div class="col-lg-6">
@@ -420,6 +596,7 @@
               <th class="col-check-cargo" style="display:none;"></th>
               <th>Concepto</th>
               <th>Referencia</th>
+              {% if imp.facturas_embarque.count() %}<th>Aplica a</th>{% endif %}
               <th class="text-end">Monto</th>
             </tr>
           </thead>
@@ -431,13 +608,22 @@
               </td>
               <td>{{ c.concepto }}</td>
               <td>{{ c.referencia or '-' }}</td>
+              {% if imp.facturas_embarque.count() %}
+              <td>
+                {% if c.facturas_aplicables %}
+                  {% for f in c.facturas_aplicables %}<span class="badge bg-secondary">{{ f.numero_factura }}</span>{% endfor %}
+                {% else %}
+                  <span class="badge bg-info text-dark">Todo el despacho</span>
+                {% endif %}
+              </td>
+              {% endif %}
               <td class="text-end">
                 {{ c.monto_moneda|moneda }} {{ c.moneda }}
                 {% if c.moneda != 'USD' %}<div class="text-muted small">≈ {{ c.monto_usd|moneda }} USD · T/C {{ c.tipo_cambio|moneda(4) }}</div>{% endif %}
               </td>
             </tr>
             {% else %}
-            <tr><td colspan="4" class="text-center text-muted py-3">Sin ítems cargados (Flete, Seguro, Handling Fee, etc.).</td></tr>
+            <tr><td colspan="5" class="text-center text-muted py-3">Sin ítems cargados (Flete, Seguro, Handling Fee, etc.).</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -730,6 +916,18 @@
           <div class="col-4"><label class="form-label">Monto *</label><input type="number" step="0.01" class="form-control" name="monto_moneda" required></div>
           <div class="col-4 campo-tc-cargo"><label class="form-label">Unid. por 1 USD</label><input type="number" step="0.0001" class="form-control" name="tipo_cambio" value="{{ imp.tipo_cambio_moneda_usd }}"></div>
           <div class="col-12"><label class="form-label">Referencia</label><input class="form-control" name="referencia" placeholder="Ej: Línea 24 de la Invoice"></div>
+          {% if imp.facturas_embarque.count() %}
+          <div class="col-12">
+            <label class="form-label">¿A qué factura(s) corresponde? (opcional)</label>
+            <div class="form-text mt-0 mb-1">Si no marcas ninguna, se prorratea entre TODOS los productos del despacho (como siempre).</div>
+            {% for f in imp.facturas_embarque %}
+            <div class="form-check form-check-inline">
+              <input class="form-check-input" type="checkbox" name="facturas_ids" value="{{ f.id }}" id="cargoNuevoFactura{{ f.id }}">
+              <label class="form-check-label" for="cargoNuevoFactura{{ f.id }}">{{ f.numero_factura }}</label>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
           <div class="col-12">
             <div class="form-text mt-0">
               Monto = <strong>total de la factura completa</strong> para este concepto (no el de un parcial
@@ -771,6 +969,18 @@
           <div class="col-4"><label class="form-label">Monto</label><input type="number" step="0.01" class="form-control" name="monto_moneda" value="{{ c.monto_moneda }}"></div>
           <div class="col-4 campo-tc-cargo"><label class="form-label">Unid. por 1 USD</label><input type="number" step="0.0001" class="form-control" name="tipo_cambio" value="{{ c.tipo_cambio }}"></div>
           <div class="col-12"><label class="form-label">Referencia</label><input class="form-control" name="referencia" value="{{ c.referencia or '' }}"></div>
+          {% if imp.facturas_embarque.count() %}
+          <div class="col-12">
+            <label class="form-label">¿A qué factura(s) corresponde? (opcional)</label>
+            <div class="form-text mt-0 mb-1">Si no marcas ninguna, se prorratea entre TODOS los productos del despacho (como siempre).</div>
+            {% for f in imp.facturas_embarque %}
+            <div class="form-check form-check-inline">
+              <input class="form-check-input" type="checkbox" name="facturas_ids" value="{{ f.id }}" id="cargoEditar{{ c.id }}Factura{{ f.id }}" {% if f in c.facturas_aplicables %}checked{% endif %}>
+              <label class="form-check-label" for="cargoEditar{{ c.id }}Factura{{ f.id }}">{{ f.numero_factura }}</label>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
         </div>
         <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
       </form>
@@ -1085,6 +1295,29 @@ document.querySelectorAll('.form-mover-parcial').forEach(form => {
     const seleccionadas = document.querySelectorAll(`.check-linea-parcial[data-parcial="${parcialId}"]:checked`);
     if (seleccionadas.length === 0) {
       alert('Selecciona al menos un producto de este parcial antes de moverlo.');
+      e.preventDefault();
+      return;
+    }
+    seleccionadas.forEach(b => {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'linea_ids';
+      input.value = b.value;
+      form.appendChild(input);
+    });
+  });
+});
+
+// Asignar productos seleccionados a una factura real del proveedor (punto
+// 4, pedido del usuario 2026-10-02/03) -- mismo mecanismo que mover a otro
+// parcial arriba, pero manda a parcial_lineas_asignar_factura_masivo.
+document.querySelectorAll('.form-asignar-factura').forEach(form => {
+  form.addEventListener('submit', (e) => {
+    const parcialId = form.dataset.parcial;
+    form.querySelectorAll('input[name="linea_ids"]').forEach(el => el.remove());
+    const seleccionadas = document.querySelectorAll(`.check-linea-parcial[data-parcial="${parcialId}"]:checked`);
+    if (seleccionadas.length === 0) {
+      alert('Selecciona al menos un producto de este parcial antes de asignarlo a una factura.');
       e.preventDefault();
       return;
     }
