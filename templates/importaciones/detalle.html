@@ -611,7 +611,8 @@
               <th class="col-check-cargo" style="display:none;"></th>
               <th>Concepto</th>
               <th>Referencia</th>
-              {% if imp.facturas_embarque.count() %}<th>Aplica a</th>{% endif %}
+              {% if imp.facturas_embarque.count() %}<th>Aplica a (costeo)</th>{% endif %}
+              <th>Factura de pago</th>
               <th class="text-end">Monto</th>
             </tr>
           </thead>
@@ -632,13 +633,22 @@
                 {% endif %}
               </td>
               {% endif %}
+              <td>
+                {% if c.factura_pago_implicita %}
+                  <span class="badge bg-success">Implícita ({{ imp.numero_factura or 'sin número' }})</span>
+                {% elif c.factura_pago_embarque %}
+                  <span class="badge bg-success">{{ c.factura_pago_embarque.numero_factura }}</span>
+                {% else %}
+                  <span class="badge bg-light text-muted border">Ninguna (solo costeo)</span>
+                {% endif %}
+              </td>
               <td class="text-end">
                 {{ c.monto_moneda|moneda }} {{ c.moneda }}
                 {% if c.moneda != 'USD' %}<div class="text-muted small">≈ {{ c.monto_usd|moneda }} USD · T/C {{ c.tipo_cambio|moneda(4) }}</div>{% endif %}
               </td>
             </tr>
             {% else %}
-            <tr><td colspan="5" class="text-center text-muted py-3">Sin ítems cargados (Flete, Seguro, Handling Fee, etc.).</td></tr>
+            <tr><td colspan="6" class="text-center text-muted py-3">Sin ítems cargados (Flete, Seguro, Handling Fee, etc.).</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -944,6 +954,17 @@
           </div>
           {% endif %}
           <div class="col-12">
+            <label class="form-label">¿En cuál factura del proveedor está facturado este monto? (opcional, para Pago Proveedores)</label>
+            <div class="form-text mt-0 mb-1">Si el proveedor realmente te cobra este ítem dentro de una de sus facturas, elegila aquí para que su Cuenta por Pagar coincida con lo que esa factura dice -- esto NO cambia entre qué productos se reparte arriba, son dos cosas independientes. Por defecto ninguna (se usa solo para costeo, como siempre).</div>
+            <select class="form-select" name="factura_pago_grupo">
+              <option value="">Ninguna -- solo para costeo (como siempre)</option>
+              <option value="implicita">Factura implícita de la Importación ({{ imp.numero_factura or 'sin número' }})</option>
+              {% for f in imp.facturas_embarque %}
+              <option value="{{ f.id }}">{{ f.numero_factura }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-12">
             <div class="form-text mt-0">
               Monto = <strong>total de la factura completa</strong> para este concepto (no el de un parcial
               en particular). Por defecto se precarga en la moneda de la factura ({{ imp.moneda_factura }}) —
@@ -996,6 +1017,22 @@
             {% endfor %}
           </div>
           {% endif %}
+          <div class="col-12">
+            <label class="form-label">¿En cuál factura del proveedor está facturado este monto? (opcional, para Pago Proveedores)</label>
+            <div class="form-text mt-0 mb-1">Si el proveedor realmente te cobra este ítem dentro de una de sus facturas, elegila aquí para que su Cuenta por Pagar coincida con lo que esa factura dice -- esto NO cambia entre qué productos se reparte arriba, son dos cosas independientes. Por defecto ninguna (se usa solo para costeo, como siempre).</div>
+            <select class="form-select" name="factura_pago_grupo">
+              <option value="" {% if not c.factura_pago_id and not c.factura_pago_implicita %}selected{% endif %}>Ninguna -- solo para costeo (como siempre)</option>
+              <option value="implicita" {% if c.factura_pago_implicita %}selected{% endif %}>Factura implícita de la Importación ({{ imp.numero_factura or 'sin número' }})</option>
+              {% for f in imp.facturas_embarque %}
+              <option value="{{ f.id }}" {% if c.factura_pago_id==f.id %}selected{% endif %}>{{ f.numero_factura }}</option>
+              {% endfor %}
+            </select>
+            {% if c.factura_pago_id and imp.facturas_pago.filter_by(factura_embarque_id=c.factura_pago_id).first() %}
+            <div class="form-text text-warning mt-1">Esa factura ya tiene una Cuenta por Pagar generada -- si cambiás esto, NO se actualiza sola (ver aviso en Pago Proveedores al volver a presionar "Generar factura").</div>
+            {% elif c.factura_pago_implicita and imp.facturas_pago.filter_by(factura_embarque_id=None).first() %}
+            <div class="form-text text-warning mt-1">La factura implícita ya tiene una Cuenta por Pagar generada -- si cambiás esto, NO se actualiza sola (ver aviso en Pago Proveedores al volver a presionar "Generar factura").</div>
+            {% endif %}
+          </div>
         </div>
         <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
       </form>

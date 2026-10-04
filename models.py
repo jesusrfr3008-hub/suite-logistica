@@ -1746,6 +1746,22 @@ class CargoAdicionalImportacion(db.Model):
         "FacturaEmbarqueImportacion", secondary="cargo_factura_aplicable", backref="cargos_especificos"
     )
 
+    # Ronda BA (2026-10-04, 2da corrección a pedido del usuario): lo de
+    # arriba (facturas_aplicables) decide entre qué PRODUCTOS se reparte
+    # este monto para el COSTEO (puede ser varias facturas a la vez, o
+    # ninguna = todas). Esto de abajo es una pregunta DISTINTA e
+    # independiente: a cuál factura REAL del proveedor hay que sumarle este
+    # monto para que su Cuenta por Pagar en Pago Proveedores coincida con lo
+    # que esa factura puntual dice que se le debe -- un monto de plata solo
+    # puede estar facturado en UN documento real, por eso es un solo valor
+    # (no una lista como facturas_aplicables). NULL/False en ambos (el
+    # default) = no se suma a ninguna Cuenta por Pagar, el comportamiento de
+    # siempre (este item queda solo para costeo, como hasta ahora).
+    factura_pago_id = db.Column(db.Integer, db.ForeignKey("facturas_embarque_importacion.id"), nullable=True)
+    factura_pago_implicita = db.Column(db.Boolean, default=False)  # True = va a la Cuenta por Pagar "implícita" (numero_factura de la Importación), no a una FacturaEmbarqueImportacion puntual
+
+    factura_pago_embarque = db.relationship("FacturaEmbarqueImportacion", foreign_keys=[factura_pago_id])
+
     @property
     def monto_usd(self):
         moneda = self.moneda or "USD"
@@ -1849,6 +1865,17 @@ class FacturaProveedor(db.Model):
     fecha_emision = db.Column(db.Date, nullable=True)
     moneda = db.Column(db.String(10), default="USD")
     valor_factura = db.Column(db.Float, default=0)  # en 'moneda' -- el valor TOTAL de la factura
+    # Ronda BA (2026-10-04, 2da corrección): desglose de valor_factura entre
+    # lo que es por productos y lo que es por Flete/Seguro/Handling
+    # Fee/Otros que el usuario asignó explícitamente a ESTA factura (ver
+    # CargoAdicionalImportacion.factura_pago_id/factura_pago_implicita).
+    # NULL (facturas generadas antes de este cambio) = toda la diferencia es
+    # "productos", no había forma de asignar cargos a una factura puntual
+    # todavía -- se trata como 0 en los cálculos/plantillas. No se
+    # recalculan solas si se agregan/cambian cargos después de generada esta
+    # factura -- ver el aviso en importacion_generar_factura.
+    subtotal_productos_moneda = db.Column(db.Float, nullable=True)
+    cargos_adicionales_moneda = db.Column(db.Float, nullable=True)
     fecha_vencimiento = db.Column(db.Date, nullable=True)
     # Valor en CLP solo de REFERENCIA (al tipo de cambio vigente cuando se
     # registro la factura) -- informativo para el listado; NO es el que se

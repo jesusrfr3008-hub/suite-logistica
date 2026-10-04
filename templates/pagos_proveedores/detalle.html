@@ -35,6 +35,11 @@
         <div class="col-6 col-md-3">
           <div class="small text-muted">Valor factura</div>
           <div class="fw-semibold">{{ factura.valor_factura|moneda }} {{ factura.moneda }}</div>
+          {% if factura.cargos_adicionales_moneda %}
+          <div class="text-muted" style="font-size:0.78rem;">
+            Productos: {{ factura.subtotal_productos_moneda|moneda }} + Flete/Seguro/Handling/Otros: {{ factura.cargos_adicionales_moneda|moneda }}
+          </div>
+          {% endif %}
         </div>
         <div class="col-6 col-md-3">
           <div class="small text-muted">Saldo pendiente</div>

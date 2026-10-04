@@ -551,6 +551,8 @@ def ensure_schema_migrations():
         "cargos_adicionales_importacion": [
             ("moneda", "VARCHAR(10) DEFAULT 'USD'"),
             ("tipo_cambio", "FLOAT DEFAULT 1"),
+            ("factura_pago_id", "INTEGER"),
+            ("factura_pago_implicita", "BOOLEAN DEFAULT 0"),
         ],
         "despachos": [
             ("url_tracking_manual", "VARCHAR(500)"),
@@ -581,6 +583,8 @@ def ensure_schema_migrations():
         "facturas_proveedor": [
             ("origen", "VARCHAR(20) DEFAULT 'manual'"),
             ("factura_embarque_id", "INTEGER"),
+            ("subtotal_productos_moneda", "FLOAT"),
+            ("cargos_adicionales_moneda", "FLOAT"),
         ],
         # Ronda AX (2026-09-30, a pedido del usuario): NC "solo_valor" ahora
         # tambien indica a que producto corresponde, para poder rebajar el
@@ -7555,13 +7559,15 @@ def importacion_generar_factura(importacion_id):
             numero, fecha = imp.numero_factura, imp.fecha_factura
             moneda = (imp.moneda_factura or "USD").strip().upper()
             moneda = "EUR" if moneda.startswith("EUR") else moneda
+            tc_usd_grupo = imp.tipo_cambio_moneda_usd or 1
             if not lineas_consignacion and len(lineas_grupo) == len(todas_las_lineas):
-                valor_total = round(imp.fob_total_moneda, 2)
+                subtotal_productos = round(imp.fob_total_moneda, 2)
             else:
-                valor_total = round(sum((l.valor_total_moneda for l in lineas_grupo), 0.0), 2)
+                subtotal_productos = round(sum((l.valor_total_moneda for l in lineas_grupo), 0.0), 2)
             lineas_payload = [
                 (l, round(l.valor_total_moneda, 2), l.valor_unitario_moneda or 0) for l in lineas_grupo
             ]
+            cargos_grupo = [c for c in imp.cargos_adicionales if c.factura_pago_implicita]
         else:
             # Grupo de una factura de embarque real: convierte a SU PROPIA
             # moneda (puente por USD) -- puede ser distinta de la moneda de
@@ -7571,20 +7577,34 @@ def importacion_generar_factura(importacion_id):
             numero, fecha = fe.numero_factura, fe.fecha_factura
             moneda = (fe.moneda_efectiva or "USD").strip().upper()
             moneda = "EUR" if moneda.startswith("EUR") else moneda
-            tc_usd = fe.tipo_cambio_moneda_usd_efectivo
+            tc_usd_grupo = fe.tipo_cambio_moneda_usd_efectivo
             lineas_payload = []
-            valor_total = 0.0
+            subtotal_productos = 0.0
             for l in lineas_grupo:
                 valor_usd = l.valor_total_usd
-                valor_destino = valor_usd if moneda == "USD" else valor_usd * tc_usd
+                valor_destino = valor_usd if moneda == "USD" else valor_usd * tc_usd_grupo
                 valor_unit_destino = (valor_destino / l.cantidad_unidades) if l.cantidad_unidades else 0
-                valor_total += valor_destino
+                subtotal_productos += valor_destino
                 lineas_payload.append((l, round(valor_destino, 2), round(valor_unit_destino, 4)))
-            valor_total = round(valor_total, 2)
+            subtotal_productos = round(subtotal_productos, 2)
+            cargos_grupo = [c for c in imp.cargos_adicionales if c.factura_pago_id == factura_embarque_id]
 
         if not numero or not fecha:
             sin_datos.append(numero or f"(factura de embarque sin número, #{factura_embarque_id})")
             continue
+
+        # Ronda BA (2026-10-04, 2da corrección a pedido del usuario): si hay
+        # Flete/Seguro/Handling Fee/Otros asignados explícitamente a ESTA
+        # factura (ver CargoAdicionalImportacion.factura_pago_id/
+        # factura_pago_implicita), se suman al total -- para que la Cuenta
+        # por Pagar coincida con lo que esa factura real del proveedor dice
+        # que se le debe, no solo el valor de los productos. Si no se asignó
+        # ninguno (el caso de siempre), cargos_moneda queda en 0 y el total
+        # es igual que antes de este cambio.
+        cargos_moneda = round(sum(
+            (c.monto_usd if moneda == "USD" else c.monto_usd * tc_usd_grupo) for c in cargos_grupo
+        ), 2)
+        valor_total = round(subtotal_productos + cargos_moneda, 2)
 
         factura = FacturaProveedor(
             proveedor_id=imp.proveedor_id,
@@ -7594,6 +7614,8 @@ def importacion_generar_factura(importacion_id):
             fecha_emision=fecha,
             moneda=moneda,
             valor_factura=valor_total,
+            subtotal_productos_moneda=subtotal_productos,
+            cargos_adicionales_moneda=cargos_moneda,
             fecha_vencimiento=_calcular_fecha_vencimiento(imp.proveedor, fecha),
             estado="pendiente",
             origen="costeo",
@@ -7615,6 +7637,40 @@ def importacion_generar_factura(importacion_id):
 
     db.session.commit()
 
+    # Ronda BA (2026-10-04, 2da corrección a pedido del usuario): si una
+    # Cuenta por Pagar YA estaba generada de antes (por eso su grupo se
+    # saltó arriba) y después se le asignó un Flete/Seguro/Handling/Otros
+    # que todavía no está reflejado en su valor_factura, se avisa -- a
+    # pedido explícito del usuario NO se recalcula sola (podría tener pagos
+    # o notas de crédito ya registradas encima), queda a revisión manual.
+    avisos_cargos = []
+    for fe_id in ya_generadas_ids:
+        fp_existente = next((fp for fp in imp.facturas_pago if fp.factura_embarque_id == fe_id), None)
+        if not fp_existente:
+            continue
+        if fe_id is None:
+            cargos_grupo_fp = [c for c in imp.cargos_adicionales if c.factura_pago_implicita]
+            tc_usd_grupo_fp = imp.tipo_cambio_moneda_usd or 1
+        else:
+            cargos_grupo_fp = [c for c in imp.cargos_adicionales if c.factura_pago_id == fe_id]
+            fe_obj = FacturaEmbarqueImportacion.query.get(fe_id)
+            tc_usd_grupo_fp = fe_obj.tipo_cambio_moneda_usd_efectivo if fe_obj else (imp.tipo_cambio_moneda_usd or 1)
+        if not cargos_grupo_fp:
+            continue
+        moneda_fp = (fp_existente.moneda or "USD").strip().upper()
+        total_cargos_moneda_fp = sum(
+            (c.monto_usd if moneda_fp == "USD" else c.monto_usd * tc_usd_grupo_fp) for c in cargos_grupo_fp
+        )
+        ya_incluido_fp = fp_existente.cargos_adicionales_moneda or 0.0
+        diferencia_fp = round(total_cargos_moneda_fp - ya_incluido_fp, 2)
+        if diferencia_fp > 0.01:
+            avisos_cargos.append(
+                f"{fp_existente.numero_factura}: hay {diferencia_fp:,.2f} {fp_existente.moneda} de Flete/"
+                f"Seguro/Handling Fee/Otros asignados a ella que todavía NO están incluidos en su Cuenta por "
+                f"Pagar ya generada (quedó por {fp_existente.valor_factura:,.2f} {fp_existente.moneda}) -- "
+                "revisar y ajustar a mano si corresponde."
+            )
+
     if not creadas:
         if sin_datos:
             flash(
@@ -7623,6 +7679,8 @@ def importacion_generar_factura(importacion_id):
             )
         else:
             flash("No había ninguna factura nueva pendiente de generar en Pago Proveedores.", "info")
+        if avisos_cargos:
+            flash("Atención -- " + " | ".join(avisos_cargos), "warning")
         return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
     mensaje = f"{len(creadas)} factura(s) generada(s) en Pago Proveedores: " + ", ".join(
@@ -7637,6 +7695,8 @@ def importacion_generar_factura(importacion_id):
     if sin_datos:
         mensaje += " Pendientes por falta de número/fecha: " + ", ".join(sin_datos) + "."
     flash(mensaje, "success")
+    if avisos_cargos:
+        flash("Atención -- " + " | ".join(avisos_cargos), "warning")
     return redirect(url_for("pagos_proveedores_detalle", factura_id=creadas[0].id))
 
 
@@ -9307,6 +9367,28 @@ def importacion_legajo_eliminar(importacion_id, doc_id):
 # moneda/tipo de cambio (punto 3): por defecto se asume la moneda de la
 # factura, pero se puede cargar en otra si el proveedor lo factura distinto.
 
+def _aplicar_factura_pago_grupo(cargo, importacion_id):
+    """Ronda BA (2026-10-04, 2da corrección a pedido del usuario): parsea el
+    selector ÚNICO 'factura_pago_grupo' del formulario (a diferencia de
+    'facturas_ids', que es una lista para el costeo) y lo aplica a
+    cargo.factura_pago_id/factura_pago_implicita -- a cuál factura REAL se
+    le suma este monto para su Cuenta por Pagar en Pago Proveedores. Valores
+    posibles: "" (no asignar a ninguna, el default de siempre), "implicita"
+    (la factura implícita de la Importación), o el id de una
+    FacturaEmbarqueImportacion puntual."""
+    valor = request.form.get("factura_pago_grupo", "").strip()
+    if valor == "implicita":
+        cargo.factura_pago_id = None
+        cargo.factura_pago_implicita = True
+    elif valor:
+        fe = FacturaEmbarqueImportacion.query.filter_by(id=valor, importacion_id=importacion_id).first()
+        cargo.factura_pago_id = fe.id if fe else None
+        cargo.factura_pago_implicita = False
+    else:
+        cargo.factura_pago_id = None
+        cargo.factura_pago_implicita = False
+
+
 @app.route("/importaciones/<int:importacion_id>/cargos/nuevo", methods=["POST"])
 @requiere_permiso("generar_costeo")
 def cargos_nuevo(importacion_id):
@@ -9325,6 +9407,7 @@ def cargos_nuevo(importacion_id):
         cargo.facturas_aplicables = FacturaEmbarqueImportacion.query.filter(
             FacturaEmbarqueImportacion.id.in_(facturas_ids), FacturaEmbarqueImportacion.importacion_id == imp.id,
         ).all()
+    _aplicar_factura_pago_grupo(cargo, imp.id)
     db.session.add(cargo)
     db.session.commit()
     flash(f"'{cargo.concepto}' agregado.", "success")
@@ -9348,6 +9431,7 @@ def cargos_editar(cargo_id):
             FacturaEmbarqueImportacion.importacion_id == cargo.importacion_id,
         ).all() if facturas_ids else []
     )
+    _aplicar_factura_pago_grupo(cargo, cargo.importacion_id)
     db.session.commit()
     flash("Actualizado.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=cargo.importacion_id))
@@ -9359,9 +9443,12 @@ def cargos_editar(cargo_id):
 # productos de un mismo despacho, cada una con su propia porcion de
 # Flete/Seguro/Handling Fee (CargoAdicionalImportacion.facturas_aplicables
 # arriba). Independiente del Parcial (regimen aduanero/DIN) a pedido
-# explicito del usuario -- ver FacturaEmbarqueImportacion en models.py. NO
-# afecta a Pago Proveedores: la Cuenta por Pagar sigue consolidada en una
-# sola FacturaProveedor por Importacion, sin cambios (importacion_generar_factura). ---
+# explicito del usuario -- ver FacturaEmbarqueImportacion en models.py.
+# Ronda BA (2026-10-04, 2da corrección): Pago Proveedores ahora SI puede
+# verse afectado -- cada CargoAdicionalImportacion puede marcar, aparte,
+# a cuál factura puntual se le suma su monto para la Cuenta por Pagar (ver
+# CargoAdicionalImportacion.factura_pago_id/factura_pago_implicita y
+# importacion_generar_factura). ---
 
 @app.route("/importaciones/<int:importacion_id>/facturas-embarque/nueva", methods=["POST"])
 @requiere_permiso("generar_costeo")
