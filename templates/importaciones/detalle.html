@@ -69,18 +69,24 @@
     <button class="btn btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#modalCargaLotesImportacion">Carga Lotes</button>
     <button class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarImportacion">Editar datos</button>
     {% if current_user.tiene_permiso('pagos_proveedores') or current_user.tiene_permiso('generar_costeo') %}
-      {% if imp.factura_pago %}
-      <a href="{{ url_for('pagos_proveedores_detalle', factura_id=imp.factura_pago.id) }}" class="btn btn-outline-success">
-        Ver factura en Pago Proveedores
-      </a>
-      {% else %}
+      {% if imp.facturas_pago.count() %}
+      <div class="dropdown">
+        <button class="btn btn-outline-success dropdown-toggle" type="button" data-bs-toggle="dropdown">
+          Ver factura(s) en Pago Proveedores ({{ imp.facturas_pago.count() }})
+        </button>
+        <ul class="dropdown-menu">
+          {% for fp in imp.facturas_pago %}
+          <li><a class="dropdown-item" href="{{ url_for('pagos_proveedores_detalle', factura_id=fp.id) }}">{{ fp.numero_factura }} -- {{ fp.valor_factura|moneda }} {{ fp.moneda }}</a></li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
       <form method="post" action="{{ url_for('importacion_generar_factura', importacion_id=imp.id) }}"
-            onsubmit="return confirm('¿Generar la cuenta por pagar de esta importación en Pago Proveedores? Usa el N° y fecha de factura ya cargados aquí.');">
-        <button class="btn btn-outline-success" {{ 'disabled title=Carga primero N° y fecha de factura' if not imp.numero_factura or not imp.fecha_factura }}>
-          Generar factura
+            onsubmit="return confirm('¿Generar en Pago Proveedores la(s) Cuenta(s) por Pagar pendiente(s) de esta importación? Si hay varias facturas individualizadas, se genera una por cada una (las que ya se generaron antes no se duplican).');">
+        <button class="btn btn-outline-success">
+          Generar factura{{ 's' if imp.facturas_embarque.count() > 1 }}
         </button>
       </form>
-      {% endif %}
     {% endif %}
     <form method="post" action="{{ url_for('importaciones_eliminar', importacion_id=imp.id) }}" onsubmit="return confirm('¿Eliminar esta importación y todo su costeo?');">
       <button class="btn btn-outline-danger">Eliminar</button>
@@ -445,6 +451,7 @@
           <th class="text-end">FOB (USD)</th>
           <th class="text-end">CIF (USD)</th>
           <th class="text-end">Costo total (CLP)</th>
+          <th>Pago Proveedores</th>
           <th></th>
         </tr>
       </thead>
@@ -459,6 +466,13 @@
           <td class="text-end">{{ rf.fob_usd|moneda }}</td>
           <td class="text-end">{{ rf.cif_usd|moneda }}</td>
           <td class="text-end fw-bold">{{ rf.costo_total_clp|clp }}</td>
+          <td>
+            {% if rf.factura.factura_proveedor_generada %}
+            <a href="{{ url_for('pagos_proveedores_detalle', factura_id=rf.factura.factura_proveedor_generada.id) }}" class="badge bg-success text-decoration-none">Generada</a>
+            {% else %}
+            <span class="badge bg-secondary">Pendiente</span>
+            {% endif %}
+          </td>
           <td class="text-end">
             <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarFacturaEmbarque{{ rf.factura.id }}">Editar</button>
           </td>
@@ -470,6 +484,7 @@
           <td class="text-end">{{ rf.fob_usd|moneda }}</td>
           <td class="text-end">{{ rf.cif_usd|moneda }}</td>
           <td class="text-end fw-bold">{{ rf.costo_total_clp|clp }}</td>
+          <td></td>
           <td></td>
         </tr>
         {% endif %}

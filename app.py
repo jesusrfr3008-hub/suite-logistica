@@ -580,6 +580,7 @@ def ensure_schema_migrations():
         ],
         "facturas_proveedor": [
             ("origen", "VARCHAR(20) DEFAULT 'manual'"),
+            ("factura_embarque_id", "INTEGER"),
         ],
         # Ronda AX (2026-09-30, a pedido del usuario): NC "solo_valor" ahora
         # tambien indica a que producto corresponde, para poder rebajar el
@@ -7481,47 +7482,47 @@ def importacion_generar_factura(importacion_id):
     de factura real cargados) en vez de automático al primer cálculo de
     Costeo, porque el Costeo se recalcula en vivo cada vez que se abre la
     pantalla (nada se "confirma") -- así el usuario decide el momento exacto
-    en que esa cuenta por pagar queda registrada, y nunca se duplica (una
-    Importación solo puede tener una FacturaProveedor, ver
-    Importacion.factura_pago).
+    en que esa cuenta por pagar queda registrada.
 
     Ronda AX (2026-09-30, punto 2, a pedido del usuario): si esta
     Importación trae líneas que vienen de una OC marcada consignación (ver
-    _es_consignacion_parcial_linea), esas líneas específicas NO entran a la
-    FacturaProveedor -- todavía no hay factura real del proveedor, recién
-    la habrá cuando se le informe qué se usó (ver
+    _es_consignacion_parcial_linea), esas líneas específicas NO entran a
+    ninguna FacturaProveedor -- todavía no hay factura real del proveedor,
+    recién la habrá cuando se le informe qué se usó (ver
     pagos_proveedores_emitir_documento). En vez de eso, sus lotes se
-    registran en ConsignacionPendienteLote. Si TODAS las líneas son de
-    consignación, no se genera ninguna FacturaProveedor."""
+    registran en ConsignacionPendienteLote.
+
+    Ronda BA (2026-10-04, punto 4, CORREGIDO a pedido del usuario tras
+    revisar el primer diseño): el usuario aclaró que el estado de cuenta
+    que le manda el proveedor llega discriminado por factura, así que cada
+    factura real individualizada en el costeo (ver
+    FacturaEmbarqueImportacion) debe generar su PROPIA Cuenta por Pagar acá
+    -- NO una consolidada por Importación como se había construido primero.
+    Las líneas normales se agrupan por su factura (ParcialLinea.
+    factura_embarque_id); las que no tienen ninguna asignada (o el caso de
+    SIEMPRE, una Importación que nunca individualizó ninguna factura) caen
+    en el grupo "implícito", que usa el número/fecha/moneda de la propia
+    Importación -- EXACTAMENTE el cálculo y los valores de antes de este
+    cambio, verificado con test dedicado (compatibilidad total con datos ya
+    cargados). Cada grupo genera como máximo UNA FacturaProveedor (dedup
+    por FacturaProveedor.factura_embarque_id vía Importacion.facturas_pago)
+    -- así el botón se puede volver a presionar después de agregar una
+    factura nueva sin duplicar las que ya se generaron."""
     imp = Importacion.query.get_or_404(importacion_id)
-    if imp.factura_pago:
-        flash(
-            f"Esta importación ya tiene una factura en Pago Proveedores ({imp.factura_pago.numero_factura}).",
-            "warning",
-        )
-        return redirect(url_for("pagos_proveedores_detalle", factura_id=imp.factura_pago.id))
     if imp.parciales.count() == 0:
         flash("Esta importación todavía no tiene parciales/productos cargados -- no hay nada que facturar.", "warning")
-        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
-    if not imp.numero_factura or not imp.fecha_factura:
-        flash("Carga el número y la fecha de factura de esta importación antes de generar la cuenta por pagar.", "warning")
         return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
     todas_las_lineas = [linea for parcial in imp.parciales for linea in parcial.lineas]
     lineas_consignacion = [l for l in todas_las_lineas if _es_consignacion_parcial_linea(l)]
     lineas_normales = [l for l in todas_las_lineas if l not in lineas_consignacion]
 
-    lotes_consignacion_registrados = 0
     if lineas_consignacion and not imp.consignacion_registrada:
         for linea in lineas_consignacion:
             _registrar_consignacion_recibida(imp.proveedor_id, linea)
-            lotes_consignacion_registrados += 1
         imp.consignacion_registrada = True
-    elif lineas_consignacion and imp.consignacion_registrada:
-        # Ya se registraron antes (ej. se volvió a presionar el botón
-        # porque todas las líneas eran de consignación y no quedó ninguna
-        # FacturaProveedor que bloqueara un segundo click) -- no duplicar.
-        pass
+    # Si ya estaba registrada antes (ej. se volvió a presionar el botón),
+    # no se duplica -- no hace falta hacer nada más aquí.
 
     if not lineas_normales:
         db.session.commit()
@@ -7534,49 +7535,109 @@ def importacion_generar_factura(importacion_id):
         )
         return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
-    moneda = (imp.moneda_factura or "USD").strip().upper()
-    moneda = "EUR" if moneda.startswith("EUR") else moneda
-    valor_factura_normales = round(sum((l.valor_total_moneda for l in lineas_normales), 0.0), 2)
-    factura = FacturaProveedor(
-        proveedor_id=imp.proveedor_id,
-        importacion_id=imp.id,
-        numero_factura=imp.numero_factura,
-        fecha_emision=imp.fecha_factura,
-        moneda=moneda,
-        valor_factura=(valor_factura_normales if lineas_consignacion else round(imp.fob_total_moneda, 2)),
-        fecha_vencimiento=_calcular_fecha_vencimiento(imp.proveedor, imp.fecha_factura),
-        estado="pendiente",
-        origen="costeo",
-    )
-    db.session.add(factura)
-    db.session.flush()
+    grupos = defaultdict(list)
+    for l in lineas_normales:
+        grupos[l.factura_embarque_id].append(l)
 
-    n_lineas = 0
-    for linea in lineas_normales:
-        db.session.add(FacturaProveedorLinea(
-            factura_id=factura.id,
-            codigo_producto=linea.codigo,
-            descripcion=linea.descripcion,
-            codigo_lote=linea.codigo_lote,
-            cantidad=linea.cantidad_unidades or 0,
-            precio_unitario=linea.valor_unitario_moneda or 0,
-            valor_total=round(linea.valor_total_moneda, 2),
-            parcial_linea_id=linea.id,
-        ))
-        n_lineas += 1
+    ya_generadas_ids = {fp.factura_embarque_id for fp in imp.facturas_pago}
+    creadas = []
+    sin_datos = []
+
+    for factura_embarque_id, lineas_grupo in grupos.items():
+        if factura_embarque_id in ya_generadas_ids:
+            continue  # esta factura ya tiene su Cuenta por Pagar generada -- no duplicar
+
+        if factura_embarque_id is None:
+            # Grupo implícito: líneas sin factura de embarque asignada (o
+            # TODA Importación que nunca individualizó ninguna -- el caso
+            # de siempre). Usa los datos de cabecera de la Importación,
+            # con el MISMO cálculo de antes de este cambio.
+            numero, fecha = imp.numero_factura, imp.fecha_factura
+            moneda = (imp.moneda_factura or "USD").strip().upper()
+            moneda = "EUR" if moneda.startswith("EUR") else moneda
+            if not lineas_consignacion and len(lineas_grupo) == len(todas_las_lineas):
+                valor_total = round(imp.fob_total_moneda, 2)
+            else:
+                valor_total = round(sum((l.valor_total_moneda for l in lineas_grupo), 0.0), 2)
+            lineas_payload = [
+                (l, round(l.valor_total_moneda, 2), l.valor_unitario_moneda or 0) for l in lineas_grupo
+            ]
+        else:
+            # Grupo de una factura de embarque real: convierte a SU PROPIA
+            # moneda (puente por USD) -- puede ser distinta de la moneda de
+            # la Importación si el proveedor facturó esta en particular en
+            # otra moneda.
+            fe = FacturaEmbarqueImportacion.query.get(factura_embarque_id)
+            numero, fecha = fe.numero_factura, fe.fecha_factura
+            moneda = (fe.moneda_efectiva or "USD").strip().upper()
+            moneda = "EUR" if moneda.startswith("EUR") else moneda
+            tc_usd = fe.tipo_cambio_moneda_usd_efectivo
+            lineas_payload = []
+            valor_total = 0.0
+            for l in lineas_grupo:
+                valor_usd = l.valor_total_usd
+                valor_destino = valor_usd if moneda == "USD" else valor_usd * tc_usd
+                valor_unit_destino = (valor_destino / l.cantidad_unidades) if l.cantidad_unidades else 0
+                valor_total += valor_destino
+                lineas_payload.append((l, round(valor_destino, 2), round(valor_unit_destino, 4)))
+            valor_total = round(valor_total, 2)
+
+        if not numero or not fecha:
+            sin_datos.append(numero or f"(factura de embarque sin número, #{factura_embarque_id})")
+            continue
+
+        factura = FacturaProveedor(
+            proveedor_id=imp.proveedor_id,
+            importacion_id=imp.id,
+            factura_embarque_id=factura_embarque_id,
+            numero_factura=numero,
+            fecha_emision=fecha,
+            moneda=moneda,
+            valor_factura=valor_total,
+            fecha_vencimiento=_calcular_fecha_vencimiento(imp.proveedor, fecha),
+            estado="pendiente",
+            origen="costeo",
+        )
+        db.session.add(factura)
+        db.session.flush()
+        for linea, valor_total_linea, precio_unit_linea in lineas_payload:
+            db.session.add(FacturaProveedorLinea(
+                factura_id=factura.id,
+                codigo_producto=linea.codigo,
+                descripcion=linea.descripcion,
+                codigo_lote=linea.codigo_lote,
+                cantidad=linea.cantidad_unidades or 0,
+                precio_unitario=precio_unit_linea,
+                valor_total=valor_total_linea,
+                parcial_linea_id=linea.id,
+            ))
+        creadas.append(factura)
+
     db.session.commit()
-    mensaje = (
-        f"Factura {factura.numero_factura} generada en Pago Proveedores ({n_lineas} línea(s), "
-        f"{factura.valor_factura:,.2f} {moneda})."
-    )
+
+    if not creadas:
+        if sin_datos:
+            flash(
+                "No se generó ninguna Cuenta por Pagar nueva -- falta número/fecha en: " + ", ".join(sin_datos) + ".",
+                "warning",
+            )
+        else:
+            flash("No había ninguna factura nueva pendiente de generar en Pago Proveedores.", "info")
+        return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
+
+    mensaje = f"{len(creadas)} factura(s) generada(s) en Pago Proveedores: " + ", ".join(
+        f"{f.numero_factura} ({f.valor_factura:,.2f} {f.moneda})" for f in creadas
+    ) + "."
     if lineas_consignacion:
         mensaje += (
             f" Además, {len(lineas_consignacion)} línea(s) de consignación se registraron aparte en "
-            "'Consignación pendiente de facturar' -- no entraron a esta factura porque todavía no hay "
+            "'Consignación pendiente de facturar' -- no entraron a ninguna factura porque todavía no hay "
             "factura real del proveedor por esas unidades."
         )
+    if sin_datos:
+        mensaje += " Pendientes por falta de número/fecha: " + ", ".join(sin_datos) + "."
     flash(mensaje, "success")
-    return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+    return redirect(url_for("pagos_proveedores_detalle", factura_id=creadas[0].id))
 
 
 @app.route("/importaciones/<int:importacion_id>/eliminar", methods=["POST"])

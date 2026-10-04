@@ -1356,8 +1356,8 @@ class Importacion(db.Model):
     # consignación (si tiene) ya se registraron en ConsignacionPendienteLote
     # -- evita duplicar cantidad_recibida si "Generar factura" se presiona
     # más de una vez (cuando TODAS las líneas son de consignación no se
-    # crea FacturaProveedor, así que el guard normal -- imp.factura_pago --
-    # no alcanza a proteger este caso).
+    # crea FacturaProveedor, así que el guard normal -- por grupo, via
+    # facturas_pago -- no alcanza a proteger este caso).
     consignacion_registrada = db.Column(db.Boolean, default=False)
     numero_factura = db.Column(db.String(80))
     fecha_factura = db.Column(db.Date, nullable=True)
@@ -1831,6 +1831,19 @@ class FacturaProveedor(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False)
     importacion_id = db.Column(db.Integer, db.ForeignKey("importaciones.id"), nullable=True)
+    # Ronda BA (2026-10-04, punto 4, corregido a pedido del usuario): a que
+    # factura de embarque especifica corresponde esta Cuenta por Pagar, si
+    # viene de una Importacion con mas de una factura real individualizada
+    # (ver FacturaEmbarqueImportacion). NULL = la "factura implicita" de la
+    # Importacion (numero_factura/fecha_factura propios de la cabecera) --
+    # el caso de SIEMPRE, una sola factura por Importacion. El usuario
+    # aclaro que el estado de cuenta del proveedor llega discriminado por
+    # factura, asi que cada factura real debe generar su PROPIA Cuenta por
+    # Pagar (no una consolidada) -- ver importacion_generar_factura en
+    # app.py, que ahora genera una FacturaProveedor POR GRUPO (por factura
+    # de embarque, o la implicita para lineas sin asignar), en vez de una
+    # sola por Importacion.
+    factura_embarque_id = db.Column(db.Integer, db.ForeignKey("facturas_embarque_importacion.id"), nullable=True)
 
     numero_factura = db.Column(db.String(80), nullable=False)
     fecha_emision = db.Column(db.Date, nullable=True)
@@ -1852,7 +1865,16 @@ class FacturaProveedor(db.Model):
     origen = db.Column(db.String(20), default="manual")
 
     proveedor = db.relationship("Proveedor")
-    importacion = db.relationship("Importacion", backref=db.backref("factura_pago", uselist=False))
+    # Ronda BA (2026-10-04): antes era "factura_pago" (uselist=False, una
+    # sola por Importacion) -- ahora una Importacion puede tener VARIAS
+    # FacturaProveedor (una por cada factura de embarque individualizada),
+    # asi que paso a ser una coleccion. Ver factura_embarque_id arriba.
+    importacion = db.relationship("Importacion", backref=db.backref(
+        "facturas_pago", lazy="dynamic", order_by="FacturaProveedor.id",
+    ))
+    factura_embarque = db.relationship("FacturaEmbarqueImportacion", backref=db.backref(
+        "factura_proveedor_generada", uselist=False,
+    ))
     pagos = db.relationship(
         "PagoFacturaProveedor", backref="factura", cascade="all, delete-orphan",
         lazy="dynamic", order_by="PagoFacturaProveedor.fecha_pago",
