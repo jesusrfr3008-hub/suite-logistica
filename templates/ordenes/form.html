@@ -314,9 +314,16 @@ function renderListaVariantesForm(filtro) {
   const f = (filtro || '').toLowerCase();
   const lista = document.getElementById('listaVariantesForm');
   lista.innerHTML = '';
-  (productoPendienteVariante?._variantes || [])
-    .filter(v => !f || v.codigo.toLowerCase().includes(f) || v.descripcion.toLowerCase().includes(f))
-    .slice(0, 60)
+  // Ronda BB (2026-10-06, a pedido del usuario): antes esto cortaba en 60
+  // variantes SIN avisar -- un producto con más de 60 (ej. MEDICONTUR
+  // 877MTYP, ~173 variantes) dejaba el resto invisible e inalcanzable sin
+  // adivinar el filtro exacto. Ahora el límite es mucho más alto (400, de
+  // sobra para cualquier catálogo real) y si aun así se corta, se avisa.
+  const LIMITE_VARIANTES_FORM = 400;
+  const filtradas = (productoPendienteVariante?._variantes || [])
+    .filter(v => !f || v.codigo.toLowerCase().includes(f) || v.descripcion.toLowerCase().includes(f));
+  filtradas
+    .slice(0, LIMITE_VARIANTES_FORM)
     .forEach(v => {
       const yaAgregada = !!lineasAgregadas[claveLinea(productoPendienteVariante.id, v.codigo)];
       const item = document.createElement('label');
@@ -340,6 +347,12 @@ function renderListaVariantesForm(filtro) {
       item.appendChild(texto);
       lista.appendChild(item);
     });
+  if (filtradas.length > LIMITE_VARIANTES_FORM) {
+    const aviso = document.createElement('p');
+    aviso.className = 'text-warning small px-2 mb-0 mt-1';
+    aviso.textContent = `Mostrando ${LIMITE_VARIANTES_FORM} de ${filtradas.length} variantes -- usa el filtro de arriba para encontrar el resto.`;
+    lista.appendChild(aviso);
+  }
 }
 document.getElementById('buscarVarianteForm').addEventListener('input', (e) => renderListaVariantesForm(e.target.value));
 document.getElementById('btnLimpiarVariantesForm').addEventListener('click', () => {

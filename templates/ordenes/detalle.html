@@ -763,9 +763,13 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
   function renderListaVariantes(filtro) {
     const f = (filtro || '').toLowerCase();
     listaVariantes.innerHTML = '';
-    variantesProductoActual
-      .filter(v => !f || v.codigo.toLowerCase().includes(f) || v.descripcion.toLowerCase().includes(f))
-      .slice(0, 60)
+    // Ronda BB (2026-10-06, a pedido del usuario): mismo arreglo que en
+    // ordenes/form.html -- antes cortaba en 60 variantes sin avisar.
+    const LIMITE_VARIANTES = 400;
+    const filtradas = variantesProductoActual
+      .filter(v => !f || v.codigo.toLowerCase().includes(f) || v.descripcion.toLowerCase().includes(f));
+    filtradas
+      .slice(0, LIMITE_VARIANTES)
       .forEach(v => {
         const yaEnOrden = productoYaEnOrden(campoProductoId.value, v.codigo);
         const item = document.createElement('label');
@@ -789,6 +793,12 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
         item.appendChild(texto);
         listaVariantes.appendChild(item);
       });
+    if (filtradas.length > LIMITE_VARIANTES) {
+      const aviso = document.createElement('p');
+      aviso.className = 'text-warning small px-2 mb-0 mt-1';
+      aviso.textContent = `Mostrando ${LIMITE_VARIANTES} de ${filtradas.length} variantes -- usa el filtro de arriba para encontrar el resto.`;
+      listaVariantes.appendChild(aviso);
+    }
   }
 
   btnLimpiarVariantes.addEventListener('click', () => {
