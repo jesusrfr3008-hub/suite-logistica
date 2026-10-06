@@ -6680,9 +6680,21 @@ def ordenes_nota_agregar(orden_id):
 
 
 @app.route("/ordenes/<int:orden_id>/imprimir")
-@requiere_permiso("crear_orden", "aprobar_orden")
+@requiere_permiso("crear_orden", "aprobar_orden", "orden_simple")
 def ordenes_imprimir(orden_id):
+    """Ronda BC (2026-10-06, a pedido del usuario): quien tiene el perfil
+    orden_simple no podía imprimir/descargar en PDF las órdenes que EL
+    MISMO emite para enviárselas al proveedor -- antes esto era exclusivo
+    de crear_orden/aprobar_orden. Se habilita igual que para esos perfiles,
+    pero solo sobre SUS PROPIAS órdenes (ver _puede_gestionar_orden_simple).
+    El PDF/impresión siempre muestran el precio real (va dirigido al
+    proveedor, que ya lo conoce) -- el ocultamiento de precio_catalogo_oculto
+    es solo para la pantalla interna de este perfil (simple_detalle.html),
+    no para el documento que sale de la empresa."""
     orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _puede_gestionar_orden_simple(orden):
+        flash("Solo puedes imprimir/descargar las órdenes que tú mismo creaste.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
     lineas = orden.lineas.all()
     return render_template("ordenes/imprimir.html", orden=orden, lineas=lineas)
 
@@ -6782,22 +6794,28 @@ def generar_pdf_orden(orden):
 
 
 @app.route("/ordenes/<int:orden_id>/pdf")
-@requiere_permiso("crear_orden", "aprobar_orden")
+@requiere_permiso("crear_orden", "aprobar_orden", "orden_simple")
 def ordenes_pdf(orden_id):
     """Descarga directa del PDF de la orden (ronda L, punto 1) -- sirve
     tanto como fin en si mismo (el usuario quiere el archivo) como
     respaldo cuando 'Enviar por Outlook' no puede abrir Outlook (Outlook
     no instalado/no es Windows, etc.): el PDF queda generado igual y el
-    usuario lo adjunta a mano."""
+    usuario lo adjunta a mano.
+
+    Ronda BC (2026-10-06): habilitado también para orden_simple sobre sus
+    propias órdenes -- ver el mismo comentario en ordenes_imprimir arriba."""
     orden = OrdenCompra.query.get_or_404(orden_id)
+    if not _puede_gestionar_orden_simple(orden):
+        flash("Solo puedes imprimir/descargar las órdenes que tú mismo creaste.", "danger")
+        return redirect(url_for("ordenes_simple_list"))
     if orden.lineas.count() == 0:
         flash("La orden no tiene productos todavía, no se puede generar el PDF.", "warning")
-        return redirect(url_for("ordenes_detalle", orden_id=orden_id))
+        return redirect(_destino_detalle_orden(orden))
     try:
         ruta_pdf = generar_pdf_orden(orden)
     except Exception as exc:
         flash(f"No se pudo generar el PDF de la orden: {exc}", "danger")
-        return redirect(url_for("ordenes_detalle", orden_id=orden_id))
+        return redirect(_destino_detalle_orden(orden))
     directorio, nombre = os.path.split(ruta_pdf)
     return send_from_directory(
         directorio, nombre, as_attachment=True,

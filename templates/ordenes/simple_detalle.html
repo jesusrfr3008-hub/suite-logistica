@@ -38,6 +38,8 @@
     </div>
   </div>
   <div class="d-flex gap-2">
+    <a href="{{ url_for('ordenes_imprimir', orden_id=orden.id) }}" target="_blank" class="btn btn-outline-secondary"><i class="bi bi-printer"></i> Imprimir / PDF</a>
+    <a href="{{ url_for('ordenes_pdf', orden_id=orden.id) }}" class="btn btn-outline-secondary"><i class="bi bi-file-earmark-pdf"></i> Descargar PDF</a>
     {% if orden.estado == 'Emisión de Orden' %}
     <form method="post" action="{{ url_for('ordenes_simple_cancelar', orden_id=orden.id) }}" onsubmit="return confirm('¿Anular esta orden completa? Se eliminará del sistema junto con sus líneas y documentos.');">
       <button class="btn btn-outline-danger">Anular orden</button>
