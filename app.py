@@ -516,6 +516,10 @@ def ensure_schema_migrations():
             ("creado_por_usuario_id", "INTEGER"),
             ("estado_aprobacion", "VARCHAR(20) DEFAULT 'Aprobada'"),
             ("es_consignacion", "BOOLEAN DEFAULT 0"),
+            # Ronda BD (2026-10-07): distingue "Sin Emitir" por borrador nunca
+            # enviado (False, default) de "Sin Emitir" por devolución real
+            # del aprobador (True) -- ver el comentario en models.py.
+            ("fue_devuelta_por_aprobador", "BOOLEAN DEFAULT 0"),
         ],
         "importaciones": [
             ("despacho_id", "INTEGER"),
@@ -5303,6 +5307,11 @@ def ordenes_devolver_aprobacion(orden_id):
         flash("Esta orden ya no está 'Por Aprobar'.", "warning")
         return redirect(url_for("ordenes_por_aprobar"))
     orden.estado_aprobacion = "Sin Emitir"
+    # Ronda BD (2026-10-07): esta SI es una devolución real por quien
+    # aprueba (a diferencia de "Guardar y continuar después" en
+    # ordenes_nueva, que deja la orden en el mismo estado pero sin pasar por
+    # acá) -- distingue el mensaje que ve el creador en la pantalla.
+    orden.fue_devuelta_por_aprobador = True
     motivo = (request.form.get("motivo") or "").strip()
     sello = f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} · {current_user.nombre_completo}]"
     nota = f"{sello} Devolvió la orden (queda 'Sin Emitir')."

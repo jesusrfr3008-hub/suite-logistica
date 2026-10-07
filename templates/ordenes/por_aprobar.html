@@ -8,10 +8,12 @@
     <div class="text-muted small">
       {% if puede_aprobar %}
       Órdenes nuevas que todavía no son una Orden de Compra definitiva (de cualquier usuario), más
-      las que devolviste y siguen "Sin Emitir" mientras las corrigen.
+      las tuyas que siguen "Sin Emitir" -- ya sea un borrador propio sin enviar o una que devolviste
+      y están corrigiendo.
       {% else %}
-      Tus propias órdenes que todavía no son una Orden de Compra definitiva, o que fueron devueltas
-      ("Sin Emitir") para que las corrijas y reenvíes.
+      Tus propias órdenes que todavía no son una Orden de Compra definitiva, o que están
+      "Sin Emitir" (un borrador propio sin enviar, o una devuelta por el aprobador) para que las
+      completes y envíes.
       {% endif %}
     </div>
   </div>
@@ -49,8 +51,10 @@
           <td>
             {% if o.estado_aprobacion == 'Por Aprobar' %}
               <span class="badge bg-warning text-dark">Por Aprobar</span>
+            {% elif o.fue_devuelta_por_aprobador %}
+              <span class="badge bg-danger" data-bs-toggle="tooltip" title="Devuelta por quien aprueba">Sin Emitir</span>
             {% else %}
-              <span class="badge bg-danger">Sin Emitir</span>
+              <span class="badge bg-secondary" data-bs-toggle="tooltip" title="Borrador guardado, sin enviar">Sin Emitir</span>
             {% endif %}
           </td>
           <td class="text-end">{{ "%.2f"|format(o.total) }} {{ o.moneda }}</td>
@@ -64,7 +68,7 @@
               <button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#modalDevolver{{ o.id }}">Devolver</button>
               {% elif o.estado_aprobacion == 'Sin Emitir' and o.creado_por_usuario_id == current_user.id %}
               <form method="post" action="{{ url_for('ordenes_reenviar_aprobacion', orden_id=o.id) }}">
-                <button type="submit" class="btn btn-sm btn-brand">Reenviar</button>
+                <button type="submit" class="btn btn-sm btn-brand">{{ 'Reenviar' if o.fue_devuelta_por_aprobador else 'Enviar' }}</button>
               </form>
               {% endif %}
             </div>

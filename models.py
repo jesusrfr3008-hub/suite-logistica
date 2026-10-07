@@ -814,6 +814,16 @@ class OrdenCompra(db.Model):
     # ESTADOS_APROBACION_OC mas arriba. Default "Aprobada" para que la
     # migracion automatica no oculte ninguna orden ya existente.
     estado_aprobacion = db.Column(db.String(20), default="Aprobada")
+    # Ronda BD (2026-10-07, a pedido del usuario): "Sin Emitir" significaba
+    # dos cosas muy distintas en la misma columna -- 1) un borrador guardado
+    # con "Guardar y continuar después" (ordenes_nueva) que NUNCA se envió a
+    # aprobación, y 2) una orden que SI se envió y el aprobador la devolvió
+    # (ver ordenes_devolver_aprobacion). La pantalla mostraba siempre el
+    # mensaje de "fue devuelta por quien aprueba" aunque fuera un simple
+    # borrador que el usuario jamás envió. Este flag distingue el caso 2
+    # (True = genuinamente devuelta) del caso 1 (False = borrador propio,
+    # default). Solo se pone True en ordenes_devolver_aprobacion.
+    fue_devuelta_por_aprobador = db.Column(db.Boolean, default=False)
     # Consignación (ronda AH, 2026-09-16): la orden COMPLETA (no por línea)
     # se marca en consignación desde su emisión -- esos productos llegan con
     # una pro-forma invoice y el proveedor solo emite la factura real

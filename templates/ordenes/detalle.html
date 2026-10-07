@@ -55,12 +55,17 @@
 <div class="alert alert-danger d-flex justify-content-between align-items-center flex-wrap gap-2">
   <div>
     <i class="bi bi-x-octagon me-1"></i>
+    {% if orden.fue_devuelta_por_aprobador %}
     <strong>Sin Emitir</strong> -- fue devuelta por quien aprueba. Corrígela y reenvíala para que
     vuelva a quedar 'Por Aprobar'.
+    {% else %}
+    <strong>Sin Emitir</strong> -- borrador guardado, todavía no se envió a aprobación. Termínala y
+    envíala cuando esté lista.
+    {% endif %}
   </div>
   {% if puede_crear %}
   <form method="post" action="{{ url_for('ordenes_reenviar_aprobacion', orden_id=orden.id) }}">
-    <button type="submit" class="btn btn-brand btn-sm"><i class="bi bi-send me-1"></i>Reenviar a aprobación</button>
+    <button type="submit" class="btn btn-brand btn-sm"><i class="bi bi-send me-1"></i>{{ 'Reenviar a aprobación' if orden.fue_devuelta_por_aprobador else 'Enviar a aprobación' }}</button>
   </form>
   {% endif %}
 </div>
@@ -370,10 +375,25 @@
             <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
           </div>
           <div class="modal-body">
-            <div class="mb-2">
-              <label class="form-label small">Buscar en el catálogo de {{ orden.proveedor.nombre }}</label>
-              <input type="text" class="form-control form-control-sm" id="buscarCatalogoOrden" placeholder="Código o descripción...">
-              <div class="list-group mt-1" id="resultadosCatalogoOrden" style="max-height:180px; overflow-y:auto;"></div>
+            <!-- Ronda BD (2026-10-07, a pedido del usuario): antes esta
+                 caja solo mostraba resultados DESPUES de escribir, a
+                 diferencia del catálogo siempre visible de "Nueva Orden de
+                 Compra" -- ahora carga el catálogo completo (hasta 50
+                 productos) apenas se abre el modal, igual que en
+                 ordenes/form.html, para todos los proveedores (con o sin
+                 variantes). -->
+            <div class="mb-2 d-flex justify-content-between align-items-center flex-wrap gap-2">
+              <label class="form-label small mb-0">Catálogo de {{ orden.proveedor.nombre }}</label>
+              <input type="text" class="form-control form-control-sm" id="buscarCatalogoOrden" placeholder="Buscar por código o descripción..." style="max-width:260px;">
+            </div>
+            <p class="text-muted small mb-1" id="hintCatalogoOrden">Cargando catálogo...</p>
+            <div class="table-responsive mb-2" style="max-height:220px; overflow-y:auto;">
+              <table class="table table-sm table-hover mb-0">
+                <thead>
+                  <tr><th>Código</th><th>Descripción</th><th>Empaque</th><th class="text-end">Precio/caja</th><th></th></tr>
+                </thead>
+                <tbody id="cuerpoCatalogoOrden"></tbody>
+              </table>
             </div>
             <div class="row g-2">
               <input type="hidden" name="producto_id" id="campoProductoIdOrden" required>
@@ -683,7 +703,8 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
 (function () {
   const proveedorId = {{ orden.proveedor_id }};
   const input = document.getElementById('buscarCatalogoOrden');
-  const resultados = document.getElementById('resultadosCatalogoOrden');
+  const hint = document.getElementById('hintCatalogoOrden');
+  const cuerpoCatalogo = document.getElementById('cuerpoCatalogoOrden');
   const campoProductoId = document.getElementById('campoProductoIdOrden');
   const campoVarianteCodigo = document.getElementById('campoVarianteCodigoOrden');
   const campoVarianteDescripcion = document.getElementById('campoVarianteDescripcionOrden');
@@ -815,8 +836,6 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
     campoPrecio.value = p.precio_caja;
     aviso.textContent = '';
     aviso.className = 'text-muted small mb-0 mt-2';
-    resultados.innerHTML = '';
-    input.value = `${p.codigo} — ${p.descripcion}`;
 
     if (p.tiene_variantes) {
       btnGuardar.disabled = true;
@@ -842,44 +861,67 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
 
   buscarVariante.addEventListener('input', () => renderListaVariantes(buscarVariante.value));
 
+  function fmt(n) {
+    if (n === null || n === undefined || n === '') return '';
+    return (Math.round(n * 100) / 100).toFixed(2);
+  }
+
+  // Ronda BD (2026-10-07, a pedido del usuario): catálogo siempre visible
+  // (hasta 50 productos), igual que en "Nueva Orden de Compra" -- se carga
+  // completo al abrir el modal y se refiltra en vivo al escribir, en vez de
+  // quedar vacío hasta que el usuario tipeara algo.
+  async function cargarCatalogoOrden(q) {
+    hint.textContent = 'Cargando catálogo...';
+    const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(q || '')}`);
+    const productos = await resp.json();
+    cuerpoCatalogo.innerHTML = '';
+    if (productos.length === 0) {
+      hint.textContent = 'Sin resultados en el catálogo de este proveedor.';
+    } else {
+      hint.textContent = `${productos.length} producto(s) encontrados (máx. 50 mostrados).`;
+    }
+    productos.forEach(p => {
+      // Ronda U (2026-09-12, punto 4): un producto inactivo ahora SI
+      // aparece en el catálogo (antes quedaba oculto), sombreado -- si se
+      // elige, se pide confirmar antes (el backend lo reactiva al guardar
+      // la línea).
+      const duplicado = !p.tiene_variantes && productoYaEnOrden(p.id, null);
+      const tr = document.createElement('tr');
+      if (duplicado) tr.className = 'text-muted';
+      else if (!p.activo) tr.className = 'table-secondary';
+      tr.innerHTML = `
+        <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}${!p.activo ? ' <span class="badge bg-secondary">Inactivo</span>' : ''}</td>
+        <td style="max-width:320px;">${p.descripcion}</td>
+        <td>${p.empaque || ''}</td>
+        <td class="text-end">${fmt(p.precio_caja)}</td>
+        <td class="text-end">${duplicado
+          ? '<span class="badge bg-secondary">Ya agregado</span>'
+          : '<button type="button" class="btn btn-sm btn-outline-primary">Agregar</button>'}</td>
+      `;
+      if (!duplicado) tr.querySelector('button').addEventListener('click', () => {
+        if (!p.activo && !confirm(`'${p.codigo}' está desactivado en el catálogo. ¿Deseas activarlo y agregarlo a esta orden?`)) {
+          return;
+        }
+        seleccionarProducto(p);
+      });
+      cuerpoCatalogo.appendChild(tr);
+    });
+  }
+
   let debounce;
   input.addEventListener('input', () => {
     clearTimeout(debounce);
-    campoProductoId.value = '';
-    btnGuardar.disabled = true;
-    limpiarVariante();
-    debounce = setTimeout(async () => {
-      if (!input.value) { resultados.innerHTML = ''; return; }
-      const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(input.value)}`);
-      const productos = await resp.json();
-      resultados.innerHTML = '';
-      productos.slice(0, 15).forEach(p => {
-        const item = document.createElement('button');
-        item.type = 'button';
-        const duplicado = !p.tiene_variantes && productoYaEnOrden(p.id, null);
-        // Ronda U (2026-09-12, punto 4): un producto inactivo ahora SI
-        // aparece en la búsqueda (antes quedaba oculto), sombreado -- si se
-        // elige, se pide confirmar antes (el backend lo reactiva al
-        // guardar la línea).
-        item.className = 'list-group-item list-group-item-action py-1 small' + (duplicado || !p.activo ? ' text-muted' : '');
-        let etiqueta = `${p.codigo} — ${p.descripcion}`;
-        if (duplicado) etiqueta += ' (ya en la orden)';
-        else if (!p.activo) etiqueta += ' (inactivo)';
-        item.textContent = etiqueta;
-        item.addEventListener('click', () => {
-          if (!duplicado && !p.activo && !confirm(`'${p.codigo}' está desactivado en el catálogo. ¿Deseas activarlo y agregarlo a esta orden?`)) {
-            return;
-          }
-          seleccionarProducto(p);
-        });
-        resultados.appendChild(item);
-      });
-    }, 300);
+    debounce = setTimeout(() => cargarCatalogoOrden(input.value), 300);
+  });
+
+  document.getElementById('modalAgregarProducto').addEventListener('shown.bs.modal', () => {
+    cargarCatalogoOrden(input.value);
   });
 
   document.getElementById('modalAgregarProducto').addEventListener('hidden.bs.modal', () => {
     input.value = '';
-    resultados.innerHTML = '';
+    cuerpoCatalogo.innerHTML = '';
+    hint.textContent = 'Cargando catálogo...';
     campoProductoId.value = '';
     campoCodigo.value = '';
     campoDescripcion.value = '';
