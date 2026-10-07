@@ -1,0 +1,408 @@
+{% extends "base.html" %}
+{% block title %}Agregar productos · {{ orden.numero_po }} · Suite Logística{% endblock %}
+{% block content %}
+
+{#
+  Ronda BD (2026-10-07, a pedido del usuario): esta pantalla reemplaza, para
+  una orden que TODAVÍA no es una Orden de Compra definitiva (borrador
+  'Sin Emitir' o 'Por Aprobar'), al modal angosto "+ Agregar producto" de
+  ordenes/detalle.html -- es la MISMA forma, pantalla y opciones que "Nueva
+  Orden de Compra" (ver ordenes/form.html, del cual se copió casi todo el
+  catálogo/modal de variantes/tabla de líneas tal cual), pero con
+  Empresa/Proveedor/Moneda fijos (ya pertenecen a esta orden) y guardando
+  todas las líneas elegidas en UNA sola orden ya existente en vez de crear
+  una nueva (ver ordenes_lineas_agregar_multiple en app.py).
+#}
+
+<div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-1">Agregar productos a la orden {{ orden.numero_po }}</h3>
+    <div class="text-muted small">
+      {{ orden.empresa.nombre if orden.empresa else 'Sin empresa asignada' }} · {{ orden.proveedor.nombre }} ·
+      Moneda {{ orden.moneda }}
+    </div>
+  </div>
+  <a href="{{ url_for('ordenes_detalle', orden_id=orden.id) }}" class="btn btn-outline-secondary btn-sm">
+    <i class="bi bi-arrow-left"></i> Volver a la orden
+  </a>
+</div>
+
+<form method="post" action="{{ url_for('ordenes_lineas_agregar_multiple', orden_id=orden.id) }}" id="formAgregarPagina">
+  <div class="card p-3 mb-3">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h5 class="section-title mb-0">Productos del proveedor</h5>
+      <input type="text" class="form-control w-auto" id="buscarProducto" placeholder="Buscar por código o descripción..." style="min-width:280px;">
+    </div>
+    <p class="text-muted small" id="hintProveedor">Cargando catálogo...</p>
+    <div class="table-responsive" style="max-height: 320px; overflow-y:auto;">
+      <table class="table table-sm table-hover" id="tablaCatalogo">
+        <thead>
+          <tr>
+            <th>Código</th>
+            <th>Descripción</th>
+            <th>Empaque</th>
+            <th class="text-end">Precio/Caja</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="cuerpoCatalogo"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Igual que en "Nueva Orden de Compra": elegir variante (ej. dioptria de
+       un lente MEDICONTUR) antes de agregar la linea -- el precio siempre es
+       el del codigo padre, no de la variante. Selección múltiple. -->
+  <div class="modal fade" id="modalElegirVarianteForm" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Elige la(s) variante(s)</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small mb-1" id="tituloProductoVarianteForm"></p>
+          <div class="d-flex justify-content-between align-items-center mb-1">
+            <input type="text" class="form-control form-control-sm" id="buscarVarianteForm" placeholder="Filtrar por código o descripción..." style="max-width:260px;">
+            <button type="button" class="btn btn-sm btn-link p-0" id="btnLimpiarVariantesForm">Limpiar selección</button>
+          </div>
+          <div class="list-group" id="listaVariantesForm" style="max-height:280px; overflow-y:auto;"></div>
+        </div>
+        <div class="modal-footer">
+          <span class="text-muted small me-auto" id="contadorVariantesForm">Ninguna variante marcada.</span>
+          <button type="button" class="btn btn-brand" id="btnAgregarVariantesForm" disabled>Agregar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card p-3 mb-3">
+    <h5 class="section-title">Productos a agregar</h5>
+    <p class="text-muted small mb-2">
+      Se guardan todos juntos al hacer clic en "Guardar productos en la orden" -- hasta entonces no
+      se modifica la orden. Los productos que ya están en la orden aparecen marcados "Ya agregado"
+      en el catálogo de arriba.
+    </p>
+    <div class="d-flex align-items-end gap-2 mb-2 p-2 bg-light rounded flex-wrap">
+      <div>
+        <label class="form-label small mb-0">Aplicar fecha est. despacho a las líneas seleccionadas</label>
+        <input type="date" class="form-control form-control-sm" id="fechaMasiva">
+      </div>
+      <button type="button" class="btn btn-sm btn-outline-secondary" id="btnAplicarFechaMasiva">Aplicar a seleccionadas</button>
+      <button type="button" class="btn btn-sm btn-link" id="btnSeleccionarTodas">Seleccionar todas</button>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle" id="tablaLineas">
+        <thead>
+          <tr>
+            <th style="width:30px;"><input type="checkbox" id="checkTodas"></th>
+            <th>Código</th>
+            <th>Descripción</th>
+            <th style="width:100px;">Cant. cajas</th>
+            <th style="width:120px;">Precio/caja</th>
+            <th style="width:110px;">Subtotal</th>
+            <th style="width:160px;">Fecha est. despacho</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="cuerpoLineas">
+          <tr id="filaVacia"><td colspan="8" class="text-center text-muted py-3">Agrega productos desde el catálogo de arriba.</td></tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="5" class="text-end fw-bold">Total</td>
+            <td class="fw-bold" id="totalOrden">0.00</td>
+            <td colspan="2"></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+
+  <div class="d-flex gap-2 align-items-center flex-wrap">
+    <button type="submit" class="btn btn-brand" id="btnGuardarPagina" disabled>Guardar productos en la orden</button>
+    <a href="{{ url_for('ordenes_detalle', orden_id=orden.id) }}" class="btn btn-outline-secondary">Cancelar</a>
+  </div>
+</form>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const proveedorId = {{ orden.proveedor_id }};
+const buscarProducto = document.getElementById('buscarProducto');
+const cuerpoCatalogo = document.getElementById('cuerpoCatalogo');
+const cuerpoLineas = document.getElementById('cuerpoLineas');
+const filaVacia = document.getElementById('filaVacia');
+const hintProveedor = document.getElementById('hintProveedor');
+const totalOrdenEl = document.getElementById('totalOrden');
+const btnGuardarPagina = document.getElementById('btnGuardarPagina');
+
+// Ronda BD (2026-10-07): a diferencia de "Nueva Orden de Compra" (que
+// arranca sin ninguna línea), esta orden puede ya tener productos -- se
+// precargan acá para que el catálogo los muestre "Ya agregado" desde el
+// primer momento (no se pueden volver a agregar, igual que en el modal
+// anterior).
+let lineasAgregadas = {
+  {%- for l in orden.lineas if not l.anulada -%}
+  "{{ l.producto_id }}::{{ l.variante_codigo or '' }}": true{{ "," if not loop.last }}
+  {%- endfor -%}
+};
+let lineaIndex = 0;
+let productoPendienteVariante = null;
+const modalVarianteForm = new bootstrap.Modal(document.getElementById('modalElegirVarianteForm'));
+
+function fmt(n) {
+  return (Math.round(n * 100) / 100).toFixed(2);
+}
+
+function claveLinea(productoId, varianteCodigo) {
+  return `${productoId}::${varianteCodigo || ''}`;
+}
+
+function actualizarBotonGuardar() {
+  btnGuardarPagina.disabled = cuerpoLineas.querySelectorAll('tr[data-clave-linea]').length === 0;
+}
+
+async function cargarCatalogo(q) {
+  hintProveedor.textContent = 'Cargando catálogo...';
+  try {
+    const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(q || '')}`);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const productos = await resp.json();
+    cuerpoCatalogo.innerHTML = '';
+    if (productos.length === 0) {
+      hintProveedor.textContent = 'Sin resultados en el catálogo de este proveedor.';
+    } else {
+      hintProveedor.textContent = `${productos.length} producto(s) encontrados (máx. 50 mostrados).`;
+    }
+    productos.forEach(p => {
+      const yaAgregado = !p.tiene_variantes && !!lineasAgregadas[claveLinea(p.id, null)];
+      const tr = document.createElement('tr');
+      if (yaAgregado) tr.className = 'text-muted';
+      else if (!p.activo) tr.className = 'table-secondary';
+      tr.innerHTML = `
+        <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}${!p.activo ? ' <span class="badge bg-secondary">Inactivo</span>' : ''}</td>
+        <td style="max-width:380px;">${p.descripcion}</td>
+        <td>${p.empaque}</td>
+        <td class="text-end">${fmt(p.precio_caja)}</td>
+        <td class="text-end">${yaAgregado
+          ? '<span class="badge bg-secondary">Ya agregado</span>'
+          : '<button type="button" class="btn btn-sm btn-outline-primary btn-agregar">Agregar</button>'}</td>
+      `;
+      if (!yaAgregado) tr.querySelector('.btn-agregar').addEventListener('click', () => {
+        if (!p.activo && !confirm(`'${p.codigo}' está desactivado en el catálogo. ¿Deseas activarlo y agregarlo a esta orden?`)) {
+          return;
+        }
+        if (p.tiene_variantes) {
+          abrirModalVariante(p);
+        } else {
+          agregarLinea(p, null);
+        }
+      });
+      cuerpoCatalogo.appendChild(tr);
+    });
+  } catch (err) {
+    hintProveedor.textContent = 'No se pudo cargar el catálogo -- revisa tu conexión y vuelve a intentar.';
+  }
+}
+
+let variantesFormSeleccionadas = new Map();
+const btnAgregarVariantesForm = document.getElementById('btnAgregarVariantesForm');
+const contadorVariantesForm = document.getElementById('contadorVariantesForm');
+
+async function abrirModalVariante(producto) {
+  productoPendienteVariante = producto;
+  variantesFormSeleccionadas = new Map();
+  document.getElementById('tituloProductoVarianteForm').textContent = `${producto.codigo} — ${producto.descripcion}`;
+  document.getElementById('buscarVarianteForm').value = '';
+  const lista = document.getElementById('listaVariantesForm');
+  lista.innerHTML = '<p class="text-muted small px-2">Cargando variantes...</p>';
+  actualizarContadorVariantesForm();
+  modalVarianteForm.show();
+  const resp = await fetch(`/api/productos/${producto.id}/variantes`);
+  producto._variantes = await resp.json();
+  renderListaVariantesForm('');
+}
+
+function actualizarContadorVariantesForm() {
+  const n = variantesFormSeleccionadas.size;
+  contadorVariantesForm.textContent = n === 0 ? 'Ninguna variante marcada.' : `${n} variante(s) marcada(s).`;
+  btnAgregarVariantesForm.disabled = n === 0;
+  btnAgregarVariantesForm.textContent = n > 1 ? `Agregar ${n} variantes` : 'Agregar';
+}
+
+function renderListaVariantesForm(filtro) {
+  const f = (filtro || '').toLowerCase();
+  const lista = document.getElementById('listaVariantesForm');
+  lista.innerHTML = '';
+  const LIMITE_VARIANTES_FORM = 400;
+  const filtradas = (productoPendienteVariante?._variantes || [])
+    .filter(v => !f || v.codigo.toLowerCase().includes(f) || v.descripcion.toLowerCase().includes(f));
+  filtradas
+    .slice(0, LIMITE_VARIANTES_FORM)
+    .forEach(v => {
+      const yaAgregada = !!lineasAgregadas[claveLinea(productoPendienteVariante.id, v.codigo)];
+      const item = document.createElement('label');
+      item.className = 'list-group-item list-group-item-action py-1 small d-flex align-items-center gap-2' + (yaAgregada ? ' text-muted' : '');
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.className = 'form-check-input mt-0 flex-shrink-0';
+      check.disabled = yaAgregada;
+      check.checked = variantesFormSeleccionadas.has(v.codigo);
+      check.addEventListener('change', () => {
+        if (check.checked) {
+          variantesFormSeleccionadas.set(v.codigo, v);
+        } else {
+          variantesFormSeleccionadas.delete(v.codigo);
+        }
+        actualizarContadorVariantesForm();
+      });
+      const texto = document.createElement('span');
+      texto.textContent = yaAgregada ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`;
+      item.appendChild(check);
+      item.appendChild(texto);
+      lista.appendChild(item);
+    });
+  if (filtradas.length > LIMITE_VARIANTES_FORM) {
+    const aviso = document.createElement('p');
+    aviso.className = 'text-warning small px-2 mb-0 mt-1';
+    aviso.textContent = `Mostrando ${LIMITE_VARIANTES_FORM} de ${filtradas.length} variantes -- usa el filtro de arriba para encontrar el resto.`;
+    lista.appendChild(aviso);
+  }
+}
+document.getElementById('buscarVarianteForm').addEventListener('input', (e) => renderListaVariantesForm(e.target.value));
+document.getElementById('btnLimpiarVariantesForm').addEventListener('click', () => {
+  variantesFormSeleccionadas = new Map();
+  renderListaVariantesForm(document.getElementById('buscarVarianteForm').value);
+  actualizarContadorVariantesForm();
+});
+btnAgregarVariantesForm.addEventListener('click', () => {
+  variantesFormSeleccionadas.forEach(v => agregarLinea(productoPendienteVariante, v));
+  modalVarianteForm.hide();
+});
+
+function agregarLinea(producto, variante) {
+  const varianteCodigo = variante ? variante.codigo : null;
+  const varianteDescripcion = variante ? variante.descripcion : '';
+  const clave = claveLinea(producto.id, varianteCodigo);
+  if (lineasAgregadas[clave]) {
+    alert(`'${varianteCodigo || producto.codigo}' ya fue agregado a esta orden. Ajusta la cantidad en su fila en vez de agregarlo de nuevo.`);
+    return;
+  }
+  if (filaVacia) filaVacia.remove();
+
+  const idx = lineaIndex++;
+  lineasAgregadas[clave] = idx;
+
+  const codigoMostrar = varianteCodigo || producto.codigo;
+  const descripcionMostrar = variante ? variante.descripcion : producto.descripcion;
+
+  const tr = document.createElement('tr');
+  tr.dataset.productoId = producto.id;
+  tr.dataset.claveLinea = clave;
+  tr.innerHTML = `
+    <td><input type="checkbox" class="check-linea"></td>
+    <td>${codigoMostrar}
+      <input type="hidden" name="producto_id" value="${producto.id}">
+      <input type="hidden" name="variante_codigo" value="${varianteCodigo || ''}">
+      <input type="hidden" name="variante_descripcion" value="${varianteDescripcion}">
+    </td>
+    <td style="max-width:320px;">${descripcionMostrar}</td>
+    <td><input type="number" min="1" step="1" class="form-control form-control-sm cantidad" name="cantidad_cajas" value="1" required></td>
+    <td><input type="number" min="0" step="0.01" class="form-control form-control-sm precio" name="precio_unitario_pactado" value="${producto.precio_caja}"></td>
+    <td class="subtotal">${fmt(producto.precio_caja)}</td>
+    <td><input type="date" class="form-control form-control-sm fecha-linea" name="fecha_estimada_despacho"></td>
+    <td class="text-end"><button type="button" class="btn btn-sm btn-outline-danger btn-quitar">&times;</button></td>
+  `;
+  cuerpoLineas.appendChild(tr);
+
+  const cantidadInput = tr.querySelector('.cantidad');
+  const precioInput = tr.querySelector('.precio');
+  const subtotalCell = tr.querySelector('.subtotal');
+
+  function recalcular() {
+    const cant = parseInt(cantidadInput.value, 10) || 0;
+    const precio = parseFloat(precioInput.value) || 0;
+    subtotalCell.textContent = fmt(cant * precio);
+    recalcularTotal();
+  }
+
+  cantidadInput.addEventListener('input', recalcular);
+  precioInput.addEventListener('input', recalcular);
+  cantidadInput.addEventListener('keydown', (e) => enfocarMismoCampoFilaSiguiente(e, '.cantidad'));
+  precioInput.addEventListener('keydown', (e) => enfocarMismoCampoFilaSiguiente(e, '.precio'));
+  tr.querySelector('.btn-quitar').addEventListener('click', () => {
+    delete lineasAgregadas[clave];
+    tr.remove();
+    if (cuerpoLineas.children.length === 0) {
+      cuerpoLineas.appendChild(filaVacia);
+    }
+    recalcularTotal();
+    actualizarBotonGuardar();
+  });
+
+  recalcularTotal();
+  actualizarBotonGuardar();
+}
+
+function enfocarMismoCampoFilaSiguiente(evento, selectorClase) {
+  if (evento.key !== 'Enter') return;
+  evento.preventDefault();
+  const filaActual = evento.target.closest('tr');
+  const filaSiguiente = filaActual ? filaActual.nextElementSibling : null;
+  const campoSiguiente = filaSiguiente ? filaSiguiente.querySelector(selectorClase) : null;
+  if (campoSiguiente) {
+    campoSiguiente.focus();
+    campoSiguiente.select();
+  }
+}
+
+function recalcularTotal() {
+  let total = 0;
+  cuerpoLineas.querySelectorAll('tr').forEach(tr => {
+    const cant = parseInt(tr.querySelector('.cantidad')?.value, 10) || 0;
+    const precio = parseFloat(tr.querySelector('.precio')?.value) || 0;
+    total += cant * precio;
+  });
+  totalOrdenEl.textContent = fmt(total);
+}
+
+document.getElementById('btnAplicarFechaMasiva').addEventListener('click', () => {
+  const fecha = document.getElementById('fechaMasiva').value;
+  if (!fecha) {
+    alert('Ingresa primero una fecha.');
+    return;
+  }
+  let aplicadas = 0;
+  cuerpoLineas.querySelectorAll('tr').forEach(tr => {
+    const check = tr.querySelector('.check-linea');
+    if (check && check.checked) {
+      tr.querySelector('.fecha-linea').value = fecha;
+      aplicadas++;
+    }
+  });
+  if (aplicadas === 0) {
+    alert('Selecciona al menos una línea (casillas de la primera columna).');
+  }
+});
+
+document.getElementById('btnSeleccionarTodas').addEventListener('click', () => {
+  const marcar = !document.getElementById('checkTodas').checked;
+  document.getElementById('checkTodas').checked = marcar;
+  cuerpoLineas.querySelectorAll('.check-linea').forEach(c => c.checked = marcar);
+});
+
+document.getElementById('checkTodas').addEventListener('change', (e) => {
+  cuerpoLineas.querySelectorAll('.check-linea').forEach(c => c.checked = e.target.checked);
+});
+
+let debounceTimer;
+buscarProducto.addEventListener('input', () => {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => cargarCatalogo(buscarProducto.value), 300);
+});
+
+cargarCatalogo('');
+</script>
+{% endblock %}

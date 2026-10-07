@@ -6188,6 +6188,115 @@ def ordenes_linea_nueva(orden_id):
     return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
 
+@app.route("/ordenes/<int:orden_id>/agregar-productos")
+@requiere_permiso("crear_orden")
+def ordenes_agregar_pagina(orden_id):
+    """Ronda BD (2026-10-07, a pedido del usuario): mientras una orden NO es
+    todavía una Orden de Compra definitiva (borrador 'Sin Emitir' nunca
+    enviado, devuelta por el aprobador, o 'Por Aprobar'), agregar productos
+    usaba un modal angosto que el usuario encontró "engorroso" -- pidió
+    explícitamente que, en ese caso, agregar productos lleve a la MISMA
+    pantalla/experiencia que 'Nueva Orden de Compra' (catálogo siempre
+    visible en tabla + líneas a agregar, en vez de un modal), no solo que
+    el modal cargue mejor. Una vez la orden ya es definitiva ('Aprobada'),
+    se sigue usando el modal de ordenes/detalle.html (orden ya emitida al
+    proveedor -- cambio más puntual, no amerita salir de esa pantalla)."""
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.estado_aprobacion in (None, "Aprobada"):
+        flash("Esta orden ya es una Orden de Compra definitiva -- agrega productos desde '+ Agregar producto' en su detalle.", "info")
+        return redirect(url_for("ordenes_detalle", orden_id=orden.id))
+    if orden.estado in ("Cancelada", "Anulada"):
+        flash("No se pueden agregar productos a una orden cancelada o anulada.", "warning")
+        return redirect(url_for("ordenes_detalle", orden_id=orden.id))
+    return render_template("ordenes/agregar_pagina.html", orden=orden)
+
+
+@app.route("/ordenes/<int:orden_id>/lineas/nuevas-multiple", methods=["POST"])
+@requiere_permiso("crear_orden")
+def ordenes_lineas_agregar_multiple(orden_id):
+    """Ronda BD (2026-10-07): guarda de una sola vez TODAS las líneas que el
+    usuario armó en ordenes/agregar_pagina.html (mismo patrón de listas
+    paralelas que ordenes_nueva al crear una orden desde cero), con la
+    misma detección de duplicados que ordenes_linea_nueva (si una línea ya
+    estaba en la orden, se salta y se avisa cuál, en vez de abortar todo el
+    guardado por una sola duplicada)."""
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    if orden.estado in ("Cancelada", "Anulada"):
+        flash("No se pueden agregar productos a una orden cancelada o anulada.", "warning")
+        return redirect(url_for("ordenes_detalle", orden_id=orden.id))
+
+    producto_ids = request.form.getlist("producto_id")
+    cantidades = request.form.getlist("cantidad_cajas")
+    precios = request.form.getlist("precio_unitario_pactado")
+    fechas = request.form.getlist("fecha_estimada_despacho")
+    variante_codigos = request.form.getlist("variante_codigo")
+    variante_descripciones = request.form.getlist("variante_descripcion")
+
+    creadas = []
+    duplicadas = []
+    reactivado = False
+    for i, (pid, cant, precio, fecha) in enumerate(zip(producto_ids, cantidades, precios, fechas)):
+        if not pid or not cant:
+            continue
+        cant_val = parse_int(cant, default=0)
+        if cant_val <= 0:
+            continue
+        producto_id = int(pid)
+        variante_codigo = (variante_codigos[i].strip() if i < len(variante_codigos) and variante_codigos[i].strip() else None)
+        variante_descripcion = (variante_descripciones[i].strip() if i < len(variante_descripciones) and variante_descripciones[i].strip() else None)
+
+        filtro_duplicado = [OrdenCompraLinea.producto_id == producto_id, OrdenCompraLinea.anulada == False]  # noqa: E712
+        if variante_codigo:
+            filtro_duplicado.append(OrdenCompraLinea.variante_codigo == variante_codigo)
+        else:
+            filtro_duplicado.append(OrdenCompraLinea.variante_codigo.is_(None))
+        ya_existe = orden.lineas.filter(*filtro_duplicado).first()
+        if ya_existe:
+            duplicadas.append(ya_existe.codigo_mostrar)
+            continue
+
+        linea = OrdenCompraLinea(
+            orden_id=orden.id,
+            producto_id=producto_id,
+            cantidad_cajas=cant_val,
+            precio_unitario_pactado=float(precio) if precio else 0,
+            fecha_estimada_despacho=parse_date(fecha),
+            etapa=ETAPAS_LINEA[0],
+            variante_codigo=variante_codigo,
+            variante_descripcion=variante_descripcion,
+        )
+        db.session.add(linea)
+        db.session.flush()
+        # Ronda U (2026-09-12, punto 4): igual que al crear la orden o
+        # agregar desde el modal -- un producto inactivo elegido desde el
+        # catálogo (sombreado, con confirmación) se reactiva al guardarse.
+        if linea.producto and not linea.producto.activo:
+            linea.producto.activo = True
+            reactivado = True
+        creadas.append(linea.codigo_mostrar)
+
+    if not creadas:
+        if duplicadas:
+            flash("'" + "', '".join(duplicadas) + "' ya está(n) en esta orden -- no se agregaron de nuevo.", "warning")
+        else:
+            flash("No se agregó ningún producto -- revisa las cantidades.", "warning")
+        return redirect(url_for("ordenes_agregar_pagina", orden_id=orden.id))
+
+    recalcular_estado_orden(orden)
+    # Si la orden ya tenia lineas mas avanzadas (ej. despachada) estas
+    # lineas nuevas en "Emision de Orden" quedarian mezclando cohortes --
+    # se separa igual que al confirmar/despachar/agregar desde el modal.
+    nuevas_ordenes = dividir_orden_si_corresponde(orden)
+    db.session.commit()
+    mensaje = f"{len(creadas)} producto(s) agregado(s) a la orden: {', '.join(creadas)}.{_mensaje_division(nuevas_ordenes)}"
+    if duplicadas:
+        mensaje += f" (Ya estaba(n) en la orden, no se repitieron: {', '.join(duplicadas)}.)"
+    if reactivado:
+        mensaje += " Se reactivó algún producto que estaba inactivo en el catálogo."
+    flash(mensaje, "success")
+    return redirect(url_for("ordenes_detalle", orden_id=orden.id))
+
+
 @app.route("/ordenes/<int:orden_id>/linea/<int:linea_id>/actualizar", methods=["POST"])
 @requiere_permiso("crear_orden")
 def ordenes_linea_actualizar(orden_id, linea_id):

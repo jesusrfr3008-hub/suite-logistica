@@ -278,9 +278,20 @@
   <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
     <h5 class="section-title mb-0">Líneas de la orden</h5>
     {% if puede_crear and orden.estado not in ('Cancelada', 'Anulada') %}
-    <button type="button" class="btn btn-sm btn-brand no-print" data-bs-toggle="modal" data-bs-target="#modalAgregarProducto">
-      <i class="bi bi-plus-lg"></i> Agregar producto
-    </button>
+      {% if orden_aprobada %}
+      <button type="button" class="btn btn-sm btn-brand no-print" data-bs-toggle="modal" data-bs-target="#modalAgregarProducto">
+        <i class="bi bi-plus-lg"></i> Agregar producto
+      </button>
+      {% else %}
+      {# Ronda BD (2026-10-07, a pedido del usuario): mientras la orden no es
+         todavía una Orden de Compra definitiva (borrador 'Sin Emitir' o 'Por
+         Aprobar'), agregar productos lleva a la MISMA pantalla que "Nueva
+         Orden de Compra" (catálogo siempre visible), no a un modal -- el
+         usuario la encontró engorrosa para este caso. #}
+      <a href="{{ url_for('ordenes_agregar_pagina', orden_id=orden.id) }}" class="btn btn-sm btn-brand no-print">
+        <i class="bi bi-plus-lg"></i> Agregar producto
+      </a>
+      {% endif %}
     {% endif %}
   </div>
 
@@ -364,8 +375,9 @@
     </div>
   </div>
 
-  {% if puede_crear %}
-  <!-- Modal: agregar producto nuevo a la orden ya creada -->
+  {% if puede_crear and orden_aprobada %}
+  <!-- Modal: agregar producto nuevo a la orden ya creada (orden definitiva
+       -- mientras no lo es, ver ordenes_agregar_pagina / agregar_pagina.html) -->
   <div class="modal fade" id="modalAgregarProducto" tabindex="-1">
     <div class="modal-dialog modal-lg">
       <div class="modal-content">
@@ -703,6 +715,11 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
 (function () {
   const proveedorId = {{ orden.proveedor_id }};
   const input = document.getElementById('buscarCatalogoOrden');
+  // Ronda BD (2026-10-07): este modal ya no se renderiza para una orden
+  // que todavía no es definitiva (ver ordenes_agregar_pagina /
+  // agregar_pagina.html) -- sin esto, el resto del IIFE rompería al
+  // intentar engancharse a elementos que no existen en esa pantalla.
+  if (!input) return;
   const hint = document.getElementById('hintCatalogoOrden');
   const cuerpoCatalogo = document.getElementById('cuerpoCatalogoOrden');
   const campoProductoId = document.getElementById('campoProductoIdOrden');
