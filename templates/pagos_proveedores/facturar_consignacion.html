@@ -36,12 +36,13 @@
   {% endif %}
 </div>
 
-{% if proveedor and not pendientes and not pendientes_lote %}
+{% if proveedor and not pendientes_lote %}
 <div class="alert alert-success">
-  {{ proveedor.nombre }} no tiene productos pendientes de facturar en consignación -- todo lo que se le ha
-  recibido bajo esa condición ya fue facturado, o no hay ninguno detectado todavía. Si acabas de costear una
-  Orden de Compra en consignación, los lotes aparecerán acá recién cuando el próximo Stock de Ergopyme muestre
-  que se usó/vendió algo (ver más abajo, "Agregar producto" para cargarlo a mano mientras tanto).
+  {{ proveedor.nombre }} no tiene productos pendientes de facturar en consignación -- todo lo que se le informó
+  en un reporte ya fue facturado, o todavía no hay nada informado. Si acabas de costear una Orden de Compra en
+  consignación, o detectaste consumo nuevo, los lotes aparecerán acá recién cuando los incluyas en un reporte
+  enviado al proveedor (ver <a href="{{ url_for('stock_consignacion_list') }}">Stock en Consignación</a> -- botón
+  "Generar reporte"). Mientras tanto, usa "Agregar producto" más abajo para cargarlo a mano.
 </div>
 {% endif %}
 
@@ -87,11 +88,12 @@
   {% if pendientes_lote %}
   <div class="card p-3 mb-3">
     <div class="fw-semibold mb-2">
-      Detectado automáticamente -- consumido del Stock, listo para facturar por LOTE ({{ pendientes_lote|length }})
+      Ya informado al proveedor, listo para facturar por LOTE ({{ pendientes_lote|length }})
     </div>
     <div class="text-muted small mb-2">
-      Cada vez que se carga un Stock nuevo de Ergopyme, el sistema compara contra el anterior: si un lote de
-      consignación bajó o desapareció, aparece acá solo. Puedes facturar menos de lo sugerido si el proveedor
+      Solo se sugiere lo que ya se incluyó en un reporte enviado al proveedor (ver "Stock en Consignación" >
+      "Generar reporte"). Lo que se detectó como consumido pero todavía no se informó NO aparece acá a propósito
+      -- el proveedor todavía no sabe que debe facturarlo. Puedes facturar menos de lo sugerido si el proveedor
       todavía no te facturó todo -- lo que sobre queda pendiente para la próxima.
     </div>
     <div class="table-responsive">
@@ -128,47 +130,6 @@
           {% endfor %}
         </tbody>
       </table>
-    </div>
-  </div>
-  {% endif %}
-
-  {% if pendientes %}
-  <div class="card p-3 mb-3">
-    <div class="fw-semibold mb-2">Productos recibidos en consignación, pendientes de facturar ({{ pendientes|length }})</div>
-    <div class="text-muted small mb-2">Mecanismo anterior (histórico, sin lote) -- se mantiene mientras quede algo pendiente con él.</div>
-    <div class="table-responsive">
-      <table class="table table-sm align-middle mb-0">
-        <thead>
-          <tr class="text-muted small">
-            <th style="width: 32px;"></th>
-            <th>Código proveedor</th>
-            <th>Descripción</th>
-            <th class="text-end">Unidades</th>
-            <th>Recibido</th>
-            <th class="text-end">Precio unitario real</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for c in pendientes %}
-          <tr>
-            <td><input type="checkbox" name="compra_id" value="{{ c.id }}" class="form-check-input chk-consig"></td>
-            <td>{{ c.codigo_proveedor or c.codigo_interno }}</td>
-            <td>{{ c.descripcion }}</td>
-            <td class="text-end">{{ c.unidades|int }}</td>
-            <td class="small text-muted">{{ c.fecha_factura.strftime('%d-%m-%Y') if c.fecha_factura else '--' }}</td>
-            <td class="text-end" style="width: 160px;">
-              <input type="number" step="0.01" min="0" name="precio_{{ c.id }}" class="form-control form-control-sm text-end"
-                     value="{{ '%.2f'|format(c.costo_unitario_clp) if c.costo_unitario_clp else '' }}" placeholder="0.00">
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    <div class="form-text mt-2">
-      El precio sugerido es el costo de importación registrado -- reemplázalo por el precio real que indica la
-      factura del proveedor si es distinto (lo normal, ya que esta suele incluir su condición comercial, no el
-      costo de importación).
     </div>
   </div>
   {% endif %}

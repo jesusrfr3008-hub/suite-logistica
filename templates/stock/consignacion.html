@@ -60,7 +60,7 @@
   </div>
 </div>
 
-<div class="card p-3">
+<div class="card p-3 mb-3">
   <div class="table-responsive" style="max-height: 65vh; overflow-y: auto;">
     <table class="table table-sm table-hover align-middle mb-0">
       <thead class="sticky-top bg-white">
@@ -87,6 +87,100 @@
         </tr>
         {% else %}
         <tr><td colspan="7" class="text-center text-muted py-4">Sin datos de consignación cargados todavía.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="fw-semibold mb-1">Consumido, pendiente de informar al proveedor ({{ pendientes_informar|length }})</div>
+  <div class="text-muted small mb-2">
+    Esto es lo que el sistema detectó solo -- un lote de consignación que bajó o desapareció del Stock de
+    Ergopyme desde la última carga -- pero que todavía NO se incluyó en ningún reporte enviado al proveedor.
+    Está en el orden en que se fue detectando la salida del stock. Marca lo que vas a reportarle hoy (por
+    ejemplo, tu corte semanal), indica la fecha y genera el reporte -- recién ahí "Emitir documento" lo va a
+    sugerir para facturar, para no confundirte con algo que el proveedor todavía no sabe que debe facturar.
+  </div>
+  {% if not proveedor_obj %}
+  <div class="alert alert-info mb-0">
+    Selecciona un proveedor arriba para ver y generar su reporte de consumido pendiente de informar.
+  </div>
+  {% elif not pendientes_informar %}
+  <div class="alert alert-success mb-0">
+    {{ proveedor_obj.nombre }} no tiene nada consumido pendiente de informar por ahora.
+  </div>
+  {% else %}
+  <form method="post" action="{{ url_for('consignacion_generar_reporte') }}">
+    <input type="hidden" name="proveedor_id" value="{{ proveedor_obj.id }}">
+    <div class="table-responsive mb-2">
+      <table class="table table-sm align-middle mb-0">
+        <thead>
+          <tr class="text-muted small">
+            <th style="width: 32px;">
+              <input type="checkbox" class="form-check-input" id="chkTodosInformar" checked>
+            </th>
+            <th>Código proveedor</th>
+            <th>Descripción</th>
+            <th>Lote</th>
+            <th class="text-end">Consumido sin informar</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for f in pendientes_informar %}
+          <tr>
+            <td><input type="checkbox" name="lote_id" value="{{ f.id }}" class="form-check-input chk-informar" checked></td>
+            <td>{{ f.codigo_proveedor or f.codigo_interno }}</td>
+            <td>{{ f.descripcion }}</td>
+            <td><span class="badge bg-light text-dark border">{{ f.codigo_lote }}</span></td>
+            <td class="text-end">{{ f.cantidad_pendiente_informar }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="row g-2 align-items-end">
+      <div class="col-auto">
+        <label class="form-label small mb-0">Fecha del reporte al proveedor</label>
+        <input type="date" class="form-control" name="fecha_reporte" value="{{ hoy }}" required>
+      </div>
+      <div class="col-auto">
+        <button type="submit" class="btn btn-brand">Generar reporte</button>
+      </div>
+    </div>
+  </form>
+  <script>
+    document.getElementById('chkTodosInformar').addEventListener('change', function () {
+      document.querySelectorAll('.chk-informar').forEach(function (c) { c.checked = this.checked; }.bind(this));
+    });
+  </script>
+  {% endif %}
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="fw-semibold mb-2">Reportes enviados al proveedor ({{ reportes_enviados|length }})</div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>Proveedor</th>
+          <th>Fecha reportada</th>
+          <th class="text-end">Lotes</th>
+          <th class="text-end">Unidades</th>
+          <th>Generado por</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in reportes_enviados %}
+        <tr>
+          <td>{{ r.proveedor.nombre }}</td>
+          <td>{{ r.fecha_reporte.strftime('%d-%m-%Y') }}</td>
+          <td class="text-end">{{ r.cantidad_lotes }}</td>
+          <td class="text-end">{{ r.cantidad_unidades }}</td>
+          <td class="small text-muted">{{ r.creado_por.nombre_completo if r.creado_por else '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-center text-muted py-3">Todavía no se generó ningún reporte.</td></tr>
         {% endfor %}
       </tbody>
     </table>

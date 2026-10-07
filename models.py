@@ -482,7 +482,19 @@ class ConsignacionPendienteLote(db.Model):
 
     cantidad_recibida = db.Column(db.Float, default=0)   # total que entró en consignación (acumulado por lote)
     cantidad_consumida = db.Column(db.Float, default=0)  # detectado como usado/vendido (acumulado, vía baja de Stock)
+    # Ronda BE (2026-10-07, a pedido del usuario): paso intermedio entre
+    # "consumido" (detectado solo, automático) y "facturado" (factura real
+    # ya emitida) -- el usuario reporta PERIÓDICAMENTE al proveedor (ej.
+    # semanal) lo consumido hasta esa fecha; el proveedor factura 1-2 días
+    # después SOLO lo que se le reportó. Si "Emitir documento" sugiriera
+    # directamente todo lo consumido (incluido lo que salió del stock
+    # DESPUÉS del último reporte), confundiría al usuario con productos que
+    # el proveedor todavía no sabe que debe facturar. cantidad_informada
+    # avanza únicamente vía "Generar reporte" (ver
+    # consignacion_generar_reporte en app.py) -- nunca directo.
+    cantidad_informada = db.Column(db.Float, default=0)
     cantidad_facturada = db.Column(db.Float, default=0)  # ya facturado de verdad (Factura Consignación o NC por cantidad)
+    ultimo_reporte_id = db.Column(db.Integer, db.ForeignKey("consignacion_reportes_proveedor.id"), nullable=True)
 
     # Trazabilidad de origen (informativa, no autoritativa).
     origen_orden_compra_linea_id = db.Column(db.Integer, db.ForeignKey("ordenes_compra_lineas.id"), nullable=True)
@@ -492,22 +504,63 @@ class ConsignacionPendienteLote(db.Model):
     actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     proveedor = db.relationship("Proveedor")
+    ultimo_reporte = db.relationship("ConsignacionReporteProveedor")
 
     @property
     def cantidad_en_stock(self):
         """Cuánto de este lote el sistema todavía espera encontrar en el
         próximo Stock de Ergopyme (no facturado ni detectado como
-        consumido todavía)."""
+        consumido todavía) -- esta es la cantidad VIGENTE en consignación
+        hoy, la que usa Stock Valorizado para separar propio de
+        consignación por código (ver _cantidad_consignacion_por_codigo en
+        app.py)."""
         return round((self.cantidad_recibida or 0) - (self.cantidad_consumida or 0), 4)
 
     @property
+    def cantidad_pendiente_informar(self):
+        """Consumido (detectado automáticamente) pero todavía NO incluido
+        en ningún reporte enviado al proveedor -- lo que ofrece "Generar
+        reporte"."""
+        return round((self.cantidad_consumida or 0) - (self.cantidad_informada or 0), 4)
+
+    @property
     def cantidad_pendiente_facturar(self):
-        """Consumido pero todavía no facturado -- esto es lo que aparece
-        en "Emitir documento > Factura Consignación" como sugerencia."""
-        return round((self.cantidad_consumida or 0) - (self.cantidad_facturada or 0), 4)
+        """Ya INFORMADO al proveedor (no solo consumido) pero todavía no
+        facturado -- esto es lo que aparece en "Emitir documento > Emitir
+        documento" como sugerencia. A propósito tope en cantidad_informada,
+        no en cantidad_consumida: lo consumido después del último reporte
+        todavía no lo sabe el proveedor, así que no se le puede facturar
+        todavía (se ofrecerá recién cuando se incluya en un reporte
+        nuevo)."""
+        informado_vigente = min(self.cantidad_consumida or 0, self.cantidad_informada or 0)
+        return round(informado_vigente - (self.cantidad_facturada or 0), 4)
 
     def __repr__(self):
         return f"<ConsignacionPendienteLote {self.codigo_interno} lote={self.codigo_lote}>"
+
+
+class ConsignacionReporteProveedor(db.Model):
+    """Ronda BE (2026-10-07, a pedido del usuario): un "reporte" es el
+    corte periódico (ej. semanal) donde se le informa al proveedor qué se
+    consumió de su consignación hasta cierta fecha -- el proveedor factura
+    1-2 días después SOLO lo reportado. Cada ConsignacionPendienteLote
+    queda con ultimo_reporte_id apuntando acá cuando se incluye en uno,
+    para trazabilidad ("se informó en el reporte del DD-MM-AAAA")."""
+    __tablename__ = "consignacion_reportes_proveedor"
+
+    id = db.Column(db.Integer, primary_key=True)
+    proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False, index=True)
+    fecha_reporte = db.Column(db.Date, nullable=False)
+    cantidad_lotes = db.Column(db.Integer, default=0)
+    cantidad_unidades = db.Column(db.Float, default=0)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    creado_por_usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+
+    proveedor = db.relationship("Proveedor")
+    creado_por = db.relationship("Usuario")
+
+    def __repr__(self):
+        return f"<ConsignacionReporteProveedor proveedor={self.proveedor_id} fecha={self.fecha_reporte}>"
 
 
 class PedidoComprometido(db.Model):
