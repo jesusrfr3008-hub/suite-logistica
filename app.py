@@ -4526,16 +4526,24 @@ def reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09():
 
     Idempotente: solo crea filas para combinaciones (proveedor, código,
     lote) que todavía no existen -- una vez sembradas, as nunca vuelve a
-    tocarlas (el flujo normal de Stock sigue solo desde ahí)."""
+    tocarlas (el flujo normal de Stock sigue solo desde ahí).
+
+    Se llama tanto al ARRANCAR la app (startup, para el caso normal en que
+    el archivo ya estaba cargado antes de este deploy) como justo después
+    de cada carga manual exitosa en /stock-consignacion/cargar (para el
+    caso en que el archivo recién se sube DESPUÉS de este deploy -- así no
+    hace falta esperar a que el servidor se reinicie de nuevo). Devuelve la
+    cantidad de lotes sembrados en esta corrida (0 si no había nada nuevo
+    que sembrar)."""
     medicontur = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "MEDICONTUR").first()
     if not medicontur:
         print("[reparar_ronda_be] No se encontró el proveedor MEDICONTUR, se omite la siembra.")
-        return
+        return 0
 
     baseline = StockConsignacionVigente.query.filter_by(proveedor_id=medicontur.id).all()
     if not baseline:
         print("[reparar_ronda_be] No hay stock de consignación vigente cargado para MEDICONTUR, se omite la siembra.")
-        return
+        return 0
 
     # Stock físico actual, sumado por (código interno, lote) -- misma clave
     # que usa _detectar_consumo_consignacion_por_lote, pero leyendo
@@ -4582,6 +4590,7 @@ def reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09():
             f"[reparar_ronda_be] Se sembró ConsignacionPendienteLote con {sembrados} lote(s) de MEDICONTUR "
             "a partir de la foto de consignación vigente del 23-09-2026, comparada contra el stock físico actual."
         )
+    return sembrados
 
 
 with app.app_context():
@@ -10969,7 +10978,25 @@ def stock_consignacion_cargar():
 
     resumen = _cargar_stock_consignacion(filas)
     db.session.commit()
+
+    # Ronda BE (2026-10-07, a pedido del usuario): la siembra de
+    # ConsignacionPendienteLote (reparar_sembrar_consignacion_pendiente_lote_
+    # medicontur_23_09) corre al ARRANCAR la app -- si en ese momento
+    # StockConsignacionVigente todavía estaba vacía para MEDICONTUR (como
+    # pasó: el usuario había compartido el archivo en el chat, pero nunca lo
+    # había subido todavía con este mismo botón en producción), la siembra
+    # no tenía de dónde sembrar y no hacía nada. Para no depender de que se
+    # reinicie el servidor de nuevo, se corre otra vez acá mismo, justo
+    # después de cargar el archivo -- es idempotente (ver la función), así
+    # que no duplica nada si ya se había sembrado antes.
+    sembrados = reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09()
+
     mensaje = f"Stock en consignación actualizado: {resumen['lotes']} lote(s) de {resumen['proveedores']} proveedor(es)."
+    if sembrados:
+        mensaje += (
+            f" Además, se sembraron {sembrados} lote(s) nuevos en el reporte de consignación pendiente por "
+            "informar/facturar, comparando esta foto contra el stock actual."
+        )
     if resumen["no_encontrados"]:
         mensaje += (
             f" Atención: {', '.join(resumen['no_encontrados'])} no coincide con ningún proveedor del catálogo -- "
