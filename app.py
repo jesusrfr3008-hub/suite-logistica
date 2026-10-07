@@ -4593,6 +4593,86 @@ def reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09():
     return sembrados
 
 
+def reparar_migrar_productos_ellex_a_quantel():
+    """Ronda BF (2026-10-07, a pedido del usuario): ELLEX ahora vende a
+    través de QUANTEL -- el usuario pidió que los productos que antes
+    estaban bajo el proveedor ELLEX pasen a estar bajo el proveedor
+    QUANTEL. Verificado contra 'Master_Lista_precios_Proveedores.xlsx'
+    (hoja QM): las filas ELLEX de ese archivo coinciden exactamente
+    (mismos 56 códigos únicos) con el catálogo que hoy tiene el proveedor
+    ELLEX -- confirma que es el universo completo a migrar.
+
+    A pedido explícito del usuario, esto SOLO cambia el proveedor de cada
+    Producto -- no toca precio_unitario/precio_caja (el usuario decidió no
+    actualizar precios con este archivo). Las Órdenes de Compra y compras
+    históricas ya hechas a nombre de ELLEX no se tocan -- quedan tal cual,
+    con su proveedor_id de ELLEX, como registro histórico real de lo que
+    pasó; esto solo cambia el CATÁLOGO hacia adelante (de qué proveedor se
+    puede volver a pedir cada producto).
+
+    Si un código de ELLEX ya existe IDÉNTICO bajo QUANTEL ANTES de esta
+    migración (caso real encontrado: "2436115/7", mismo precio y
+    descripción -- Quantel ya lo tenía en su propio catálogo), no se
+    duplica: el producto que viene de ELLEX se reasigna igual (mantiene su
+    id, por si alguna Orden de Compra ya lo referencia), pero se desactiva,
+    porque ya hay un equivalente activo bajo Quantel y dejar los dos
+    activos solo confundiría el catálogo al armar una Orden de Compra
+    nueva. OJO: esto compara SOLO contra lo que Quantel ya tenía ANTES de
+    migrar -- el catálogo de ELLEX en sí trae códigos repetidos legítimos
+    (ver el comentario en Producto.__table_args__: "el Excel origen trae
+    codigos repetidos para variantes/paquetes de un mismo proveedor"), así
+    que dos productos de ELLEX con el mismo código entre sí NO se fusionan
+    entre ellos -- ambos se migran tal cual estaban, para no alterar nada
+    que el usuario no pidió tocar.
+
+    Una vez que ELLEX se queda sin productos propios, se desactiva ese
+    proveedor (a pedido del usuario) -- ya no se podrá elegir para una
+    Orden de Compra nueva, pero el historial que ya tiene queda intacto.
+
+    Idempotente: se activa viendo si el proveedor ELLEX todavía tiene
+    productos -- una vez migrados todos, no vuelve a encontrar nada que
+    mover (y no vuelve a tocar el flag activo de ELLEX una segunda vez)."""
+    ellex = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "ELLEX").first()
+    quantel = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == "QUANTEL").first()
+    if not ellex or not quantel:
+        print("[reparar_ronda_bf] No se encontró el proveedor ELLEX y/o QUANTEL, se omite la migración.")
+        return 0
+
+    productos_ellex = Producto.query.filter_by(proveedor_id=ellex.id).all()
+    if not productos_ellex:
+        if ellex.activo:
+            ellex.activo = False
+            db.session.commit()
+            print("[reparar_ronda_bf] Proveedor ELLEX desactivado (ya no tenía productos propios en el catálogo).")
+        return 0
+
+    # Instantánea FIJA del catálogo de Quantel ANTES de migrar -- a
+    # propósito no se actualiza dentro del loop, para no fusionar entre sí
+    # productos de ELLEX que compartan código (esos son duplicados legítimos
+    # ya existentes en el propio catálogo de ELLEX, no algo que haya que
+    # limpiar acá).
+    codigos_quantel_previos = {(p.codigo or "").strip().upper() for p in Producto.query.filter_by(proveedor_id=quantel.id).all()}
+    migrados = 0
+    fusionados = 0
+    for p in productos_ellex:
+        codigo_norm = (p.codigo or "").strip().upper()
+        ya_estaba_en_quantel = codigo_norm in codigos_quantel_previos
+        p.proveedor_id = quantel.id
+        if ya_estaba_en_quantel:
+            p.activo = False
+            fusionados += 1
+        migrados += 1
+
+    ellex.activo = False
+    db.session.commit()
+    print(
+        f"[reparar_ronda_bf] {migrados} producto(s) de ELLEX migrados al proveedor QUANTEL "
+        f"({fusionados} fusionado(s) con un código ya existente en Quantel, desactivado para no duplicar el catálogo). "
+        "Proveedor ELLEX desactivado (sin productos propios y ya no vende directo)."
+    )
+    return migrados
+
+
 with app.app_context():
     reparar_ordenes_mezcladas()
     limpiar_ordenes_canceladas()
@@ -4604,6 +4684,7 @@ with app.app_context():
     reparar_consignacion_y_codigo_interno_ronda_au()
     reparar_status_despachos_desincronizados()
     reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09()
+    reparar_migrar_productos_ellex_a_quantel()
 
 
 def _mensaje_division(ordenes_destino):
