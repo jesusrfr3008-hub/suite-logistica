@@ -4673,6 +4673,104 @@ def reparar_migrar_productos_ellex_a_quantel():
     return migrados
 
 
+def reparar_deduplicar_catalogo_productos():
+    """Ronda BG (2026-10-08, a pedido del usuario): tras fusionar el
+    catálogo de ELLEX dentro de QUANTEL (ronda BF), el usuario reportó que
+    al armar una Orden de Compra a Quantel aparecían "muchos productos
+    repetidos" y pidió: "si el proveedor, codigo, descripcion y precio es
+    el mismo y está repetido favor deja 1 solo". Confirmado: 54 grupos con
+    el mismo (proveedor, código, descripción, precio unitario, precio por
+    caja) -- 96 filas "de más" en total, TODAS bajo QUANTEL (duplicados que
+    ya traía su catálogo original más los que arrastró la fusión con
+    Ellex, ver ronda BF).
+
+    A diferencia del resto del catálogo (que SIEMPRE se desactiva, nunca se
+    borra), acá se BORRA de verdad la fila duplicada de más -- porque el
+    selector de catálogo al armar una Orden de Compra muestra también los
+    productos inactivos, sombreados (ver api_productos_por_proveedor, ronda
+    U), así que solo desactivar NO resolvía lo que el usuario reportó: los
+    seguía viendo repetidos igual. Por seguridad, antes de borrar cada fila
+    se verifica que no esté referenciada en ningún lado (ProductoVariante,
+    HomologacionStock, StockExistencia, AliasCodigoProveedor,
+    OrdenCompraLinea, ParcialLinea) -- si lo está, esa fila puntual se
+    desactiva en vez de borrarse (igual que el resto del catálogo), para no
+    romper nunca una referencia real.
+
+    Dentro de cada grupo de duplicados se decide cuál fila se CONSERVA así:
+      1) Si EXACTAMENTE una de las filas del grupo tiene
+         codigo_interno_inventario cargado (el cruce con el código del
+         sistema de Inventarios/Ergopyme, ver Producto.codigo_interno_
+         inventario), se conserva esa -- ya está conectada a Homologación
+         de Stock; borrar otra en su lugar rompería ese cruce.
+      2) Si no, se prefiere una fila ACTIVA (la de menor id entre las
+         activas) sobre una inactiva, y si ninguna está activa, la de
+         menor id de todas.
+    Se agrupa sobre TODO el catálogo (activos e inactivos, de cualquier
+    proveedor) -- no se limita a Quantel, por si este mismo problema
+    aparece en otro proveedor más adelante.
+
+    Idempotente: una vez que cada grupo de duplicados reales queda con 1
+    sola fila, no hay nada más que agrupar ni borrar en la próxima
+    corrida."""
+    grupos = defaultdict(list)
+    for p in Producto.query.all():
+        clave = (
+            p.proveedor_id,
+            (p.codigo or "").strip().upper(),
+            (p.descripcion or "").strip().upper(),
+            round(p.precio_unitario or 0, 4),
+            round(p.precio_caja or 0, 4),
+        )
+        grupos[clave].append(p)
+
+    candidatos_a_quitar = []
+    conservar_por_id = {}
+    for clave, filas in grupos.items():
+        if len(filas) < 2:
+            continue
+        con_codigo_interno = [p for p in filas if p.codigo_interno_inventario]
+        if len(con_codigo_interno) == 1:
+            conservar = con_codigo_interno[0]
+        else:
+            activos = [p for p in filas if p.activo]
+            conservar = min(activos, key=lambda p: p.id) if activos else min(filas, key=lambda p: p.id)
+        for p in filas:
+            if p.id != conservar.id:
+                candidatos_a_quitar.append(p)
+                conservar_por_id[p.id] = conservar
+
+    if not candidatos_a_quitar:
+        return 0
+
+    ids_candidatos = [p.id for p in candidatos_a_quitar]
+    referenciados = set()
+    referenciados.update(r[0] for r in db.session.query(ProductoVariante.producto_id).filter(ProductoVariante.producto_id.in_(ids_candidatos)).all())
+    referenciados.update(r[0] for r in db.session.query(HomologacionStock.producto_id).filter(HomologacionStock.producto_id.in_(ids_candidatos)).all())
+    referenciados.update(r[0] for r in db.session.query(StockExistencia.producto_id).filter(StockExistencia.producto_id.in_(ids_candidatos)).all())
+    referenciados.update(r[0] for r in db.session.query(AliasCodigoProveedor.producto_destino_id).filter(AliasCodigoProveedor.producto_destino_id.in_(ids_candidatos)).all())
+    referenciados.update(r[0] for r in db.session.query(OrdenCompraLinea.producto_id).filter(OrdenCompraLinea.producto_id.in_(ids_candidatos)).all())
+    referenciados.update(r[0] for r in db.session.query(ParcialLinea.producto_id).filter(ParcialLinea.producto_id.in_(ids_candidatos)).all())
+
+    borrados = 0
+    desactivados = 0
+    for p in candidatos_a_quitar:
+        if p.id in referenciados:
+            p.activo = False
+            desactivados += 1
+        else:
+            db.session.delete(p)
+            borrados += 1
+
+    db.session.commit()
+    print(
+        f"[reparar_ronda_bg] Catálogo deduplicado: {borrados} producto(s) duplicado(s) (mismo proveedor, código, "
+        f"descripción y precio) eliminados, {desactivados} más desactivados (por estar referenciados en otra "
+        f"parte del sistema) -- {len(candidatos_a_quitar)} fila(s) de más resueltas en total, dejando 1 sola fila "
+        "por grupo."
+    )
+    return len(candidatos_a_quitar)
+
+
 with app.app_context():
     reparar_ordenes_mezcladas()
     limpiar_ordenes_canceladas()
@@ -4685,6 +4783,7 @@ with app.app_context():
     reparar_status_despachos_desincronizados()
     reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09()
     reparar_migrar_productos_ellex_a_quantel()
+    reparar_deduplicar_catalogo_productos()
 
 
 def _mensaje_division(ordenes_destino):
