@@ -88,6 +88,7 @@
         {% if fac.origen == 'Sistema' %}<span class="badge" style="background-color: var(--brand);">Sistema</span>
         {% elif fac.origen == 'Nota de Crédito' %}<span class="badge bg-danger-subtle text-danger-emphasis">Nota de Crédito</span>
         {% elif fac.origen == 'Ajuste manual' %}<span class="badge bg-warning-subtle text-warning-emphasis" data-bs-toggle="tooltip" title="Ajuste manual -- solo corrige este reporte, no afecta Cuentas por Pagar.">Ajuste manual</span>
+        {% elif fac.origen == 'Pago Proveedores' %}<span class="badge bg-info-subtle text-info-emphasis" data-bs-toggle="tooltip" title="Factura registrada en Pago Proveedores > Emitir documento -- ya es Cuenta por Pagar real.">Pago Proveedores</span>
         {% else %}<span class="badge bg-secondary">Histórico</span>{% endif %}
         {% if fac.fue_consignacion %}<span class="badge badge-consignacion-facturada ms-1" data-bs-toggle="tooltip" title="Llegó en consignación (sin costo para el proveedor hasta venderse) y se facturó después de vendida.">Consignación facturada</span>{% endif %}
       </td>

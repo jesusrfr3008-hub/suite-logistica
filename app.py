@@ -12325,6 +12325,73 @@ def _filas_ajustes_compra_proveedor(proveedor=None, fecha_desde=None, fecha_hast
     return filas
 
 
+def _filas_facturas_consignacion_proveedor(proveedor=None, fecha_desde=None, fecha_hasta=None):
+    """Ronda BK (2026-10-08, punto 3 del pedido del usuario -- el que él
+    mismo marcó como "el punto más crítico"): las FacturaProveedor con
+    origen="consignacion" (creadas en Pago Proveedores > Emitir documento >
+    Factura Consignación, ver pagos_proveedores_facturar_consignacion)
+    JAMÁS entraban al reporte Compras Proveedor -- _compras_sistema solo
+    mira Importacion/Costeo real (estas facturas no tienen importacion_id),
+    y _filas_notas_credito/_filas_ajustes_compra_proveedor son siempre
+    movimientos NEGATIVOS (nunca la compra positiva original). El usuario
+    reportó el caso real: facturó ZK2606998 a Medicontur por esa pantalla y
+    no apareció en el reporte de Medicontur, pese a que el mensaje de éxito
+    de esa misma pantalla afirma "ya se cuentan como compra en firme en
+    Compras Proveedor" -- esta función hace que esa frase sea cierta.
+    Devuelve una fila POSITIVA por cada línea de cada FacturaProveedor con
+    ese origen, con la MISMA forma que el resto del reporte (ver
+    _fila_historica_dict/_compras_sistema).
+
+    Limitación conocida (no hay de dónde sacar el dato): como esta factura
+    no nace de un Costeo real, no hay ninguna Empresa compradora asociada
+    (se deja en blanco, igual que ya hacían _filas_notas_credito/
+    _filas_ajustes_compra_proveedor) -- si el reporte se filtra por Empresa
+    estas líneas no van a aparecer, pero sí aparecen al mirar el reporte
+    por Proveedor (o sin filtro de empresa), que es el caso que reportó el
+    usuario. Tampoco hay tipo de cambio aduanero propio -- se usa paridad
+    1.0, igual que ya asume _filas_notas_credito para este mismo origen.
+
+    Se marcan con fue_consignacion=True (nunca es_consignacion=True, que es
+    para lo que TODAVÍA no se factura): esta pantalla existe justamente
+    para facturar de verdad algo que llegó en consignación, así que al
+    emitirse ya es una compra en firme -- el mismo criterio que usa el
+    histórico para sombrear una línea que "llegó en consignación y después
+    se facturó de verdad" (ver CompraHistorica.fue_consignacion)."""
+    query = (
+        FacturaProveedorLinea.query
+        .join(FacturaProveedor, FacturaProveedorLinea.factura_id == FacturaProveedor.id)
+        .join(Proveedor, FacturaProveedor.proveedor_id == Proveedor.id)
+        .filter(FacturaProveedor.origen == "consignacion")
+    )
+    if proveedor:
+        query = query.filter(db.func.upper(Proveedor.nombre) == proveedor.upper())
+    if fecha_desde:
+        query = query.filter(FacturaProveedor.fecha_emision >= fecha_desde)
+    if fecha_hasta:
+        query = query.filter(FacturaProveedor.fecha_emision <= fecha_hasta)
+
+    filas = []
+    for linea in query.all():
+        factura = linea.factura
+        if not factura or not factura.proveedor:
+            continue
+        moneda_factura = (factura.moneda or "USD").strip().upper()
+        moneda_operacion = "EUR" if moneda_factura.startswith("EUR") else moneda_factura
+        filas.append({
+            "origen": "Pago Proveedores", "fecha_factura": factura.fecha_emision,
+            "proveedor": factura.proveedor.nombre, "factura": factura.numero_factura,
+            "codigo_interno": "", "codigo_producto": linea.codigo_producto or "(sin código)",
+            "descripcion": linea.descripcion or linea.codigo_producto or "",
+            "unidades": linea.cantidad or 0, "total_invoice": linea.valor_total or 0,
+            "total_usd": linea.valor_total or 0,
+            "moneda_operacion": moneda_operacion, "tipo_cambio": 0, "paridad": 1.0,
+            "flete_usd": 0, "derechos_usd": 0, "derechos_moneda": 0, "otros_gastos_usd": 0, "otros_gastos_moneda": 0,
+            "empresa_compradora": "", "categoria": "", "tipo_flete": "", "homologado": True, "via_ergopyme": False,
+            "es_consignacion": False, "fue_consignacion": True,
+        })
+    return filas
+
+
 def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha_hasta=None, homologar=None):
     """Junta histórico + sistema ya homologados y filtrados -- reutilizado
     tanto por el listado general como por la vista de un proveedor
@@ -12350,6 +12417,13 @@ def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha
     # _filas_ajustes_compra_proveedor. Mismo patrón que las NC reales de
     # arriba, pero nunca tocan Cuentas por Pagar.
     filas += _filas_ajustes_compra_proveedor(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
+    # Ronda BK (2026-10-08, punto 3, "el punto más crítico" según el
+    # usuario): las Facturas Consignación emitidas en Pago Proveedores
+    # (ver _filas_facturas_consignacion_proveedor) entran como compra en
+    # firme POSITIVA -- antes no entraban por ninguna de las 4 fuentes de
+    # arriba, por lo que no aparecían en el reporte del proveedor (caso
+    # real reportado: factura ZK2606998 de Medicontur).
+    filas += _filas_facturas_consignacion_proveedor(proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta)
     if empresa:
         filas = [f for f in filas if (f["empresa_compradora"] or "").upper() == empresa.upper()]
     return filas
