@@ -5796,6 +5796,14 @@ def ordenes_nueva():
         # variantes o no se eligió ninguna.
         variante_codigos = request.form.getlist("variante_codigo")
         variante_descripciones = request.form.getlist("variante_descripcion")
+        # Ronda BK (2026-10-08, 2da vuelta, punto 3): descuento por línea --
+        # ver OrdenCompraLinea.descuento_tipo/descuento_valor. El JS ya deja
+        # "precio_unitario_pactado" con el precio NETO (con descuento
+        # aplicado) -- estas 3 listas son solo para guardar de dónde salió,
+        # vacías ("") en una línea sin descuento.
+        precios_lista = request.form.getlist("precio_unitario_lista")
+        descuento_tipos = request.form.getlist("descuento_tipo")
+        descuento_valores = request.form.getlist("descuento_valor")
 
         lineas_creadas = 0
         for i, (pid, cant, precio, fecha) in enumerate(zip(producto_ids, cantidades, precios, fechas)):
@@ -5804,6 +5812,7 @@ def ordenes_nueva():
             cant_val = parse_int(cant, default=0)
             if cant_val <= 0:
                 continue
+            desc_tipo_i = descuento_tipos[i].strip() if i < len(descuento_tipos) else ""
             linea = OrdenCompraLinea(
                 orden_id=orden.id,
                 producto_id=int(pid),
@@ -5813,6 +5822,9 @@ def ordenes_nueva():
                 etapa=ETAPAS_LINEA[0],
                 variante_codigo=(variante_codigos[i].strip() if i < len(variante_codigos) and variante_codigos[i].strip() else None),
                 variante_descripcion=(variante_descripciones[i].strip() if i < len(variante_descripciones) and variante_descripciones[i].strip() else None),
+                precio_unitario_lista=(float(precios_lista[i]) if i < len(precios_lista) and precios_lista[i].strip() else None),
+                descuento_tipo=(desc_tipo_i if desc_tipo_i in ("porcentaje", "monto") else None),
+                descuento_valor=(float(descuento_valores[i]) if i < len(descuento_valores) and descuento_valores[i].strip() else None),
             )
             db.session.add(linea)
             lineas_creadas += 1
@@ -6538,6 +6550,18 @@ def ordenes_linea_nueva(orden_id):
         return redirect(url_for("ordenes_detalle", orden_id=orden.id))
     precio = float(request.form.get("precio_unitario_pactado") or 0)
     fecha_despacho = parse_date(request.form.get("fecha_estimada_despacho"))
+    # Ronda BK (2026-10-08, 2da vuelta, punto 3): descuento -- ver
+    # OrdenCompraLinea.descuento_tipo/descuento_valor. El JS ya deja
+    # "precio_unitario_pactado" (precio) con el precio NETO; estos 3 campos
+    # son solo para guardar de dónde salió (vacíos si no se usó descuento).
+    # Si se marcó más de una variante, el mismo descuento se aplica a todas
+    # (ya comparten el mismo precio pactado).
+    precio_lista_txt = (request.form.get("precio_unitario_lista") or "").strip()
+    descuento_tipo_txt = (request.form.get("descuento_tipo") or "").strip()
+    descuento_valor_txt = (request.form.get("descuento_valor") or "").strip()
+    precio_lista = float(precio_lista_txt) if precio_lista_txt else None
+    descuento_tipo = descuento_tipo_txt if descuento_tipo_txt in ("porcentaje", "monto") else None
+    descuento_valor = float(descuento_valor_txt) if descuento_valor_txt else None
 
     creadas = []
     duplicadas = []
@@ -6569,6 +6593,9 @@ def ordenes_linea_nueva(orden_id):
             etapa=ETAPAS_LINEA[0],
             variante_codigo=variante_codigo,
             variante_descripcion=variante_descripcion,
+            precio_unitario_lista=precio_lista,
+            descuento_tipo=descuento_tipo,
+            descuento_valor=descuento_valor,
         )
         db.session.add(linea)
         db.session.flush()
@@ -6650,6 +6677,11 @@ def ordenes_lineas_agregar_multiple(orden_id):
     fechas = request.form.getlist("fecha_estimada_despacho")
     variante_codigos = request.form.getlist("variante_codigo")
     variante_descripciones = request.form.getlist("variante_descripcion")
+    # Ronda BK (2026-10-08, 2da vuelta, punto 3): ver la misma nota en
+    # ordenes_nueva -- descuento por línea, opcional.
+    precios_lista = request.form.getlist("precio_unitario_lista")
+    descuento_tipos = request.form.getlist("descuento_tipo")
+    descuento_valores = request.form.getlist("descuento_valor")
 
     creadas = []
     duplicadas = []
@@ -6663,6 +6695,7 @@ def ordenes_lineas_agregar_multiple(orden_id):
         producto_id = int(pid)
         variante_codigo = (variante_codigos[i].strip() if i < len(variante_codigos) and variante_codigos[i].strip() else None)
         variante_descripcion = (variante_descripciones[i].strip() if i < len(variante_descripciones) and variante_descripciones[i].strip() else None)
+        desc_tipo_i = descuento_tipos[i].strip() if i < len(descuento_tipos) else ""
 
         filtro_duplicado = [OrdenCompraLinea.producto_id == producto_id, OrdenCompraLinea.anulada == False]  # noqa: E712
         if variante_codigo:
@@ -6683,6 +6716,9 @@ def ordenes_lineas_agregar_multiple(orden_id):
             etapa=ETAPAS_LINEA[0],
             variante_codigo=variante_codigo,
             variante_descripcion=variante_descripcion,
+            precio_unitario_lista=(float(precios_lista[i]) if i < len(precios_lista) and precios_lista[i].strip() else None),
+            descuento_tipo=(desc_tipo_i if desc_tipo_i in ("porcentaje", "monto") else None),
+            descuento_valor=(float(descuento_valores[i]) if i < len(descuento_valores) and descuento_valores[i].strip() else None),
         )
         db.session.add(linea)
         db.session.flush()
@@ -8254,6 +8290,7 @@ def importacion_generar_factura(importacion_id):
 
         factura = FacturaProveedor(
             proveedor_id=imp.proveedor_id,
+            empresa_id=imp.empresa_id,
             importacion_id=imp.id,
             factura_embarque_id=factura_embarque_id,
             numero_factura=numero,
@@ -12396,14 +12433,17 @@ def _filas_facturas_consignacion_proveedor(proveedor=None, fecha_desde=None, fec
     ese origen, con la MISMA forma que el resto del reporte (ver
     _fila_historica_dict/_compras_sistema).
 
-    Limitación conocida (no hay de dónde sacar el dato): como esta factura
-    no nace de un Costeo real, no hay ninguna Empresa compradora asociada
-    (se deja en blanco, igual que ya hacían _filas_notas_credito/
+    Ronda BK (2026-10-08, 2da vuelta, a pedido del usuario): como esta
+    factura no nace de un Costeo real, no hay forma de DEDUCIR sola la
+    Empresa compradora -- por eso FacturaProveedor.empresa_id se eligió a
+    mano en "Emitir documento" (ver pagos_proveedores_facturar_consignacion)
+    y se usa directo acá. Una factura cargada ANTES de que existiera ese
+    campo queda sin empresa (igual que _filas_notas_credito/
     _filas_ajustes_compra_proveedor) -- si el reporte se filtra por Empresa
-    estas líneas no van a aparecer, pero sí aparecen al mirar el reporte
-    por Proveedor (o sin filtro de empresa), que es el caso que reportó el
-    usuario. Tampoco hay tipo de cambio aduanero propio -- se usa paridad
-    1.0, igual que ya asume _filas_notas_credito para este mismo origen.
+    esas líneas viejas no van a aparecer, pero sí aparecen por Proveedor (o
+    sin filtro de empresa). Tampoco hay tipo de cambio aduanero propio -- se
+    usa paridad 1.0, igual que ya asume _filas_notas_credito para este mismo
+    origen.
 
     Se marcan con fue_consignacion=True (nunca es_consignacion=True, que es
     para lo que TODAVÍA no se factura): esta pantalla existe justamente
@@ -12440,7 +12480,8 @@ def _filas_facturas_consignacion_proveedor(proveedor=None, fecha_desde=None, fec
             "total_usd": linea.valor_total or 0,
             "moneda_operacion": moneda_operacion, "tipo_cambio": 0, "paridad": 1.0,
             "flete_usd": 0, "derechos_usd": 0, "derechos_moneda": 0, "otros_gastos_usd": 0, "otros_gastos_moneda": 0,
-            "empresa_compradora": "", "categoria": "", "tipo_flete": "", "homologado": True, "via_ergopyme": False,
+            "empresa_compradora": factura.empresa.nombre.upper() if factura.empresa else "",
+            "categoria": "", "tipo_flete": "", "homologado": True, "via_ergopyme": False,
             "es_consignacion": False, "fue_consignacion": True,
         })
     return filas
@@ -13504,6 +13545,8 @@ def pagos_proveedores_facturar_consignacion():
 
         fecha_emision = fecha("fecha_emision")
         moneda = (request.form.get("moneda") or proveedor.moneda_default or "USD").strip().upper()
+        empresa_id_txt = request.form.get("empresa_id", "").strip()
+        empresa_id = int(empresa_id_txt) if empresa_id_txt.isdigit() else None
 
         lotes = ConsignacionPendienteLote.query.filter(
             ConsignacionPendienteLote.id.in_(ids_lote),
@@ -13517,6 +13560,7 @@ def pagos_proveedores_facturar_consignacion():
 
         factura = FacturaProveedor(
             proveedor_id=proveedor.id,
+            empresa_id=empresa_id,
             numero_factura=numero_factura,
             fecha_emision=fecha_emision,
             moneda=moneda,
@@ -13597,6 +13641,7 @@ def pagos_proveedores_facturar_consignacion():
         proveedores=Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all(),
         proveedor=proveedor,
         pendientes_lote=pendientes_lote,
+        empresas=Empresa.query.order_by(Empresa.nombre).all(),
     )
 
 

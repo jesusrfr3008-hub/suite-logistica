@@ -78,6 +78,19 @@
           {% endif %}
         </div>
       </div>
+      <div class="col-md-3">
+        <label class="form-label">Empresa compradora</label>
+        <select class="form-select" name="empresa_id">
+          <option value="">Sin asignar</option>
+          {% for e in empresas %}
+          <option value="{{ e.id }}">{{ e.nombre }}</option>
+          {% endfor %}
+        </select>
+        <div class="form-text">
+          Esta factura no viene de ningún Costeo que ya sepa qué empresa compró -- elígela para que el
+          reporte Compras Proveedor la pueda filtrar por empresa.
+        </div>
+      </div>
       <div class="col-12">
         <label class="form-label">Notas</label>
         <input type="text" class="form-control" name="notas">

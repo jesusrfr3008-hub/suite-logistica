@@ -1028,6 +1028,22 @@ class OrdenCompraLinea(db.Model):
     # un producto que YA existía, queda en False -- no hay nada que activar.
     producto_creado_por_esta_orden = db.Column(db.Boolean, default=False)
 
+    # Ronda BK (2026-10-08, 2da vuelta, punto 3 del pedido del usuario):
+    # descuento aplicado a ESTA línea puntual (puede haber un descuento
+    # distinto por producto dentro de la misma OC -- el usuario fue
+    # explícito: "puede que algún producto específico tenga un descuento de
+    # valor"). El usuario pidió que el descuento MODIFIQUE EL PRECIO REAL
+    # (para que Despacho/Costeo, que leen precio_unitario_pactado
+    # directamente, ya reciban el precio con descuento sin ningún cambio
+    # downstream) -- por eso precio_unitario_pactado SIEMPRE queda con el
+    # precio NETO (ya con el descuento aplicado, igual que si el usuario lo
+    # hubiera escrito directo); estos 3 campos son solo para mostrar/auditar
+    # de dónde salió ese precio neto (NULL en líneas sin descuento, o
+    # cargadas antes de este cambio).
+    precio_unitario_lista = db.Column(db.Float, nullable=True)  # precio antes del descuento
+    descuento_tipo = db.Column(db.String(12), nullable=True)  # "porcentaje" o "monto"
+    descuento_valor = db.Column(db.Float, nullable=True)  # el número ingresado (ej. 10 = 10%, o 5.5 = $5.5/caja)
+
     producto = db.relationship("Producto")
 
     @property
@@ -1950,6 +1966,16 @@ class FacturaProveedor(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False)
     importacion_id = db.Column(db.Integer, db.ForeignKey("importaciones.id"), nullable=True)
+    # Ronda BK (2026-10-08, punto 3 del pedido del usuario, 2da vuelta): qué
+    # Empresa compradora corresponde a esta Cuenta por Pagar -- para una
+    # factura "costeo" se completa sola con la Empresa de la Importación
+    # (ver importacion_generar_factura); para una factura "consignacion" el
+    # usuario la elige a mano al emitir el documento (ver
+    # pagos_proveedores_facturar_consignacion) porque esa pantalla no pasa
+    # por ningún Costeo que ya la sepa. NULL en facturas cargadas antes de
+    # este campo (quedan "sin asignar" en el reporte Compras Proveedor,
+    # igual que antes).
+    empresa_id = db.Column(db.Integer, db.ForeignKey("empresas.id"), nullable=True)
     # Ronda BA (2026-10-04, punto 4, corregido a pedido del usuario): a que
     # factura de embarque especifica corresponde esta Cuenta por Pagar, si
     # viene de una Importacion con mas de una factura real individualizada
@@ -2009,6 +2035,7 @@ class FacturaProveedor(db.Model):
     factura_pdf_content_type = db.Column(db.String(100))
 
     proveedor = db.relationship("Proveedor")
+    empresa = db.relationship("Empresa")
     # Ronda BA (2026-10-04): antes era "factura_pago" (uselist=False, una
     # sola por Importacion) -- ahora una Importacion puede tener VARIAS
     # FacturaProveedor (una por cada factura de embarque individualizada),

@@ -432,6 +432,26 @@
               <div class="col-4"><label class="form-label">Precio/caja pactado</label><input type="number" min="0" step="0.01" class="form-control" name="precio_unitario_pactado" id="campoPrecioOrden"></div>
               <div class="col-4"><label class="form-label">Fecha est. despacho</label><input type="date" class="form-control" name="fecha_estimada_despacho"></div>
             </div>
+            <!-- Ronda BK (2026-10-08, 2da vuelta, punto 3): mismo mecanismo
+                 de descuento por línea que en "Nueva Orden de Compra" -- ver
+                 el comentario completo en ordenes/form.html. Si hay más de
+                 una variante marcada arriba, el descuento se aplica igual a
+                 todas (ya comparten el mismo precio pactado). -->
+            <div class="row g-2 mt-1">
+              <div class="col-6">
+                <label class="form-label">Descuento</label>
+                <select class="form-select" id="campoDescuentoTipoOrden" name="descuento_tipo">
+                  <option value="">Sin descuento</option>
+                  <option value="porcentaje">Porcentaje (%)</option>
+                  <option value="monto">Monto fijo ($)</option>
+                </select>
+              </div>
+              <div class="col-6">
+                <label class="form-label">Valor del descuento</label>
+                <input type="number" min="0" step="0.01" class="form-control" id="campoDescuentoValorOrden" name="descuento_valor" placeholder="0" disabled>
+              </div>
+              <input type="hidden" name="precio_unitario_lista" id="campoPrecioListaOrden">
+            </div>
             <p class="text-muted small mb-0 mt-2" id="avisoDuplicadoOrden"></p>
           </div>
           <div class="modal-footer">
@@ -465,7 +485,15 @@
           <td>{{ l.codigo_mostrar }}</td>
           <td style="max-width:260px;">{{ l.descripcion_mostrar }}</td>
           <td class="text-end">{{ l.cantidad_cajas }} <span class="text-muted small">({{ l.cantidad_unidades }} u.)</span></td>
-          <td class="text-end">{{ "%.2f"|format(l.precio_unitario_pactado) }}</td>
+          <td class="text-end">
+            {{ "%.2f"|format(l.precio_unitario_pactado) }}
+            {% if l.descuento_tipo %}
+            <br>
+            <span class="badge bg-light text-dark border small" title="Precio de lista: {{ '%.2f'|format(l.precio_unitario_lista or 0) }}">
+              -{{ l.descuento_valor|int if l.descuento_valor == l.descuento_valor|int else l.descuento_valor }}{{ '%' if l.descuento_tipo == 'porcentaje' else '$' }} dto.
+            </span>
+            {% endif %}
+          </td>
           <td class="text-end">{{ "%.2f"|format(l.subtotal) }}</td>
           <td>{{ l.fecha_estimada_despacho or '-' }}</td>
           <td>
@@ -766,6 +794,9 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
   const campoDescripcion = document.getElementById('campoDescripcionOrden');
   const campoCantidad = document.getElementById('campoCantidadOrden');
   const campoPrecio = document.getElementById('campoPrecioOrden');
+  const campoDescuentoTipo = document.getElementById('campoDescuentoTipoOrden');
+  const campoDescuentoValor = document.getElementById('campoDescuentoValorOrden');
+  const campoPrecioLista = document.getElementById('campoPrecioListaOrden');
   const aviso = document.getElementById('avisoDuplicadoOrden');
   const btnGuardar = document.getElementById('btnGuardarProductoOrden');
   const bloqueVariante = document.getElementById('bloqueVarianteOrden');
@@ -881,8 +912,45 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
     actualizarSeleccionVariantes();
   });
 
+  // Ronda BK (2026-10-08, 2da vuelta, punto 3): mismo mecanismo que en
+  // "Nueva Orden de Compra" -- ver el comentario completo en
+  // ordenes/form.html. Acá hay un solo juego de campos (no una tabla de
+  // filas), así que la "lista" se guarda en campoPrecio.dataset.
+  function aplicarDescuentoOrden() {
+    const tipo = campoDescuentoTipo.value;
+    campoDescuentoValor.disabled = !tipo;
+    if (!tipo) {
+      if (campoPrecio.dataset.listaOriginal !== undefined) {
+        campoPrecio.value = campoPrecio.dataset.listaOriginal;
+        delete campoPrecio.dataset.listaOriginal;
+      }
+      campoPrecioLista.value = '';
+      return;
+    }
+    if (campoPrecio.dataset.listaOriginal === undefined) {
+      campoPrecio.dataset.listaOriginal = campoPrecio.value;
+    }
+    const lista = parseFloat(campoPrecio.dataset.listaOriginal) || 0;
+    const val = parseFloat(campoDescuentoValor.value) || 0;
+    let neto = tipo === 'porcentaje' ? lista * (1 - val / 100) : lista - val;
+    if (neto < 0) neto = 0;
+    campoPrecio.value = fmt(neto);
+    campoPrecioLista.value = fmt(lista);
+  }
+  campoDescuentoTipo.addEventListener('change', aplicarDescuentoOrden);
+  campoDescuentoValor.addEventListener('input', aplicarDescuentoOrden);
+
+  function reiniciarDescuentoOrden() {
+    campoDescuentoTipo.value = '';
+    campoDescuentoValor.value = '';
+    campoDescuentoValor.disabled = true;
+    campoPrecioLista.value = '';
+    delete campoPrecio.dataset.listaOriginal;
+  }
+
   async function seleccionarProducto(p) {
     limpiarVariante();
+    reiniciarDescuentoOrden();
     campoProductoId.value = p.id;
     campoCodigo.value = p.codigo;
     campoDescripcion.value = p.descripcion;
@@ -980,6 +1048,7 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
     campoDescripcion.value = '';
     campoCantidad.value = '';
     campoPrecio.value = '';
+    reiniciarDescuentoOrden();
     aviso.textContent = '';
     limpiarVariante();
     btnGuardar.disabled = true;

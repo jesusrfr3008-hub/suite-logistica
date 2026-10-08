@@ -132,19 +132,28 @@
             <th>Descripción</th>
             <th style="width:100px;">Cant. cajas</th>
             <th style="width:120px;">Precio/caja</th>
+            <th style="width:150px;">Descuento</th>
             <th style="width:110px;">Subtotal</th>
             <th style="width:160px;">Fecha est. despacho</th>
             <th></th>
           </tr>
         </thead>
         <tbody id="cuerpoLineas">
-          <tr id="filaVacia"><td colspan="8" class="text-center text-muted py-3">Agrega productos desde el catálogo de arriba.</td></tr>
+          <tr id="filaVacia"><td colspan="9" class="text-center text-muted py-3">Agrega productos desde el catálogo de arriba.</td></tr>
         </tbody>
         <tfoot>
           <tr>
-            <td colspan="5" class="text-end fw-bold">Total</td>
+            <td colspan="6" class="text-end fw-bold">Total</td>
             <td class="fw-bold" id="totalOrden">0.00</td>
             <td colspan="2"></td>
+          </tr>
+          <!-- Ronda BK (2026-10-08, 2da vuelta, punto 2): resumen en vivo de
+               cajas/unidades totales -- antes solo se veía el total en $, y
+               recién después de emitir la orden. -->
+          <tr>
+            <td colspan="9" class="text-end small text-muted">
+              <span id="resumenCajas">0</span> caja(s) · <span id="resumenUnidades">0</span> unidad(es) en total
+            </td>
           </tr>
         </tfoot>
       </table>
@@ -384,16 +393,30 @@ function agregarLinea(producto, variante) {
   const tr = document.createElement('tr');
   tr.dataset.productoId = producto.id;
   tr.dataset.claveLinea = clave;
+  tr.dataset.empaque = producto.empaque || 1;
   tr.innerHTML = `
     <td><input type="checkbox" class="check-linea"></td>
     <td>${codigoMostrar}
       <input type="hidden" name="producto_id" value="${producto.id}">
       <input type="hidden" name="variante_codigo" value="${varianteCodigo || ''}">
       <input type="hidden" name="variante_descripcion" value="${varianteDescripcion}">
+      <input type="hidden" class="precio-lista-hidden" name="precio_unitario_lista" value="">
+      <input type="hidden" class="descuento-tipo-hidden" name="descuento_tipo" value="">
+      <input type="hidden" class="descuento-valor-hidden" name="descuento_valor" value="">
     </td>
     <td style="max-width:320px;">${descripcionMostrar}</td>
     <td><input type="number" min="1" step="1" class="form-control form-control-sm cantidad" name="cantidad_cajas" value="1" required></td>
     <td><input type="number" min="0" step="0.01" class="form-control form-control-sm precio" name="precio_unitario_pactado" value="${producto.precio_caja}"></td>
+    <td>
+      <div class="d-flex gap-1">
+        <select class="form-select form-select-sm descuento-tipo" style="max-width:62px;">
+          <option value="">Sin desc.</option>
+          <option value="porcentaje">%</option>
+          <option value="monto">$</option>
+        </select>
+        <input type="number" min="0" step="0.01" class="form-control form-control-sm descuento-valor" style="max-width:80px;" placeholder="0" disabled>
+      </div>
+    </td>
     <td class="subtotal">${fmt(producto.precio_caja)}</td>
     <td><input type="date" class="form-control form-control-sm fecha-linea" name="fecha_estimada_despacho"></td>
     <td class="text-end"><button type="button" class="btn btn-sm btn-outline-danger btn-quitar">&times;</button></td>
@@ -403,6 +426,11 @@ function agregarLinea(producto, variante) {
   const cantidadInput = tr.querySelector('.cantidad');
   const precioInput = tr.querySelector('.precio');
   const subtotalCell = tr.querySelector('.subtotal');
+  const descuentoTipoSelect = tr.querySelector('.descuento-tipo');
+  const descuentoValorInput = tr.querySelector('.descuento-valor');
+  const precioListaHidden = tr.querySelector('.precio-lista-hidden');
+  const descuentoTipoHidden = tr.querySelector('.descuento-tipo-hidden');
+  const descuentoValorHidden = tr.querySelector('.descuento-valor-hidden');
 
   function recalcular() {
     const cant = parseInt(cantidadInput.value, 10) || 0;
@@ -410,6 +438,47 @@ function agregarLinea(producto, variante) {
     subtotalCell.textContent = fmt(cant * precio);
     recalcularTotal();
   }
+
+  // Ronda BK (2026-10-08, 2da vuelta, punto 3): descuento por línea -- al
+  // activarlo se guarda el precio ACTUAL del campo "Precio/caja" como
+  // "precio de lista" (una sola vez por fila, en tr.dataset) y ese mismo
+  // campo (name="precio_unitario_pactado", el que Despacho/Costeo leen
+  // directamente) se sobreescribe con el NETO ya descontado -- así no hace
+  // falta tocar nada downstream, el descuento ya viaja "adentro" del
+  // precio pactado. Si se desactiva el descuento, se restaura el precio
+  // de lista guardado. Si el usuario edita el precio A MANO mientras hay
+  // un descuento activo, ese valor manual queda como el pactado real (gana
+  // siempre lo que esté en el campo), pero los 3 campos de auditoría
+  // (lista/tipo/valor) no se vuelven a recalcular en ese caso puntual.
+  function aplicarDescuento() {
+    const tipo = descuentoTipoSelect.value;
+    descuentoValorInput.disabled = !tipo;
+    if (!tipo) {
+      if (tr.dataset.precioListaOriginal !== undefined) {
+        precioInput.value = tr.dataset.precioListaOriginal;
+        delete tr.dataset.precioListaOriginal;
+      }
+      precioListaHidden.value = '';
+      descuentoTipoHidden.value = '';
+      descuentoValorHidden.value = '';
+      recalcular();
+      return;
+    }
+    if (tr.dataset.precioListaOriginal === undefined) {
+      tr.dataset.precioListaOriginal = precioInput.value;
+    }
+    const lista = parseFloat(tr.dataset.precioListaOriginal) || 0;
+    const val = parseFloat(descuentoValorInput.value) || 0;
+    let neto = tipo === 'porcentaje' ? lista * (1 - val / 100) : lista - val;
+    if (neto < 0) neto = 0;
+    precioInput.value = fmt(neto);
+    precioListaHidden.value = fmt(lista);
+    descuentoTipoHidden.value = tipo;
+    descuentoValorHidden.value = val;
+    recalcular();
+  }
+  descuentoTipoSelect.addEventListener('change', aplicarDescuento);
+  descuentoValorInput.addEventListener('input', aplicarDescuento);
 
   cantidadInput.addEventListener('input', recalcular);
   precioInput.addEventListener('input', recalcular);
@@ -448,12 +517,20 @@ function enfocarMismoCampoFilaSiguiente(evento, selectorClase) {
 
 function recalcularTotal() {
   let total = 0;
+  let cajas = 0;
+  let unidades = 0;
   cuerpoLineas.querySelectorAll('tr').forEach(tr => {
     const cant = parseInt(tr.querySelector('.cantidad')?.value, 10) || 0;
     const precio = parseFloat(tr.querySelector('.precio')?.value) || 0;
     total += cant * precio;
+    cajas += cant;
+    unidades += cant * (parseFloat(tr.dataset.empaque) || 1);
   });
   totalOrdenEl.textContent = fmt(total);
+  const resumenCajas = document.getElementById('resumenCajas');
+  const resumenUnidades = document.getElementById('resumenUnidades');
+  if (resumenCajas) resumenCajas.textContent = cajas;
+  if (resumenUnidades) resumenUnidades.textContent = fmt(unidades).replace(/\.00$/, '');
 }
 
 document.getElementById('btnAplicarFechaMasiva').addEventListener('click', () => {
