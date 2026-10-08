@@ -82,6 +82,11 @@
     {% endif %}
   </div>
 
+  {# Ronda BK (2026-10-08, 2da vuelta, a pedido del usuario): la columna
+     "Descuento" solo se agrega al documento si AL MENOS UNA linea de esta
+     orden tiene descuento -- si ninguna lo tiene, no se trae esa columna
+     vacia a todo el documento. #}
+  {% set tiene_descuento = lineas|selectattr('descuento_tipo')|list|length > 0 %}
   <table class="tabla-productos">
     <thead>
       <tr>
@@ -90,6 +95,7 @@
         <th class="num">Cant. Cajas</th>
         <th class="num">Cant. Unidades</th>
         <th class="num">Precio Caja</th>
+        {% if tiene_descuento %}<th class="num">Descuento</th>{% endif %}
         <th class="num">Subtotal</th>
       </tr>
     </thead>
@@ -101,13 +107,20 @@
         <td class="num">{{ l.cantidad_cajas|numero_flex }}</td>
         <td class="num">{{ l.cantidad_unidades|numero_flex }}</td>
         <td class="num">{{ l.precio_unitario_pactado|numero_flex }}</td>
+        {% if tiene_descuento %}
+        <td class="num">
+          {% if l.descuento_tipo == 'porcentaje' %}-{{ l.descuento_valor|numero_flex }}%
+          {% elif l.descuento_tipo == 'monto' %}-{{ l.descuento_valor|numero_flex }}
+          {% else %}-{% endif %}
+        </td>
+        {% endif %}
         <td class="num">{{ l.subtotal|numero_flex }}</td>
       </tr>
       {% endfor %}
     </tbody>
     <tfoot>
       <tr>
-        <td colspan="5" style="text-align:right;">TOTAL</td>
+        <td colspan="{{ 6 if tiene_descuento else 5 }}" style="text-align:right;">TOTAL</td>
         <td class="num">{{ orden.total|numero_flex }} {{ orden.moneda }}</td>
       </tr>
     </tfoot>
