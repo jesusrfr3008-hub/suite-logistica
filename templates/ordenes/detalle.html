@@ -594,6 +594,42 @@
   {% endif %}
 </div>
 
+<div class="card p-3 mt-3">
+  <h5 class="section-title mb-2">Envíos al proveedor</h5>
+  <p class="text-muted small mb-3">
+    Cada vez que se abre un borrador con "Enviar al proveedor" (por Outlook o por correo) queda
+    registrado aquí. <strong>Importante:</strong> esto confirma que se preparó el borrador, no que
+    el correo salió de verdad -- el último clic de Enviar se da desde Outlook/tu programa de
+    correo, fuera del alcance de esta pantalla.
+  </p>
+  {% if correos_enviados %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th>Destinatario</th>
+          <th>Vía</th>
+          <th>Fecha</th>
+          <th>Preparado por</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in correos_enviados %}
+        <tr>
+          <td>{{ c.destinatario }}</td>
+          <td><span class="badge bg-secondary">{{ c.via }}</span></td>
+          <td>{{ c.fecha_envio | hora_cl }}</td>
+          <td>{{ c.usuario.nombre_completo if c.usuario else '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted mb-0">Todavía no se ha preparado ningún envío al proveedor para esta orden.</p>
+  {% endif %}
+</div>
+
 {% for l in lineas %}
 <div class="modal fade" id="modalConfirmar{{ l.id }}" tabindex="-1">
   <div class="modal-dialog">

@@ -894,6 +894,13 @@ class OrdenCompra(db.Model):
         "OrdenDocumento", backref="orden", cascade="all, delete-orphan", lazy="dynamic",
         order_by="OrdenDocumento.fecha_subida.desc()",
     )
+    # Ronda BI (2026-10-08): historial de "Enviar al proveedor" -- ver
+    # OrdenCorreoEnviado arriba para la nota importante sobre qué confirma
+    # (un borrador abierto) y qué NO confirma (que el correo salió de verdad).
+    correos_enviados = db.relationship(
+        "OrdenCorreoEnviado", backref="orden", cascade="all, delete-orphan", lazy="dynamic",
+        order_by="OrdenCorreoEnviado.fecha_envio.desc()",
+    )
 
     @property
     def total(self):
@@ -1102,6 +1109,39 @@ class OrdenDocumento(db.Model):
     # cualquier actualización.
     contenido = db.Column(db.LargeBinary)
     content_type = db.Column(db.String(100))
+
+
+class OrdenCorreoEnviado(db.Model):
+    """Ronda BI (2026-10-08, a pedido del usuario, Fase 1 de la propuesta de
+    seguimiento de correos/notificaciones): registro de cada vez que se usa
+    "Enviar al proveedor" (por Outlook o por el enlace de correo) desde una
+    Orden de Compra -- la base de la pestaña "Envíos al proveedor" en el
+    detalle de la orden.
+
+    IMPORTANTE -- qué significa este registro y qué NO significa: tanto
+    "Enviar por Outlook" (mail.Display(), nunca .Send(), decisión del
+    usuario desde la ronda L) como el enlace mailto: solo ABREN un borrador
+    en el programa de correo del usuario -- no confirman que el correo
+    salió de verdad, porque el último clic de Enviar lo da el usuario desde
+    su propio cliente de correo, fuera del alcance de este programa. Por
+    eso este registro se guarda apenas se abre el borrador (si Outlook no
+    está disponible, no llega a crearse ninguna fila) y el texto que se le
+    muestra al usuario en pantalla dice "Borrador preparado", nunca
+    "Enviado" -- no hay forma de saber, desde aquí, si headers después
+    efectivamente lo envió, lo editó o lo descartó. La Fase 2 de la
+    propuesta (Microsoft Graph contra un buzón de Microsoft 365) sí podría
+    confirmar un envío real en el futuro."""
+
+    __tablename__ = "ordenes_correos_enviados"
+
+    id = db.Column(db.Integer, primary_key=True)
+    orden_id = db.Column(db.Integer, db.ForeignKey("ordenes_compra.id"), nullable=False)
+    destinatario = db.Column(db.String(255))
+    asunto = db.Column(db.String(255))
+    via = db.Column(db.String(30))  # "Outlook" o "Correo (mailto)"
+    fecha_envio = db.Column(db.DateTime, default=datetime.utcnow)
+    usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    usuario = db.relationship("Usuario", foreign_keys=[usuario_id])
 
 
 # ---------------------------------------------------------------------------

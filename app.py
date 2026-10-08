@@ -28,6 +28,7 @@ from markupsafe import escape
 
 from models import (
     db, Empresa, Proveedor, Producto, ProductoVariante, OrdenCompra, OrdenCompraLinea, OrdenDocumento,
+    OrdenCorreoEnviado,
     ESTADOS_OC, ETAPAS_LINEA, TIPOS_DOCUMENTO_ORDEN,
     Importacion, Parcial, ParcialLinea, ParcialLineaLote, GastoImportacion, GastoDocumento,
     ImportacionDocumento,
@@ -6321,6 +6322,9 @@ def ordenes_detalle(orden_id):
     orden = OrdenCompra.query.get_or_404(orden_id)
     lineas = orden.lineas.all()
     documentos = orden.documentos.all()
+    # Ronda BI (2026-10-08): historial de "Enviar al proveedor" -- ver
+    # OrdenCorreoEnviado en models.py para la nota sobre qué confirma esto.
+    correos_enviados = orden.correos_enviados.all()
     # Otras ordenes que comparten el mismo numero de PO (por una division
     # automatica al confirmar o despachar solo una parte de los productos).
     # Ronda BH (2026-10-08, a pedido del usuario): el numero de PO ya NO es
@@ -6358,6 +6362,7 @@ def ordenes_detalle(orden_id):
         tipos_documento=TIPOS_DOCUMENTO_ORDEN,
         otras_partes=otras_partes,
         empresas=empresas,
+        correos_enviados=correos_enviados,
     )
 
 
@@ -7435,6 +7440,19 @@ def ordenes_enviar_outlook(orden_id):
         )
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
 
+    # Ronda BI (2026-10-08, Fase 1 de la propuesta de seguimiento de
+    # correos): registra que se preparó este envío -- ver OrdenCorreoEnviado
+    # en models.py para la nota importante sobre qué confirma esto (un
+    # borrador abierto, NO que el correo salió de verdad).
+    db.session.add(OrdenCorreoEnviado(
+        orden_id=orden.id,
+        destinatario=destinatario or "(sin correo de contacto cargado)",
+        asunto=asunto,
+        via="Outlook",
+        usuario_id=current_user.id,
+    ))
+    db.session.commit()
+
     if destinatario:
         flash(
             f"Se abrió un borrador en Outlook para {destinatario} con la OC {orden.numero_po} "
@@ -7461,6 +7479,16 @@ def ordenes_mailto(orden_id):
     cuerpo = quote(cuerpo_txt)
     destinatario = prov.contacto_email or ""
     mailto = f"mailto:{destinatario}?subject={asunto}&body={cuerpo}"
+    # Ronda BI (2026-10-08, Fase 1): mismo registro que el envío por Outlook
+    # -- ver la nota en OrdenCorreoEnviado (models.py) sobre qué confirma.
+    db.session.add(OrdenCorreoEnviado(
+        orden_id=orden.id,
+        destinatario=destinatario or "(sin correo de contacto cargado)",
+        asunto=asunto_txt,
+        via="Correo (mailto)",
+        usuario_id=current_user.id,
+    ))
+    db.session.commit()
     return redirect(mailto)
 
 
