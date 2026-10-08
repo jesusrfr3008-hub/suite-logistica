@@ -1579,59 +1579,142 @@ def _cargar_stock_valorizado(filas):
     return {"cargados": len(filas), "unidades_total": total_unidades}
 
 
-def _cantidad_consignacion_por_codigo():
-    """Ronda BE (2026-10-07, a pedido del usuario): reemplaza a
-    _codigos_en_consignacion (ronda AM/AQ) -- aquella función solo decía SI
-    o NO un código tenía algo en consignación, y Stock Valorizado mostraba
-    el stock_total COMPLETO de ese código en la vista "consignación" (y lo
-    excluía COMPLETO en "desactivado"), aunque ese código tuviera stock
-    MIXTO (ej. 3 unidades totales, 2 en consignación, 1 propio) -- el
-    usuario señaló exactamente este caso y pidió que se separe de verdad
-    por código, no todo-o-nada.
+def _empresas_accuv_accum_ids():
+    """Ronda BL (2026-10-08): IDs de las Empresa "Accuvision"/"Accumedical"
+    -- mismo criterio de nombre (sin sufijo SPA, sin distinguir mayúsculas)
+    que ya usa _empresa_por_nombre_reporte al cargar Stock. Se usa para
+    cruzar StockExistencia/consignación por empresa en Stock Valorizado.
+    Cualquiera de los dos puede ser None si esa Empresa no existe (no
+    debería pasar en producción, pero no debe romper la pantalla)."""
+    accuv = Empresa.query.filter(db.func.upper(Empresa.nombre) == "ACCUVISION").first()
+    accum = Empresa.query.filter(db.func.upper(Empresa.nombre) == "ACCUMEDICAL").first()
+    return (accuv.id if accuv else None, accum.id if accum else None)
 
-    Ahora se usa ConsignacionPendienteLote (ronda AX) como fuente -- es la
-    ÚNICA tabla que sabe, lote por lote y todo el tiempo actualizada sola
-    (cada Stock nuevo de Ergopyme corre _detectar_consumo_consignacion_por_lote),
-    cuánto de cada código sigue vigente en consignación HOY
-    (cantidad_en_stock = recibido - consumido). Devuelve
-    {codigo_interno: cantidad_vigente_en_consignacion}, sumando todos los
-    lotes/proveedores de ese código y proveedores."""
+
+def _disponible_por_codigo_y_empresa():
+    """Ronda BL (2026-10-08, a pedido del usuario): unidades REALMENTE
+    disponibles para la venta, por código y por empresa, tal como las trae
+    el reporte de Stock ("Control de Existencias > Informes > Stock
+    General", lo que alimenta StockExistencia) -- a diferencia de Stock
+    Valorizado, este reporte YA excluye stock en préstamo/leasing/no
+    disponible para la venta (Ergopyme no los incluye en este informe) y ya
+    excluye los códigos homologados como "excluido" (ver
+    _clasificar_y_cargar_stock, nunca llegan a crear una fila de
+    StockExistencia). Devuelve {(codigo_interno, empresa_id): unidades},
+    sumando todos los lotes de ese código en esa empresa."""
     totales = defaultdict(float)
-    filas = (
+    for codigo, empresa_id, stock_fisico in StockExistencia.query.with_entities(
+        StockExistencia.codigo_interno, StockExistencia.empresa_id, StockExistencia.stock_fisico
+    ).all():
+        codigo = (codigo or "").strip()
+        if not codigo:
+            continue
+        totales[(codigo, empresa_id)] += stock_fisico or 0
+    return dict(totales)
+
+
+def _consignacion_por_codigo_y_empresa():
+    """Ronda BL (2026-10-08, a pedido del usuario -- CORRIGE la versión de
+    ronda BE): la versión anterior (_cantidad_consignacion_por_codigo, hoy
+    reemplazada) sabía cuánto de un código estaba en consignación en TOTAL,
+    pero no en qué empresa -- Stock Valorizado lo resolvía repartiendo
+    proporcionalmente entre Accuvision/Accumedical según el stock total de
+    cada una, lo que inventaba decimales que no existen en el reporte real
+    de Ergopyme. El usuario señaló que no hace falta inventar nada: cada
+    lote de consignación (ConsignacionPendienteLote.codigo_lote) se puede
+    cruzar contra el Stock físico actual (StockExistencia, que SÍ sabe en
+    qué empresa está cada lote) por la clave (codigo_interno, codigo_lote)
+    -- la misma clave que ya usa _detectar_consumo_consignacion_por_lote.
+
+    Con eso, en el caso normal (un lote está completo en una sola empresa)
+    la cantidad en consignación de ese lote se asigna ENTERA a esa empresa,
+    sin reparto de ningún tipo. Si por alguna razón el mismo lote tiene
+    stock físico en AMBAS empresas a la vez (caso raro -- un lote
+    literalmente dividido entre las dos bodegas), se reparte SOLO ese lote
+    puntual según el stock físico real de cada empresa para ese lote exacto
+    (un hecho real y verificable, no un promedio inventado a nivel de
+    código).
+
+    Si un lote de consignación vigente (cantidad_en_stock > 0) no aparece
+    HOY en ninguna empresa del Stock físico (ej. se vendió y todavía no se
+    le reportó el consumo al proveedor -- el usuario confirmó que este es
+    un caso transitorio normal, no un error), esa cantidad no se asigna a
+    ninguna empresa: no está físicamente en el stock de nadie en este
+    momento, así que no corresponde restarla del stock propio de ninguna
+    de las dos.
+
+    Devuelve {(codigo_interno, empresa_id): cantidad_vigente_en_consignacion}."""
+    stock_por_lote_empresa = defaultdict(lambda: defaultdict(float))
+    for codigo, lote, empresa_id, stock_fisico in StockExistencia.query.with_entities(
+        StockExistencia.codigo_interno, StockExistencia.codigo_lote,
+        StockExistencia.empresa_id, StockExistencia.stock_fisico
+    ).all():
+        codigo = (codigo or "").strip()
+        lote_norm = (lote or "").strip() or "(sin lote)"
+        if not codigo or not stock_fisico:
+            continue
+        stock_por_lote_empresa[(codigo, lote_norm)][empresa_id] += stock_fisico or 0
+
+    totales = defaultdict(float)
+    lotes_consignacion = (
         ConsignacionPendienteLote.query
         .filter(ConsignacionPendienteLote.codigo_interno.isnot(None))
         .filter(ConsignacionPendienteLote.codigo_interno != "")
         .all()
     )
-    for fila in filas:
+    for fila in lotes_consignacion:
         cantidad = fila.cantidad_en_stock
-        if cantidad > 0:
-            totales[fila.codigo_interno] += cantidad
+        if cantidad <= 0:
+            continue
+        codigo = (fila.codigo_interno or "").strip()
+        lote_norm = (fila.codigo_lote or "").strip() or "(sin lote)"
+        stock_empresas = stock_por_lote_empresa.get((codigo, lote_norm))
+        if not stock_empresas:
+            continue  # lote sin stock físico hoy -- ver docstring, no se asigna a nadie
+        stock_total_lote = sum(v for v in stock_empresas.values() if v > 0)
+        if stock_total_lote <= 0:
+            continue
+        for empresa_id, stock_empresa in stock_empresas.items():
+            if stock_empresa <= 0:
+                continue
+            proporcion = stock_empresa / stock_total_lote  # 1.0 en el caso normal (un solo empresa_id con stock)
+            totales[(codigo, empresa_id)] += round(cantidad * proporcion, 4)
     return dict(totales)
 
 
-class _FilaStockValorizadoDividida:
-    """Ronda BE (2026-10-07): copia liviana, de solo lectura, de una fila de
-    StockValorizado con sus cantidades (stock y valor, por empresa y total)
-    multiplicadas por `factor` -- usada por stock_valorizado_list() para
-    mostrar solo la porción propia o solo la porción en consignación de un
-    código con stock mixto, sin tocar los datos reales guardados. El PMP
-    (costo promedio por unidad) NO se reescala -- es independiente de la
-    cantidad."""
+def _limpiar_cantidad(x):
+    """Redondea a 4 decimales y devuelve un int de verdad cuando el
+    resultado es un número entero (el caso normal, ahora que ya no se
+    reparte proporcionalmente) -- así la pantalla muestra "7", no "7.0"."""
+    x = round(x or 0, 4)
+    entero = round(x)
+    return entero if abs(x - entero) < 1e-9 else x
 
-    def __init__(self, base, factor):
+
+class _FilaStockValorizadoVista:
+    """Ronda BL (2026-10-08): reemplaza a _FilaStockValorizadoDividida.
+    Aquella versión repartía proporcionalmente (factor) y por eso inventaba
+    decimales que no existen en el reporte real -- el usuario pidió que NO
+    se reparta nada (ver _consignacion_por_codigo_y_empresa). Esta clase ya
+    recibe las cantidades FINALES (exactas) de Accuvision/Accumedical --
+    ya sea el stock propio/consignación tras el cruce por lote, o las
+    unidades disponibles de _disponible_por_codigo_y_empresa -- y solo
+    calcula el valor como cantidad * PMP (el PMP no se reescala, es
+    independiente de la cantidad, igual que en la versión anterior)."""
+
+    def __init__(self, base, stock_accuvision, stock_accumedical):
         self.codigo_interno = base.codigo_interno
         self.descripcion = base.descripcion
         self.unidad_medida = base.unidad_medida
         self.pmp_accuvision = base.pmp_accuvision
         self.pmp_accumedical = base.pmp_accumedical
         self.pmp_total = base.pmp_total
-        self.stock_accuvision = round((base.stock_accuvision or 0) * factor, 4)
-        self.valor_accuvision = round((base.valor_accuvision or 0) * factor, 2)
-        self.stock_accumedical = round((base.stock_accumedical or 0) * factor, 4)
-        self.valor_accumedical = round((base.valor_accumedical or 0) * factor, 2)
-        self.stock_total = round((base.stock_total or 0) * factor, 4)
-        self.valor_total = round((base.valor_total or 0) * factor, 2)
+        self.stock_accuvision = _limpiar_cantidad(stock_accuvision)
+        self.stock_accumedical = _limpiar_cantidad(stock_accumedical)
+        self.stock_total = _limpiar_cantidad((stock_accuvision or 0) + (stock_accumedical or 0))
+        self.valor_accuvision = round((stock_accuvision or 0) * (base.pmp_accuvision or 0), 2)
+        self.valor_accumedical = round((stock_accumedical or 0) * (base.pmp_accumedical or 0), 2)
+        self.valor_total = round(self.valor_accuvision + self.valor_accumedical, 2)
 
 
 def _leer_filas_stock_consignacion(ws):
@@ -11121,15 +11204,31 @@ def stock_valorizado_list():
 
     El filtro "vista" es el botón de 3 fases que pidió el usuario:
     - "desactivado": solo stock propio, EXCLUYE los códigos que hoy
-      sabemos que están en consignación (ver _codigos_en_consignacion).
+      sabemos que están en consignación.
     - "consolidado" (default): todos los códigos, propios + consignación.
     - "consignacion": SOLO los códigos en consignación.
-    Ver la nota en _codigos_en_consignacion sobre por qué esto es hoy una
-    aproximación parcial (solo Medicontur) mientras no llegue el archivo
-    maestro de consignación de todos los proveedores."""
+
+    Ronda BL (2026-10-08, a pedido del usuario, corrige ronda BE): la
+    separación propio/consignación por empresa YA NO reparte
+    proporcionalmente -- usa _consignacion_por_codigo_y_empresa(), que
+    cruza cada lote de consignación contra el Stock físico actual
+    (StockExistencia) por (código, lote) para saber EXACTAMENTE en qué
+    empresa está, sin inventar decimales.
+
+    Ronda BL también agrega un segundo filtro independiente,
+    "disponibilidad" (todo/disponible), combinable con "vista": cuando es
+    "disponible", en vez de las cantidades que trae Stock Valorizado (que
+    incluye stock en préstamo/leasing, no vendible) se usan las unidades
+    reales disponibles para la venta por empresa, tomadas de
+    StockExistencia (_disponible_por_codigo_y_empresa) -- el PMP sigue
+    viniendo de Stock Valorizado, así que el valor mostrado es
+    unidades_disponibles * PMP, tal como pidió el usuario."""
     vista = request.args.get("vista", "consolidado")
     if vista not in ("desactivado", "consolidado", "consignacion"):
         vista = "consolidado"
+    disponibilidad = request.args.get("disponibilidad", "todo")
+    if disponibilidad not in ("todo", "disponible"):
+        disponibilidad = "todo"
     q = request.args.get("q", "").strip()
 
     query = StockValorizado.query
@@ -11139,41 +11238,56 @@ def stock_valorizado_list():
             StockValorizado.descripcion.ilike(like),
             StockValorizado.codigo_interno.ilike(like),
         ))
-    filas = query.order_by(StockValorizado.descripcion).all()
+    filas_base = query.order_by(StockValorizado.descripcion).all()
 
-    consignacion_por_codigo = _cantidad_consignacion_por_codigo()
-    if vista in ("desactivado", "consignacion"):
-        # Ronda BE (2026-10-07, a pedido del usuario): antes esto era
-        # todo-o-nada por código -- un código con 3 unidades totales, 2 en
-        # consignación y 1 propia, mostraba sus 3 unidades COMPLETAS en
-        # "consignación" y 0 en "desactivado" (o viceversa). Ahora se separa
-        # de verdad la cantidad: para cada código se calcula qué porción es
-        # consignación (según ConsignacionPendienteLote, tope al stock_total
-        # real) y el resto es propio, repartiendo esa porción
-        # proporcionalmente entre Accuvision/Accumedical (no se registra por
-        # separado en qué empresa física está cada lote en consignación, así
-        # que se reparte según la proporción de stock que cada empresa ya
-        # tenía para ese código -- el PMP, costo por unidad, no cambia).
-        filas_divididas = []
-        for f in filas:
-            stock_total = f.stock_total or 0
-            if stock_total <= 0:
-                continue
-            cantidad_consig = max(0.0, min(consignacion_por_codigo.get(f.codigo_interno, 0.0), stock_total))
-            cantidad_propio = stock_total - cantidad_consig
-            cantidad_mostrar = cantidad_consig if vista == "consignacion" else cantidad_propio
-            if cantidad_mostrar <= 0.0001:
-                continue
-            factor = cantidad_mostrar / stock_total
-            filas_divididas.append(_FilaStockValorizadoDividida(f, factor))
-        filas = filas_divididas
-
+    id_accuv, id_accum = _empresas_accuv_accum_ids()
+    consignacion_por_codigo_empresa = _consignacion_por_codigo_y_empresa()
+    consignacion_por_codigo = defaultdict(float)
+    for (codigo, empresa_id), cantidad in consignacion_por_codigo_empresa.items():
+        consignacion_por_codigo[codigo] += cantidad
     codigos_con_consignacion = {c for c, cant in consignacion_por_codigo.items() if cant > 0.0001}
+
+    if vista == "consolidado" and disponibilidad == "todo":
+        # Caso de siempre (default): se muestra Stock Valorizado tal cual
+        # viene de Ergopyme, sin tocar nada -- se mantiene el objeto
+        # original (no se reconstruye vía _FilaStockValorizadoVista) para
+        # no arriesgar ninguna diferencia con el reporte real en el caso
+        # más usado.
+        filas = filas_base
+    else:
+        disponible_por_codigo_empresa = (
+            _disponible_por_codigo_y_empresa() if disponibilidad == "disponible" else None
+        )
+        filas = []
+        for f in filas_base:
+            codigo = (f.codigo_interno or "").strip()
+            if disponibilidad == "disponible":
+                base_accuv = disponible_por_codigo_empresa.get((codigo, id_accuv), 0.0) if id_accuv else 0.0
+                base_accum = disponible_por_codigo_empresa.get((codigo, id_accum), 0.0) if id_accum else 0.0
+            else:
+                base_accuv = f.stock_accuvision or 0
+                base_accum = f.stock_accumedical or 0
+
+            if vista == "consolidado":
+                stock_accuv, stock_accum = base_accuv, base_accum
+            else:
+                consig_accuv = min(consignacion_por_codigo_empresa.get((codigo, id_accuv), 0.0), base_accuv) if id_accuv else 0.0
+                consig_accum = min(consignacion_por_codigo_empresa.get((codigo, id_accum), 0.0), base_accum) if id_accum else 0.0
+                if vista == "consignacion":
+                    stock_accuv, stock_accum = consig_accuv, consig_accum
+                else:  # desactivado -> solo propio
+                    stock_accuv = max(0.0, base_accuv - consig_accuv)
+                    stock_accum = max(0.0, base_accum - consig_accum)
+
+            if stock_accuv <= 0.0001 and stock_accum <= 0.0001:
+                continue
+            filas.append(_FilaStockValorizadoVista(f, stock_accuv, stock_accum))
+
     stock_total_vista = sum(f.stock_total or 0 for f in filas)
     valor_total_vista = sum(f.valor_total or 0 for f in filas)
     ultima_carga = db.session.query(db.func.max(StockValorizado.cargado_en)).scalar()
     return render_template(
-        "stock/valorizado.html", filas=filas, vista=vista, q=q,
+        "stock/valorizado.html", filas=filas, vista=vista, disponibilidad=disponibilidad, q=q,
         ultima_carga=ultima_carga, total_codigos_consignacion=len(codigos_con_consignacion),
         stock_total_vista=stock_total_vista, valor_total_vista=valor_total_vista,
     )

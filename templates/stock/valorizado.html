@@ -47,28 +47,43 @@
 </div>
 
 <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
-  <div class="btn-group" role="group" aria-label="Vista de consignación">
-    <a href="{{ url_for('stock_valorizado_list', vista='desactivado', q=q) }}"
-       class="btn btn-sm {{ 'btn-brand' if vista == 'desactivado' else 'btn-outline-secondary' }}">
-      Desactivado <span class="d-none d-md-inline">(solo propio)</span>
-    </a>
-    <a href="{{ url_for('stock_valorizado_list', vista='consolidado', q=q) }}"
-       class="btn btn-sm {{ 'btn-brand' if vista == 'consolidado' else 'btn-outline-secondary' }}">
-      Consolidado <span class="d-none d-md-inline">(propio + consignación)</span>
-    </a>
-    <a href="{{ url_for('stock_valorizado_list', vista='consignacion', q=q) }}"
-       class="btn btn-sm {{ 'btn-brand' if vista == 'consignacion' else 'btn-outline-secondary' }}">
-      Consignación <span class="d-none d-md-inline">(solo consignación)</span>
-    </a>
+  <div class="d-flex flex-wrap gap-2">
+    <div class="btn-group" role="group" aria-label="Vista de consignación">
+      <a href="{{ url_for('stock_valorizado_list', vista='desactivado', disponibilidad=disponibilidad, q=q) }}"
+         class="btn btn-sm {{ 'btn-brand' if vista == 'desactivado' else 'btn-outline-secondary' }}">
+        Propio
+      </a>
+      <a href="{{ url_for('stock_valorizado_list', vista='consolidado', disponibilidad=disponibilidad, q=q) }}"
+         class="btn btn-sm {{ 'btn-brand' if vista == 'consolidado' else 'btn-outline-secondary' }}">
+        Consolidado <span class="d-none d-md-inline">(propio + consignación)</span>
+      </a>
+      <a href="{{ url_for('stock_valorizado_list', vista='consignacion', disponibilidad=disponibilidad, q=q) }}"
+         class="btn btn-sm {{ 'btn-brand' if vista == 'consignacion' else 'btn-outline-secondary' }}">
+        Consignación
+      </a>
+    </div>
+    <div class="btn-group" role="group" aria-label="Disponibilidad">
+      <a href="{{ url_for('stock_valorizado_list', vista=vista, disponibilidad='todo', q=q) }}"
+         class="btn btn-sm {{ 'btn-brand' if disponibilidad == 'todo' else 'btn-outline-secondary' }}"
+         data-bs-toggle="tooltip" title="Stock tal como viene de Stock Valorizado -- incluye stock en préstamo/leasing/no vendible.">
+        Todo el stock
+      </a>
+      <a href="{{ url_for('stock_valorizado_list', vista=vista, disponibilidad='disponible', q=q) }}"
+         class="btn btn-sm {{ 'btn-brand' if disponibilidad == 'disponible' else 'btn-outline-secondary' }}"
+         data-bs-toggle="tooltip" title="Solo unidades realmente disponibles para la venta (reporte de Stock por empresas) -- excluye préstamo/leasing. El valor se calcula como unidades disponibles × PMP.">
+        Stock disponible
+      </a>
+    </div>
   </div>
   <div class="text-muted small" data-bs-toggle="tooltip"
-       title="Hoy solo se reconocen como &quot;en consignación&quot; los códigos que ya rastreamos en Pago Proveedores (Medicontur, pendientes de facturar). Es una aproximación parcial mientras no se suba el archivo maestro de códigos+lotes en consignación de todos los proveedores -- ver ronda AM.">
-    <i class="bi bi-info-circle"></i> {{ total_codigos_consignacion }} código(s) reconocidos hoy como en consignación (solo Medicontur -- dato parcial)
+       title="Separación por empresa calculada cruzando cada lote en consignación contra el Stock físico actual por código + lote -- sin repartos inventados. Hoy solo se reconocen como &quot;en consignación&quot; los códigos que ya rastreamos en Pago Proveedores -- ver ronda BL.">
+    <i class="bi bi-info-circle"></i> {{ total_codigos_consignacion }} código(s) reconocidos hoy como en consignación
   </div>
 </div>
 
 <form class="row g-2 mb-3" method="get">
   <input type="hidden" name="vista" value="{{ vista }}">
+  <input type="hidden" name="disponibilidad" value="{{ disponibilidad }}">
   <div class="col-auto">
     <input type="text" class="form-control" name="q" value="{{ q }}" placeholder="Buscar código o descripción...">
   </div>

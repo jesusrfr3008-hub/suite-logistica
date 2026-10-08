@@ -512,8 +512,8 @@ class ConsignacionPendienteLote(db.Model):
         próximo Stock de Ergopyme (no facturado ni detectado como
         consumido todavía) -- esta es la cantidad VIGENTE en consignación
         hoy, la que usa Stock Valorizado para separar propio de
-        consignación por código (ver _cantidad_consignacion_por_codigo en
-        app.py)."""
+        consignación por código y por empresa (ver
+        _consignacion_por_codigo_y_empresa en app.py, ronda BL)."""
         return round((self.cantidad_recibida or 0) - (self.cantidad_consumida or 0), 4)
 
     @property
