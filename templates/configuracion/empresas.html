@@ -103,8 +103,10 @@
             <label class="form-label mb-0">Plantilla de correo al proveedor</label>
             <div class="form-text mb-2">
               Se usa cuando envías la OC por Outlook (botón "Enviar al proveedor" en el detalle de la orden).
-              Déjala vacía para usar la plantilla general. Puedes usar estos marcadores y se reemplazan
-              automáticamente: <code>[PROVEEDOR]</code>, <code>[NUMERO_OC]</code>, <code>[EMPRESA]</code>,
+              Déjala vacía para usar la plantilla general (en inglés, dirigida al contacto del proveedor).
+              Puedes usar estos marcadores y se reemplazan automáticamente: <code>[PROVEEDOR]</code>,
+              <code>[CONTACTO]</code> (el nombre de la persona de contacto cargada en el proveedor; si no
+              tiene ninguno cargado, usa "[PROVEEDOR] Team"), <code>[NUMERO_OC]</code>, <code>[EMPRESA]</code>,
               <code>[FECHA_EMISION]</code>, <code>[MONEDA]</code>, <code>[TOTAL]</code> y <code>[NOTAS]</code>
               (esto último toma lo que escribas en el campo "Notas" de cada orden).
             </div>

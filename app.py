@@ -7230,13 +7230,24 @@ def ordenes_imprimir(orden_id):
 # cuando la empresa compradora de la orden no tiene una plantilla propia
 # configurada en Configuración > Empresas. Usa los mismos marcadores
 # [ENTRE_CORCHETES] que puede usar el usuario en su plantilla personalizada.
-DEFAULT_ASUNTO_CORREO = "Orden de Compra [NUMERO_OC] - [EMPRESA]"
+# Ronda BI (2026-10-08, a pedido del usuario): el correo va a un proveedor
+# extranjero, así que el cuerpo pasa a redacción profesional en INGLÉS,
+# dirigido por nombre al contacto del proveedor (marcador nuevo
+# [CONTACTO], ver mas abajo) -- antes decía "Estimados [PROVEEDOR]" (el
+# nombre de la EMPRESA proveedora, no de una persona) en español. El
+# asunto también se tradujo al inglés por consistencia con el cuerpo (ya
+# traía el número de OC y la empresa compradora, eso no cambió). Si el
+# usuario ya tenía una plantilla propia configurada para alguna empresa en
+# Configuración > Empresas, esta plantilla por defecto NO la pisa -- hay
+# que revisarla ahí aparte si también se quiere en este formato.
+DEFAULT_ASUNTO_CORREO = "Purchase Order [NUMERO_OC] - [EMPRESA]"
 DEFAULT_CUERPO_CORREO = (
-    "Estimados [PROVEEDOR],\n\n"
-    "Adjuntamos la Orden de Compra [NUMERO_OC].\n\n"
+    "Dear [CONTACTO],\n\n"
+    "Please find attached Purchase Order [NUMERO_OC], issued by [EMPRESA].\n\n"
     "[NOTAS]\n\n"
-    "Quedamos atentos a la confirmación de disponibilidad y fecha de despacho.\n\n"
-    "Saludos."
+    "Kindly confirm the availability of the products and the estimated dispatch date.\n\n"
+    "Best regards,\n"
+    "[EMPRESA]"
 )
 
 
@@ -7247,13 +7258,26 @@ def construir_correo_oc(orden):
     empresa compradora si está configurada (Configuración > Empresas); si
     no, cae en la plantilla por defecto. Así el usuario no necesita editar
     nada a mano en Outlook -- solo escribe lo que quiera agregar en el campo
-    "Notas" de la orden y eso queda en el marcador [NOTAS]."""
+    "Notas" de la orden y eso queda en el marcador [NOTAS].
+
+    Ronda BI (2026-10-08): nuevo marcador [CONTACTO] -- el nombre de la
+    PERSONA de contacto del proveedor (Proveedor.contacto_nombre, campo ya
+    existente en el catálogo de Proveedores), para dirigir el correo por
+    nombre en vez de a la empresa en general. Si el proveedor no tiene
+    ningún contacto cargado, cae de respaldo a "[PROVEEDOR] Team" (nunca
+    deja un saludo vacío como "Dear ,")."""
     empresa = orden.empresa
     asunto_plantilla = (empresa.plantilla_asunto_correo if empresa else None) or DEFAULT_ASUNTO_CORREO
     cuerpo_plantilla = (empresa.plantilla_cuerpo_correo if empresa else None) or DEFAULT_CUERPO_CORREO
 
+    proveedor = orden.proveedor
+    nombre_contacto = (proveedor.contacto_nombre or "").strip() if proveedor else ""
+    if not nombre_contacto:
+        nombre_contacto = f"{proveedor.nombre} Team" if proveedor else "Sir/Madam"
+
     marcadores = {
         "[PROVEEDOR]": orden.proveedor.nombre if orden.proveedor else "",
+        "[CONTACTO]": nombre_contacto,
         "[NUMERO_OC]": orden.numero_po or "",
         "[EMPRESA]": empresa.nombre if empresa else "",
         "[FECHA_EMISION]": str(orden.fecha_emision) if orden.fecha_emision else "",
