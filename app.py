@@ -516,6 +516,12 @@ def ensure_schema_migrations():
             ("precio_catalogo_oculto", "BOOLEAN DEFAULT 0"),
             ("producto_creado_por_esta_orden", "BOOLEAN DEFAULT 0"),
             ("disponibilidad_parcial_pendiente", "BOOLEAN DEFAULT 0"),
+            # Ronda BK (2026-10-08, 2da vuelta, punto 3): descuento por
+            # línea -- ver OrdenCompraLinea.precio_unitario_lista/
+            # descuento_tipo/descuento_valor en models.py.
+            ("precio_unitario_lista", "FLOAT"),
+            ("descuento_tipo", "VARCHAR(12)"),
+            ("descuento_valor", "FLOAT"),
         ],
         "ordenes_compra": [
             ("despacho_id", "INTEGER"),
@@ -596,6 +602,22 @@ def ensure_schema_migrations():
             ("factura_embarque_id", "INTEGER"),
             ("subtotal_productos_moneda", "FLOAT"),
             ("cargos_adicionales_moneda", "FLOAT"),
+            # Ronda BK (2026-10-08, punto 2 del pedido del usuario): PDF de
+            # respaldo de la factura real del proveedor -- ver
+            # FacturaProveedor.factura_pdf_* en models.py.
+            ("factura_pdf_nombre_original", "VARCHAR(255)"),
+            ("factura_pdf_contenido", "BYTEA"),
+            ("factura_pdf_content_type", "VARCHAR(100)"),
+            # Ronda BK (2026-10-08, 2da vuelta, punto 1a): empresa
+            # compradora -- ver FacturaProveedor.empresa_id en models.py.
+            ("empresa_id", "INTEGER"),
+        ],
+        # Ronda BK (2026-10-08, punto 2c, "pago múltiple"): a qué
+        # comprobante (tabla nueva comprobantes_pago_proveedor, ya la crea
+        # db.create_all() sola) corresponde cada pago -- ver
+        # PagoFacturaProveedor.comprobante_id en models.py.
+        "pagos_factura_proveedor": [
+            ("comprobante_id", "INTEGER"),
         ],
         # Ronda AX (2026-09-30, a pedido del usuario): NC "solo_valor" ahora
         # tambien indica a que producto corresponde, para poder rebajar el
