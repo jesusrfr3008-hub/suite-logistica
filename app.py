@@ -3704,7 +3704,18 @@ def dividir_orden_si_corresponde(orden):
         if not lineas_cohorte:
             continue
         destino = None
-        for candidata in OrdenCompra.query.filter_by(numero_po=orden.numero_po).filter(OrdenCompra.id != orden.id):
+        # Ronda BH (2026-10-08): la busqueda de la orden hermana tiene que
+        # exigir tambien la MISMA empresa compradora -- el numero de PO solo
+        # es unico POR EMPRESA (ver OrdenCompra.numero_po), asi que dos
+        # ordenes de empresas distintas pueden coincidir en el numero por
+        # pura casualidad sin ser hermanas. Sin este filtro, esta funcion
+        # podia terminar moviendo lineas de una orden de una empresa hacia
+        # una orden de OTRA empresa con el mismo numero -- un bug de
+        # integridad de datos, no solo de visualizacion.
+        for candidata in (
+            OrdenCompra.query.filter_by(numero_po=orden.numero_po, empresa_id=orden.empresa_id)
+            .filter(OrdenCompra.id != orden.id)
+        ):
             if candidata.estado == "Cancelada":
                 continue
             lineas_candidata = [l for l in candidata.lineas if not l.anulada]
@@ -3776,7 +3787,14 @@ def _fusionar_orden_si_duplica_cohorte_hermana(orden):
         return None
     cohorte_unico = cohortes_presentes.pop()
     hermana = None
-    for candidata in OrdenCompra.query.filter_by(numero_po=orden.numero_po).filter(OrdenCompra.id != orden.id):
+    # Ronda BH (2026-10-08): mismo motivo que en dividir_orden_si_corresponde
+    # -- exigir tambien la MISMA empresa compradora, para no fusionar lineas
+    # con una orden de OTRA empresa que coincida en numero de PO por pura
+    # casualidad.
+    for candidata in (
+        OrdenCompra.query.filter_by(numero_po=orden.numero_po, empresa_id=orden.empresa_id)
+        .filter(OrdenCompra.id != orden.id)
+    ):
         if candidata.estado == "Cancelada":
             continue
         lineas_candidata = [l for l in candidata.lineas if not l.anulada]
@@ -4771,6 +4789,60 @@ def reparar_deduplicar_catalogo_productos():
     return len(candidatos_a_quitar)
 
 
+def reparar_detectar_po_duplicados_entre_empresas():
+    """Ronda BH (2026-10-08, a pedido del usuario): el usuario reporto ver
+    el mensaje "Este PO está dividido en N partes" entre dos órdenes que NO
+    tenían relación real -- una era de la empresa compradora Accumedical y
+    la otra de Accuvision, coincidencia de número de PO (ver
+    ordenes_detalle, dividir_orden_si_corresponde y
+    _fusionar_orden_si_duplica_cohorte_hermana, que ahora exigen también la
+    MISMA empresa compradora, no solo el mismo número).
+
+    Esta función NO modifica nada -- solo recorre el catálogo de órdenes
+    existente y deja un aviso en el log del servidor por cada número de PO
+    que aparezca repetido entre MÁS DE UNA empresa compradora distinta (la
+    única forma en que esto puede pasar hoy es una orden legacy a la que se
+    le asignó la empresa compradora sin corregir su número, de antes de que
+    ordenes_editar validara también ese caso -- ver ronda BH ahí). Decidir
+    qué número corregir y a cuál de las dos órdenes es una decisión de
+    negocio (cuál ya se le comunicó al proveedor, cuál fue un error) que le
+    corresponde al usuario tomar a mano desde "Editar" en cada orden -- este
+    aviso solo la hace visible, no la resuelve sola."""
+    filas = (
+        db.session.query(OrdenCompra.numero_po, OrdenCompra.empresa_id)
+        .distinct()
+        .all()
+    )
+    por_numero = defaultdict(set)
+    for numero_po, empresa_id in filas:
+        por_numero[numero_po].add(empresa_id)
+
+    conflictivos = {n: emp for n, emp in por_numero.items() if len(emp) > 1}
+    if not conflictivos:
+        return 0
+
+    for numero_po, empresa_ids in conflictivos.items():
+        ordenes = (
+            OrdenCompra.query.filter_by(numero_po=numero_po)
+            .order_by(OrdenCompra.empresa_id, OrdenCompra.id)
+            .all()
+        )
+        detalle = ", ".join(
+            f"#{o.id} (empresa={o.empresa.nombre if o.empresa else 'Sin asignar'}, "
+            f"proveedor={o.proveedor.nombre}, estado='{o.estado}')"
+            for o in ordenes
+        )
+        print(
+            f"[reparar_ronda_bh] AVISO: el número de PO '{numero_po}' aparece en más de una empresa "
+            f"compradora distinta -- revisar y corregir a mano desde 'Editar' en cada orden: {detalle}"
+        )
+    print(
+        f"[reparar_ronda_bh] {len(conflictivos)} número(s) de PO repetido(s) entre empresas distintas -- "
+        "ver el detalle de cada uno arriba. No se modificó ninguna orden automáticamente."
+    )
+    return len(conflictivos)
+
+
 with app.app_context():
     reparar_ordenes_mezcladas()
     limpiar_ordenes_canceladas()
@@ -4784,6 +4856,7 @@ with app.app_context():
     reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09()
     reparar_migrar_productos_ellex_a_quantel()
     reparar_deduplicar_catalogo_productos()
+    reparar_detectar_po_duplicados_entre_empresas()
 
 
 def _mensaje_division(ordenes_destino):
@@ -6250,14 +6323,23 @@ def ordenes_detalle(orden_id):
     documentos = orden.documentos.all()
     # Otras ordenes que comparten el mismo numero de PO (por una division
     # automatica al confirmar o despachar solo una parte de los productos).
-    # Se excluyen las 'Cancelada' sin lineas: una orden cancelada y vacia no
-    # es una parte real de la division (nuestra logica de division nunca
-    # crea una orden nueva sin productos), asi que mostrarla como "parte"
-    # solo confunde -- probablemente quedo de una orden creada por error y
-    # cancelada antes de agregarle productos.
+    # Ronda BH (2026-10-08, a pedido del usuario): el numero de PO ya NO es
+    # unico a nivel global, solo DENTRO de cada empresa compradora (ver
+    # siguiente_numero_po y la nota en OrdenCompra.numero_po) -- dos ordenes
+    # de EMPRESAS DISTINTAS pueden coincidir en el numero por pura
+    # casualidad (ej. numeracion manual heredada de antes de asignarles
+    # empresa, ver ordenes_editar) sin tener ninguna relacion entre si. Antes
+    # esta busqueda comparaba solo el numero de PO, asi que mostraba "este PO
+    # esta dividido" entre dos ordenes de empresas distintas que no tenian
+    # nada que ver -- ahora exige tambien que sea la MISMA empresa
+    # compradora: es la unica forma en que el sistema permite que dos ordenes
+    # repitan numero (ver la validacion en ordenes_editar), asi que coincidir
+    # en (empresa, numero de PO) ya implica que es una division/fusion real.
     otras_partes = (
         OrdenCompra.query.filter(
-            OrdenCompra.numero_po == orden.numero_po, OrdenCompra.id != orden.id
+            OrdenCompra.numero_po == orden.numero_po,
+            OrdenCompra.empresa_id == orden.empresa_id,
+            OrdenCompra.id != orden.id,
         )
         .order_by(OrdenCompra.id)
         .all()
@@ -6304,10 +6386,23 @@ def ordenes_editar(orden_id):
     # terminar con el mismo numero (por coincidencia al tipearlo a mano) y
     # el sistema las trata como si fueran partes de una misma division
     # automatica (ver dividir_orden_si_corresponde), lo que confunde a
-    # quien aprueba. Solo se valida cuando el numero CAMBIA -- una orden ya
-    # dividida (que comparte numero de PO a proposito con sus hermanas) se
-    # puede volver a guardar sin tocar nada mas sin que esto la bloquee.
-    if nuevo_empresa_id is not None and nuevo_numero.lower() != (orden.numero_po or "").lower():
+    # quien aprueba. Solo se valida cuando el numero o la empresa CAMBIAN --
+    # una orden ya dividida (que comparte numero de PO a proposito con sus
+    # hermanas) se puede volver a guardar sin tocar nada mas sin que esto la
+    # bloquee.
+    # Ronda BH (2026-10-08, a pedido del usuario): antes esta validacion solo
+    # se disparaba si el TEXTO del numero de PO cambiaba -- asignarle (o
+    # cambiarle) la empresa compradora a una orden que ya tenia un numero
+    # (tipicamente una orden legacy "Sin asignar") sin tocar ese numero NO
+    # pasaba por esta validacion, asi que podia colar una orden con el mismo
+    # numero que otra orden YA EXISTENTE de la empresa nueva -- justo el caso
+    # que el usuario reporto (PO-2026-0007 repetido entre Accumedical y
+    # Accuvision sin ninguna relacion real). Ahora se valida tambien cuando
+    # cambia la empresa, aunque el numero de PO quede igual.
+    if nuevo_empresa_id is not None and (
+        nuevo_numero.lower() != (orden.numero_po or "").lower()
+        or nuevo_empresa_id != orden.empresa_id
+    ):
         conflicto = OrdenCompra.query.filter(
             OrdenCompra.id != orden.id,
             OrdenCompra.empresa_id == nuevo_empresa_id,
