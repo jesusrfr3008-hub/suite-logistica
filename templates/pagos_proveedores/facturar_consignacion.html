@@ -111,7 +111,7 @@
         </thead>
         <tbody>
           {% for f in pendientes_lote %}
-          <tr>
+          <tr class="fila-lote">
             <td><input type="checkbox" name="lote_id" value="{{ f.id }}" class="form-check-input chk-consig" checked></td>
             <td>{{ f.codigo_proveedor or f.codigo_interno }}</td>
             <td>{{ f.descripcion }}</td>
@@ -119,12 +119,12 @@
             <td class="text-end">{{ f.cantidad_pendiente_facturar }}</td>
             <td class="text-end">
               <input type="number" step="0.0001" min="0" max="{{ f.cantidad_pendiente_facturar }}"
-                     name="cantidad_lote_{{ f.id }}" class="form-control form-control-sm text-end"
+                     name="cantidad_lote_{{ f.id }}" class="form-control form-control-sm text-end input-cantidad-lote"
                      value="{{ f.cantidad_pendiente_facturar }}">
             </td>
             <td class="text-end">
               <input type="number" step="0.01" min="0" name="precio_lote_{{ f.id }}"
-                     class="form-control form-control-sm text-end" placeholder="0.00">
+                     class="form-control form-control-sm text-end input-precio-lote" placeholder="0.00">
             </td>
           </tr>
           {% endfor %}
@@ -141,7 +141,8 @@
     </div>
     <div class="text-muted small mb-2">
       Úsalo si sabes que se usó/vendió un producto en consignación pero todavía no aparece arriba (por ejemplo,
-      si el Stock todavía no se ha vuelto a cargar).
+      si el Stock todavía no se ha vuelto a cargar). Si el código que escribes está en el catálogo de
+      {{ proveedor.nombre }}, la descripción se completa sola al salir del campo.
     </div>
     <div id="filasManuales"></div>
   </div>
@@ -149,25 +150,45 @@
   <template id="plantillaFilaManual">
     <div class="row g-2 align-items-center mb-2 fila-manual">
       <div class="col-md-2">
-        <input type="text" class="form-control form-control-sm" name="manual_codigo" placeholder="Código">
+        <input type="text" class="form-control form-control-sm manual-codigo" name="manual_codigo" placeholder="Código">
       </div>
       <div class="col-md-3">
-        <input type="text" class="form-control form-control-sm" name="manual_descripcion" placeholder="Descripción">
+        <input type="text" class="form-control form-control-sm manual-descripcion" name="manual_descripcion" placeholder="Descripción">
       </div>
       <div class="col-md-2">
         <input type="text" class="form-control form-control-sm" name="manual_lote" placeholder="Lote (opcional)">
       </div>
       <div class="col-md-2">
-        <input type="number" step="0.0001" min="0" class="form-control form-control-sm" name="manual_cantidad" placeholder="Cantidad">
+        <input type="number" step="0.0001" min="0" class="form-control form-control-sm manual-cantidad" name="manual_cantidad" placeholder="Cantidad">
       </div>
       <div class="col-md-2">
-        <input type="number" step="0.01" min="0" class="form-control form-control-sm" name="manual_precio" placeholder="Precio unitario">
+        <input type="number" step="0.01" min="0" class="form-control form-control-sm manual-precio" name="manual_precio" placeholder="Precio unitario">
       </div>
       <div class="col-md-1">
         <button type="button" class="btn btn-sm btn-outline-danger btn-quitar-manual">Quitar</button>
       </div>
     </div>
   </template>
+
+  <div class="card p-3 mb-3 bg-light">
+    <div class="row text-center g-2">
+      <div class="col-md-4">
+        <div class="text-muted small">Total unidades</div>
+        <div class="fw-bold fs-5" id="totalUnidades">0</div>
+      </div>
+      <div class="col-md-4">
+        <div class="text-muted small">Total valor</div>
+        <div class="fw-bold fs-5"><span id="totalValor">0.00</span> <span id="totalValorMoneda" class="text-muted"></span></div>
+      </div>
+      <div class="col-md-4">
+        <div class="text-muted small">Líneas a facturar</div>
+        <div class="fw-bold fs-5" id="totalLineas">0</div>
+      </div>
+    </div>
+    <div class="text-muted small mt-2 text-center">
+      Verifica que estos totales coincidan con la factura real del proveedor antes de emitir.
+    </div>
+  </div>
 
   <button type="submit" class="btn btn-brand">Emitir Factura Consignación</button>
   <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-outline-secondary">Cancelar</a>
@@ -176,12 +197,97 @@
 <script>
   const filasManuales = document.getElementById('filasManuales');
   const plantillaFilaManual = document.getElementById('plantillaFilaManual');
+  const proveedorIdActual = {{ proveedor.id }};
+
+  // Ronda BK (2026-10-08, punto 1a del pedido del usuario): al salir del
+  // campo "Código" de una fila agregada a mano, si ese código existe en el
+  // catálogo de este proveedor, se completa sola la descripción -- nunca
+  // pisa algo que el usuario ya haya escrito a mano en ese campo.
+  async function autocompletarDescripcionManual(inputCodigo) {
+    const codigo = inputCodigo.value.trim();
+    const fila = inputCodigo.closest('.fila-manual');
+    const inputDescripcion = fila ? fila.querySelector('.manual-descripcion') : null;
+    if (!codigo || !inputDescripcion || inputDescripcion.value.trim()) return;
+    try {
+      const resp = await fetch(`/api/proveedores/${proveedorIdActual}/productos?q=${encodeURIComponent(codigo)}`);
+      if (!resp.ok) return;
+      const productos = await resp.json();
+      const exacto = productos.find(p => (p.codigo || '').trim().toUpperCase() === codigo.toUpperCase());
+      if (exacto && exacto.descripcion) {
+        inputDescripcion.value = exacto.descripcion;
+      }
+    } catch (e) {
+      // Autocompletar es solo una ayuda -- si falla, el usuario sigue
+      // pudiendo escribir la descripción a mano sin que nada se bloquee.
+    }
+  }
+
+  // Ronda BK (2026-10-08, punto 1b): subtotal de unidades y valor de TODO lo
+  // que se va a facturar (lotes marcados + filas manuales con código y
+  // cantidad), para poder cuadrarlo contra la factura real del proveedor
+  // antes de emitir.
+  function recalcularTotales() {
+    let totalUnidades = 0, totalValor = 0, totalLineas = 0;
+    document.querySelectorAll('.fila-lote').forEach((fila) => {
+      const chk = fila.querySelector('.chk-consig');
+      if (!chk || !chk.checked) return;
+      const cantidad = parseFloat(fila.querySelector('.input-cantidad-lote').value) || 0;
+      const precio = parseFloat(fila.querySelector('.input-precio-lote').value) || 0;
+      if (cantidad > 0) {
+        totalUnidades += cantidad;
+        totalValor += cantidad * precio;
+        totalLineas += 1;
+      }
+    });
+    document.querySelectorAll('.fila-manual').forEach((fila) => {
+      const codigo = (fila.querySelector('.manual-codigo').value || '').trim();
+      const cantidad = parseFloat(fila.querySelector('.manual-cantidad').value) || 0;
+      const precio = parseFloat(fila.querySelector('.manual-precio').value) || 0;
+      if (codigo && cantidad > 0) {
+        totalUnidades += cantidad;
+        totalValor += cantidad * precio;
+        totalLineas += 1;
+      }
+    });
+    document.getElementById('totalUnidades').textContent =
+      totalUnidades.toLocaleString('es-CL', { maximumFractionDigits: 4 });
+    document.getElementById('totalValor').textContent =
+      totalValor.toLocaleString('es-CL', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    document.getElementById('totalLineas').textContent = totalLineas;
+    const selectMoneda = document.querySelector('select[name="moneda"]');
+    document.getElementById('totalValorMoneda').textContent = selectMoneda ? selectMoneda.value : '';
+  }
+
+  function conectarFilaLote(fila) {
+    fila.querySelectorAll('.chk-consig, .input-cantidad-lote, .input-precio-lote').forEach((el) => {
+      el.addEventListener('input', recalcularTotales);
+      el.addEventListener('change', recalcularTotales);
+    });
+  }
+
+  function conectarFilaManual(fila) {
+    const inputCodigo = fila.querySelector('.manual-codigo');
+    inputCodigo.addEventListener('blur', () => autocompletarDescripcionManual(inputCodigo));
+    fila.querySelectorAll('.manual-codigo, .manual-cantidad, .manual-precio').forEach((el) => {
+      el.addEventListener('input', recalcularTotales);
+    });
+  }
+
   document.getElementById('btnAgregarManual').addEventListener('click', () => {
     const fragmento = plantillaFilaManual.content.cloneNode(true);
     const fila = fragmento.querySelector('.fila-manual');
-    fila.querySelector('.btn-quitar-manual').addEventListener('click', () => fila.remove());
+    fila.querySelector('.btn-quitar-manual').addEventListener('click', () => {
+      fila.remove();
+      recalcularTotales();
+    });
+    conectarFilaManual(fila);
     filasManuales.appendChild(fila);
   });
+
+  document.querySelectorAll('.fila-lote').forEach(conectarFilaLote);
+  const selectMonedaInicial = document.querySelector('select[name="moneda"]');
+  if (selectMonedaInicial) selectMonedaInicial.addEventListener('change', recalcularTotales);
+  recalcularTotales();
 </script>
 {% endif %}
 

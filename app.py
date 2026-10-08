@@ -6247,7 +6247,7 @@ def ordenes_simple_cancelar(orden_id):
 
 
 @app.route("/api/proveedores/<int:proveedor_id>/productos")
-@requiere_permiso("crear_orden", "generar_costeo")
+@requiere_permiso("crear_orden", "generar_costeo", "pagos_proveedores")
 def api_productos_por_proveedor(proveedor_id):
     """Ronda U (2026-09-12, punto 4): antes solo devolvía productos activos
     -- uno inactivo simplemente no aparecía en la búsqueda del catálogo al
