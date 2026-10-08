@@ -41,7 +41,7 @@ from models import (
     StockConsignacionVigente, StockComprometidoBodega, ConsignacionPendienteLote,
     ConsignacionReporteProveedor,
     CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
-    FacturaProveedor, PagoFacturaProveedor, ESTADOS_FACTURA_PROVEEDOR,
+    FacturaProveedor, PagoFacturaProveedor, ComprobantePagoProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
     AjusteCompraProveedor,
     FacturaEmbarqueImportacion,
@@ -52,6 +52,11 @@ import costing
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
+# Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
+# factura del proveedor y del comprobante de pago en Pago Proveedores -- el
+# usuario pidió específicamente PDF para estos dos, así que a diferencia de
+# OrdenDocumento/GastoDocumento no se aceptan imágenes acá.
+EXTENSIONES_PERMITIDAS_PDF_PAGO = {".pdf"}
 # Documentos de Gastos (ronda G, punto 7): ademas de PDF/imagen, el usuario
 # pidio poder adjuntar Word y Excel (suele recibir el respaldo de un gasto
 # en esos formatos, no solo PDF).
@@ -7065,6 +7070,25 @@ def _servir_documento(doc, carpeta_disco, forzar_descarga):
     return None
 
 
+def _servir_pdf_en_bd(nombre_original, contenido, content_type, forzar_descarga=False):
+    """Ronda BK (2026-10-08, punto 2): variante simple de _servir_documento
+    para los PDF de Pago Proveedores (factura del proveedor,
+    FacturaProveedor.factura_pdf_*, y comprobante de pago,
+    ComprobantePagoProveedor) -- a diferencia de OrdenDocumento/
+    GastoDocumento/ImportacionDocumento, estos nacieron DESPUÉS de la
+    corrección de ronda AU (disco no permanente) así que nunca tuvieron ni
+    van a tener un respaldo en disco que considerar: siempre viven solo en
+    la base de datos."""
+    if not contenido:
+        return None
+    return send_file(
+        io.BytesIO(contenido),
+        mimetype=content_type or "application/pdf",
+        download_name=nombre_original or "documento.pdf",
+        as_attachment=forzar_descarga,
+    )
+
+
 def _guardar_documento_orden(orden, archivo, tipo):
     """Guarda un archivo adjunto de una orden -- su contenido va directo a
     la base de datos (ver _servir_documento) -- y su fila OrdenDocumento
@@ -8072,6 +8096,31 @@ def _registrar_consignacion_recibida(proveedor_id, linea):
     return total_registrado
 
 
+def _invoice_pdf_desde_oc_para_lineas(lineas_grupo):
+    """Ronda BK (2026-10-08, punto 2a del pedido del usuario): si la(s)
+    Orden(es) de Compra detrás de estas líneas ya tienen un documento tipo
+    "Invoice" adjunto (ver TIPOS_DOCUMENTO_ORDEN/OrdenDocumento, se sube
+    desde el detalle de la Orden de Compra), lo usa como backup automático
+    de la FacturaProveedor que se va a generar -- el usuario no tiene que
+    volver a buscarlo y subirlo a mano en Pago Proveedores. Si hay más de
+    un documento "Invoice" entre las OC involucradas (ej. una Importación
+    que junta líneas de más de una OC), se usa el más reciente -- es solo
+    una ayuda automática, el usuario siempre puede reemplazarlo a mano
+    después desde el detalle de la factura. Devuelve None si ninguna OC
+    detrás de este grupo tiene un "Invoice" adjunto."""
+    mejor = None
+    for linea in lineas_grupo:
+        orden_linea = linea.orden_compra_linea
+        if not orden_linea or not orden_linea.orden:
+            continue
+        for doc in orden_linea.orden.documentos:
+            if doc.tipo != "Invoice" or not doc.contenido:
+                continue
+            if mejor is None or (doc.fecha_subida or datetime.min) > (mejor.fecha_subida or datetime.min):
+                mejor = doc
+    return mejor
+
+
 @app.route("/importaciones/<int:importacion_id>/generar-factura", methods=["POST"])
 @requiere_permiso("generar_costeo", "pagos_proveedores")
 def importacion_generar_factura(importacion_id):
@@ -8230,6 +8279,11 @@ def importacion_generar_factura(importacion_id):
                 valor_total=valor_total_linea,
                 parcial_linea_id=linea.id,
             ))
+        invoice_doc = _invoice_pdf_desde_oc_para_lineas(lineas_grupo)
+        if invoice_doc:
+            factura.factura_pdf_nombre_original = invoice_doc.nombre_original
+            factura.factura_pdf_contenido = invoice_doc.contenido
+            factura.factura_pdf_content_type = invoice_doc.content_type
         creadas.append(factura)
 
     db.session.commit()
@@ -12901,6 +12955,71 @@ def _factura_proveedor_estado_por_saldo(factura):
     return "pendiente"
 
 
+def _extension_valida_pdf_pago(nombre_archivo):
+    _, ext = os.path.splitext(nombre_archivo.lower())
+    return ext in EXTENSIONES_PERMITIDAS_PDF_PAGO
+
+
+def _crear_comprobante_pago_si_corresponde(fecha_pago, numero_referencia):
+    """Ronda BK (2026-10-08, punto 2/2c del pedido del usuario): si la
+    request actual trae un archivo en 'comprobante_pdf', crea (sin hacer
+    commit -- lo hace el caller) el ComprobantePagoProveedor que lo
+    respalda. Devuelve None si no se subió ningún archivo (el pago se
+    puede registrar igual sin comprobante, como antes de este cambio) o si
+    la extensión no es PDF -- en ese caso avisa pero NO bloquea el registro
+    del pago."""
+    archivo = request.files.get("comprobante_pdf")
+    if not archivo or not archivo.filename:
+        return None
+    if not _extension_valida_pdf_pago(archivo.filename):
+        flash(
+            "El comprobante de pago debe ser un archivo PDF -- el pago se registró igual, pero sin el "
+            "comprobante adjunto.",
+            "warning",
+        )
+        return None
+    comprobante = ComprobantePagoProveedor(
+        numero_referencia=(numero_referencia or "").strip() or None,
+        fecha_pago=fecha_pago,
+        nombre_original=archivo.filename,
+        contenido=archivo.read(),
+        content_type=archivo.mimetype or "application/pdf",
+        registrado_por_id=current_user.id,
+    )
+    db.session.add(comprobante)
+    db.session.flush()
+    return comprobante
+
+
+def _totalizacion_pendientes_por_proveedor():
+    """Ronda BK (2026-10-08, punto 2b del pedido del usuario): cuánto se le
+    debe HOY a cada proveedor (saldo_pendiente > 0, sumado por moneda) y
+    cuánto nos debe el proveedor EN SENTIDO CONTRARIO (saldo_pendiente < 0
+    -- crédito a favor: pagamos de más, o nos hicieron una Nota de Crédito
+    sobre una factura que ya estaba pagada). Se calcula sobre TODAS las
+    facturas sin importar su estado -- una factura con saldo negativo queda
+    marcada 'pagada' por _factura_proveedor_estado_por_saldo (su saldo ya no
+    es positivo), así que si esto solo mirara el filtro 'pendientes' ese
+    crédito a favor nunca se vería en ningún lado. Separado por moneda para
+    no mezclar, por ejemplo, un crédito en EUR con una deuda en USD del
+    mismo proveedor."""
+    totales = {}
+    for f in FacturaProveedor.query.all():
+        saldo = f.saldo_pendiente
+        if abs(saldo) < 0.01:
+            continue
+        moneda = (f.moneda or "USD").strip().upper()
+        clave = (f.proveedor_id, moneda)
+        bucket = totales.setdefault(clave, {
+            "proveedor_id": f.proveedor_id, "moneda": moneda, "debemos": 0.0, "credito_a_favor": 0.0,
+        })
+        if saldo > 0:
+            bucket["debemos"] += saldo
+        else:
+            bucket["credito_a_favor"] += -saldo
+    return totales
+
+
 @app.route("/pagos-proveedores")
 @requiere_permiso("pagos_proveedores")
 def pagos_proveedores_list():
@@ -12930,11 +13049,21 @@ def pagos_proveedores_list():
 
     proveedores_con_facturas = Proveedor.query.join(FacturaProveedor).distinct().order_by(Proveedor.nombre).all()
 
+    # Ronda BK (2026-10-08, punto 2b): totalización por proveedor (lo que
+    # debemos + crédito a favor, por moneda) -- ver
+    # _totalizacion_pendientes_por_proveedor. Se agrupa por proveedor_id
+    # para que la plantilla lo pueda mostrar junto a cada tarjeta, sin
+    # importar el filtro de estado que se esté usando para la tabla.
+    totales_por_proveedor_id = defaultdict(list)
+    for bucket in _totalizacion_pendientes_por_proveedor().values():
+        totales_por_proveedor_id[bucket["proveedor_id"]].append(bucket)
+
     return render_template(
         "pagos_proveedores/list.html",
         agrupado=agrupado, hoy=hoy, estado_filtro=estado_filtro,
         proveedor_filtro=proveedor_filtro, proveedores=proveedores_con_facturas,
         ESTADOS_FACTURA_PROVEEDOR=ESTADOS_FACTURA_PROVEEDOR,
+        totales_por_proveedor_id=totales_por_proveedor_id,
     )
 
 
@@ -12979,6 +13108,11 @@ def pagos_proveedores_registrar_pago(factura_id):
     saldo_antes = factura.saldo_pendiente
     es_abono = monto < (saldo_antes - 0.01)
 
+    # Ronda BK (2026-10-08, punto 2 del pedido del usuario): comprobante de
+    # pago en PDF como respaldo -- opcional, el pago se puede registrar sin
+    # él (como antes) y subirlo después desde el detalle de la factura.
+    comprobante = _crear_comprobante_pago_si_corresponde(fecha_pago, request.form.get("numero_comprobante", ""))
+
     pago = PagoFacturaProveedor(
         factura_id=factura.id,
         fecha_pago=fecha_pago,
@@ -12987,6 +13121,7 @@ def pagos_proveedores_registrar_pago(factura_id):
         es_abono=es_abono,
         notas=request.form.get("notas", "").strip(),
         registrado_por_id=current_user.id,
+        comprobante_id=comprobante.id if comprobante else None,
     )
     db.session.add(pago)
     db.session.flush()
@@ -13119,6 +13254,151 @@ def pagos_proveedores_nota_credito(factura_id):
         "pagos_proveedores/nota_credito.html", factura=factura, lineas=lineas,
         TIPOS_NC_PROVEEDOR=TIPOS_NC_PROVEEDOR,
     )
+
+
+@app.route("/pagos-proveedores/<int:factura_id>/factura-pdf/subir", methods=["POST"])
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_factura_pdf_subir(factura_id):
+    """Ronda BK (2026-10-08, punto 2 del pedido del usuario): backup en PDF
+    de la factura real del proveedor, para tener respaldo sin depender del
+    correo o de una carpeta externa -- se puede subir a mano acá, o llega
+    sola si la Orden de Compra de origen ya tenía un documento "Invoice"
+    adjunto al presionar "Generar factura" desde Costeo (ver
+    importacion_generar_factura)."""
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    archivo = request.files.get("factura_pdf")
+    if not archivo or not archivo.filename:
+        flash("Selecciona un archivo PDF para subir.", "danger")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+    if not _extension_valida_pdf_pago(archivo.filename):
+        flash("Solo se permiten archivos PDF.", "danger")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+    factura.factura_pdf_nombre_original = archivo.filename
+    factura.factura_pdf_contenido = archivo.read()
+    factura.factura_pdf_content_type = archivo.mimetype or "application/pdf"
+    db.session.commit()
+    flash(f"Factura '{archivo.filename}' adjuntada como respaldo.", "success")
+    return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+
+@app.route("/pagos-proveedores/<int:factura_id>/factura-pdf/ver")
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_factura_pdf_ver(factura_id):
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    respuesta = _servir_pdf_en_bd(
+        factura.factura_pdf_nombre_original, factura.factura_pdf_contenido, factura.factura_pdf_content_type,
+    )
+    if respuesta is None:
+        flash("Esta factura todavía no tiene ningún PDF de respaldo adjunto.", "warning")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+    return respuesta
+
+
+@app.route("/pagos-proveedores/comprobantes/<int:comprobante_id>/ver")
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_comprobante_ver(comprobante_id):
+    comprobante = ComprobantePagoProveedor.query.get_or_404(comprobante_id)
+    respuesta = _servir_pdf_en_bd(comprobante.nombre_original, comprobante.contenido, comprobante.content_type)
+    if respuesta is None:
+        flash("Este comprobante de pago no tiene ningún PDF adjunto.", "warning")
+        return redirect(url_for("pagos_proveedores_list"))
+    return respuesta
+
+
+@app.route("/pagos-proveedores/pago-multiple")
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_pago_multiple():
+    """Ronda BK (2026-10-08, punto 2c del pedido del usuario): a veces el
+    proveedor se paga con UNA sola transferencia que cubre 2 o más
+    facturas -- esta pantalla deja elegir cuáles (preseleccionadas si se
+    viene con "Pagar seleccionadas" desde el listado) y cuánto se le abona
+    a cada una, para registrar todo junto con un solo comprobante (ver
+    pagos_proveedores_pago_multiple_registrar)."""
+    proveedor_id = request.args.get("proveedor_id", "").strip()
+    proveedor = Proveedor.query.get(int(proveedor_id)) if proveedor_id.isdigit() else None
+    if not proveedor:
+        flash("Elige un proveedor para registrar un pago múltiple.", "danger")
+        return redirect(url_for("pagos_proveedores_list"))
+
+    ids_preseleccionados = {int(i) for i in request.args.getlist("factura_id") if i.isdigit()}
+    facturas = (
+        FacturaProveedor.query
+        .filter(FacturaProveedor.proveedor_id == proveedor.id, FacturaProveedor.estado.in_(["pendiente", "abonada"]))
+        .order_by(FacturaProveedor.fecha_vencimiento)
+        .all()
+    )
+    if not facturas:
+        flash(f"{proveedor.nombre} no tiene facturas pendientes para pagar.", "warning")
+        return redirect(url_for("pagos_proveedores_list"))
+
+    return render_template(
+        "pagos_proveedores/pago_multiple.html",
+        proveedor=proveedor, facturas=facturas,
+        ids_preseleccionados=ids_preseleccionados if ids_preseleccionados else {f.id for f in facturas},
+    )
+
+
+@app.route("/pagos-proveedores/pago-multiple/registrar", methods=["POST"])
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_pago_multiple_registrar():
+    proveedor_id = request.form.get("proveedor_id", "").strip()
+    proveedor = Proveedor.query.get(int(proveedor_id)) if proveedor_id.isdigit() else None
+    if not proveedor:
+        flash("Proveedor inválido.", "danger")
+        return redirect(url_for("pagos_proveedores_list"))
+
+    fecha_pago_txt = request.form.get("fecha_pago", "").strip()
+    try:
+        fecha_pago = datetime.strptime(fecha_pago_txt, "%Y-%m-%d").date() if fecha_pago_txt else datetime.utcnow().date()
+    except ValueError:
+        fecha_pago = datetime.utcnow().date()
+
+    ids_factura = [int(i) for i in request.form.getlist("factura_id") if i.isdigit()]
+    facturas = FacturaProveedor.query.filter(
+        FacturaProveedor.id.in_(ids_factura), FacturaProveedor.proveedor_id == proveedor.id,
+    ).all() if ids_factura else []
+
+    montos = {}
+    for f in facturas:
+        monto = _parse_float_seguro(request.form.get(f"monto_factura_{f.id}"))
+        tipo_cambio_pago = _parse_float_seguro(request.form.get(f"tipo_cambio_factura_{f.id}"))
+        if monto > 0:
+            montos[f.id] = (monto, tipo_cambio_pago)
+
+    if not montos:
+        flash("Marca al menos una factura con un monto a pagar mayor a 0.", "danger")
+        return redirect(url_for("pagos_proveedores_pago_multiple", proveedor_id=proveedor.id))
+
+    # Un solo comprobante (PDF + número de referencia) respalda TODOS los
+    # pagos que se registren en este mismo envío -- ver
+    # ComprobantePagoProveedor y PagoFacturaProveedor.comprobante_id.
+    comprobante = _crear_comprobante_pago_si_corresponde(fecha_pago, request.form.get("numero_comprobante", ""))
+
+    notas = request.form.get("notas", "").strip()
+    facturas_pagadas, facturas_abonadas = [], []
+    for f in facturas:
+        if f.id not in montos:
+            continue
+        monto, tipo_cambio_pago = montos[f.id]
+        saldo_antes = f.saldo_pendiente
+        es_abono = monto < (saldo_antes - 0.01)
+        db.session.add(PagoFacturaProveedor(
+            factura_id=f.id, fecha_pago=fecha_pago, monto=monto, tipo_cambio_pago=tipo_cambio_pago,
+            es_abono=es_abono, notas=notas, registrado_por_id=current_user.id,
+            comprobante_id=comprobante.id if comprobante else None,
+        ))
+        db.session.flush()
+        f.estado = _factura_proveedor_estado_por_saldo(f)
+        (facturas_pagadas if f.estado == "pagada" else facturas_abonadas).append(f.numero_factura)
+    db.session.commit()
+
+    partes = []
+    if facturas_pagadas:
+        partes.append(f"{len(facturas_pagadas)} factura(s) quedaron PAGADA(S) ({', '.join(facturas_pagadas)})")
+    if facturas_abonadas:
+        partes.append(f"{len(facturas_abonadas)} factura(s) quedaron con abono parcial ({', '.join(facturas_abonadas)})")
+    flash(f"Pago múltiple registrado a {proveedor.nombre} -- " + "; ".join(partes) + ".", "success")
+    return redirect(url_for("pagos_proveedores_list", proveedor_id=proveedor.id))
 
 
 def _parse_float_seguro(texto, default=0.0):

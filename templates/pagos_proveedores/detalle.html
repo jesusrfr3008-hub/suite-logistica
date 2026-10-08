@@ -73,6 +73,20 @@
           <div>{{ factura.notas }}</div>
         </div>
         {% endif %}
+        <div class="col-12">
+          <div class="small text-muted mb-1">Factura del proveedor (PDF de respaldo)</div>
+          {% if factura.factura_pdf_contenido %}
+          <a href="{{ url_for('pagos_proveedores_factura_pdf_ver', factura_id=factura.id) }}" target="_blank" class="btn btn-sm btn-outline-secondary">
+            <i class="bi bi-file-earmark-pdf"></i> Ver {{ factura.factura_pdf_nombre_original or 'PDF' }}
+          </a>
+          {% else %}
+          <span class="text-muted small">Todavía no se adjuntó el PDF de esta factura.</span>
+          {% endif %}
+          <form method="post" action="{{ url_for('pagos_proveedores_factura_pdf_subir', factura_id=factura.id) }}" enctype="multipart/form-data" class="d-inline-flex gap-2 align-items-center ms-2">
+            <input type="file" name="factura_pdf" accept=".pdf" class="form-control form-control-sm" style="max-width: 220px;">
+            <button type="submit" class="btn btn-sm btn-outline-brand">{{ 'Reemplazar' if factura.factura_pdf_contenido else 'Subir' }}</button>
+          </form>
+        </div>
       </div>
     </div>
   </div>
@@ -100,7 +114,7 @@
 {% if factura.estado != 'pagada' and factura.estado != 'anulada' %}
 <div class="card p-3 mb-4">
   <div class="fw-semibold mb-2">Registrar pago</div>
-  <form method="post" action="{{ url_for('pagos_proveedores_registrar_pago', factura_id=factura.id) }}" class="row g-2 align-items-end">
+  <form method="post" action="{{ url_for('pagos_proveedores_registrar_pago', factura_id=factura.id) }}" enctype="multipart/form-data" class="row g-2 align-items-end">
     <div class="col-md-2">
       <label class="form-label small mb-0">Fecha de pago</label>
       <input type="date" class="form-control form-control-sm" name="fecha_pago" required>
@@ -113,17 +127,29 @@
       <label class="form-label small mb-0">Tipo de cambio del pago</label>
       <input type="text" class="form-control form-control-sm" name="tipo_cambio_pago" placeholder="CLP por 1 {{ factura.moneda }}" required>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-2">
+      <label class="form-label small mb-0">N° comprobante</label>
+      <input type="text" class="form-control form-control-sm" name="numero_comprobante" placeholder="Opcional">
+    </div>
+    <div class="col-md-2">
+      <label class="form-label small mb-0">Comprobante (PDF)</label>
+      <input type="file" class="form-control form-control-sm" name="comprobante_pdf" accept=".pdf">
+    </div>
+    <div class="col-md-2">
       <label class="form-label small mb-0">Notas</label>
       <input type="text" class="form-control form-control-sm" name="notas" placeholder="Opcional">
     </div>
-    <div class="col-md-3">
-      <button type="submit" class="btn btn-sm btn-brand w-100">Registrar pago</button>
+    <div class="col-12">
+      <button type="submit" class="btn btn-sm btn-brand">Registrar pago</button>
+      <a href="{{ url_for('pagos_proveedores_pago_multiple', proveedor_id=factura.proveedor_id, factura_id=factura.id) }}" class="btn btn-sm btn-outline-secondary">
+        Pagar junto con otra(s) factura(s) de este proveedor
+      </a>
     </div>
   </form>
   <div class="text-muted small mt-2">
     Si el monto ingresado cubre el saldo pendiente completo, la factura queda "Pagada"; si es menor, queda
-    "Abonada" y puedes seguir registrando pagos hasta completarla.
+    "Abonada" y puedes seguir registrando pagos hasta completarla. El comprobante de pago es opcional -- puedes
+    registrar el pago sin él y adjuntarlo después.
   </div>
 </div>
 {% endif %}
@@ -206,6 +232,7 @@
           <th class="text-end">Tipo de cambio</th>
           <th class="text-end">CLP</th>
           <th>Tipo</th>
+          <th>Comprobante</th>
           <th>Notas</th>
           <th>Registrado por</th>
         </tr>
@@ -218,6 +245,15 @@
           <td class="text-end">{{ p.tipo_cambio_pago|moneda }}</td>
           <td class="text-end">{{ p.monto_clp|clp }}</td>
           <td>{{ 'Abono' if p.es_abono else 'Pago total' }}</td>
+          <td>
+            {% if p.comprobante and p.comprobante.contenido %}
+            <a href="{{ url_for('pagos_proveedores_comprobante_ver', comprobante_id=p.comprobante.id) }}" target="_blank" class="btn btn-sm btn-outline-secondary py-0">
+              <i class="bi bi-file-earmark-pdf"></i> Ver{% if p.comprobante.numero_referencia %} ({{ p.comprobante.numero_referencia }}){% endif %}
+            </a>
+            {% else %}
+            <span class="text-muted small">--</span>
+            {% endif %}
+          </td>
           <td class="text-muted small">{{ p.notas or '' }}</td>
           <td class="text-muted small">{{ p.registrado_por.nombre_completo if p.registrado_por else '--' }}</td>
         </tr>

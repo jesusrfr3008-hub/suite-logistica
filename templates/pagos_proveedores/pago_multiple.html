@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Pago múltiple · {{ proveedor.nombre }} · Pago Proveedores{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+  <div>
+    <h3 class="section-title mb-1">Pago múltiple -- {{ proveedor.nombre }}</h3>
+    <div class="text-muted small">
+      Registra un solo pago/comprobante que cubra 2 o más facturas de este proveedor -- deja en 0 o en blanco
+      el monto de las que no se paguen en este envío. Cada factura puede tener su propio tipo de cambio si
+      corresponde (normalmente el mismo para todas, si se pagaron juntas el mismo día).
+    </div>
+  </div>
+  <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-sm btn-outline-secondary">&larr; Volver al listado</a>
+</div>
+
+<form method="post" action="{{ url_for('pagos_proveedores_pago_multiple_registrar') }}" enctype="multipart/form-data">
+  <input type="hidden" name="proveedor_id" value="{{ proveedor.id }}">
+
+  <div class="card p-3 mb-3">
+    <div class="row g-2 align-items-end">
+      <div class="col-md-3">
+        <label class="form-label small mb-0">Fecha de pago</label>
+        <input type="date" class="form-control form-control-sm" name="fecha_pago" required>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small mb-0">N° comprobante</label>
+        <input type="text" class="form-control form-control-sm" name="numero_comprobante" placeholder="Opcional">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small mb-0">Comprobante (PDF)</label>
+        <input type="file" class="form-control form-control-sm" name="comprobante_pdf" accept=".pdf">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small mb-0">Notas</label>
+        <input type="text" class="form-control form-control-sm" name="notas" placeholder="Opcional">
+      </div>
+    </div>
+  </div>
+
+  <div class="card p-3 mb-3">
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead>
+          <tr class="text-muted small">
+            <th>Factura</th>
+            <th>Vencimiento</th>
+            <th class="text-end">Saldo pendiente</th>
+            <th class="text-end" style="width: 160px;">Monto a pagar</th>
+            <th class="text-end" style="width: 160px;">Tipo de cambio</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for f in facturas %}
+          <tr>
+            <td class="fw-semibold">{{ f.numero_factura }}</td>
+            <td>{{ f.fecha_vencimiento.strftime('%d-%m-%Y') if f.fecha_vencimiento else '--' }}</td>
+            <td class="text-end">{{ f.saldo_pendiente|moneda }} {{ f.moneda }}</td>
+            <td class="text-end">
+              <input type="hidden" name="factura_id" value="{{ f.id }}">
+              <input type="text" class="form-control form-control-sm text-end" name="monto_factura_{{ f.id }}"
+                     value="{{ f.saldo_pendiente if f.id in ids_preseleccionados else '' }}" placeholder="0.00">
+            </td>
+            <td class="text-end">
+              <input type="text" class="form-control form-control-sm text-end" name="tipo_cambio_factura_{{ f.id }}" placeholder="CLP por 1 {{ f.moneda }}">
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <button type="submit" class="btn btn-brand">Registrar pago múltiple</button>
+  <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-outline-secondary">Cancelar</a>
+</form>
+
+{% endblock %}

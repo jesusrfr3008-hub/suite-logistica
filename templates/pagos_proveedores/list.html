@@ -54,10 +54,25 @@
       {% else %}
       <span class="badge bg-light text-muted border">Sin plazo de crédito cargado</span>
       {% endif %}
+      {# Ronda BK (2026-10-08, punto 2b): totalización por proveedor -- lo
+         que le debemos (por moneda) y, si corresponde, el crédito a favor
+         (saldo negativo: pagamos de más o nos hicieron una NC sobre una
+         factura ya pagada) -- ver _totalizacion_pendientes_por_proveedor. #}
+      {% for t in totales_por_proveedor_id.get(proveedor.id, []) %}
+      <span class="badge bg-dark">Debemos: {{ t.debemos|moneda }} {{ t.moneda }}</span>
+      {% if t.credito_a_favor > 0.01 %}
+      <span class="badge bg-success" data-bs-toggle="tooltip" title="Saldo negativo a nuestro favor -- pagamos de más o nos hicieron una Nota de Crédito sobre una factura ya pagada.">A favor: {{ t.credito_a_favor|moneda }} {{ t.moneda }}</span>
+      {% endif %}
+      {% endfor %}
     </div>
-    <a href="{{ url_for('proveedores_editar', proveedor_id=proveedor.id) }}" class="btn btn-sm btn-outline-secondary">
-      Editar condiciones de crédito
-    </a>
+    <div class="d-flex gap-2">
+      <a href="{{ url_for('pagos_proveedores_pago_multiple', proveedor_id=proveedor.id) }}" class="btn btn-sm btn-outline-brand">
+        Pago múltiple
+      </a>
+      <a href="{{ url_for('proveedores_editar', proveedor_id=proveedor.id) }}" class="btn btn-sm btn-outline-secondary">
+        Editar condiciones de crédito
+      </a>
+    </div>
   </div>
 
   <div class="table-responsive">

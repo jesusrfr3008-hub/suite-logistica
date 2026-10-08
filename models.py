@@ -1994,6 +1994,20 @@ class FacturaProveedor(db.Model):
     # cargaron una sola vez desde el Excel de saldos iniciales, fase 1).
     origen = db.Column(db.String(20), default="manual")
 
+    # Ronda BK (2026-10-08, punto 2 del pedido del usuario): PDF de la
+    # factura real del proveedor, como respaldo dentro de Pago Proveedores
+    # (sin depender de ir a buscar el correo o la carpeta original). El
+    # contenido va directo a la base de datos, igual que OrdenDocumento/
+    # GastoDocumento/ImportacionDocumento (ver _servir_documento en
+    # app.py) -- sobrevive a los despliegues. Se completa sola cuando la
+    # factura se genera desde Costeo y la Orden de Compra de origen ya
+    # tenía un documento tipo "Invoice" adjunto (ver
+    # importacion_generar_factura); si no, el usuario la sube a mano desde
+    # el detalle de la factura.
+    factura_pdf_nombre_original = db.Column(db.String(255))
+    factura_pdf_contenido = db.Column(db.LargeBinary)
+    factura_pdf_content_type = db.Column(db.String(100))
+
     proveedor = db.relationship("Proveedor")
     # Ronda BA (2026-10-04): antes era "factura_pago" (uselist=False, una
     # sola por Importacion) -- ahora una Importacion puede tener VARIAS
@@ -2043,6 +2057,33 @@ class FacturaProveedor(db.Model):
         return f"<FacturaProveedor {self.numero_factura} ({self.estado})>"
 
 
+class ComprobantePagoProveedor(db.Model):
+    """Ronda BK (2026-10-08, punto 2 del pedido del usuario): el PDF del
+    comprobante de pago (transferencia/banco) que respalda uno o más pagos
+    -- ver PagoFacturaProveedor.comprobante_id. Vive en su propia tabla (en
+    vez de ser solo un campo más de PagoFacturaProveedor) porque un mismo
+    comprobante puede cubrir VARIAS facturas a la vez ("pago múltiple",
+    punto 2c -- el proveedor a veces se paga con una sola transferencia que
+    cubre 2 o más facturas). El contenido va directo a la base de datos,
+    igual que OrdenDocumento/GastoDocumento (ver _servir_documento en
+    app.py)."""
+    __tablename__ = "comprobantes_pago_proveedor"
+
+    id = db.Column(db.Integer, primary_key=True)
+    numero_referencia = db.Column(db.String(120))
+    fecha_pago = db.Column(db.Date, nullable=False)
+    nombre_original = db.Column(db.String(255))
+    contenido = db.Column(db.LargeBinary)
+    content_type = db.Column(db.String(100))
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    registrado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+
+    registrado_por = db.relationship("Usuario")
+
+    def __repr__(self):
+        return f"<ComprobantePagoProveedor {self.numero_referencia or self.id}>"
+
+
 class PagoFacturaProveedor(db.Model):
     __tablename__ = "pagos_factura_proveedor"
 
@@ -2055,8 +2096,16 @@ class PagoFacturaProveedor(db.Model):
     notas = db.Column(db.String(300))
     registrado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    # Ronda BK (2026-10-08, punto 2c, "pago múltiple"): a qué comprobante
+    # (PDF + número de referencia) corresponde este pago -- NULL en pagos
+    # cargados antes de este cambio (sin comprobante adjunto todavía) o
+    # cuando el usuario no subió ningún PDF. Varios PagoFacturaProveedor
+    # (de facturas distintas) pueden compartir el MISMO comprobante_id
+    # cuando se pagaron juntas con una sola transferencia.
+    comprobante_id = db.Column(db.Integer, db.ForeignKey("comprobantes_pago_proveedor.id"), nullable=True)
 
     registrado_por = db.relationship("Usuario")
+    comprobante = db.relationship("ComprobantePagoProveedor", backref=db.backref("pagos", lazy="dynamic"))
 
     @property
     def monto_clp(self):
