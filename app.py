@@ -10838,6 +10838,38 @@ def _estados_homologacion_por_codigo():
     return {h.codigo_interno: h.estado for h in HomologacionStock.query.all()}
 
 
+def _producto_variante_por_codigo_interno():
+    """Ronda BM (2026-10-09, a pedido del usuario): mapeo codigo_interno ->
+    (producto_id, variante_codigo_en_mayuscula_o_None) para los codigos
+    Ergopyme que SI estan ligados a un Producto/ProductoVariante del
+    catalogo (estado 'vinculado' en HomologacionStock).
+
+    El usuario reportó que, tras fusionar 'VISCO BIOVIS 3.0/1.8/1.6' con
+    'BIOVISC 3,0%/1,8%/1,6%' y homologar el codigo interno de Ergopyme, la
+    columna Tránsito de Consulta de Stock seguía en 0 para esos códigos
+    pese a tener despachos reales en "Internación Aduanas". La causa real
+    NO fue la fusión en sí (HomologacionStock.producto_id SI se reasigna
+    siempre al producto destino en _migrar_historial_producto_a_producto,
+    sin condicionarlo al empaque) sino que esos códigos, en el momento
+    reportado, no tenían ninguna fila en el ÚLTIMO reporte de Stock
+    cargado (por eso aparecían con la fila "sintética" de abajo, resaltada
+    en amarillo, con descripción del reporte de Pedido/Bodegas en vez de
+    la del catálogo) -- y esa fila sintética dejaba Tránsito hardcodeado
+    en 0 sin siquiera consultar _transito_por_linea(). Este helper permite
+    que esa fila sintética también resuelva su (producto_id, variante)
+    real vía homologación, igual que lo hace cualquier fila con stock
+    físico cargado."""
+    resultado = {}
+    for h in HomologacionStock.query.filter(
+        db.or_(HomologacionStock.producto_id.isnot(None), HomologacionStock.variante_id.isnot(None))
+    ).all():
+        if h.variante_id and h.variante:
+            resultado[h.codigo_interno] = (h.variante.producto_id, (h.variante.codigo or "").strip().upper() or None)
+        elif h.producto_id:
+            resultado[h.codigo_interno] = (h.producto_id, None)
+    return resultado
+
+
 @app.route("/stock")
 @requiere_permiso("consultar_stock", "inventarios")
 def stock_list():
@@ -10998,6 +11030,11 @@ def stock_list():
     codigos_cubiertos = {(f.empresa_id, f.codigo_interno) for f in filas}
     empresas_por_id = {e.id: e for e in Empresa.query.all()}
     q_lower = q.lower() if q else ""
+    # Ronda BM (2026-10-09): ver _producto_variante_por_codigo_interno -- esta
+    # fila sintética ya NO deja Tránsito hardcodeado en 0; si el código
+    # Ergopyme está vinculado a un Producto/Variante del catálogo, se resuelve
+    # su tránsito real igual que cualquier fila con stock físico cargado.
+    producto_variante_por_codigo = _producto_variante_por_codigo_interno()
     if proveedor_id != "sin_marca":
         for (emp_id, codigo), cantidad_pedido in pedido_por_codigo.items():
             if not cantidad_pedido or (emp_id, codigo) in codigos_cubiertos:
@@ -11019,6 +11056,11 @@ def stock_list():
                 and q_lower not in (codigo_prov_res or "").lower()
             ):
                 continue
+            producto_id_res, variante_codigo_res = producto_variante_por_codigo.get(codigo, (None, None))
+            transito_info_res = (
+                transito_por_linea.get((producto_id_res, variante_codigo_res)) if producto_id_res else None
+            )
+            transito_res = transito_info_res["cantidad"] if transito_info_res else 0
             grupos[("pedido_sin_stock", codigo, emp_id)] = {
                 "empresa": empresas_por_id.get(emp_id),
                 "proveedor_id": prov_id_res,
@@ -11032,13 +11074,16 @@ def stock_list():
                 "homologado": bool(resuelto),
                 "via_ergopyme": bool(resuelto),
                 "sin_stock_cargado": True,
-                "_producto_id": None,
-                "_variante_codigo": None,
+                "_producto_id": producto_id_res,
+                "_variante_codigo": variante_codigo_res,
                 "stock_actual": 0,
-                "transito": 0,
-                "transito_detalle": "",
+                "transito": transito_res,
+                "transito_detalle": (
+                    "<br>".join(str(escape(linea)) for linea in transito_info_res["detalle"])
+                    if transito_info_res else ""
+                ),
                 "pedido": cantidad_pedido,
-                "stock_total_proyectado": 0 + 0 - cantidad_pedido,
+                "stock_total_proyectado": 0 + transito_res - cantidad_pedido,
             }
 
     # Ronda AD (2026-09-14): orden por defecto pedido por el usuario -- el
