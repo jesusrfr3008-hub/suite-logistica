@@ -1366,11 +1366,10 @@ def _detectar_consumo_consignacion_por_lote(filas_nuevas):
     antes de reemplazar StockExistencia con cada Stock nuevo que llega de
     Ergopyme (manual desde /stock, o automático vía la automatización AHK).
     Para cada lote que ConsignacionPendienteLote todavía espera encontrar
-    en stock (cantidad_en_stock > 0), compara esa cantidad esperada contra
-    la nueva foto: si la nueva cantidad es MENOR (bajó o el lote
-    desapareció del todo), la diferencia se suma a cantidad_consumida --
-    "consumido, listo para facturarle al proveedor". Un aumento no cuenta
-    como consumo (se ignora -- solo importan las bajadas).
+    en stock, compara esa cantidad esperada contra la nueva foto: si la
+    nueva cantidad es MENOR (bajó o el lote desapareció del todo), la
+    diferencia se suma a cantidad_consumida -- "consumido, listo para
+    facturarle al proveedor".
 
     Ejemplo real que confirmó el usuario: el 15-09 había 4 lotes de
     consignación con 1 unidad cada uno; el 16-09 la carga nueva solo trae 2
@@ -1378,24 +1377,58 @@ def _detectar_consumo_consignacion_por_lote(filas_nuevas):
     a cantidad_consumida = 1 cada uno, es decir, quedan pendientes de
     facturar.
 
+    Ronda BL (2026-10-08, a pedido del usuario -- dos escenarios reales que
+    señaló): un producto+lote que salió de consignación (se vendió, quedó
+    "consumido") y LUEGO vuelve al stock físico (ej. devolución de
+    cliente) antes de habérselo informado al proveedor, debe "revivir"
+    como consignación vigente otra vez -- todavía no se le avisó nada al
+    proveedor, así que sigue siendo de él. Pero si esa misma unidad YA se
+    le informó al proveedor como consumida antes de volver, debe quedar
+    como stock PROPIO -- ya se le avisó que se consumió, no corresponde
+    "retractarse".
+
+    Por eso ahora, además de las bajadas, también se detectan SUBIDAS: si
+    la nueva cantidad es MAYOR a la esperada, se revive cantidad_consumida
+    hacia atrás, pero SOLO hasta el tope de lo que todavía no se informó
+    (cantidad_consumida - cantidad_informada) -- nunca se revive la
+    porción ya informada al proveedor. Si la subida es mayor a esa porción
+    revivible, el excedente simplemente queda como stock propio (no hay
+    nada más que revivir en este lote).
+
+    Se vuelven a incluir en la consulta los lotes YA "completos"
+    (cantidad_recibida == cantidad_consumida) que todavía tengan algo sin
+    informar (cantidad_consumida > cantidad_informada), porque esos son
+    justo los candidatos a revivir -- antes quedaban excluidos para
+    siempre apenas se consumían del todo.
+
     No toca StockExistencia ni ninguna otra tabla de stock -- es puramente
-    el control financiero de qué consignación falta facturar."""
-    pendientes = ConsignacionPendienteLote.query.filter(
-        ConsignacionPendienteLote.cantidad_recibida > ConsignacionPendienteLote.cantidad_consumida
-    ).all()
-    if not pendientes:
-        return 0
+    el control financiero de qué consignación falta facturar. Devuelve
+    {"consumidos": N, "revividos": M}."""
+    candidatos = ConsignacionPendienteLote.query.filter(db.or_(
+        ConsignacionPendienteLote.cantidad_recibida > ConsignacionPendienteLote.cantidad_consumida,
+        ConsignacionPendienteLote.cantidad_consumida > ConsignacionPendienteLote.cantidad_informada,
+    )).all()
+    if not candidatos:
+        return {"consumidos": 0, "revividos": 0}
     nuevas_cantidades = _cantidades_stock_por_lote(filas_nuevas)
-    detectados = 0
-    for fila in pendientes:
+    consumidos = 0
+    revividos = 0
+    for fila in candidatos:
         clave = ((fila.codigo_interno or "").strip(), (fila.codigo_lote or "").strip() or "(sin lote)")
         cantidad_nueva = nuevas_cantidades.get(clave, 0)
         cantidad_esperada = fila.cantidad_en_stock
         if cantidad_nueva < cantidad_esperada - 0.0001:
             consumido_ahora = cantidad_esperada - cantidad_nueva
             fila.cantidad_consumida = (fila.cantidad_consumida or 0) + consumido_ahora
-            detectados += 1
-    return detectados
+            consumidos += 1
+        elif cantidad_nueva > cantidad_esperada + 0.0001:
+            subida = cantidad_nueva - cantidad_esperada
+            revivible = max(0.0, (fila.cantidad_consumida or 0) - (fila.cantidad_informada or 0))
+            revivir_ahora = min(subida, revivible)
+            if revivir_ahora > 0.0001:
+                fila.cantidad_consumida = (fila.cantidad_consumida or 0) - revivir_ahora
+                revividos += 1
+    return {"consumidos": consumidos, "revividos": revividos}
 
 
 def _filas_desde_reporte_stock_valorizado(filas_crudas):
@@ -11064,14 +11097,21 @@ def stock_cargar():
     # (es el único momento en que se puede comparar contra lo que
     # ConsignacionPendienteLote todavía espera encontrar), se detecta qué
     # lotes de consignación bajaron o desaparecieron.
-    lotes_consumidos = _detectar_consumo_consignacion_por_lote(filas)
+    deteccion_consignacion = _detectar_consumo_consignacion_por_lote(filas)
     db.session.commit()
 
     mensaje, severidad = _mensaje_resumen_carga_stock(resumen)
-    if lotes_consumidos:
+    if deteccion_consignacion["consumidos"]:
         mensaje += (
-            f" {lotes_consumidos} lote(s) de consignación se detectaron como consumidos -- revísalos en "
-            "Pago Proveedores > Emitir documento."
+            f" {deteccion_consignacion['consumidos']} lote(s) de consignación se detectaron como consumidos -- "
+            "revísalos en Pago Proveedores > Emitir documento."
+        )
+    if deteccion_consignacion["revividos"]:
+        # Ronda BL (2026-10-08): devolución de un lote que todavía no se
+        # le había informado al proveedor -- vuelve a consignación vigente.
+        mensaje += (
+            f" {deteccion_consignacion['revividos']} lote(s) de consignación que habían salido del stock "
+            "volvieron (ej. devolución) antes de informarse al proveedor -- vuelven a quedar vigentes."
         )
     flash(mensaje, severidad)
     return redirect(url_for("stock_list"))
@@ -11177,7 +11217,7 @@ def api_stock_cargar_auto():
     # ver stock_cargar. Esta ruta es la que usa la automatización AHK
     # (15:30/17:30), así que es el camino real por el que se va a detectar
     # consumo de consignación día a día.
-    lotes_consumidos = _detectar_consumo_consignacion_por_lote(filas)
+    deteccion_consignacion = _detectar_consumo_consignacion_por_lote(filas)
     db.session.commit()
 
     mensaje, severidad = _mensaje_resumen_carga_stock(resumen)
@@ -11189,7 +11229,8 @@ def api_stock_cargar_auto():
         unidades_cargadas=resumen["unidades_cargadas"],
         cargados=resumen["cargados"],
         pendientes_nuevos=resumen["pendientes_nuevos"],
-        lotes_consignacion_consumidos=lotes_consumidos,
+        lotes_consignacion_consumidos=deteccion_consignacion["consumidos"],
+        lotes_consignacion_revividos=deteccion_consignacion["revividos"],
     ), (200 if severidad != "danger" else 422)
 
 
