@@ -5308,10 +5308,29 @@ def productos_variante_editar(variante_id):
     Homologación de Stock -- editarlo aquí es equivalente a asignarlo desde
     ahí). También permite reactivarla/desactivarla a mano (checkbox
     'Activo') -- por ejemplo, para reactivar una que la consolidación
-    automática de duplicados desactivó por error de criterio."""
+    automática de duplicados desactivó por error de criterio.
+
+    Ronda BO (2026-10-15, a pedido del usuario): cuando hay que corregir
+    varias variantes seguidas (ej. varias dioptrías de un mismo código
+    padre), guardar cada una por separado recargaba la página completa y
+    volvía a la pantalla anterior -- si ya se habían editado otras filas sin
+    guardarlas todavía, esos cambios se perdían. El formulario de cada fila
+    ahora se envía por AJAX (ver el JS de templates/proveedores/detalle.html)
+    sin recargar nada, y un botón nuevo "Guardar todos los cambios" guarda
+    de una sola vez todas las filas editadas del mismo código padre. Esta
+    ruta sigue funcionando EXACTAMENTE igual que antes (flash + redirect) si
+    el envío NO viene marcado como AJAX (ej. con JavaScript desactivado) --
+    es un agregado, no reemplaza el camino anterior."""
     variante = ProductoVariante.query.get_or_404(variante_id)
     proveedor_id = variante.producto.proveedor_id
     nuevo_codigo = request.form["codigo"].strip()
+    es_ajax = request.form.get("ajax") == "1"
+
+    def _responder(mensaje, categoria):
+        if es_ajax:
+            return jsonify(ok=(categoria != "danger"), mensaje=mensaje), (200 if categoria != "danger" else 400)
+        flash(mensaje, categoria)
+        return _redirect_proveedor_detalle(proveedor_id)
 
     if nuevo_codigo.upper() != (variante.codigo or "").strip().upper():
         choca_con_producto = Producto.query.filter(
@@ -5323,8 +5342,7 @@ def productos_variante_editar(variante_id):
             db.func.upper(ProductoVariante.codigo) == nuevo_codigo.upper(),
         ).first()
         if choca_con_producto or choca_con_variante:
-            flash(f"El código '{nuevo_codigo}' ya existe en este catálogo -- no se puede repetir.", "danger")
-            return _redirect_proveedor_detalle(proveedor_id)
+            return _responder(f"El código '{nuevo_codigo}' ya existe en este catálogo -- no se puede repetir.", "danger")
 
     # Ronda AQ (2026-09-24): mismo caso que se corrigió para el reporte
     # Compras Proveedor en la ronda AO/AP -- si acá se corrige a mano el
@@ -5341,8 +5359,7 @@ def productos_variante_editar(variante_id):
     if codigo_anterior and codigo_anterior.upper() != nuevo_codigo.upper():
         _registrar_alias_codigo_proveedor(proveedor_id, codigo_anterior, variante_destino=variante)
     db.session.commit()
-    flash(f"Variante '{variante.codigo}' actualizada.", "success")
-    return _redirect_proveedor_detalle(proveedor_id)
+    return _responder(f"Variante '{variante.codigo}' actualizada.", "success")
 
 
 @app.route("/variantes/<int:variante_id>/reasignar-padre", methods=["POST"])

@@ -115,19 +115,26 @@
         <tr class="collapse" id="variantes{{ p.id }}">
           <td></td>
           <td colspan="7">
-            <div class="small text-muted mb-1">Variantes de {{ p.codigo }} (sin precio propio -- usan el del código padre). Edita cualquier campo y presiona Guardar:</div>
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-1">
+              <div class="small text-muted">Variantes de {{ p.codigo }} (sin precio propio -- usan el del código padre). Edita cualquier campo y presiona Guardar, o edita varias y usa "Guardar todos los cambios":</div>
+              <button type="button" class="btn btn-sm btn-brand btnGuardarTodasVariantes d-none" data-panel="variantes{{ p.id }}" data-estado="estadoGuardado{{ p.id }}">
+                Guardar todos los cambios <span class="badge bg-light text-dark contadorSucias"></span>
+              </button>
+            </div>
+            <div class="small panelEstadoGuardadoVariantes" id="estadoGuardado{{ p.id }}"></div>
             <div class="border rounded p-2" style="max-height: 260px; overflow-y: auto;">
               {% for v in variantes_p %}
-              <div class="d-flex align-items-center gap-1 flex-wrap mb-1 pb-1 {% if not loop.last %}border-bottom{% endif %} {% if not v.activo %}text-muted{% endif %}">
+              <div class="filaVariante mb-1 pb-1 {% if not loop.last %}border-bottom{% endif %} {% if not v.activo %}text-muted{% endif %}">
+                <div class="d-flex align-items-center gap-1 flex-wrap">
                 <form method="post" action="{{ url_for('productos_variante_editar', variante_id=v.id) }}"
-                      class="d-flex align-items-center gap-1 flex-wrap flex-grow-1">
+                      class="formEditarVariante d-flex align-items-center gap-1 flex-wrap flex-grow-1">
                   <input type="hidden" name="q" value="{{ q }}">
-                  <input class="form-control form-control-sm" style="max-width:150px" name="codigo" value="{{ v.codigo }}" required>
-                  <input class="form-control form-control-sm flex-grow-1" style="min-width:220px" name="descripcion" value="{{ v.descripcion }}" required>
-                  <input class="form-control form-control-sm" style="max-width:150px" name="codigo_interno_inventario"
+                  <input class="form-control form-control-sm campoVariante" style="max-width:150px" name="codigo" value="{{ v.codigo }}" required>
+                  <input class="form-control form-control-sm campoVariante flex-grow-1" style="min-width:220px" name="descripcion" value="{{ v.descripcion }}" required>
+                  <input class="form-control form-control-sm campoVariante" style="max-width:150px" name="codigo_interno_inventario"
                          value="{{ v.codigo_interno_inventario or '' }}" placeholder="Código Ergopyme">
                   <span class="form-check form-check-inline mb-0" title="Activo (aparece para elegir al armar una OC)">
-                    <input type="checkbox" class="form-check-input" name="activo" id="varActivo{{ v.id }}" {% if v.activo %}checked{% endif %}>
+                    <input type="checkbox" class="form-check-input campoVariante" name="activo" id="varActivo{{ v.id }}" {% if v.activo %}checked{% endif %}>
                     <label class="form-check-label small" for="varActivo{{ v.id }}">Activo</label>
                   </span>
                   <button type="submit" class="btn btn-sm btn-outline-primary">Guardar</button>
@@ -140,6 +147,8 @@
                   <input type="hidden" name="q" value="{{ q }}">
                   <button type="submit" class="btn btn-sm btn-outline-danger">Eliminar</button>
                 </form>
+                </div>
+                <div class="small mensajeVariante"></div>
                 <div class="d-none border rounded p-2 mt-1 bg-light w-100" id="reasignarPadre{{ v.id }}">
                   <div class="small text-muted mb-1">
                     Mueve esta variante (código, descripción, código Ergopyme e historial de Homologación/Stock
@@ -586,6 +595,149 @@
       if (tabla) sessionStorage.setItem(CLAVE_TABLA, String(tabla.scrollTop));
     } catch (e) {}
   }, true);
+})();
+</script>
+
+<script>
+(function () {
+  // Ronda BO (2026-10-15, a pedido del usuario): "si hago el cambio en
+  // varios codigos y presiono guardar en alguno de ellos se actualiza la
+  // pagina... y al volver solo hizo el cambio para el que presione guardar".
+  // Antes, el "Guardar" de cada variante era un submit normal -- recargaba
+  // toda la página, así que editar varias filas seguidas y guardar solo UNA
+  // perdía los cambios sin guardar de las demás. Ahora cada fila se guarda
+  // por AJAX, sin recargar nada, y se puede guardar una fila a la vez (igual
+  // que antes, solo que ya no pierde las otras) o varias de un saque con el
+  // botón nuevo "Guardar todos los cambios" (una por código padre). La ruta
+  // del backend (productos_variante_editar) sigue funcionando igual que
+  // siempre si este JS no corre (ej. JavaScript desactivado): el formulario
+  // se manda normal, con flash + redirect, sin el campo "ajax".
+  const filas = document.querySelectorAll('.filaVariante');
+  if (!filas.length) return;
+
+  function actualizarBotonPanel(panel) {
+    if (!panel) return;
+    const boton = document.querySelector('.btnGuardarTodasVariantes[data-panel="' + panel.id + '"]');
+    if (!boton) return;
+    const sucias = panel.querySelectorAll('.filaVariante[data-sucia="1"]').length;
+    const contador = boton.querySelector('.contadorSucias');
+    boton.classList.toggle('d-none', sucias === 0);
+    if (contador) contador.textContent = sucias > 0 ? sucias : '';
+  }
+
+  function marcarSucia(fila) {
+    if (fila.dataset.sucia === '1') return;
+    fila.dataset.sucia = '1';
+    fila.classList.add('border-start', 'border-warning', 'border-3', 'ps-1');
+    actualizarBotonPanel(fila.closest('tr.collapse'));
+  }
+
+  function marcarLimpia(fila) {
+    fila.dataset.sucia = '';
+    fila.classList.remove('border-start', 'border-warning', 'border-3', 'ps-1');
+    actualizarBotonPanel(fila.closest('tr.collapse'));
+  }
+
+  filas.forEach(function (fila) {
+    fila.querySelectorAll('.campoVariante').forEach(function (campo) {
+      campo.addEventListener('input', function () { marcarSucia(fila); });
+      campo.addEventListener('change', function () { marcarSucia(fila); });
+    });
+  });
+
+  function guardarFila(fila) {
+    const form = fila.querySelector('.formEditarVariante');
+    const mensaje = fila.querySelector('.mensajeVariante');
+    const formData = new FormData(form);
+    formData.set('ajax', '1');
+    if (mensaje) {
+      mensaje.textContent = 'Guardando...';
+      mensaje.className = 'small mensajeVariante text-muted';
+    }
+    return fetch(form.action, {
+      method: 'POST',
+      body: formData,
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    })
+      .then(function (r) {
+        return r.json().then(function (data) { return { status: r.status, data: data }; });
+      })
+      .then(function (res) {
+        if (res.status === 200 && res.data.ok) {
+          marcarLimpia(fila);
+          if (mensaje) {
+            mensaje.textContent = '✓ Guardado';
+            mensaje.className = 'small mensajeVariante text-success';
+            setTimeout(function () {
+              if (mensaje.textContent === '✓ Guardado') mensaje.textContent = '';
+            }, 3000);
+          }
+          return true;
+        }
+        if (mensaje) {
+          mensaje.textContent = (res.data && res.data.mensaje) || 'No se pudo guardar -- revisa este código.';
+          mensaje.className = 'small mensajeVariante text-danger';
+        }
+        return false;
+      })
+      .catch(function () {
+        if (mensaje) {
+          mensaje.textContent = 'Error de conexión -- no se pudo guardar, intenta de nuevo.';
+          mensaje.className = 'small mensajeVariante text-danger';
+        }
+        return false;
+      });
+  }
+
+  document.querySelectorAll('.formEditarVariante').forEach(function (form) {
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      const fila = form.closest('.filaVariante');
+      if (fila) guardarFila(fila);
+    });
+  });
+
+  document.querySelectorAll('.btnGuardarTodasVariantes').forEach(function (boton) {
+    boton.addEventListener('click', function () {
+      const panel = document.getElementById(boton.dataset.panel);
+      const estado = boton.dataset.estado ? document.getElementById(boton.dataset.estado) : null;
+      if (!panel) return;
+      const sucias = Array.prototype.slice.call(panel.querySelectorAll('.filaVariante[data-sucia="1"]'));
+      if (!sucias.length) return;
+
+      boton.disabled = true;
+      const textoOriginal = boton.innerHTML;
+      boton.textContent = 'Guardando ' + sucias.length + ' variante(s)...';
+      if (estado) { estado.textContent = ''; }
+
+      // Secuencial (no en paralelo): si algo falla, el mensaje de error de
+      // cada fila queda legible una por una, sin mezclarse entre sí.
+      let ok = 0, fallidas = 0;
+      function siguiente(i) {
+        if (i >= sucias.length) {
+          boton.disabled = false;
+          boton.innerHTML = textoOriginal;
+          if (estado) {
+            if (fallidas === 0) {
+              estado.textContent = '✓ ' + ok + ' variante(s) guardada(s).';
+              estado.className = 'small panelEstadoGuardadoVariantes text-success';
+              setTimeout(function () { estado.textContent = ''; }, 4000);
+            } else {
+              estado.textContent = ok + ' guardada(s), ' + fallidas + ' con error (ver detalle en cada fila).';
+              estado.className = 'small panelEstadoGuardadoVariantes text-danger';
+            }
+          }
+          actualizarBotonPanel(panel);
+          return;
+        }
+        guardarFila(sucias[i]).then(function (exito) {
+          if (exito) { ok++; } else { fallidas++; }
+          siguiente(i + 1);
+        });
+      }
+      siguiente(0);
+    });
+  });
 })();
 </script>
 
