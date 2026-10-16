@@ -39,6 +39,7 @@ from models import (
     Usuario, Rol, PERMISOS_DISPONIBLES,
     HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
     StockConsignacionVigente, StockComprometidoBodega, ConsignacionPendienteLote,
+    ConsignacionRecepcionImportacion,
     ConsignacionReporteProveedor,
     CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
     FacturaProveedor, PagoFacturaProveedor, ComprobantePagoProveedor, ESTADOS_FACTURA_PROVEEDOR,
@@ -556,6 +557,10 @@ def ensure_schema_migrations():
         "parcial_lineas": [
             ("orden_compra_linea_id", "INTEGER"),
             ("factura_embarque_id", "INTEGER"),
+            # Ronda BR (2026-10-16, punto 2): excluye una línea manual de la
+            # herencia de "consignación" del resto de la Importación -- ver
+            # ParcialLinea.excluir_de_consignacion en models.py.
+            ("excluir_de_consignacion", "BOOLEAN DEFAULT 0"),
         ],
         "parciales": [
             ("referencia", "VARCHAR(120)"),
@@ -8148,6 +8153,12 @@ def despachos_generar_importacion(despacho_id):
             lineas_creadas += 1
 
     db.session.commit()
+    # Ronda BR (2026-10-16, punto 2 del pedido del usuario): si alguna de
+    # estas líneas viene de una OC marcada consignación, se registra como
+    # "recibida en consignación" automáticamente ACÁ -- no hace falta
+    # esperar a que alguien presione "Generar factura" en Costeo.
+    _sincronizar_consignacion_recibida(imp)
+    db.session.commit()
 
     mensaje = (
         f"Importación creada desde el despacho, con {lineas_creadas} línea(s) traídas automáticamente "
@@ -8309,6 +8320,20 @@ def importaciones_detalle(importacion_id):
     # pagos_proveedores_aplicar_cargos_pendientes), en vez de tener que
     # volver a presionar ese botón solo para ver el aviso de nuevo.
     avisos_cargos_pendientes = _avisos_cargos_pendientes_factura(imp)
+    # Ronda BR (2026-10-16, punto 1 del pedido del usuario -- "cuando estoy
+    # en costeo no tiene etiqueta de consignacion"): antes no había ningún
+    # indicador en esta pantalla de que la Importación (o parte de ella)
+    # viene de una OC marcada consignación. Se calcula acá para mostrar un
+    # badge en el encabezado y ajustar el texto/confirmación del botón
+    # "Generar factura" (ver _es_consignacion_parcial_linea).
+    todas_las_lineas_imp = [l for p in imp.parciales for l in p.lineas]
+    lineas_consignacion_imp = [l for l in todas_las_lineas_imp if _es_consignacion_parcial_linea(l)]
+    info_consignacion = {
+        "tiene": bool(lineas_consignacion_imp),
+        "total": len(lineas_consignacion_imp),
+        "total_lineas": len(todas_las_lineas_imp),
+        "es_toda": bool(lineas_consignacion_imp) and len(lineas_consignacion_imp) == len(todas_las_lineas_imp),
+    }
     return render_template(
         "importaciones/detalle.html", imp=imp, resultado=resultado,
         regimenes=REGIMENES_PARCIAL, vias=VIAS_EMBARQUE,
@@ -8317,6 +8342,7 @@ def importaciones_detalle(importacion_id):
         tipos_documento_gasto=TIPOS_DOCUMENTO_GASTO, empresas=empresas,
         sugerido_correlativo_inventario=sugerido_correlativo_inventario,
         avisos_cargos_pendientes=avisos_cargos_pendientes,
+        info_consignacion=info_consignacion,
     )
 
 
@@ -8339,58 +8365,218 @@ def importaciones_editar(importacion_id):
     return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
 
 
-def _es_consignacion_parcial_linea(linea):
-    """Ronda AX (2026-09-30, punto 2): una ParcialLinea viene de una OC
-    marcada consignación si su OrdenCompraLinea de origen (trazabilidad ya
-    existente desde el Despacho, ver ParcialLinea.orden_compra_linea_id)
-    pertenece a una OrdenCompra con es_consignacion=True. Una línea cargada
-    a mano en el Costeo (sin ese vínculo) nunca es consignación."""
+def _oc_de_linea_es_consignacion(linea):
+    """Verdadero solo si esta ParcialLinea traza (vía orden_compra_linea,
+    trazabilidad del Despacho) a una OrdenCompra marcada es_consignacion.
+    Ignora por completo si la línea en sí es manual -- ver
+    _es_consignacion_parcial_linea, que además hereda el carácter de
+    consignación para líneas manuales dentro de una Importación que ya
+    tiene otras líneas de consignación."""
     ocl = linea.orden_compra_linea
     return bool(ocl and ocl.orden and ocl.orden.es_consignacion)
 
 
-def _registrar_consignacion_recibida(proveedor_id, linea):
-    """Ronda AX (2026-09-30, punto 2, a pedido del usuario): al costear una
-    OC marcada consignación, en vez de facturarla de inmediato como compra
-    en firme, se registra cuánto entró de cada lote en
-    ConsignacionPendienteLote -- de ahí en adelante, cuando el Stock de
-    Ergopyme muestre que un lote bajó o desapareció, se detecta como
-    "consumido" y queda listo para facturarle al proveedor (ver
-    _detectar_consumo_consignacion_por_lote). No crea ninguna
-    FacturaProveedor -- todavía no hay factura real del proveedor.
+def _es_consignacion_parcial_linea(linea):
+    """Ronda AX (2026-09-30, punto 2): una ParcialLinea viene de una OC
+    marcada consignación si su OrdenCompraLinea de origen (trazabilidad ya
+    existente desde el Despacho, ver ParcialLinea.orden_compra_linea_id)
+    pertenece a una OrdenCompra con es_consignacion=True.
 
-    Se registra por cada ParcialLineaLote de la línea (el desglose real por
-    lote); si la línea no tiene ese desglose cargado (producto que no se
-    trackea por lote individual), se usa un único "lote" con el código
-    resumen de la línea (o "(sin lote)" si ni eso tiene)."""
-    codigo_interno = _codigo_interno_homologado(linea) or ""
-    codigo_proveedor = (linea.codigo or "").strip()
+    Ronda BR (2026-10-16, punto 2 del pedido del usuario): antes, una línea
+    cargada a mano en Costeo (sin ese vínculo -- "+ Agregar producto", o un
+    código del archivo de Carga Lotes que no calzó con ninguna línea
+    existente) NUNCA se consideraba consignación, aunque el resto de la
+    Importación sí lo fuera -- quedaba expuesta a facturarse de verdad por
+    error si se presionaba "Generar factura". Ahora hereda el carácter de
+    consignación de sus líneas hermanas (las que sí trazan a una OC) de la
+    MISMA Importación, salvo que se haya marcado explícitamente
+    excluir_de_consignacion=True al agregarla (porque de verdad es una
+    compra real, no consignación)."""
+    if getattr(linea, "excluir_de_consignacion", False):
+        return False
+    if _oc_de_linea_es_consignacion(linea):
+        return True
+    if linea.orden_compra_linea_id is None and linea.parcial and linea.parcial.importacion:
+        hermanas = [l for p in linea.parcial.importacion.parciales for l in p.lineas]
+        return any(_oc_de_linea_es_consignacion(h) for h in hermanas if h.id != linea.id)
+    return False
+
+
+def _desglose_lotes_linea_consignacion(linea):
+    """Lista de (codigo_lote, cantidad) para una línea de consignación --
+    usa el desglose real por lote (ParcialLineaLote) si está cargado, o un
+    único "lote" implícito con el código/cantidad resumen de la línea si
+    no (producto que no se trackea por lote individual)."""
     desglose = list(linea.lotes) if linea.lotes else None
     if not desglose:
         lote_unico = (linea.codigo_lote or "").strip() or "(sin lote)"
-        desglose = [type("_LoteImplicito", (), {"codigo_lote": lote_unico, "cantidad_unidades": linea.cantidad_unidades or 0})()]
+        return [(lote_unico, linea.cantidad_unidades or 0)]
+    return [((lote.codigo_lote or "").strip() or "(sin lote)", lote.cantidad_unidades or 0) for lote in desglose]
 
-    total_registrado = 0
-    for lote in desglose:
-        codigo_lote = (lote.codigo_lote or "").strip() or "(sin lote)"
-        cantidad = lote.cantidad_unidades or 0
-        if cantidad <= 0:
+
+def _calcular_consignacion_deseada_importacion(imp):
+    """Para cada línea de consignación de esta Importación (ver
+    _es_consignacion_parcial_linea), calcula cuánto debería haber HOY
+    registrado como "recibido" por código interno + lote, agregando en un
+    solo total por (proveedor_id, codigo_interno, codigo_lote). Compartido
+    entre _sincronizar_consignacion_recibida (registro automático al
+    costear, ronda BR) y la siembra puente con datos de antes de esa
+    ronda (ver reparar_migrar_ledger_consignacion_recibida_ronda_br)."""
+    deseado = {}
+    for parcial in imp.parciales:
+        for linea in parcial.lineas:
+            if not _es_consignacion_parcial_linea(linea):
+                continue
+            codigo_interno = _codigo_interno_homologado(linea) or ""
+            codigo_proveedor = (linea.codigo or "").strip()
+            for codigo_lote, cantidad in _desglose_lotes_linea_consignacion(linea):
+                if cantidad <= 0:
+                    continue
+                clave = (imp.proveedor_id, codigo_interno, codigo_lote)
+                bucket = deseado.setdefault(clave, {
+                    "cantidad": 0.0, "codigo_proveedor": codigo_proveedor, "descripcion": linea.descripcion,
+                })
+                bucket["cantidad"] += cantidad
+    return deseado
+
+
+def _sincronizar_consignacion_recibida(imp, forzar_vacio=False):
+    """Ronda BR (2026-10-16, punto 2 del pedido del usuario: "no es
+    necesario presionar el boton genera factura para que considere el
+    programa el codigo + lote consignado como recibido"): registra
+    automáticamente en ConsignacionPendienteLote cuánto hay HOY recibido en
+    consignación para esta Importación, cada vez que se guarda algo en su
+    Costeo (crear/editar/eliminar una línea, cargar lotes, eliminar un
+    parcial) -- ya NO depende de presionar "Generar factura" (ver
+    importacion_generar_factura, que ahora solo llama a esta misma función
+    como red de seguridad adicional para importaciones antiguas).
+
+    A diferencia de la versión anterior (_registrar_consignacion_recibida,
+    retirada en esta ronda), esto es un RE-SYNC completo: compara lo que
+    esta Importación debería aportar hoy (_calcular_consignacion_deseada_
+    importacion) contra lo que ya había aportado la última vez (guardado en
+    ConsignacionRecepcionImportacion, un ledger por Importación), y solo
+    aplica la DIFERENCIA a ConsignacionPendienteLote.cantidad_recibida --
+    así se puede llamar las veces que haga falta (cada guardado) sin
+    duplicar nunca lo ya registrado, y también revierte lo que corresponda
+    si una línea se edita a una cantidad menor, se excluye o se elimina.
+
+    cantidad_consumida/cantidad_informada/cantidad_facturada de
+    ConsignacionPendienteLote NUNCA se tocan acá -- son control financiero
+    aparte (ver el modelo en models.py), ajeno a cuánto se costeó.
+
+    forzar_vacio=True trata a esta Importación como si ya no tuviera
+    ninguna línea de consignación (usado justo antes de eliminarla del
+    todo, para revertir su aporte antes de que sus líneas desaparezcan)."""
+    deseado = {} if forzar_vacio else _calcular_consignacion_deseada_importacion(imp)
+    existente = {
+        (fila.proveedor_id, fila.codigo_interno, fila.codigo_lote): fila
+        for fila in ConsignacionRecepcionImportacion.query.filter_by(importacion_id=imp.id).all()
+    }
+
+    claves = set(deseado.keys()) | set(existente.keys())
+    cambios = 0
+    for clave in claves:
+        proveedor_id, codigo_interno, codigo_lote = clave
+        nueva_cantidad = round(deseado.get(clave, {}).get("cantidad", 0.0), 4)
+        fila_ledger = existente.get(clave)
+        vieja_cantidad = round(fila_ledger.cantidad, 4) if fila_ledger else 0.0
+        delta = round(nueva_cantidad - vieja_cantidad, 4)
+
+        if delta:
+            pendiente = ConsignacionPendienteLote.query.filter_by(
+                proveedor_id=proveedor_id, codigo_interno=codigo_interno, codigo_lote=codigo_lote,
+            ).first()
+            if pendiente is None:
+                pendiente = ConsignacionPendienteLote(
+                    proveedor_id=proveedor_id, codigo_interno=codigo_interno,
+                    codigo_proveedor=deseado.get(clave, {}).get("codigo_proveedor", ""),
+                    descripcion=deseado.get(clave, {}).get("descripcion", ""),
+                    codigo_lote=codigo_lote, cantidad_recibida=0,
+                )
+                db.session.add(pendiente)
+            # No debería bajar de 0 (ni de lo ya consumido/facturado) salvo
+            # un error de carga -- se deja en 0 como piso defensivo en vez
+            # de dejar un valor negativo sin sentido en pantalla.
+            pendiente.cantidad_recibida = max(0.0, (pendiente.cantidad_recibida or 0) + delta)
+            cambios += 1
+
+        if nueva_cantidad <= 0:
+            if fila_ledger is not None:
+                db.session.delete(fila_ledger)
+        elif fila_ledger is not None:
+            fila_ledger.cantidad = nueva_cantidad
+        else:
+            db.session.add(ConsignacionRecepcionImportacion(
+                importacion_id=imp.id, proveedor_id=proveedor_id, codigo_interno=codigo_interno,
+                codigo_proveedor=deseado[clave]["codigo_proveedor"], descripcion=deseado[clave]["descripcion"],
+                codigo_lote=codigo_lote, cantidad=nueva_cantidad,
+            ))
+
+    if deseado and not imp.consignacion_registrada:
+        imp.consignacion_registrada = True
+    return cambios
+
+
+def reparar_migrar_ledger_consignacion_recibida_ronda_br():
+    """Ronda BR (2026-10-16, punto 2 del pedido del usuario): puente entre
+    datos de ANTES de esta ronda y el nuevo ledger ConsignacionRecepcion
+    Importacion que usa _sincronizar_consignacion_recibida para registrar
+    la diferencia en vez de sumar todo de nuevo cada vez.
+
+    Antes de esta ronda, ConsignacionPendienteLote.cantidad_recibida de una
+    Importación ya costeada (botón "Generar factura" presionado alguna vez,
+    o nunca) no tenía ningún ledger por Importación asociado. Si
+    _sincronizar_consignacion_recibida corriera por primera vez sobre esa
+    Importación SIN este puente, vería "lo ya aportado" en 0 y sumaría de
+    nuevo la cantidad completa -- duplicando cantidad_recibida.
+
+    Para cada Importación que todavía no tiene ninguna fila en el ledger
+    nuevo, se siembra esa fila reflejando lo que YA debería estar aportando
+    hoy (mismo cálculo que _calcular_consignacion_deseada_importacion) --
+    SIN tocar ConsignacionPendienteLote.cantidad_recibida (se asume
+    correcto si el botón ya se había presionado; si nunca se había
+    presionado, igual queda sembrado el ledger, y _sincronizar_
+    consignacion_recibida se encarga de completar ConsignacionPendienteLote
+    la próxima vez que se guarde algo en esa Importación, sin duplicar
+    nada a partir de ahí).
+
+    Idempotente: una Importación que ya tiene alguna fila en el ledger
+    nunca se vuelve a tocar."""
+    importaciones_con_ledger = {
+        row[0] for row in db.session.query(ConsignacionRecepcionImportacion.importacion_id).distinct().all()
+    }
+    sembrados = 0
+    importaciones_tocadas = 0
+    for imp in Importacion.query.all():
+        if imp.id in importaciones_con_ledger:
             continue
-        fila = ConsignacionPendienteLote.query.filter_by(
-            proveedor_id=proveedor_id, codigo_interno=codigo_interno, codigo_lote=codigo_lote,
-        ).first()
-        if fila is None:
-            fila = ConsignacionPendienteLote(
-                proveedor_id=proveedor_id, codigo_interno=codigo_interno,
-                codigo_proveedor=codigo_proveedor, descripcion=linea.descripcion,
-                codigo_lote=codigo_lote, cantidad_recibida=0,
-                origen_orden_compra_linea_id=linea.orden_compra_linea_id,
-                origen_parcial_linea_id=linea.id,
-            )
-            db.session.add(fila)
-        fila.cantidad_recibida = (fila.cantidad_recibida or 0) + cantidad
-        total_registrado += cantidad
-    return total_registrado
+        deseado = _calcular_consignacion_deseada_importacion(imp)
+        if not deseado:
+            continue
+        for (proveedor_id, codigo_interno, codigo_lote), datos in deseado.items():
+            if datos["cantidad"] <= 0:
+                continue
+            db.session.add(ConsignacionRecepcionImportacion(
+                importacion_id=imp.id, proveedor_id=proveedor_id, codigo_interno=codigo_interno,
+                codigo_proveedor=datos["codigo_proveedor"], descripcion=datos["descripcion"],
+                codigo_lote=codigo_lote, cantidad=datos["cantidad"],
+            ))
+            sembrados += 1
+        importaciones_tocadas += 1
+
+    if sembrados:
+        db.session.commit()
+        print(
+            f"[reparar_ronda_br] Ledger de recepción de consignación por Importación: {sembrados} fila(s) "
+            f"sembrada(s) en {importaciones_tocadas} importación(es) ya costeada(s) antes de esta ronda -- de "
+            "ahora en más los cambios se registran por diferencia, sin duplicar lo ya recibido."
+        )
+    return sembrados
+
+
+with app.app_context():
+    reparar_migrar_ledger_consignacion_recibida_ronda_br()
 
 
 def _invoice_pdf_desde_oc_para_lineas(lineas_grupo):
@@ -8502,12 +8688,17 @@ def importacion_generar_factura(importacion_id):
     lineas_consignacion = [l for l in todas_las_lineas if _es_consignacion_parcial_linea(l)]
     lineas_normales = [l for l in todas_las_lineas if l not in lineas_consignacion]
 
-    if lineas_consignacion and not imp.consignacion_registrada:
-        for linea in lineas_consignacion:
-            _registrar_consignacion_recibida(imp.proveedor_id, linea)
-        imp.consignacion_registrada = True
-    # Si ya estaba registrada antes (ej. se volvió a presionar el botón),
-    # no se duplica -- no hace falta hacer nada más aquí.
+    # Ronda BR (2026-10-16, punto 2 del pedido del usuario): desde esta
+    # ronda, la recepción en consignación ya se registra sola apenas se
+    # guarda algo en Costeo (ver _sincronizar_consignacion_recibida,
+    # llamada desde despachos_generar_importacion/parcial_lineas_nueva/
+    # parcial_lineas_editar/parcial_lineas_eliminar/parciales_eliminar/
+    # importacion_lotes_cargar) -- este botón YA NO es el único lugar que
+    # lo hace. Se vuelve a llamar acá de todas formas como red de
+    # seguridad (idempotente, sin costo si no hay nada nuevo) para
+    # importaciones que se costearon ANTES de esta ronda y nunca se
+    # tocaron de nuevo.
+    _sincronizar_consignacion_recibida(imp)
 
     if not lineas_normales:
         db.session.commit()
@@ -8671,6 +8862,12 @@ def importacion_generar_factura(importacion_id):
 @requiere_permiso("generar_costeo")
 def importaciones_eliminar(importacion_id):
     imp = Importacion.query.get_or_404(importacion_id)
+    # Ronda BR (2026-10-16, punto 2): si esta Importación había registrado
+    # recepción de consignación, se revierte ese aporte de
+    # ConsignacionPendienteLote ANTES de borrarla (forzar_vacio=True) -- si
+    # no, quedaría "recibido" para siempre un lote cuya Importación de
+    # origen ya no existe.
+    _sincronizar_consignacion_recibida(imp, forzar_vacio=True)
     carpeta_legajo = os.path.join(DOCUMENTOS_LEGAJO_DIR, str(imp.id))
     if os.path.isdir(carpeta_legajo):
         shutil.rmtree(carpeta_legajo, ignore_errors=True)
@@ -8719,7 +8916,12 @@ def parciales_editar(parcial_id):
 def parciales_eliminar(parcial_id):
     parcial = Parcial.query.get_or_404(parcial_id)
     importacion_id = parcial.importacion_id
+    imp = parcial.importacion
     db.session.delete(parcial)
+    db.session.commit()
+    # Ronda BR (2026-10-16, punto 2): recalcula la recepción de consignación
+    # ya sin las líneas del parcial borrado.
+    _sincronizar_consignacion_recibida(imp)
     db.session.commit()
     flash("Parcial eliminado.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=importacion_id))
@@ -8789,6 +8991,13 @@ def parcial_lineas_nueva(parcial_id):
         fecha_vencimiento=parse_date(request.form.get("fecha_vencimiento")),
         cantidad_unidades=parse_int(request.form.get("cantidad_unidades"), default=0),
         valor_unitario_moneda=float(request.form.get("valor_unitario_moneda") or 0),
+        # Ronda BR (2026-10-16, punto 2 del pedido del usuario): una línea
+        # agregada a mano hereda el carácter de consignación del resto de
+        # la Importación por defecto (ver _es_consignacion_parcial_linea) --
+        # salvo que se marque explícitamente "Es una compra real" en el
+        # formulario, para no facturarla por error ni dejarla de registrar
+        # como recibida por error.
+        excluir_de_consignacion=bool(request.form.get("es_compra_real")),
     )
     # El desglose por lotes (ronda J) arranca con un unico lote que refleja
     # el codigo/fecha/cantidad ya ingresados en este mismo formulario -- asi
@@ -8802,6 +9011,10 @@ def parcial_lineas_nueva(parcial_id):
         ))
     db.session.add(linea)
     db.session.commit()
+    # Ronda BR (2026-10-16, punto 2): si esta línea (o alguna hermana) es de
+    # consignación, se registra/actualiza su recepción automáticamente.
+    _sincronizar_consignacion_recibida(parcial.importacion)
+    db.session.commit()
     flash(f"Línea '{linea.codigo}' agregada al parcial {parcial.numero_parcial}.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=parcial.importacion_id))
 
@@ -8814,11 +9027,21 @@ def parcial_lineas_editar(linea_id):
     linea.descripcion = request.form.get("descripcion", "").strip()
     linea.cantidad_unidades = parse_int(request.form.get("cantidad_unidades"), default=linea.cantidad_unidades)
     linea.valor_unitario_moneda = float(request.form.get("valor_unitario_moneda") or 0)
+    # Ronda BR (2026-10-16, punto 2): solo se toca si esta línea NO trae su
+    # propia OC de origen -- para una línea trazada desde el Despacho el
+    # carácter de consignación lo decide la OC, no este checkbox (ver
+    # _es_consignacion_parcial_linea).
+    if linea.orden_compra_linea_id is None:
+        linea.excluir_de_consignacion = bool(request.form.get("es_compra_real"))
     error_lotes = _guardar_lotes_linea(linea, request.form)
     if error_lotes:
         db.session.rollback()
         flash(error_lotes, "danger")
         return redirect(url_for("importaciones_detalle", importacion_id=linea.parcial.importacion_id))
+    db.session.commit()
+    # Ronda BR (2026-10-16, punto 2): la cantidad, los lotes o la exclusión
+    # pudieron haber cambiado -- re-sincroniza la recepción de consignación.
+    _sincronizar_consignacion_recibida(linea.parcial.importacion)
     db.session.commit()
     flash("Línea actualizada.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=linea.parcial.importacion_id))
@@ -8829,7 +9052,12 @@ def parcial_lineas_editar(linea_id):
 def parcial_lineas_eliminar(linea_id):
     linea = ParcialLinea.query.get_or_404(linea_id)
     importacion_id = linea.parcial.importacion_id
+    imp = linea.parcial.importacion
     db.session.delete(linea)
+    db.session.commit()
+    # Ronda BR (2026-10-16, punto 2): recalcula la recepción de consignación
+    # ya sin esta línea.
+    _sincronizar_consignacion_recibida(imp)
     db.session.commit()
     flash("Línea eliminada.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=importacion_id))
@@ -9289,6 +9517,12 @@ def importacion_lotes_cargar(importacion_id):
             nombre_parcial = linea.parcial.referencia or linea.parcial.numero_parcial or f"Parcial {linea.parcial.id}"
             lineas_por_parcial[nombre_parcial] = lineas_por_parcial.get(nombre_parcial, 0) + 1
 
+        db.session.commit()
+        # Ronda BR (2026-10-16, punto 2): el desglose por lote recién
+        # cargado puede cambiar cuánto corresponde registrar como recibido
+        # en consignación (antes de tener lotes reales se usaba un único
+        # "lote" implícito por línea) -- se re-sincroniza acá.
+        _sincronizar_consignacion_recibida(imp)
         db.session.commit()
     except Exception as e:
         db.session.rollback()

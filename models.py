@@ -539,6 +539,51 @@ class ConsignacionPendienteLote(db.Model):
         return f"<ConsignacionPendienteLote {self.codigo_interno} lote={self.codigo_lote}>"
 
 
+class ConsignacionRecepcionImportacion(db.Model):
+    """Ronda BR (2026-10-16, punto 2 del pedido del usuario: "no es
+    necesario presionar el boton genera factura para que considere el
+    programa el codigo + lote consignado como recibido"): hasta esta ronda,
+    ConsignacionPendienteLote.cantidad_recibida solo se completaba UNA VEZ,
+    al presionar "Generar factura" en Costeo (acumulativo, sin registrar
+    qué línea/Importación aportó cuánto -- ver
+    Importacion.consignacion_registrada, el guard "todo o nada" de antes).
+
+    Desde esta ronda, la recepción se registra SOLA en cuanto se guarda
+    algo en Costeo (ver _sincronizar_consignacion_recibida en app.py),
+    cada vez que cambian las líneas de una Importación -- lo que exige
+    poder calcular la DIFERENCIA contra lo que esa misma Importación ya
+    había aportado antes, en vez de sumar todo de nuevo (que duplicaría la
+    cantidad recibida si se guarda dos veces, o si se edita una cantidad).
+    Esta tabla es ese ledger: una fila por (Importación, proveedor, código
+    interno, lote) con la cantidad que esa Importación aporta HOY al
+    total de ConsignacionPendienteLote.cantidad_recibida para esa misma
+    combinación -- si la Importación cambia, se recalcula el delta contra
+    esta fila y se ajusta ConsignacionPendienteLote de una sola vez.
+
+    Se borra junto con la Importación (o la fila se pone en 0 y se borra)
+    cuando una línea deja de ser de consignación o se elimina -- restando
+    su aporte de ConsignacionPendienteLote al mismo tiempo."""
+    __tablename__ = "consignacion_recepcion_importacion"
+
+    id = db.Column(db.Integer, primary_key=True)
+    importacion_id = db.Column(db.Integer, db.ForeignKey("importaciones.id"), nullable=False, index=True)
+    proveedor_id = db.Column(db.Integer, db.ForeignKey("proveedores.id"), nullable=False)
+    codigo_interno = db.Column(db.String(40), index=True)
+    codigo_proveedor = db.Column(db.String(120))
+    descripcion = db.Column(db.String(300))
+    codigo_lote = db.Column(db.String(80))
+    cantidad = db.Column(db.Float, default=0)  # lo que ESTA Importación aporta hoy a ese lote
+
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    importacion = db.relationship("Importacion", backref=db.backref("recepciones_consignacion", cascade="all, delete-orphan"))
+    proveedor = db.relationship("Proveedor")
+
+    def __repr__(self):
+        return f"<ConsignacionRecepcionImportacion imp={self.importacion_id} {self.codigo_interno} lote={self.codigo_lote}>"
+
+
 class ConsignacionReporteProveedor(db.Model):
     """Ronda BE (2026-10-07, a pedido del usuario): un "reporte" es el
     corte periódico (ej. semanal) donde se le informa al proveedor qué se
@@ -1638,6 +1683,18 @@ class ParcialLinea(db.Model):
     factura_embarque_id = db.Column(
         db.Integer, db.ForeignKey("facturas_embarque_importacion.id"), nullable=True
     )
+
+    # Ronda BR (2026-10-16, punto 2 del pedido del usuario): una línea
+    # agregada a mano en Costeo (sin orden_compra_linea_id, ej. "+ Agregar
+    # producto" o un código del archivo de Carga Lotes que no calzó con
+    # ninguna línea existente) hereda el carácter de consignación del resto
+    # de la Importación si corresponde (ver _es_consignacion_parcial_linea
+    # en app.py) -- así nunca se factura por accidente un producto agregado
+    # a mano dentro de un costeo que es, en su origen, de consignación. Si
+    # de verdad es una compra real (no consignación) aunque el resto de la
+    # importación sí lo sea, se marca este flag en True para excluirla de
+    # esa herencia.
+    excluir_de_consignacion = db.Column(db.Boolean, default=False)
 
     codigo = db.Column(db.String(120), nullable=False)
     descripcion = db.Column(db.String(500), nullable=False)

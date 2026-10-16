@@ -50,7 +50,24 @@
 
 <div class="d-flex justify-content-between align-items-start mb-3">
   <div>
-    <h3 class="section-title mb-0">Importación: {{ imp.numero_factura or '(sin número)' }}</h3>
+    <h3 class="section-title mb-0">
+      Importación: {{ imp.numero_factura or '(sin número)' }}
+      {# Ronda BR (2026-10-16, punto 1 del pedido del usuario -- "cuando
+         estoy en costeo no tiene etiqueta de consignacion"): antes no
+         había ningún indicador acá de que esta Importación (o parte de
+         ella) viene de una OC marcada Consignación. #}
+      {% if info_consignacion.es_toda %}
+      <span class="badge" style="background:#6f42c1;" data-bs-toggle="tooltip"
+            title="Las {{ info_consignacion.total }} línea(s) de esta importación vienen de Orden(es) de Compra marcadas Consignación -- no se genera Cuenta por Pagar, se registran como recibidas para controlar su consumo.">
+        Consignación
+      </span>
+      {% elif info_consignacion.tiene %}
+      <span class="badge bg-warning text-dark" data-bs-toggle="tooltip"
+            title="{{ info_consignacion.total }} de {{ info_consignacion.total_lineas }} línea(s) de esta importación vienen de Orden(es) de Compra marcadas Consignación -- esas no se facturan, el resto sí.">
+        Consignación parcial ({{ info_consignacion.total }} línea{{ 's' if info_consignacion.total != 1 }})
+      </span>
+      {% endif %}
+    </h3>
     <div class="text-muted">
       Proveedor: <a href="{{ url_for('proveedores_detalle', proveedor_id=imp.proveedor.id) }}">{{ imp.proveedor.nombre }}</a>
       · Fecha factura: {{ imp.fecha_factura or '-' }} · Moneda factura: {{ imp.moneda_factura }}
@@ -81,12 +98,29 @@
         </ul>
       </div>
       {% endif %}
+      {# Ronda BR (2026-10-16, punto 1 del pedido del usuario -- "el boton
+         de genera factura está, si lo presiono registrará la cuenta por
+         pagar lo que sería incorrecto"): cuando TODAS las líneas son de
+         consignación, este botón ya NO genera ninguna Cuenta por Pagar (la
+         recepción en consignación además ya se registra sola al costear,
+         ver _sincronizar_consignacion_recibida) -- se relabela y se avisa
+         explícitamente en la confirmación para que quede claro que no
+         factura nada. #}
+      {% if info_consignacion.es_toda %}
       <form method="post" action="{{ url_for('importacion_generar_factura', importacion_id=imp.id) }}"
-            onsubmit="return confirm('¿Generar en Pago Proveedores la(s) Cuenta(s) por Pagar pendiente(s) de esta importación? Si hay varias facturas individualizadas, se genera una por cada una (las que ya se generaron antes no se duplican).');">
+            onsubmit="return confirm('Esta importación es 100% consignación -- NO se va a generar ninguna Cuenta por Pagar. Esto solo vuelve a verificar que sus líneas estén registradas como recibidas en consignación (ya se registran solas al costear). ¿Continuar?');">
+        <button class="btn btn-outline-secondary" data-bs-toggle="tooltip" title="No genera Cuenta por Pagar -- esta importación es 100% consignación.">
+          Verificar recepción de consignación
+        </button>
+      </form>
+      {% else %}
+      <form method="post" action="{{ url_for('importacion_generar_factura', importacion_id=imp.id) }}"
+            onsubmit="return confirm('¿Generar en Pago Proveedores la(s) Cuenta(s) por Pagar pendiente(s) de esta importación?{{ ' Las ' ~ info_consignacion.total ~ ' línea(s) de consignación NO se van a facturar -- solo se verifica que estén registradas como recibidas.' if info_consignacion.tiene else '' }} Si hay varias facturas individualizadas, se genera una por cada una (las que ya se generaron antes no se duplican).');">
         <button class="btn btn-outline-success">
           Generar factura{{ 's' if imp.facturas_embarque.count() > 1 }}
         </button>
       </form>
+      {% endif %}
     {% endif %}
     <form method="post" action="{{ url_for('importaciones_eliminar', importacion_id=imp.id) }}" onsubmit="return confirm('¿Eliminar esta importación y todo su costeo?');">
       <button class="btn btn-outline-danger">Eliminar</button>
@@ -1115,6 +1149,21 @@
             <div class="col-4"><label class="form-label">Fecha vencimiento</label><input type="date" class="form-control" name="fecha_vencimiento"></div>
             <div class="col-4"><label class="form-label">Cantidad (unidades) *</label><input type="number" min="1" step="1" class="form-control" name="cantidad_unidades" required></div>
             <div class="col-6"><label class="form-label">Valor unitario ({{ imp.moneda_factura }}) *</label><input type="number" step="0.0001" class="form-control campo-precio" name="valor_unitario_moneda" required></div>
+            {% if info_consignacion.tiene %}
+            <div class="col-12">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="es_compra_real" value="1" id="esCompraReal{{ parcial.id }}">
+                <label class="form-check-label small" for="esCompraReal{{ parcial.id }}">
+                  Es una compra real (no consignación), aunque el resto de esta importación sí lo sea
+                </label>
+              </div>
+              <div class="form-text mt-0">
+                Esta importación tiene línea(s) de consignación -- por defecto, un producto agregado a mano
+                acá también se trata como consignación (no se factura, solo se registra como recibido). Marca
+                esta casilla si este producto puntual SÍ se le va a pagar de verdad al proveedor.
+              </div>
+            </div>
+            {% endif %}
           </div>
         </div>
         <div class="modal-footer"><button type="submit" class="btn btn-brand">Agregar</button></div>
@@ -1138,6 +1187,16 @@
             <div class="col-8"><label class="form-label">Descripción</label><input class="form-control" name="descripcion" value="{{ l.descripcion }}" required></div>
             <div class="col-4"><label class="form-label">Cantidad total (unidades)</label><input type="number" min="1" step="1" class="form-control campo-cantidad-total" name="cantidad_unidades" value="{{ l.cantidad_unidades }}"></div>
             <div class="col-8"><label class="form-label">Valor unitario ({{ imp.moneda_factura }})</label><input type="number" step="0.0001" class="form-control" name="valor_unitario_moneda" value="{{ l.valor_unitario_moneda }}"></div>
+            {% if info_consignacion.tiene and not l.orden_compra_linea_id %}
+            <div class="col-12">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="es_compra_real" value="1" id="esCompraRealEditar{{ l.id }}" {{ 'checked' if l.excluir_de_consignacion }}>
+                <label class="form-check-label small" for="esCompraRealEditar{{ l.id }}">
+                  Es una compra real (no consignación), aunque el resto de esta importación sí lo sea
+                </label>
+              </div>
+            </div>
+            {% endif %}
           </div>
           <hr>
           <div class="d-flex justify-content-between align-items-center mb-1">
