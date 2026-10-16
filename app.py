@@ -8575,8 +8575,16 @@ def reparar_migrar_ledger_consignacion_recibida_ronda_br():
     return sembrados
 
 
-with app.app_context():
-    reparar_migrar_ledger_consignacion_recibida_ronda_br()
+# Ronda BS (2026-10-16, fix post-despliegue): el disparo de esta migración
+# NO puede ir aquí mismo -- _calcular_consignacion_deseada_importacion (que
+# llama internamente esta función) usa _codigo_interno_homologado, que
+# recién se define más abajo en este archivo. En el sandbox de pruebas eso
+# no se notaba porque ninguna Importación sembrada tenía líneas de
+# consignación reales que llegaran a ese punto del código; en producción,
+# con datos reales de MEDICONTUR en consignación, Python revienta con
+# NameError apenas hay algo que recorrer -- tumbando el arranque completo
+# del servidor (worker failed to boot). El disparo real quedó movido más
+# abajo, inmediatamente después de definir _codigo_interno_homologado.
 
 
 def _invoice_pdf_desde_oc_para_lineas(lineas_grupo):
@@ -9732,6 +9740,16 @@ def _codigo_interno_homologado(parcial_linea):
         if variante and variante.codigo_interno_inventario:
             return variante.codigo_interno_inventario
     return producto.codigo_interno_inventario
+
+
+# Ronda BS (2026-10-16, fix post-despliegue): el disparo de
+# reparar_migrar_ledger_consignacion_recibida_ronda_br() tiene que ir ACÁ
+# (y no junto a su propia definición, más arriba) porque internamente
+# depende de _codigo_interno_homologado, recién definida arriba -- ver la
+# nota junto a la definición de la función para el detalle del crash que
+# esto causaba en producción.
+with app.app_context():
+    reparar_migrar_ledger_consignacion_recibida_ronda_br()
 
 
 def _proveedor_canonico_historico(proveedor_original):
