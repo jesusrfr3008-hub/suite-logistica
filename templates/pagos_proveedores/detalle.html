@@ -10,9 +10,20 @@
       {% elif factura.origen == 'costeo' %}<span class="badge bg-secondary">Desde Costeo</span>
       {% endif %}
     </h3>
-    <div class="text-muted small">
-      {{ factura.proveedor.nombre }}
-      {% if factura.empresa %} -- {{ factura.empresa.nombre }}{% else %} -- <span class="text-warning">sin empresa compradora asignada</span>{% endif %}
+    <div class="text-muted small d-flex align-items-center gap-2 flex-wrap">
+      {{ factura.proveedor.nombre }} --
+      <!-- Ronda BR (2026-10-16, punto 3 del pedido del usuario): "No tengo
+           donde asignar empresa compradora en los documentos que están en
+           pago a proveedores" -- selector inline que guarda al cambiar. -->
+      <form method="post" action="{{ url_for('pagos_proveedores_asignar_empresa', factura_id=factura.id) }}" class="d-inline-flex align-items-center gap-1 mb-0">
+        <select name="empresa_id" class="form-select form-select-sm" style="width:auto;" onchange="this.form.submit()" title="Empresa compradora">
+          <option value="" {{ 'selected' if not factura.empresa_id }}>Sin asignar</option>
+          {% for e in empresas %}
+          <option value="{{ e.id }}" {{ 'selected' if factura.empresa_id == e.id }}>{{ e.nombre }}</option>
+          {% endfor %}
+        </select>
+      </form>
+      {% if not factura.empresa %}<span class="text-warning">sin empresa compradora asignada</span>{% endif %}
     </div>
   </div>
   <div class="d-flex gap-2">

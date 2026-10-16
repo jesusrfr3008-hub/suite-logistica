@@ -94,6 +94,31 @@
   </div>
 </div>
 
+<!-- Ronda BR (2026-10-16, punto 1 del pedido del usuario): banner
+     persistente -- antes este aviso solo se veía como un flash al volver a
+     presionar "Generar factura". Con un botón para aplicar directo la
+     diferencia a la Cuenta por Pagar ya generada (ver
+     pagos_proveedores_aplicar_cargos_pendientes). -->
+{% if avisos_cargos_pendientes %}
+{% for aviso in avisos_cargos_pendientes %}
+<div class="alert alert-warning d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+  <div>
+    <strong>Atención:</strong> la Cuenta por Pagar
+    <a href="{{ url_for('pagos_proveedores_detalle', factura_id=aviso.factura.id) }}">{{ aviso.factura.numero_factura }}</a>
+    ya está generada (por {{ aviso.factura.valor_factura|moneda }} {{ aviso.factura.moneda }}), pero tiene
+    {{ aviso.diferencia|moneda }} {{ aviso.factura.moneda }} de Flete/Seguro/Handling Fee/Otros asignados después
+    que todavía no están incluidos.
+  </div>
+  {% if current_user.tiene_permiso('pagos_proveedores') or current_user.tiene_permiso('generar_costeo') %}
+  <form method="post" action="{{ url_for('pagos_proveedores_aplicar_cargos_pendientes', factura_id=aviso.factura.id) }}"
+        onsubmit="return confirm('¿Aplicar esta diferencia de {{ aviso.diferencia|moneda }} {{ aviso.factura.moneda }} al valor a pagar de la factura {{ aviso.factura.numero_factura }}? Si ya estaba pagada, va a volver a quedar con un saldo pendiente por ese monto.');">
+    <button class="btn btn-sm btn-warning">Aplicar diferencia</button>
+  </form>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
 <!-- Modal: carga masiva de lotes para TODO el costeo (ronda N, 2026-09-12) -->
 <div class="modal fade" id="modalCargaLotesImportacion" tabindex="-1">
   <div class="modal-dialog">
@@ -1028,9 +1053,9 @@
               {% endfor %}
             </select>
             {% if c.factura_pago_id and imp.facturas_pago.filter_by(factura_embarque_id=c.factura_pago_id).first() %}
-            <div class="form-text text-warning mt-1">Esa factura ya tiene una Cuenta por Pagar generada -- si cambiás esto, NO se actualiza sola (ver aviso en Pago Proveedores al volver a presionar "Generar factura").</div>
+            <div class="form-text text-warning mt-1">Esa factura ya tiene una Cuenta por Pagar generada -- si cambiás esto, no se actualiza sola, pero vas a ver un aviso arriba con un botón para aplicar la diferencia directamente.</div>
             {% elif c.factura_pago_implicita and imp.facturas_pago.filter_by(factura_embarque_id=None).first() %}
-            <div class="form-text text-warning mt-1">La factura implícita ya tiene una Cuenta por Pagar generada -- si cambiás esto, NO se actualiza sola (ver aviso en Pago Proveedores al volver a presionar "Generar factura").</div>
+            <div class="form-text text-warning mt-1">La factura implícita ya tiene una Cuenta por Pagar generada -- si cambiás esto, no se actualiza sola, pero vas a ver un aviso arriba con un botón para aplicar la diferencia directamente.</div>
             {% endif %}
           </div>
         </div>

@@ -8301,6 +8301,14 @@ def importaciones_detalle(importacion_id):
     sugerido_correlativo_inventario = (
         siguiente_correlativo_inventario(imp.empresa_id) if imp.empresa_id else None
     )
+    # Ronda BR (2026-10-16, punto 1 del pedido del usuario): antes este
+    # aviso solo aparecía como un flash (desaparece al siguiente clic) al
+    # volver a presionar "Generar factura" en Costeo. Ahora se muestra
+    # también como un banner persistente en el detalle de la Importación,
+    # con un botón para aplicar la diferencia directamente (ver
+    # pagos_proveedores_aplicar_cargos_pendientes), en vez de tener que
+    # volver a presionar ese botón solo para ver el aviso de nuevo.
+    avisos_cargos_pendientes = _avisos_cargos_pendientes_factura(imp)
     return render_template(
         "importaciones/detalle.html", imp=imp, resultado=resultado,
         regimenes=REGIMENES_PARCIAL, vias=VIAS_EMBARQUE,
@@ -8308,6 +8316,7 @@ def importaciones_detalle(importacion_id):
         conceptos_item_factura=CONCEPTOS_ITEM_FACTURA, tipos_cambio=tipos_cambio,
         tipos_documento_gasto=TIPOS_DOCUMENTO_GASTO, empresas=empresas,
         sugerido_correlativo_inventario=sugerido_correlativo_inventario,
+        avisos_cargos_pendientes=avisos_cargos_pendientes,
     )
 
 
@@ -8407,6 +8416,44 @@ def _invoice_pdf_desde_oc_para_lineas(lineas_grupo):
             if mejor is None or (doc.fecha_subida or datetime.min) > (mejor.fecha_subida or datetime.min):
                 mejor = doc
     return mejor
+
+
+def _avisos_cargos_pendientes_factura(imp):
+    """Ronda BA (2026-10-04)/Ronda BR (2026-10-16, a pedido del usuario):
+    calcula, para cada FacturaProveedor ya generada de esta Importación, si
+    hay Flete/Seguro/Handling Fee/Otros asignados a ella que todavía no
+    están reflejados en su valor_factura (ej.: se generó la Cuenta por
+    Pagar y DESPUÉS se le asignaron cargos adicionales). Devuelve una lista
+    de dicts {"factura": FacturaProveedor, "diferencia": float} -- uno por
+    factura con una diferencia pendiente mayor a 1 centavo.
+
+    Extraído de importacion_generar_factura (donde antes vivía inline,
+    solo para el aviso flash) para reutilizarlo también en: el banner
+    persistente del detalle de la Importación, y la acción "Aplicar
+    diferencia" en Pago Proveedores (ver pagos_proveedores_aplicar_
+    cargos_pendientes) -- el usuario pidió poder aplicar esa diferencia en
+    vez de solo verla en un mensaje que desaparece."""
+    avisos = []
+    for fp_existente in imp.facturas_pago:
+        fe_id = fp_existente.factura_embarque_id
+        if fe_id is None:
+            cargos_grupo_fp = [c for c in imp.cargos_adicionales if c.factura_pago_implicita]
+            tc_usd_grupo_fp = imp.tipo_cambio_moneda_usd or 1
+        else:
+            cargos_grupo_fp = [c for c in imp.cargos_adicionales if c.factura_pago_id == fe_id]
+            fe_obj = FacturaEmbarqueImportacion.query.get(fe_id)
+            tc_usd_grupo_fp = fe_obj.tipo_cambio_moneda_usd_efectivo if fe_obj else (imp.tipo_cambio_moneda_usd or 1)
+        if not cargos_grupo_fp:
+            continue
+        moneda_fp = (fp_existente.moneda or "USD").strip().upper()
+        total_cargos_moneda_fp = sum(
+            (c.monto_usd if moneda_fp == "USD" else c.monto_usd * tc_usd_grupo_fp) for c in cargos_grupo_fp
+        )
+        ya_incluido_fp = fp_existente.cargos_adicionales_moneda or 0.0
+        diferencia_fp = round(total_cargos_moneda_fp - ya_incluido_fp, 2)
+        if diferencia_fp > 0.01:
+            avisos.append({"factura": fp_existente, "diferencia": diferencia_fp})
+    return avisos
 
 
 @app.route("/importaciones/<int:importacion_id>/generar-factura", methods=["POST"])
@@ -8523,9 +8570,9 @@ def importacion_generar_factura(importacion_id):
             subtotal_productos = round(subtotal_productos, 2)
             cargos_grupo = [c for c in imp.cargos_adicionales if c.factura_pago_id == factura_embarque_id]
 
-        if not numero or not fecha:
-            sin_datos.append(numero or f"(factura de embarque sin número, #{factura_embarque_id})")
-            continue
+            if not numero or not fecha:
+                sin_datos.append(numero or f"(factura de embarque sin número, #{factura_embarque_id})")
+                continue
 
         # Ronda BA (2026-10-04, 2da corrección a pedido del usuario): si hay
         # Flete/Seguro/Handling Fee/Otros asignados explícitamente a ESTA
@@ -8583,33 +8630,13 @@ def importacion_generar_factura(importacion_id):
     # que todavía no está reflejado en su valor_factura, se avisa -- a
     # pedido explícito del usuario NO se recalcula sola (podría tener pagos
     # o notas de crédito ya registradas encima), queda a revisión manual.
-    avisos_cargos = []
-    for fe_id in ya_generadas_ids:
-        fp_existente = next((fp for fp in imp.facturas_pago if fp.factura_embarque_id == fe_id), None)
-        if not fp_existente:
-            continue
-        if fe_id is None:
-            cargos_grupo_fp = [c for c in imp.cargos_adicionales if c.factura_pago_implicita]
-            tc_usd_grupo_fp = imp.tipo_cambio_moneda_usd or 1
-        else:
-            cargos_grupo_fp = [c for c in imp.cargos_adicionales if c.factura_pago_id == fe_id]
-            fe_obj = FacturaEmbarqueImportacion.query.get(fe_id)
-            tc_usd_grupo_fp = fe_obj.tipo_cambio_moneda_usd_efectivo if fe_obj else (imp.tipo_cambio_moneda_usd or 1)
-        if not cargos_grupo_fp:
-            continue
-        moneda_fp = (fp_existente.moneda or "USD").strip().upper()
-        total_cargos_moneda_fp = sum(
-            (c.monto_usd if moneda_fp == "USD" else c.monto_usd * tc_usd_grupo_fp) for c in cargos_grupo_fp
-        )
-        ya_incluido_fp = fp_existente.cargos_adicionales_moneda or 0.0
-        diferencia_fp = round(total_cargos_moneda_fp - ya_incluido_fp, 2)
-        if diferencia_fp > 0.01:
-            avisos_cargos.append(
-                f"{fp_existente.numero_factura}: hay {diferencia_fp:,.2f} {fp_existente.moneda} de Flete/"
-                f"Seguro/Handling Fee/Otros asignados a ella que todavía NO están incluidos en su Cuenta por "
-                f"Pagar ya generada (quedó por {fp_existente.valor_factura:,.2f} {fp_existente.moneda}) -- "
-                "revisar y ajustar a mano si corresponde."
-            )
+    avisos_cargos = [
+        f"{a['factura'].numero_factura}: hay {a['diferencia']:,.2f} {a['factura'].moneda} de Flete/"
+        f"Seguro/Handling Fee/Otros asignados a ella que todavía NO están incluidos en su Cuenta por "
+        f"Pagar ya generada (quedó por {a['factura'].valor_factura:,.2f} {a['factura'].moneda}) -- "
+        "podés aplicar la diferencia desde el aviso de arriba, o ajustarla a mano si corresponde."
+        for a in _avisos_cargos_pendientes_factura(imp)
+    ]
 
     if not creadas:
         if sin_datos:
@@ -13368,6 +13395,24 @@ def _crear_comprobante_pago_si_corresponde(fecha_pago, numero_referencia):
     return comprobante
 
 
+def _normalizar_moneda_proveedor(moneda):
+    """Ronda BR (2026-10-16, punto 4 del pedido del usuario): "Hay algunos
+    tag donde dice Pendiente Eur y Pendiente Euro, homologalo". La moneda
+    de una FacturaProveedor se guarda como texto libre (viene de distintos
+    orígenes -- Importación, factura de embarque, carga manual), así que
+    pueden convivir variantes de la misma moneda ('EUR' vs 'EURO') que
+    antes se totalizaban en buckets separados, mostrando dos tarjetas de
+    deuda para el mismo proveedor en la misma moneda real. Mismo criterio
+    que ya se usaba SOLO al crear una factura nueva (importacion_generar_
+    factura) -- acá se centraliza para reusarlo también al totalizar
+    facturas ya existentes, que pueden tener la variante vieja guardada
+    tal cual."""
+    moneda = (moneda or "USD").strip().upper()
+    if moneda.startswith("EUR"):
+        return "EUR"
+    return moneda
+
+
 def _totalizacion_pendientes_por_proveedor(empresa_id=""):
     """Ronda BK (2026-10-08, punto 2b del pedido del usuario): cuánto se le
     debe HOY a cada proveedor (saldo_pendiente > 0, sumado por moneda) y
@@ -13399,7 +13444,7 @@ def _totalizacion_pendientes_por_proveedor(empresa_id=""):
         saldo = f.saldo_pendiente
         if abs(saldo) < 0.01:
             continue
-        moneda = (f.moneda or "USD").strip().upper()
+        moneda = _normalizar_moneda_proveedor(f.moneda)
         clave = (f.proveedor_id, moneda)
         bucket = totales.setdefault(clave, {
             "proveedor_id": f.proveedor_id, "moneda": moneda, "debemos": 0.0, "credito_a_favor": 0.0,
@@ -13408,6 +13453,15 @@ def _totalizacion_pendientes_por_proveedor(empresa_id=""):
             bucket["debemos"] += saldo
         else:
             bucket["credito_a_favor"] += -saldo
+    # Ronda BR (2026-10-16, punto 4): "la idea es que no haya un tag a favor
+    # y otro pendiente, solo te tome lo que está pendiente aplicando los
+    # valores a favor" -- se agrega el neto ya aplicado, para que la
+    # plantilla muestre UN solo tag por moneda en vez de "Debemos" +
+    # "A favor" en paralelo. Se dejan 'debemos'/'credito_a_favor' como
+    # estaban (varios tests existentes y otros usos ya los leen por
+    # separado) y se suma 'saldo_neto' como campo nuevo.
+    for bucket in totales.values():
+        bucket["saldo_neto"] = round(bucket["debemos"] - bucket["credito_a_favor"], 2)
     return totales
 
 
@@ -13481,10 +13535,112 @@ def pagos_proveedores_detalle(factura_id):
     pagos = factura.pagos.order_by(PagoFacturaProveedor.fecha_pago.desc()).all()
     lineas = factura.lineas.all()
     notas_credito = factura.notas_credito.all()
+    # Ronda BR (2026-10-16, punto 3 del pedido del usuario): "No tengo donde
+    # asignar empresa compradora en los documentos que están en pago a
+    # proveedores" -- se pasa el listado de empresas para el selector de
+    # asignación (ver pagos_proveedores_asignar_empresa).
+    empresas = Empresa.query.order_by(Empresa.nombre).all()
     return render_template(
         "pagos_proveedores/detalle.html", factura=factura, pagos=pagos, lineas=lineas,
-        notas_credito=notas_credito, hoy=datetime.utcnow().date(),
+        notas_credito=notas_credito, hoy=datetime.utcnow().date(), empresas=empresas,
     )
+
+
+@app.route("/pagos-proveedores/<int:factura_id>/asignar-empresa", methods=["POST"])
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_asignar_empresa(factura_id):
+    """Ronda BR (2026-10-16, punto 3 del pedido del usuario): permite
+    asignar (o cambiar) la empresa compradora de una FacturaProveedor ya
+    generada, directamente desde Pago Proveedores -- antes solo se fijaba
+    automáticamente al generarse desde Costeo (origen 'costeo', ronda BK),
+    o manualmente al elegirla al emitir el documento de consignación
+    (origen 'consignacion'); las que quedaban sin empresa (o se querían
+    corregir) no tenían ningún control para arreglarlo."""
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    empresa_id = (request.form.get("empresa_id") or "").strip()
+    if not empresa_id:
+        factura.empresa_id = None
+        db.session.commit()
+        flash(f"Se quitó la empresa compradora asignada a la factura {factura.numero_factura}.", "success")
+    else:
+        empresa = Empresa.query.get_or_404(int(empresa_id))
+        factura.empresa_id = empresa.id
+        db.session.commit()
+        flash(f"Se asignó {empresa.nombre} como empresa compradora de la factura {factura.numero_factura}.", "success")
+    return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+
+@app.route("/pagos-proveedores/<int:factura_id>/aplicar-cargos-pendientes", methods=["POST"])
+@requiere_permiso("generar_costeo", "pagos_proveedores")
+def pagos_proveedores_aplicar_cargos_pendientes(factura_id):
+    """Ronda BR (2026-10-16, punto 1 y 2 del pedido del usuario): "al
+    presionar en costeo generar factura, este informe que ya esa factura
+    está generada y que hay una variacion y al aceptar se actualice el
+    valor a pagar del documento en pago a proveedores; en caso que ya se
+    haya pagado este genere un movimiento debito en pago a proveedores
+    para que quede pendiente el valor que no se habia considerado."
+
+    Antes (ronda BA, 2da corrección), cuando se le asignaba Flete/Seguro/
+    Handling Fee/Otros a una Importación DESPUÉS de ya haber generado su
+    Cuenta por Pagar, el sistema solo mostraba un aviso informativo -- a
+    propósito no se recalculaba sola, porque podía tener pagos o notas de
+    crédito ya registradas encima. El usuario ahora pide poder aplicar esa
+    diferencia con un botón, en vez de tener que ajustarla a mano por
+    fuera del sistema.
+
+    No se necesita un modelo nuevo de "nota de débito": como saldo_
+    pendiente = valor_factura - monto_pagado - total_notas_credito, basta
+    con subir valor_factura (y cargos_adicionales_moneda, para que quede
+    coherente con subtotal_productos_moneda) por la diferencia detectada, y
+    recalcular el estado con _factura_proveedor_estado_por_saldo -- que ya
+    hace exactamente lo pedido en los dos casos:
+      - si la factura NO estaba totalmente pagada, el saldo pendiente
+        sube directo (sigue 'pendiente' o 'abonada', según corresponda);
+      - si YA estaba pagada ('pagada', saldo <= 0), al subir valor_factura
+        su saldo vuelve a quedar positivo y el estado pasa automáticamente
+        a 'abonada' -- exactamente el "movimiento débito... para que quede
+        pendiente el valor que no se habia considerado" que pidió el
+        usuario, sin inventar un documento ni un modelo nuevo."""
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    imp = factura.importacion
+    if not imp:
+        flash("Esta factura no está asociada a ninguna Importación -- no hay cargos que verificar.", "warning")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    aviso = next(
+        (a for a in _avisos_cargos_pendientes_factura(imp) if a["factura"].id == factura.id), None,
+    )
+    if not aviso:
+        flash("No hay ninguna diferencia de Flete/Seguro/Handling Fee/Otros pendiente de aplicar en esta factura.", "info")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    diferencia = aviso["diferencia"]
+    estaba_pagada = factura.estado == "pagada"
+    sello = f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} · {current_user.nombre_completo}]"
+    factura.valor_factura = round((factura.valor_factura or 0.0) + diferencia, 2)
+    factura.cargos_adicionales_moneda = round((factura.cargos_adicionales_moneda or 0.0) + diferencia, 2)
+    nota = (
+        f"{sello} Se aplicó una diferencia de {diferencia:,.2f} {factura.moneda} de Flete/Seguro/Handling "
+        "Fee/Otros asignados a la Importación después de haberse generado esta Cuenta por Pagar -- nuevo "
+        f"valor de factura: {factura.valor_factura:,.2f} {factura.moneda}."
+    )
+    factura.notas = f"{factura.notas}\n{nota}" if factura.notas else nota
+    factura.estado = _factura_proveedor_estado_por_saldo(factura)
+    db.session.commit()
+
+    if estaba_pagada and factura.estado != "pagada":
+        flash(
+            f"Se aplicó la diferencia de {diferencia:,.2f} {factura.moneda} -- esta factura estaba pagada, "
+            f"así que ahora vuelve a quedar con un saldo pendiente de {factura.saldo_pendiente:,.2f} "
+            f"{factura.moneda} por ese monto que no se había considerado.",
+            "success",
+        )
+    else:
+        flash(
+            f"Se aplicó la diferencia de {diferencia:,.2f} {factura.moneda} al valor a pagar de esta factura.",
+            "success",
+        )
+    return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
 
 
 @app.route("/pagos-proveedores/<int:factura_id>/registrar-pago", methods=["POST"])

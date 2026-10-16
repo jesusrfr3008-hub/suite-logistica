@@ -68,13 +68,24 @@
       <span class="badge bg-light text-muted border">Sin plazo de crédito cargado</span>
       {% endif %}
       {# Ronda BK (2026-10-08, punto 2b): totalización por proveedor -- lo
-         que le debemos (por moneda) y, si corresponde, el crédito a favor
-         (saldo negativo: pagamos de más o nos hicieron una NC sobre una
-         factura ya pagada) -- ver _totalizacion_pendientes_por_proveedor. #}
+         que le debemos (por moneda), neteando lo que tengamos a favor en
+         esa misma moneda (saldo negativo: pagamos de más o nos hicieron
+         una NC sobre una factura ya pagada) -- ver
+         _totalizacion_pendientes_por_proveedor.
+
+         Ronda BR (2026-10-16, punto 4 del pedido del usuario): "la idea es
+         que no haya un tag a favor y otro pendiente, solo te tome lo que
+         está pendiente aplicando los valores a favor" -- antes se mostraban
+         DOS badges en paralelo (Debemos + A favor) por cada moneda; ahora
+         es un solo badge con el neto (saldo_neto = debemos - credito_a_favor).
+         También se corrigió que 'EUR' y 'EURO' quedaban en buckets
+         separados para el mismo proveedor -- ver _normalizar_moneda_proveedor,
+         ya aplicado adentro de _totalizacion_pendientes_por_proveedor. #}
       {% for t in totales_por_proveedor_id.get(proveedor.id, []) %}
-      <span class="badge bg-dark">Debemos: {{ t.debemos|moneda }} {{ t.moneda }}</span>
-      {% if t.credito_a_favor > 0.01 %}
-      <span class="badge bg-success" data-bs-toggle="tooltip" title="Saldo negativo a nuestro favor -- pagamos de más o nos hicieron una Nota de Crédito sobre una factura ya pagada.">A favor: {{ t.credito_a_favor|moneda }} {{ t.moneda }}</span>
+      {% if t.saldo_neto > 0.01 %}
+      <span class="badge bg-dark">Debemos: {{ t.saldo_neto|moneda }} {{ t.moneda }}</span>
+      {% elif t.saldo_neto < -0.01 %}
+      <span class="badge bg-success" data-bs-toggle="tooltip" title="Saldo a nuestro favor -- pagamos de más o nos hicieron una Nota de Crédito sobre una factura ya pagada, y ya se aplicó contra lo pendiente de esa misma moneda.">A favor: {{ (-t.saldo_neto)|moneda }} {{ t.moneda }}</span>
       {% endif %}
       {% endfor %}
     </div>
