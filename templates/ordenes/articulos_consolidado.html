@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Artículos de Órdenes · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="section-title mb-0">Compras / Artículos de Órdenes de Compra</h3>
+  <a href="{{ url_for('ordenes_list', estado=estado_sel, proveedor_id=proveedor_sel, empresa_id=empresa_sel, mostrar_despachadas=('1' if mostrar_despachadas else None)) }}"
+     class="btn btn-outline-secondary">
+    <i class="bi bi-arrow-left"></i> Volver al listado de órdenes
+  </a>
+</div>
+<p class="text-muted small">
+  <i class="bi bi-info-circle me-1"></i>
+  Todos los artículos (líneas activas) de las {{ ordenes_count }} orden(es) que calzan con el filtro
+  actual, sin tener que entrar orden por orden. Cada fila indica a qué N° PO pertenece y si es un
+  <span class="badge bg-warning text-dark">BO</span> (back order -- remanente pendiente de una
+  confirmación parcial del proveedor) o una línea nueva.
+</p>
+
+{% if not filas %}
+<div class="alert alert-success">No hay artículos que calcen con este filtro.</div>
+{% else %}
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover table-sm align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>N° PO</th>
+          <th>Empresa</th>
+          <th>Proveedor</th>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th class="text-end">Cajas</th>
+          <th>Etapa</th>
+          <th>Tipo</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for fila in filas %}
+        {% set o = fila.orden %}
+        {% set l = fila.linea %}
+        <tr>
+          <td class="fw-semibold">
+            {{ o.numero_po }}
+            {% if o.es_consignacion %}
+            <span class="badge text-white" style="background-color:#6f42c1;" data-bs-toggle="tooltip" title="Orden en consignación">Consig.</span>
+            {% endif %}
+          </td>
+          <td>{% if o.empresa %}{{ o.empresa.nombre }}{% else %}<span class="badge bg-warning text-dark">Sin asignar</span>{% endif %}</td>
+          <td>{{ o.proveedor.nombre }}</td>
+          <td>{{ l.codigo_mostrar }}</td>
+          <td>{{ l.variante_descripcion or l.producto.descripcion }}</td>
+          <td class="text-end">{{ l.cantidad_cajas }}</td>
+          <td>
+            {% if l.etapa == 'Emisión de Orden' %}<span class="badge bg-secondary">{{ l.etapa }}</span>
+            {% else %}<span class="badge bg-info text-dark">{{ l.etapa }}</span>{% endif %}
+          </td>
+          <td>
+            {% if l.disponibilidad_parcial_pendiente %}
+            <span class="badge bg-warning text-dark" data-bs-toggle="tooltip" title="El proveedor solo confirmó parte de la cantidad pedida -- esta línea es el resto, que quedó pendiente hasta que esté disponible, no un pedido nuevo.">BO</span>
+            {% else %}
+            <span class="badge bg-light text-muted border">Nuevo</span>
+            {% endif %}
+          </td>
+          <td class="text-end"><a href="{{ url_for('ordenes_detalle', orden_id=o.id) }}" class="btn btn-sm btn-outline-primary">Ver orden</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -36,6 +36,19 @@
       {% endfor %}
     </select>
   </div>
+  <div class="col-auto">
+    {# Ronda BQ (2026-10-16, punto 1 del pedido del usuario): filtro por
+       empresa compradora -- "Consolidado" (vacío, default) muestra las dos
+       empresas juntas, igual que siempre antes de esta ronda. #}
+    <label class="form-label small mb-0">Empresa</label>
+    <select name="empresa_id" class="form-select form-select-sm" onchange="this.form.submit()">
+      <option value="" {{ 'selected' if not empresa_filtro }}>Consolidado (todas)</option>
+      {% for e in empresas %}
+      <option value="{{ e.id }}" {{ 'selected' if empresa_filtro == e.id|string }}>{{ e.nombre }}</option>
+      {% endfor %}
+      <option value="sin-asignar" {{ 'selected' if empresa_filtro == 'sin-asignar' }}>Sin asignar</option>
+    </select>
+  </div>
 </form>
 
 {% if not agrupado %}
@@ -80,6 +93,7 @@
       <thead>
         <tr class="text-muted small">
           <th>Factura</th>
+          <th>Empresa</th>
           <th>Emisión</th>
           <th class="text-end">Valor</th>
           <th class="text-end">Pagado</th>
@@ -93,6 +107,10 @@
         {% for f in facturas %}
         <tr>
           <td class="fw-semibold">{{ f.numero_factura }}</td>
+          <td>
+            {% if f.empresa %}{{ f.empresa.nombre }}
+            {% else %}<span class="badge bg-light text-muted border">Sin asignar</span>{% endif %}
+          </td>
           <td>{{ f.fecha_emision.strftime('%d-%m-%Y') if f.fecha_emision else '--' }}</td>
           <td class="text-end">{{ f.valor_factura|moneda }} {{ f.moneda }}</td>
           <td class="text-end">{{ f.monto_pagado|moneda }} {{ f.moneda }}</td>

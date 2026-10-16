@@ -2,12 +2,33 @@
 {% block title %}Órdenes de Compra · Suite Logística{% endblock %}
 {% block content %}
 
+{# Ronda BQ (2026-10-16, punto 3 del pedido del usuario): macro para armar
+   un encabezado de columna clicable que ordena el listado, con flecha
+   indicando la columna/dirección activa -- se usa abajo en el <thead>. #}
+{% macro th_ordenable(col, etiqueta, clase='') %}
+{% set es_actual = (sort_sel == col) %}
+{% set prox_dir = 'desc' if (es_actual and dir_sel == 'asc') else 'asc' %}
+<th class="{{ clase }}">
+  <a href="{{ url_for('ordenes_list', sort=col, dir=prox_dir, estado=estado_sel, proveedor_id=proveedor_sel, empresa_id=empresa_sel, mostrar_despachadas=('1' if mostrar_despachadas else None)) }}"
+     class="text-decoration-none {{ 'text-dark fw-semibold' if es_actual else 'text-muted' }}">
+    {{ etiqueta }}
+    {% if es_actual %}
+      <i class="bi bi-arrow-{{ 'up' if dir_sel == 'asc' else 'down' }}"></i>
+    {% else %}
+      <i class="bi bi-arrow-down-up small"></i>
+    {% endif %}
+  </a>
+</th>
+{% endmacro %}
+
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h3 class="section-title mb-0">Compras / Órdenes de Compra</h3>
   <a href="{{ url_for('ordenes_nueva') }}" class="btn btn-brand"><i class="bi bi-plus-lg"></i> Nueva orden de compra</a>
 </div>
 
-<form class="row g-2 mb-3">
+<form class="row g-2 mb-3 align-items-end">
+  <input type="hidden" name="sort" value="{{ sort_sel }}">
+  <input type="hidden" name="dir" value="{{ dir_sel }}">
   <div class="col-auto">
     <select class="form-select" name="empresa_id" onchange="this.form.submit()">
       <option value="">Todas las empresas</option>
@@ -40,6 +61,17 @@
       <label class="form-check-label" for="chkMostrarDespachadas">Mostrar también despachadas</label>
     </div>
   </div>
+  {% if proveedor_sel %}
+  <div class="col-auto">
+    {# Ronda BQ (2026-10-16, punto 4 del pedido del usuario): solo tiene
+       sentido con un proveedor filtrado -- si no, "todos los articulos de
+       todas las ordenes" es una lista enorme sin mucho uso practico. #}
+    <a class="btn btn-outline-brand"
+       href="{{ url_for('ordenes_articulos_consolidado', estado=estado_sel, proveedor_id=proveedor_sel, empresa_id=empresa_sel, mostrar_despachadas=('1' if mostrar_despachadas else None)) }}">
+      <i class="bi bi-list-check"></i> Ver artículos de estas órdenes
+    </a>
+  </div>
+  {% endif %}
 </form>
 <p class="text-muted small">
   <i class="bi bi-info-circle me-1"></i>
@@ -54,13 +86,13 @@
     <table class="table table-hover align-middle mb-0">
       <thead>
         <tr>
-          <th>N° PO</th>
-          <th>Empresa</th>
-          <th>Proveedor</th>
-          <th>Fecha emisión</th>
-          <th>Estado</th>
-          <th class="text-end">Cajas pendientes</th>
-          <th class="text-end">Total</th>
+          {{ th_ordenable('po', 'N° PO') }}
+          {{ th_ordenable('empresa', 'Empresa') }}
+          {{ th_ordenable('proveedor', 'Proveedor') }}
+          {{ th_ordenable('fecha', 'Fecha emisión') }}
+          {{ th_ordenable('estado', 'Estado') }}
+          {{ th_ordenable('pendientes', 'Cajas pendientes', clase='text-end') }}
+          {{ th_ordenable('total', 'Total', clase='text-end') }}
           <th></th>
         </tr>
       </thead>
@@ -89,6 +121,9 @@
               <span class="badge bg-primary badge-estado">{{ o.estado }}</span>
             {% endif %}
             {% if o.total_anuladas > 0 %}<span class="badge bg-secondary">{{ o.total_anuladas }} anulada(s)</span>{% endif %}
+            {% if o.tiene_remanente_parcial %}
+            <span class="badge bg-warning text-dark" data-bs-toggle="tooltip" title="Incluye línea(s) BO (back order) -- remanente pendiente de una confirmación parcial del proveedor, no un pedido nuevo">BO</span>
+            {% endif %}
           </td>
           <td class="text-end">{{ o.total_unidades_pendientes|round(1) }}</td>
           <td class="text-end">{{ "%.2f"|format(o.total) }} {{ o.moneda }}</td>

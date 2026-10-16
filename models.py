@@ -941,6 +941,19 @@ class OrdenCompra(db.Model):
             if not l.anulada and l.etapa == ETAPAS_LINEA[0]
         )
 
+    @property
+    def tiene_remanente_parcial(self):
+        """Ronda BQ (2026-10-16, a pedido del usuario): True si alguna linea
+        ACTIVA de esta orden es un BO (back order) -- el remanente que quedo
+        pendiente porque el proveedor confirmo solo una PARTE de lo pedido
+        (ver disponibilidad_parcial_pendiente en OrdenCompraLinea, ronda AV).
+        Se usa en el listado para distinguir un BO real de una linea que
+        simplemente nunca se ha intentado confirmar -- ambas se ven igual
+        hoy ('Emisión de Orden') sin este indicador."""
+        return any(
+            l.disponibilidad_parcial_pendiente for l in self.lineas if not l.anulada
+        )
+
     def __repr__(self):
         return f"<OC {self.numero_po}>"
 

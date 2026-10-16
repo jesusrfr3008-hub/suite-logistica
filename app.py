@@ -3883,6 +3883,18 @@ def dividir_orden_si_corresponde(orden):
                 # "Mis ordenes"/"Por Aprobar".
                 creado_por_usuario_id=orden.creado_por_usuario_id,
                 estado_aprobacion=orden.estado_aprobacion,
+                # Ronda BQ (2026-10-16, a pedido del usuario -- "cuando creo
+                # una OC en consignacion, y esta es confirmada parcialmente,
+                # los articulos que quedan pendiente pierden la marca de
+                # consignacion"): es_consignacion es un flag de la orden
+                # COMPLETA (ver su comentario en models.py), no de la linea --
+                # faltaba copiarlo aca. Como el cohorte MENOS avanzado
+                # (tipicamente el remanente que quedo pendiente, ver
+                # disponibilidad_parcial_pendiente) es el que se muda a esta
+                # orden nueva mientras `orden` original conserva su id, sin
+                # esta linea la orden nueva (el remanente) quedaba SIEMPRE en
+                # es_consignacion=False -- exactamente el bug reportado.
+                es_consignacion=orden.es_consignacion,
             )
             db.session.add(destino)
             db.session.flush()
@@ -5739,13 +5751,25 @@ def productos_importar(proveedor_id):
 # Modulo: Compras (Ordenes de Compra)
 # ---------------------------------------------------------------------------
 
-@app.route("/ordenes")
-@requiere_permiso("crear_orden", "aprobar_orden", "actualizar_despacho")
-def ordenes_list():
-    estado = request.args.get("estado", "")
-    proveedor_id = request.args.get("proveedor_id", "")
-    empresa_id = request.args.get("empresa_id", "")
-    mostrar_despachadas = request.args.get("mostrar_despachadas") == "1"
+def _ordenes_filtros_de_request():
+    """Ronda BQ (2026-10-16): lee los filtros de query string comunes a
+    /ordenes y /ordenes/articulos, para que ambas rutas usen exactamente los
+    mismos valores (y el botón "Ver artículos" de una pueda armar el link a
+    la otra sin duplicar la lectura de params)."""
+    return {
+        "estado": request.args.get("estado", ""),
+        "proveedor_id": request.args.get("proveedor_id", ""),
+        "empresa_id": request.args.get("empresa_id", ""),
+        "mostrar_despachadas": request.args.get("mostrar_despachadas") == "1",
+    }
+
+
+def _ordenes_query_filtrada(estado, proveedor_id, empresa_id, mostrar_despachadas):
+    """Ronda BQ (2026-10-16): filtro de ordenes_list() extraido a funcion
+    compartida -- la usa tambien ordenes_articulos_consolidado() (punto 4
+    del pedido del usuario: boton para ver todos los articulos de las
+    ordenes que calzan con el filtro por proveedor) para no mantener la
+    misma logica de filtrado duplicada en dos lugares."""
     # Ronda T (2026-09-12): "los registros" (este listado) solo muestran
     # ordenes ya Aprobadas -- las 'Por Aprobar' y 'Sin Emitir' se gestionan
     # aparte, en /ordenes/por-aprobar (ver ordenes_por_aprobar).
@@ -5779,7 +5803,42 @@ def ordenes_list():
     # si hace falta consultarlas desde aqui.
     if not mostrar_despachadas and estado not in ETAPAS_ORDEN_DESPACHABLE:
         query = query.filter(~OrdenCompra.estado.in_(ETAPAS_ORDEN_DESPACHABLE))
+    return query
+
+
+# Ronda BQ (2026-10-16, punto 3 del pedido del usuario -- "el encabezado debe
+# tener las flechas para ordenar la informacion"): columnas ordenables del
+# listado de ordenes y su funcion clave de ordenamiento. Varias de las
+# columnas (cajas pendientes, total) son @property calculadas en Python, no
+# columnas de la base de datos -- como ordenes_list() ya trae TODA la lista
+# filtrada a memoria con .all() (igual que antes de esta ronda), ordenar en
+# Python despues del fetch funciona para cualquier columna sin tener que
+# tocar la consulta SQL ni arriesgar la logica de filtrado de arriba.
+ORDENES_SORT_KEYS = {
+    "po": lambda o: (o.numero_po or ""),
+    "empresa": lambda o: (o.empresa.nombre if o.empresa else ""),
+    "proveedor": lambda o: (o.proveedor.nombre if o.proveedor else ""),
+    "fecha": lambda o: (o.fecha_emision or date.min),
+    "estado": lambda o: (o.estado or ""),
+    "pendientes": lambda o: o.total_unidades_pendientes,
+    "total": lambda o: o.total,
+}
+
+
+@app.route("/ordenes")
+@requiere_permiso("crear_orden", "aprobar_orden", "actualizar_despacho")
+def ordenes_list():
+    f = _ordenes_filtros_de_request()
+    query = _ordenes_query_filtrada(**f)
     ordenes = query.order_by(OrdenCompra.id.desc()).all()
+
+    sort_sel = request.args.get("sort", "")
+    dir_sel = request.args.get("dir", "asc")
+    if dir_sel not in ("asc", "desc"):
+        dir_sel = "asc"
+    if sort_sel in ORDENES_SORT_KEYS:
+        ordenes.sort(key=ORDENES_SORT_KEYS[sort_sel], reverse=(dir_sel == "desc"))
+
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     empresas = Empresa.query.order_by(Empresa.nombre).all()
     return render_template(
@@ -5788,10 +5847,48 @@ def ordenes_list():
         proveedores=proveedores,
         empresas=empresas,
         estados=ESTADOS_OC,
-        estado_sel=estado,
-        proveedor_sel=proveedor_id,
-        empresa_sel=empresa_id,
-        mostrar_despachadas=mostrar_despachadas,
+        estado_sel=f["estado"],
+        proveedor_sel=f["proveedor_id"],
+        empresa_sel=f["empresa_id"],
+        mostrar_despachadas=f["mostrar_despachadas"],
+        sort_sel=sort_sel,
+        dir_sel=dir_sel,
+    )
+
+
+@app.route("/ordenes/articulos")
+@requiere_permiso("crear_orden", "aprobar_orden", "actualizar_despacho")
+def ordenes_articulos_consolidado():
+    """Ronda BQ (2026-10-16, punto 4 del pedido del usuario): vista
+    consolidada de TODOS los articulos (lineas activas) de las ordenes que
+    calzan con el filtro actual de /ordenes -- para no tener que entrar
+    orden por orden a revisar productos cuando se filtra por un proveedor
+    con varias ordenes abiertas. Cada fila muestra a que orden pertenece y
+    si es un BO (remanente de confirmacion parcial) o una linea nueva."""
+    f = _ordenes_filtros_de_request()
+    query = _ordenes_query_filtrada(**f)
+    ordenes = query.order_by(OrdenCompra.numero_po, OrdenCompra.id).all()
+
+    filas = []
+    for o in ordenes:
+        for l in o.lineas:
+            if l.anulada:
+                continue
+            filas.append({"orden": o, "linea": l})
+
+    proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
+    empresas = Empresa.query.order_by(Empresa.nombre).all()
+    return render_template(
+        "ordenes/articulos_consolidado.html",
+        filas=filas,
+        ordenes_count=len(ordenes),
+        proveedores=proveedores,
+        empresas=empresas,
+        estados=ESTADOS_OC,
+        estado_sel=f["estado"],
+        proveedor_sel=f["proveedor_id"],
+        empresa_sel=f["empresa_id"],
+        mostrar_despachadas=f["mostrar_despachadas"],
     )
 
 
@@ -13271,7 +13368,7 @@ def _crear_comprobante_pago_si_corresponde(fecha_pago, numero_referencia):
     return comprobante
 
 
-def _totalizacion_pendientes_por_proveedor():
+def _totalizacion_pendientes_por_proveedor(empresa_id=""):
     """Ronda BK (2026-10-08, punto 2b del pedido del usuario): cuánto se le
     debe HOY a cada proveedor (saldo_pendiente > 0, sumado por moneda) y
     cuánto nos debe el proveedor EN SENTIDO CONTRARIO (saldo_pendiente < 0
@@ -13282,9 +13379,23 @@ def _totalizacion_pendientes_por_proveedor():
     es positivo), así que si esto solo mirara el filtro 'pendientes' ese
     crédito a favor nunca se vería en ningún lado. Separado por moneda para
     no mezclar, por ejemplo, un crédito en EUR con una deuda en USD del
-    mismo proveedor."""
+    mismo proveedor.
+
+    Ronda BQ (2026-10-16, punto 1 del pedido del usuario -- filtro por
+    empresa compradora o consolidado): `empresa_id` opcional, mismo criterio
+    que el filtro de la lista (vacío = consolidado/todas; "sin-asignar" =
+    FacturaProveedor.empresa_id NULL; si no, esa empresa puntual) -- así los
+    totales por proveedor que se muestran junto a cada tarjeta reflejan el
+    mismo filtro que la tabla de abajo, en vez de mezclar las dos empresas
+    aunque se esté mirando solo una."""
+    query = FacturaProveedor.query
+    if empresa_id:
+        if empresa_id == "sin-asignar":
+            query = query.filter(FacturaProveedor.empresa_id.is_(None))
+        else:
+            query = query.filter_by(empresa_id=empresa_id)
     totales = {}
-    for f in FacturaProveedor.query.all():
+    for f in query.all():
         saldo = f.saldo_pendiente
         if abs(saldo) < 0.01:
             continue
@@ -13308,6 +13419,12 @@ def pagos_proveedores_list():
     primero). Filtrable por estado y por proveedor."""
     estado_filtro = request.args.get("estado", "pendientes").strip().lower()
     proveedor_filtro = request.args.get("proveedor_id", "").strip()
+    # Ronda BQ (2026-10-16, punto 1 del pedido del usuario -- "necesito en el
+    # menu pago proveedores que se pueda filtrar por empresa compradora, o
+    # consolidado"): mismo criterio que el filtro de empresa de /ordenes --
+    # vacío (default) = consolidado, muestra todas las empresas juntas, sin
+    # cambiar el comportamiento que ya existía antes de esta ronda.
+    empresa_filtro = request.args.get("empresa_id", "").strip()
 
     q = FacturaProveedor.query
     if estado_filtro == "pendientes":
@@ -13316,6 +13433,11 @@ def pagos_proveedores_list():
         q = q.filter(FacturaProveedor.estado == estado_filtro)
     if proveedor_filtro.isdigit():
         q = q.filter(FacturaProveedor.proveedor_id == int(proveedor_filtro))
+    if empresa_filtro:
+        if empresa_filtro == "sin-asignar":
+            q = q.filter(FacturaProveedor.empresa_id.is_(None))
+        else:
+            q = q.filter(FacturaProveedor.empresa_id == empresa_filtro)
 
     facturas = q.order_by(
         db.case((FacturaProveedor.fecha_vencimiento.is_(None), 1), else_=0),
@@ -13328,20 +13450,25 @@ def pagos_proveedores_list():
         agrupado.setdefault(f.proveedor, []).append(f)
 
     proveedores_con_facturas = Proveedor.query.join(FacturaProveedor).distinct().order_by(Proveedor.nombre).all()
+    empresas = Empresa.query.order_by(Empresa.nombre).all()
 
     # Ronda BK (2026-10-08, punto 2b): totalización por proveedor (lo que
     # debemos + crédito a favor, por moneda) -- ver
     # _totalizacion_pendientes_por_proveedor. Se agrupa por proveedor_id
     # para que la plantilla lo pueda mostrar junto a cada tarjeta, sin
-    # importar el filtro de estado que se esté usando para la tabla.
+    # importar el filtro de estado que se esté usando para la tabla (pero
+    # desde la ronda BQ SÍ respeta el filtro de empresa, para no mezclar
+    # las dos empresas si se está mirando solo una -- ver el docstring de
+    # _totalizacion_pendientes_por_proveedor).
     totales_por_proveedor_id = defaultdict(list)
-    for bucket in _totalizacion_pendientes_por_proveedor().values():
+    for bucket in _totalizacion_pendientes_por_proveedor(empresa_filtro).values():
         totales_por_proveedor_id[bucket["proveedor_id"]].append(bucket)
 
     return render_template(
         "pagos_proveedores/list.html",
         agrupado=agrupado, hoy=hoy, estado_filtro=estado_filtro,
         proveedor_filtro=proveedor_filtro, proveedores=proveedores_con_facturas,
+        empresa_filtro=empresa_filtro, empresas=empresas,
         ESTADOS_FACTURA_PROVEEDOR=ESTADOS_FACTURA_PROVEEDOR,
         totales_por_proveedor_id=totales_por_proveedor_id,
     )
