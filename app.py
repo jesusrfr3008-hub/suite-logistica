@@ -9617,11 +9617,26 @@ _RELLENO_AMARILLO = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_t
 # aplica a todas las columnas de valores (J a U) EXCEPTO "Unidades" (K), que
 # es una cantidad, no un monto.
 _FORMATO_CONTABILIDAD = '_-* #,##0.00_-;-* #,##0.00_-;_-* "-"??_-;_-@_-'
+# Ronda BT (2026-10-16, punto 2 del pedido del usuario): el sistema de
+# Inventarios (Ergopyme) rechaza el archivo si las columnas en pesos
+# chilenos (CLP) traen decimales -- comparando con un archivo real que SÍ
+# aceptó ("Carga physiol revision_programa.xlsx"), esas columnas usan
+# formato entero sin decimales ("#,##0"), a diferencia de las columnas en
+# USD/EUR (FOB, Flete, Seguro, C.I.F. en moneda extranjera), que sí
+# conservan 2 decimales. Se aplica tanto al FORMATO como al VALOR en sí
+# (redondeado), por si Ergopyme lee el valor crudo de la celda y no el
+# texto ya formateado.
+_FORMATO_ENTERO = "#,##0"
 # Indices (1-based, dentro de ENCABEZADOS_INVENTARIO) de las columnas de
 # valores a las que se les aplica el formato de contabilidad (ronda Q, punto
 # 2): de "valor Unitario EU" (9) a "COSTO UNITARIO $" (20), salteando
 # "Unidades" (10), que es una cantidad, no un monto.
 _COLS_VALORES_INVENTARIO = [i for i in range(9, 21) if i != 10]
+# Ronda BT (2026-10-16, punto 2): subconjunto de las columnas de arriba que
+# están en pesos chilenos (CLP) -- "TOTAL C.I.F. $" (16), "DERECHO ADUANA $"
+# (17), "OTROS GASTOS $" (18), "TOTAL COSTO $" (19) y "COSTO UNITARIO $"
+# (20) -- y por lo tanto van SIN decimales (ver _FORMATO_ENTERO más arriba).
+_COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO = [16, 17, 18, 19, 20]
 # Columnas que llevan fila de subtotal (ronda Q, punto 3): "desde la columna
 # J en adelante" -- a diferencia del formato de contabilidad, aca SI se
 # incluye "Unidades" (J es la primera de este rango, columna 10 de la hoja).
@@ -10133,16 +10148,25 @@ def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
     -- es el código interno del sistema de Inventarios, que este sistema
     no conoce (se completa/relaciona del otro lado).
 
-    Columnas CODIGO (B) y DESCRIPCION (C) segun el checkbox "Código
-    Proveedor" (ronda T, 2026-09-12; CODIGO homologado agregado en ronda V):
+    Columna CODIGO (B) segun el checkbox "Código Proveedor" (ronda T,
+    2026-09-12; CODIGO homologado agregado en ronda V):
     - Sin marcar (default): CODIGO lleva el código INTERNO del sistema de
       Inventarios ya homologado (ver _codigo_interno_homologado, ronda V) --
       queda en blanco solo si ese producto/variante todavía no se homologó.
-      DESCRIPCION lleva el código propio de Suite Logística concatenado con
-      la descripción, igual que siempre desde ronda O.
     - Marcado: CODIGO lleva el código del proveedor (el propio de Suite
-      Logística) y DESCRIPCION queda solo con la descripción, sin
-      concatenar."""
+      Logística).
+    DESCRIPCION (C) va SIEMPRE con la descripción pura, sin concatenar nada
+    más (ronda BT, 2026-10-16, punto 1 -- antes, con el checkbox sin
+    marcar, se concatenaba el código del proveedor delante de la
+    descripción, lo que el usuario no quiere en ningún caso).
+
+    Ronda BT (2026-10-16, punto 2): las 5 columnas en pesos chilenos (CLP --
+    "TOTAL C.I.F. $", "DERECHO ADUANA $", "OTROS GASTOS $", "TOTAL COSTO $"
+    y "COSTO UNITARIO $") se redondean a entero, sin decimales, y la fila
+    final de totales lleva un "*" en la columna CODIGO en vez del texto
+    "SUBTOTAL" -- dos requisitos del sistema de Inventarios (Ergopyme) para
+    aceptar el archivo, confirmados comparando con un archivo real que sí
+    aceptó."""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     nombres_usados = set()
@@ -10173,21 +10197,23 @@ def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
             linea = info["linea"]
             codigo_limpio = (linea.codigo or "").strip()
             descripcion_limpia = (linea.descripcion or "").strip()
+            # Ronda BT (2026-10-16, punto 1 del pedido del usuario): DESCRIPCION
+            # (C) va SIEMPRE con la descripción pura, sin el código del
+            # proveedor concatenado -- antes, cuando el checkbox "Código
+            # Proveedor" quedaba sin marcar, esta columna mezclaba "código
+            # descripción", lo que el usuario no quiere en ningún caso. Solo
+            # la columna CODIGO (B) cambia según el checkbox.
+            valor_descripcion_col_c = descripcion_limpia
             if codigo_proveedor:
                 # Checkbox marcado (ronda T): CODIGO (B) = código del proveedor
-                # (el propio de Suite Logística), DESCRIPCION (C) = solo la
-                # descripción, sin concatenar.
+                # (el propio de Suite Logística).
                 valor_codigo_col_b = codigo_limpio
-                valor_descripcion_col_c = descripcion_limpia
             else:
-                # Ronda V (2026-09-12, punto 1): CODIGO (B) ahora lleva el
-                # código interno homologado del sistema de Inventarios,
-                # cuando ya se conoce (antes quedaba siempre en blanco).
-                # DESCRIPCION (C) sigue igual que siempre: "código
-                # descripción" concatenados con el código propio de Suite
-                # Logística (no el interno).
+                # Checkbox sin marcar (default, ronda V): CODIGO (B) = código
+                # interno ya homologado del sistema de Inventarios, cuando ya
+                # se conoce (queda en blanco si el producto/variante todavía
+                # no se homologó).
                 valor_codigo_col_b = _codigo_interno_homologado(linea)
-                valor_descripcion_col_c = f"{codigo_limpio} {descripcion_limpia}".strip()
             total_unidades = linea.cantidad_unidades or 0
             lotes = list(linea.lotes) or [None]
             for lote in lotes:
@@ -10218,11 +10244,16 @@ def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
                     info["flete_usd"] * share,
                     info["seguro_usd"] * share,
                     info["cif_usd"] * share,
-                    info["cif_clp"] * share,
-                    info["derechos_clp"] * share,
-                    (info["gastos_clp"] - info["derechos_clp"]) * share,
-                    costo_total_lote,
-                    (costo_total_lote / cantidad_lote) if cantidad_lote else 0,
+                    # Ronda BT (2026-10-16, punto 2): de acá en adelante son
+                    # las 5 columnas en pesos chilenos (CLP) -- se redondean a
+                    # entero (sin decimales) porque Ergopyme no las admite con
+                    # decimales; ver _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO
+                    # para el mismo ajuste en el FORMATO de estas columnas.
+                    round(info["cif_clp"] * share),
+                    round(info["derechos_clp"] * share),
+                    round((info["gastos_clp"] - info["derechos_clp"]) * share),
+                    round(costo_total_lote),
+                    round((costo_total_lote / cantidad_lote) if cantidad_lote else 0),
                 ]
                 for i, valor in enumerate(valores):
                     ws.cell(row=fila_actual, column=i + 1 + _COL_INVENTARIO_OFFSET, value=valor)
@@ -10231,23 +10262,40 @@ def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
                     ws.cell(row=fila_actual, column=6 + _COL_INVENTARIO_OFFSET).number_format = "YYMMDD"
                 # Formato "Contabilidad" en las columnas de valores (ronda Q,
                 # punto 2) -- "Unidades" (columna K) queda fuera a propósito.
+                # Ronda BT (2026-10-16, punto 2): las columnas en CLP (ver
+                # _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO) usan formato
+                # entero en vez del de contabilidad -- Ergopyme no admite
+                # decimales ahí.
                 for col_pos in _COLS_VALORES_INVENTARIO:
-                    ws.cell(row=fila_actual, column=col_pos + _COL_INVENTARIO_OFFSET).number_format = _FORMATO_CONTABILIDAD
+                    formato = (
+                        _FORMATO_ENTERO if col_pos in _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO
+                        else _FORMATO_CONTABILIDAD
+                    )
+                    ws.cell(row=fila_actual, column=col_pos + _COL_INVENTARIO_OFFSET).number_format = formato
 
         # Fila de subtotales, filtro en el encabezado y sin cuadricula (ronda
         # Q, puntos 3, 4 y 5) -- una vez procesadas todas las lineas/lotes de
         # este parcial.
+        #
+        # Ronda BT (2026-10-16, punto 2 del pedido del usuario): esta fila ya
+        # NO lleva el texto "SUBTOTAL" en la columna DESCRIPCION -- Ergopyme
+        # espera un "*" en la columna CODIGO (B) para saber dónde terminan
+        # los productos del archivo (confirmado comparando con un archivo
+        # real que Ergopyme sí aceptó, "Carga physiol revision_programa.xlsx").
         ws.sheet_view.showGridLines = False
         if fila_actual > fila_encabezado:
             fila_subtotal = fila_actual + 1
-            ws.cell(row=fila_subtotal, column=2 + _COL_INVENTARIO_OFFSET, value="SUBTOTAL").font = Font(bold=True)
+            ws.cell(row=fila_subtotal, column=1 + _COL_INVENTARIO_OFFSET, value="*").font = Font(bold=True)
             for col_pos in _COLS_SUBTOTAL_INVENTARIO:
                 col_letra = get_column_letter(col_pos + _COL_INVENTARIO_OFFSET)
                 celda = ws.cell(row=fila_subtotal, column=col_pos + _COL_INVENTARIO_OFFSET)
                 celda.value = f"=SUM({col_letra}{fila_encabezado + 1}:{col_letra}{fila_actual})"
                 celda.font = Font(bold=True)
                 if col_pos != 10:  # 10 = "Unidades", sin formato de contabilidad
-                    celda.number_format = _FORMATO_CONTABILIDAD
+                    celda.number_format = (
+                        _FORMATO_ENTERO if col_pos in _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO
+                        else _FORMATO_CONTABILIDAD
+                    )
         ws.auto_filter.ref = (
             f"B{fila_encabezado}:U{fila_actual}" if fila_actual > fila_encabezado
             else f"B{fila_encabezado}:U{fila_encabezado}"
@@ -10269,10 +10317,11 @@ def importaciones_exportar_inventario(importacion_id):
     por parcial, un lote físico por fila) -- ver _construir_excel_inventario.
     Ronda T (2026-09-12): checkbox opcional "Código Proveedor" -- si se
     marca, la columna CODIGO (B) lleva el código propio de Suite Logística
-    (el mismo que identifica al producto en el catálogo de ese proveedor) y
-    la columna DESCRIPCION (C) queda con la descripción sola, sin
-    concatenar; si no se marca, se mantiene el comportamiento de siempre
-    (CODIGO en blanco, DESCRIPCION con "código descripción" concatenados)."""
+    (el mismo que identifica al producto en el catálogo de ese proveedor);
+    si no se marca, CODIGO lleva el código interno ya homologado del
+    sistema de Inventarios (puede quedar en blanco si todavía no se
+    homologó). DESCRIPCION (C) va siempre con la descripción pura en
+    cualquiera de los dos casos (ronda BT, 2026-10-16, punto 1)."""
     imp = Importacion.query.get_or_404(importacion_id)
     codigo_proveedor = request.args.get("codigo_proveedor") == "1"
     resultado = costing.calcular_costeo(imp)
