@@ -9,7 +9,7 @@
     <div class="row g-3">
       <div class="col-md-3">
         <label class="form-label">Empresa compradora *</label>
-        <select class="form-select" name="empresa_id" required>
+        <select class="form-select" name="empresa_id" id="empresaSelect" required>
           <option value="">Seleccione...</option>
           {% for e in empresas %}
           <option value="{{ e.id }}">{{ e.nombre }}</option>
@@ -216,6 +216,7 @@
 {% block scripts %}
 <script>
 const proveedorSelect = document.getElementById('proveedorSelect');
+const empresaSelect = document.getElementById('empresaSelect');
 const monedaSelect = document.getElementById('monedaSelect');
 const buscarProducto = document.getElementById('buscarProducto');
 const cuerpoCatalogo = document.getElementById('cuerpoCatalogo');
@@ -248,13 +249,23 @@ async function cargarCatalogo(q) {
     return;
   }
   hintProveedor.textContent = 'Cargando catálogo...';
-  const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(q || '')}`);
+  const empresaIdParam = empresaSelect.value ? `&empresa_id=${encodeURIComponent(empresaSelect.value)}` : '';
+  const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(q || '')}${empresaIdParam}`);
   const productos = await resp.json();
   cuerpoCatalogo.innerHTML = '';
   if (productos.length === 0) {
     hintProveedor.textContent = 'Sin resultados en el catálogo de este proveedor.';
   } else {
     hintProveedor.textContent = `${productos.length} producto(s) encontrados (máx. 50 mostrados).`;
+  }
+  // Ronda BV (2026-10-19, punto 3 del pedido del usuario): "cuando vaya a
+  // emitir una OC de un proveedor y haya algun producto que su stock
+  // actual + producto en transito - comprometido sea (-) negativo ... el
+  // programa sugiera, señale, destaque, coloque de primero esos
+  // productos" -- el backend ya los ordena primero (needs_reorder), acá
+  // solo se avisa si corresponde.
+  if (productos.some(p => p.needs_reorder)) {
+    hintProveedor.textContent += ' Los productos marcados "Reponer" aparecen primero: su stock proyectado (actual + tránsito - comprometido) ya quedaría negativo.';
   }
   productos.forEach(p => {
     // Un producto CON variantes nunca se marca "ya agregado" a nivel de
@@ -269,8 +280,9 @@ async function cargarCatalogo(q) {
     const tr = document.createElement('tr');
     if (yaAgregado) tr.className = 'text-muted';
     else if (!p.activo) tr.className = 'table-secondary';
+    else if (p.needs_reorder) tr.className = 'table-warning';
     tr.innerHTML = `
-      <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}${!p.activo ? ' <span class="badge bg-secondary">Inactivo</span>' : ''}</td>
+      <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}${!p.activo ? ' <span class="badge bg-secondary">Inactivo</span>' : ''}${p.needs_reorder ? ' <span class="badge bg-danger" title="Stock proyectado (actual + tránsito - comprometido) negativo">Reponer</span>' : ''}</td>
       <td style="max-width:380px;">${p.descripcion}</td>
       <td>${p.empaque}</td>
       <td class="text-end">${fmt(p.precio_caja)}</td>
@@ -307,7 +319,8 @@ async function abrirModalVariante(producto) {
   lista.innerHTML = '<p class="text-muted small px-2">Cargando variantes...</p>';
   actualizarContadorVariantesForm();
   modalVarianteForm.show();
-  const resp = await fetch(`/api/productos/${producto.id}/variantes`);
+  const empresaIdParam = empresaSelect.value ? `?empresa_id=${encodeURIComponent(empresaSelect.value)}` : '';
+  const resp = await fetch(`/api/productos/${producto.id}/variantes${empresaIdParam}`);
   producto._variantes = await resp.json();
   renderListaVariantesForm('');
 }
@@ -351,7 +364,13 @@ function renderListaVariantesForm(filtro) {
         actualizarContadorVariantesForm();
       });
       const texto = document.createElement('span');
-      texto.textContent = yaAgregada ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`;
+      // Ronda BV (2026-10-19, punto 3): misma señal de reposición que en
+      // el catálogo, acá a nivel de variante puntual.
+      const sufijoReposicion = v.needs_reorder ? ' [Reponer -- stock proyectado negativo]' : '';
+      texto.textContent = (yaAgregada ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`) + sufijoReposicion;
+      if (v.needs_reorder && !yaAgregada) {
+        item.classList.add('list-group-item-warning');
+      }
       item.appendChild(check);
       item.appendChild(texto);
       lista.appendChild(item);
@@ -579,6 +598,13 @@ let debounceTimer;
 buscarProducto.addEventListener('input', () => {
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => cargarCatalogo(buscarProducto.value), 300);
+});
+
+// Ronda BV (2026-10-19, punto 3 del pedido del usuario): elegir/cambiar la
+// empresa compradora vuelve a cargar el catálogo -- el aviso de "necesita
+// reposición" se calcula para esa empresa puntual (ver cargarCatalogo).
+empresaSelect.addEventListener('change', () => {
+  if (proveedorSelect.value) cargarCatalogo(buscarProducto.value);
 });
 
 if (proveedorSelect.value) {

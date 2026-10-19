@@ -138,6 +138,10 @@
 {% block scripts %}
 <script>
 const proveedorId = {{ orden.proveedor_id }};
+// Ronda BV (2026-10-19, punto 3 del pedido del usuario): esta orden ya
+// tiene una empresa compradora fija -- se usa para calcular el aviso de
+// "necesita reposición" (ver cargarCatalogo/abrirModalVariante).
+const empresaIdOrden = {{ orden.empresa_id or 'null' }};
 const buscarProducto = document.getElementById('buscarProducto');
 const cuerpoCatalogo = document.getElementById('cuerpoCatalogo');
 const cuerpoLineas = document.getElementById('cuerpoLineas');
@@ -175,7 +179,8 @@ function actualizarBotonGuardar() {
 async function cargarCatalogo(q) {
   hintProveedor.textContent = 'Cargando catálogo...';
   try {
-    const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(q || '')}`);
+    const empresaIdParam = empresaIdOrden ? `&empresa_id=${encodeURIComponent(empresaIdOrden)}` : '';
+    const resp = await fetch(`/api/proveedores/${proveedorId}/productos?q=${encodeURIComponent(q || '')}${empresaIdParam}`);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const productos = await resp.json();
     cuerpoCatalogo.innerHTML = '';
@@ -184,13 +189,19 @@ async function cargarCatalogo(q) {
     } else {
       hintProveedor.textContent = `${productos.length} producto(s) encontrados (máx. 50 mostrados).`;
     }
+    // Ronda BV (2026-10-19, punto 3): el backend ya ordena primero los
+    // productos marcados "Reponer" (stock proyectado negativo).
+    if (productos.some(p => p.needs_reorder)) {
+      hintProveedor.textContent += ' Los productos marcados "Reponer" aparecen primero: su stock proyectado (actual + tránsito - comprometido) ya quedaría negativo.';
+    }
     productos.forEach(p => {
       const yaAgregado = !p.tiene_variantes && !!lineasAgregadas[claveLinea(p.id, null)];
       const tr = document.createElement('tr');
       if (yaAgregado) tr.className = 'text-muted';
       else if (!p.activo) tr.className = 'table-secondary';
+      else if (p.needs_reorder) tr.className = 'table-warning';
       tr.innerHTML = `
-        <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}${!p.activo ? ' <span class="badge bg-secondary">Inactivo</span>' : ''}</td>
+        <td>${p.codigo}${p.tiene_variantes ? ' <span class="badge bg-light text-dark border">variantes</span>' : ''}${!p.activo ? ' <span class="badge bg-secondary">Inactivo</span>' : ''}${p.needs_reorder ? ' <span class="badge bg-danger" title="Stock proyectado (actual + tránsito - comprometido) negativo">Reponer</span>' : ''}</td>
         <td style="max-width:380px;">${p.descripcion}</td>
         <td>${p.empaque}</td>
         <td class="text-end">${fmt(p.precio_caja)}</td>
@@ -228,7 +239,8 @@ async function abrirModalVariante(producto) {
   lista.innerHTML = '<p class="text-muted small px-2">Cargando variantes...</p>';
   actualizarContadorVariantesForm();
   modalVarianteForm.show();
-  const resp = await fetch(`/api/productos/${producto.id}/variantes`);
+  const empresaIdParam = empresaIdOrden ? `?empresa_id=${encodeURIComponent(empresaIdOrden)}` : '';
+  const resp = await fetch(`/api/productos/${producto.id}/variantes${empresaIdParam}`);
   producto._variantes = await resp.json();
   renderListaVariantesForm('');
 }
@@ -267,7 +279,11 @@ function renderListaVariantesForm(filtro) {
         actualizarContadorVariantesForm();
       });
       const texto = document.createElement('span');
-      texto.textContent = yaAgregada ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`;
+      const sufijoReposicion = v.needs_reorder ? ' [Reponer -- stock proyectado negativo]' : '';
+      texto.textContent = (yaAgregada ? `${v.codigo} — ${v.descripcion} (ya en la orden)` : `${v.codigo} — ${v.descripcion}`) + sufijoReposicion;
+      if (v.needs_reorder && !yaAgregada) {
+        item.classList.add('list-group-item-warning');
+      }
       item.appendChild(check);
       item.appendChild(texto);
       lista.appendChild(item);

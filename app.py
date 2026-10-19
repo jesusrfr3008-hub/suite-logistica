@@ -6541,31 +6541,68 @@ def api_productos_por_proveedor(proveedor_id):
     automáticamente al agregar la línea (ver ordenes_nueva/
     ordenes_linea_nueva)."""
     q = request.args.get("q", "").strip()
+    # Ronda BV (2026-10-19, punto 3 del pedido del usuario): empresa
+    # compradora de la OC que se está armando -- opcional (el formulario de
+    # "Nueva Orden de Compra" puede no tener una empresa elegida todavía al
+    # buscar el catálogo), ver _necesita_reposicion_por_codigo.
+    empresa_id = request.args.get("empresa_id", "").strip()
     query = Producto.query.filter_by(proveedor_id=proveedor_id)
     if q:
         query = query.filter(
             db.or_(Producto.codigo.ilike(f"%{q}%"), Producto.descripcion.ilike(f"%{q}%"))
         )
     productos = query.order_by(Producto.activo.desc(), Producto.codigo).limit(50).all()
-    return jsonify(
-        [
-            {
-                "id": p.id,
-                "codigo": p.codigo,
-                "descripcion": p.descripcion,
-                "empaque": p.empaque,
-                "moneda": p.moneda,
-                "precio_caja": p.precio_caja,
-                "precio_unitario": p.precio_unitario,
-                # Ronda M (2026-09-10): si tiene variantes (ej. dioptrias de
-                # lentes MEDICONTUR), el front-end abre un modal para elegir
-                # cual en vez de agregar la linea directo con el codigo padre.
-                "tiene_variantes": p.variantes.count() > 0,
-                "activo": p.activo,
-            }
-            for p in productos
-        ]
-    )
+
+    # Ronda BV (2026-10-19, punto 3 del pedido del usuario): "cuando vaya a
+    # emitir una OC de un proveedor y haya algun producto que su stock
+    # actual + producto en transito - comprometido sea (-) negativo ... el
+    # programa sugiera, señale, destaque, coloque de primero esos
+    # productos". Si el producto tiene variantes, alcanza con que UNA sola
+    # de sus variantes necesite reposición para marcar el producto entero
+    # -- el detalle de cuál exactamente se ve al abrir el modal de
+    # variantes (ver api_producto_variantes, que aplica el mismo cálculo a
+    # nivel de variante).
+    claves = []
+    variantes_por_producto = {}
+    for p in productos:
+        claves.append((p.id, None, p.codigo_interno_inventario))
+        if p.variantes.count() > 0:
+            vs = p.variantes.filter_by(activo=True).all()
+            variantes_por_producto[p.id] = vs
+            for v in vs:
+                claves.append((p.id, (v.codigo or "").strip().upper(), v.codigo_interno_inventario))
+    necesita_reposicion = _necesita_reposicion_por_codigo(claves, empresa_id)
+
+    def _producto_necesita_reposicion(p):
+        if necesita_reposicion.get((p.id, None)):
+            return True
+        return any(
+            necesita_reposicion.get((p.id, (v.codigo or "").strip().upper()))
+            for v in variantes_por_producto.get(p.id, [])
+        )
+
+    resultado = [
+        {
+            "id": p.id,
+            "codigo": p.codigo,
+            "descripcion": p.descripcion,
+            "empaque": p.empaque,
+            "moneda": p.moneda,
+            "precio_caja": p.precio_caja,
+            "precio_unitario": p.precio_unitario,
+            # Ronda M (2026-09-10): si tiene variantes (ej. dioptrias de
+            # lentes MEDICONTUR), el front-end abre un modal para elegir
+            # cual en vez de agregar la linea directo con el codigo padre.
+            "tiene_variantes": p.variantes.count() > 0,
+            "activo": p.activo,
+            "needs_reorder": _producto_necesita_reposicion(p),
+        }
+        for p in productos
+    ]
+    # Ronda BV: "coloque de primero" -- sort estable, solo reordena los
+    # marcados hacia arriba, sin alterar el orden relativo del resto.
+    resultado.sort(key=lambda d: 0 if d["needs_reorder"] else 1)
+    return jsonify(resultado)
 
 
 @app.route("/api/productos/<int:producto_id>/variantes")
@@ -6584,9 +6621,25 @@ def api_producto_variantes(producto_id):
     # ProductoVariante.activo) -- no deberian poder elegirse para una OC
     # nueva.
     variantes = _ordenar_variantes(producto.variantes.filter_by(activo=True).all())
-    return jsonify(
-        [{"id": v.id, "codigo": v.codigo, "descripcion": v.descripcion} for v in variantes]
-    )
+    # Ronda BV (2026-10-19, punto 3 del pedido del usuario): misma señal de
+    # reposición que en el catálogo (api_productos_por_proveedor), ahora a
+    # nivel de variante puntual -- ver _necesita_reposicion_por_codigo.
+    empresa_id = request.args.get("empresa_id", "").strip()
+    claves = [(producto_id, (v.codigo or "").strip().upper(), v.codigo_interno_inventario) for v in variantes]
+    necesita_reposicion = _necesita_reposicion_por_codigo(claves, empresa_id)
+    resultado = [
+        {
+            "id": v.id,
+            "codigo": v.codigo,
+            "descripcion": v.descripcion,
+            "needs_reorder": necesita_reposicion.get((producto_id, (v.codigo or "").strip().upper()), False),
+        }
+        for v in variantes
+    ]
+    # Ronda BV: "coloque de primero" -- sort estable, mantiene el orden
+    # numerico de _ordenar_variantes entre los que quedan en el mismo grupo.
+    resultado.sort(key=lambda d: 0 if d["needs_reorder"] else 1)
+    return jsonify(resultado)
 
 
 @app.route("/ordenes/<int:orden_id>")
@@ -9638,8 +9691,19 @@ ENCABEZADOS_INVENTARIO = [
     "COD.DE LOTE", "VENCMTO AAMMDD", "UBICACIÓN", "NUL", "valor Unitario EU", "Unidades",
     "Total Ivoice EU", "TOTAL INVOICE US$", "VALOR FLETE", "US $ SEGURO", "C.I.F.",
     "TOTAL C.I.F. $", "DERECHO ADUANA $", "OTROS GASTOS $", "TOTAL COSTO $", "COSTO UNITARIO $",
+    # Ronda BV (2026-10-19, punto 1 del pedido del usuario): columna 21
+    # (V) extra, con el mismo título repetido y SIN datos/subtotal -- el
+    # usuario adjuntó un archivo real que el sistema de Inventarios
+    # (Ergopyme) SÍ aceptó ("Inventario_0315071-IN_2.xlsx") y esa columna
+    # V está ahí, vacía, con el mismo encabezado "COSTO UNITARIO $" que la
+    # columna U -- aparentemente una columna reservada que Ergopyme espera
+    # que exista aunque no se use. _COLS_VALORES_INVENTARIO/_COLS_VALORES_
+    # CLP_SIN_DECIMALES_INVENTARIO/_COLS_SUBTOTAL_INVENTARIO siguen
+    # terminando en la columna 20 (U) a propósito, para no escribirle
+    # formato ni subtotal a esta columna 21.
+    "COSTO UNITARIO $",
 ]
-_ANCHOS_INVENTARIO = [20, 42, 16, 16, 16, 14, 10, 6, 12, 10, 12, 14, 12, 12, 12, 16, 16, 14, 14, 16]
+_ANCHOS_INVENTARIO = [20, 42, 16, 16, 16, 14, 10, 6, 12, 10, 12, 14, 12, 12, 12, 16, 16, 14, 14, 16, 13]
 # La tabla de 20 columnas empieza en la columna B (no en A) -- ronda O,
 # punto 2: la columna A queda siempre en blanco y angosta, igual que en la
 # planilla real del sistema de Inventarios (columnas B a U).
@@ -10330,8 +10394,8 @@ def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
                         else _FORMATO_CONTABILIDAD
                     )
         ws.auto_filter.ref = (
-            f"B{fila_encabezado}:U{fila_actual}" if fila_actual > fila_encabezado
-            else f"B{fila_encabezado}:U{fila_encabezado}"
+            f"B{fila_encabezado}:V{fila_actual}" if fila_actual > fila_encabezado
+            else f"B{fila_encabezado}:V{fila_encabezado}"
         )
     if not wb.worksheets:
         ws = wb.create_sheet(title="Sin datos")
@@ -10339,7 +10403,7 @@ def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
         for i, titulo in enumerate(ENCABEZADOS_INVENTARIO):
             ws.cell(row=_FILA_TABLA_INVENTARIO, column=i + 1 + _COL_INVENTARIO_OFFSET, value=titulo).font = Font(bold=True)
         ws.sheet_view.showGridLines = False
-        ws.auto_filter.ref = f"B{_FILA_TABLA_INVENTARIO}:U{_FILA_TABLA_INVENTARIO}"
+        ws.auto_filter.ref = f"B{_FILA_TABLA_INVENTARIO}:V{_FILA_TABLA_INVENTARIO}"
     return wb
 
 
@@ -11267,6 +11331,61 @@ def _transito_por_linea():
     return resultado
 
 
+def _transito_huerfano_por_empresa():
+    """Ronda BV (2026-10-19, punto 2 del pedido del usuario): "en la
+    consulta de stock se muestra solo las existencias, productos en
+    transito y comprometidos de lo que tiene saldos, pero no se están
+    mostrando los productos en transito ni comprometidos de lo que no
+    tiene stock."
+
+    La parte de "comprometido sin stock" ya estaba resuelta (ver ronda AA/
+    AB más abajo, la fila sintética "pedido_sin_stock") -- lo que faltaba
+    era un producto/variante con unidades EN TRÁNSITO (ver
+    _transito_por_linea) pero SIN ninguna fila de StockExistencia cargada
+    Y SIN ningún Pedido/Comprometido pendiente tampoco: no había ningún
+    grupo armado en stock_list al que sumarle ese tránsito, así que
+    quedaba totalmente invisible en Consulta de Stock.
+
+    A diferencia de _transito_por_linea (que agrupa SIN separar por
+    empresa, porque ahí solo se usa para sumarle tránsito a una fila que
+    YA existe), acá sí hace falta separar por empresa compradora
+    (OrdenCompra.empresa_id) para poder armar la fila sintética nueva bajo
+    la empresa que corresponde. Devuelve {(producto_id,
+    variante_codigo_en_mayuscula_o_None, empresa_id): {"cantidad": int,
+    "detalle": [str, ...]}}."""
+    ETAPAS_EN_TRANSITO = ("Orden Despachada", "Internación Aduanas")
+    lineas = (
+        OrdenCompraLinea.query
+        .join(OrdenCompra)
+        .filter(
+            OrdenCompraLinea.anulada == False,  # noqa: E712
+            OrdenCompraLinea.etapa.in_(ETAPAS_EN_TRANSITO),
+            OrdenCompra.estado_aprobacion == "Aprobada",
+            OrdenCompra.estado != "Cancelada",
+        )
+        .all()
+    )
+    resultado = {}
+    for linea in lineas:
+        cantidad = linea.cantidad_unidades
+        if cantidad <= 0:
+            continue
+        clave = (linea.producto_id, (linea.variante_codigo or "").strip().upper() or None, linea.orden.empresa_id)
+        info = resultado.setdefault(clave, {"cantidad": 0, "detalle": []})
+        info["cantidad"] += cantidad
+        despacho = linea.orden.despacho
+        fecha_estimada = None
+        if despacho and despacho.fecha_estimada_llegada:
+            fecha_estimada = despacho.fecha_estimada_llegada
+        elif linea.fecha_estimada_despacho_confirmada:
+            fecha_estimada = linea.fecha_estimada_despacho_confirmada
+        elif linea.fecha_estimada_despacho:
+            fecha_estimada = linea.fecha_estimada_despacho
+        fecha_texto = fecha_estimada.strftime("%d-%m-%Y") if fecha_estimada else "sin fecha estimada"
+        info["detalle"].append(f"{cantidad} un. (llegada estimada {fecha_texto})")
+    return resultado
+
+
 def _pedido_por_codigo():
     """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
     clientes (columna 'Pedido'), sumadas por (empresa_id, codigo_interno).
@@ -11301,6 +11420,66 @@ def _pedido_por_codigo():
         if p.descripcion and clave not in descripciones:
             descripciones[clave] = p.descripcion
     return resultado, descripciones
+
+
+def _necesita_reposicion_por_codigo(claves, empresa_id):
+    """Ronda BV (2026-10-19, punto 3 del pedido del usuario): "cuando vaya a
+    emitir una OC de un proveedor y haya algun producto que su stock
+    actual + producto en transito - comprometido sea (-) negativo ...
+    el programa sugiera, señale, destaque, coloque de primero esos
+    productos". Mismo cálculo que la columna "Stock total" de Consulta de
+    Stock (stock_actual + tránsito - pedido/comprometido), pero evaluado
+    por (producto_id, variante_codigo_en_mayuscula_o_None, codigo_interno_
+    inventario_o_None) para poder usarse al armar el catálogo de una
+    Orden de Compra, donde todavía no hay ninguna fila de Stock ni de
+    Pedido armada.
+
+    `claves` es una lista de tuplas (producto_id, variante_codigo, codigo_
+    interno); `empresa_id` puede ser None (el formulario de "Nueva Orden
+    de Compra" puede no tener una empresa elegida todavía al buscar el
+    catálogo) -- en ese caso se suma el stock/tránsito/pedido de TODAS las
+    empresas, sin separar (mejor una señal "por si acaso" que ninguna).
+    Devuelve {(producto_id, variante_codigo): bool} -- True si el
+    proyectado da negativo."""
+    if not claves:
+        return {}
+    empresa_id_int = int(empresa_id) if empresa_id else None
+    producto_ids = {c[0] for c in claves}
+
+    stock_q = StockExistencia.query.filter(StockExistencia.producto_id.in_(producto_ids))
+    if empresa_id_int:
+        stock_q = stock_q.filter(StockExistencia.empresa_id == empresa_id_int)
+    stock_por_clave = {}
+    for fila in stock_q.all():
+        if fila.variante_id and fila.variante:
+            clave = (fila.variante.producto_id, (fila.variante.codigo or "").strip().upper())
+        elif fila.producto_id:
+            clave = (fila.producto_id, None)
+        else:
+            continue
+        stock_por_clave[clave] = stock_por_clave.get(clave, 0) + (fila.stock_fisico or 0)
+
+    transito_por_empresa = _transito_huerfano_por_empresa()
+    pedido_por_codigo, _ = _pedido_por_codigo()
+
+    resultado = {}
+    for producto_id, variante_codigo, codigo_interno in claves:
+        clave_pv = (producto_id, variante_codigo)
+        actual = stock_por_clave.get(clave_pv, 0)
+        if empresa_id_int:
+            transito = transito_por_empresa.get((producto_id, variante_codigo, empresa_id_int), {}).get("cantidad", 0)
+            comprometido = pedido_por_codigo.get((empresa_id_int, codigo_interno), 0) if codigo_interno else 0
+        else:
+            transito = sum(
+                info["cantidad"] for (p2, v2, _e2), info in transito_por_empresa.items()
+                if p2 == producto_id and v2 == variante_codigo
+            )
+            comprometido = (
+                sum(v for (_e2, c2), v in pedido_por_codigo.items() if c2 == codigo_interno)
+                if codigo_interno else 0
+            )
+        resultado[clave_pv] = (actual + transito - comprometido) < 0
+    return resultado
 
 
 def _estados_homologacion_por_codigo():
@@ -11559,6 +11738,71 @@ def stock_list():
                 ),
                 "pedido": cantidad_pedido,
                 "stock_total_proyectado": 0 + transito_res - cantidad_pedido,
+            }
+
+    # Ronda BV (2026-10-19, punto 2 del pedido del usuario): igual que el
+    # bloque de arriba resuelve "comprometido sin stock cargado", este
+    # resuelve "en tránsito sin stock NI pedido/comprometido cargado" --
+    # ver _transito_huerfano_por_empresa. Sin esto, un producto que el
+    # proveedor ya despachó (Orden Despachada/Internación Aduanas) pero que
+    # todavía no tiene ninguna fila de Stock ni ningún Pedido/Comprometido
+    # pendiente quedaba totalmente invisible acá.
+    cubiertos_producto_variante = {
+        (g["_producto_id"], g["_variante_codigo"])
+        for g in grupos.values()
+        if g.get("_producto_id") is not None
+    }
+    if proveedor_id != "sin_marca":
+        for (producto_id_t, variante_codigo_t, empresa_id_t), transito_info_t in _transito_huerfano_por_empresa().items():
+            if not transito_info_t["cantidad"]:
+                continue
+            if (producto_id_t, variante_codigo_t) in cubiertos_producto_variante:
+                continue
+            producto_t = Producto.query.get(producto_id_t)
+            if not producto_t:
+                continue
+            variante_t = None
+            if variante_codigo_t:
+                variante_t = ProductoVariante.query.filter(
+                    ProductoVariante.producto_id == producto_id_t,
+                    db.func.upper(ProductoVariante.codigo) == variante_codigo_t,
+                ).first()
+            descripcion_t = (variante_t.descripcion if variante_t else None) or producto_t.descripcion
+            codigo_mostrar_t = (variante_t.codigo if variante_t else None) or producto_t.codigo
+            codigo_interno_t = (
+                (variante_t.codigo_interno_inventario if variante_t else None)
+                or producto_t.codigo_interno_inventario
+            )
+            proveedor_id_t = producto_t.proveedor_id
+            if proveedor_id and str(proveedor_id_t or "") != str(proveedor_id):
+                continue
+            if empresa_id and str(empresa_id_t or "") != str(empresa_id):
+                continue
+            if q_lower and not any(
+                q_lower in (texto or "").lower()
+                for texto in (descripcion_t, codigo_mostrar_t, codigo_interno_t)
+            ):
+                continue
+            grupos[("transito_huerfano", producto_id_t, variante_codigo_t, empresa_id_t)] = {
+                "empresa": empresas_por_id.get(empresa_id_t),
+                "proveedor_id": proveedor_id_t,
+                "proveedor_nombre": producto_t.proveedor.nombre if producto_t.proveedor else None,
+                "codigo": codigo_mostrar_t,
+                "codigo_interno": codigo_interno_t,
+                "descripcion": descripcion_t,
+                "stock_total": 0,
+                "proximo_vencimiento": None,
+                "lotes": [],
+                "homologado": True,
+                "via_ergopyme": False,
+                "sin_stock_cargado": True,
+                "_producto_id": producto_id_t,
+                "_variante_codigo": variante_codigo_t,
+                "stock_actual": 0,
+                "transito": transito_info_t["cantidad"],
+                "transito_detalle": "<br>".join(str(escape(linea)) for linea in transito_info_t["detalle"]),
+                "pedido": 0,
+                "stock_total_proyectado": transito_info_t["cantidad"],
             }
 
     # Ronda AD (2026-09-14): orden por defecto pedido por el usuario -- el
