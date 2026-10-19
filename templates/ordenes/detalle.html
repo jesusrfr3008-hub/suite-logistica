@@ -452,6 +452,16 @@
               </div>
               <input type="hidden" name="precio_unitario_lista" id="campoPrecioListaOrden">
             </div>
+            <!-- Ronda BU (2026-10-19, punto 1 del pedido del usuario): nota
+                 opcional de esta línea -- si se carga, se refleja en la
+                 descripción del producto en la emisión/impresión de la OC y
+                 su PDF (no en Despacho/Costeo). -->
+            <div class="row g-2 mt-1">
+              <div class="col-12">
+                <label class="form-label">Nota (opcional, sale en la OC y su PDF)</label>
+                <input type="text" class="form-control" name="nota_linea" placeholder="Ej. empaque reforzado, coordinar con bodega">
+              </div>
+            </div>
             <p class="text-muted small mb-0 mt-2" id="avisoDuplicadoOrden"></p>
           </div>
           <div class="modal-footer">
@@ -483,7 +493,10 @@
         <tr class="{% if l.anulada %}table-secondary text-muted{% endif %}" data-producto-id="{{ l.producto_id }}" data-variante-codigo="{{ l.variante_codigo or '' }}" data-anulada="{{ 'true' if l.anulada else 'false' }}">
           <td><input type="checkbox" class="check-linea-det" value="{{ l.id }}"></td>
           <td>{{ l.codigo_mostrar }}</td>
-          <td style="max-width:260px;">{{ l.descripcion_mostrar }}</td>
+          <td style="max-width:260px;">
+            {{ l.descripcion_mostrar }}
+            {% if l.nota %}<br><span class="text-muted small" title="Nota de esta línea, se refleja en la emisión/PDF de la OC">Nota: {{ l.nota }}</span>{% endif %}
+          </td>
           <td class="text-end">{{ l.cantidad_cajas }} <span class="text-muted small">({{ l.cantidad_unidades }} u.)</span></td>
           <td class="text-end">
             {{ "%.2f"|format(l.precio_unitario_pactado) }}
@@ -705,6 +718,11 @@
           <div class="col-12"><hr><div class="text-muted small mb-1">Confirmación del proveedor</div></div>
           <div class="col-6"><label class="form-label">Fecha disponibilidad confirmada</label><input type="date" class="form-control" name="fecha_disponibilidad_confirmada" value="{{ l.fecha_disponibilidad_confirmada or '' }}"></div>
           <div class="col-6"><label class="form-label">Fecha despacho confirmada</label><input type="date" class="form-control" name="fecha_estimada_despacho_confirmada" value="{{ l.fecha_estimada_despacho_confirmada or '' }}"></div>
+          <!-- Ronda BU (2026-10-19, punto 1 del pedido del usuario): nota
+               opcional de esta línea -- si se carga, se refleja en la
+               descripción del producto en la emisión/impresión de la OC y
+               su PDF (no en Despacho/Costeo). -->
+          <div class="col-12"><hr><label class="form-label">Nota (opcional, sale en la OC y su PDF)</label><input type="text" class="form-control" name="nota_linea" value="{{ l.nota or '' }}" placeholder="Ej. empaque reforzado, coordinar con bodega"></div>
         </div>
       </form>
       <div class="modal-footer d-flex justify-content-between">

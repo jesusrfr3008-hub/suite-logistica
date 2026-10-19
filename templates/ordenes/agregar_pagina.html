@@ -320,7 +320,10 @@ function agregarLinea(producto, variante) {
       <input type="hidden" class="descuento-tipo-hidden" name="descuento_tipo" value="">
       <input type="hidden" class="descuento-valor-hidden" name="descuento_valor" value="">
     </td>
-    <td style="max-width:320px;">${descripcionMostrar}</td>
+    <td style="max-width:320px;">
+      ${descripcionMostrar}
+      <input type="text" class="form-control form-control-sm mt-1 nota-linea" name="nota_linea" placeholder="Nota (opcional, sale en la OC y su PDF)">
+    </td>
     <td><input type="number" min="1" step="1" class="form-control form-control-sm cantidad" name="cantidad_cajas" value="1" required></td>
     <td><input type="number" min="0" step="0.01" class="form-control form-control-sm precio" name="precio_unitario_pactado" value="${producto.precio_caja}"></td>
     <td>

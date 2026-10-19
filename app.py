@@ -523,6 +523,10 @@ def ensure_schema_migrations():
             ("precio_unitario_lista", "FLOAT"),
             ("descuento_tipo", "VARCHAR(12)"),
             ("descuento_valor", "FLOAT"),
+            # Ronda BU (2026-10-19, punto 1): nota opcional por línea, visible
+            # solo en la emisión/impresión de la OC -- ver
+            # OrdenCompraLinea.nota/descripcion_oc en models.py.
+            ("nota", "TEXT"),
         ],
         "ordenes_compra": [
             ("despacho_id", "INTEGER"),
@@ -6061,6 +6065,10 @@ def ordenes_nueva():
         precios_lista = request.form.getlist("precio_unitario_lista")
         descuento_tipos = request.form.getlist("descuento_tipo")
         descuento_valores = request.form.getlist("descuento_valor")
+        # Ronda BU (2026-10-19, punto 1 del pedido del usuario): nota
+        # opcional por línea -- ver OrdenCompraLinea.nota/descripcion_oc en
+        # models.py.
+        notas_linea = request.form.getlist("nota_linea")
 
         lineas_creadas = 0
         for i, (pid, cant, precio, fecha) in enumerate(zip(producto_ids, cantidades, precios, fechas)):
@@ -6082,6 +6090,7 @@ def ordenes_nueva():
                 precio_unitario_lista=(float(precios_lista[i]) if i < len(precios_lista) and precios_lista[i].strip() else None),
                 descuento_tipo=(desc_tipo_i if desc_tipo_i in ("porcentaje", "monto") else None),
                 descuento_valor=(float(descuento_valores[i]) if i < len(descuento_valores) and descuento_valores[i].strip() else None),
+                nota=(notas_linea[i].strip() if i < len(notas_linea) and notas_linea[i].strip() else None),
             )
             db.session.add(linea)
             lineas_creadas += 1
@@ -6819,6 +6828,10 @@ def ordenes_linea_nueva(orden_id):
     precio_lista = float(precio_lista_txt) if precio_lista_txt else None
     descuento_tipo = descuento_tipo_txt if descuento_tipo_txt in ("porcentaje", "monto") else None
     descuento_valor = float(descuento_valor_txt) if descuento_valor_txt else None
+    # Ronda BU (2026-10-19, punto 1 del pedido del usuario): nota opcional,
+    # igual para todas las variantes marcadas en este mismo viaje -- ver
+    # OrdenCompraLinea.nota/descripcion_oc en models.py.
+    nota_linea = (request.form.get("nota_linea") or "").strip() or None
 
     creadas = []
     duplicadas = []
@@ -6853,6 +6866,7 @@ def ordenes_linea_nueva(orden_id):
             precio_unitario_lista=precio_lista,
             descuento_tipo=descuento_tipo,
             descuento_valor=descuento_valor,
+            nota=nota_linea,
         )
         db.session.add(linea)
         db.session.flush()
@@ -6939,6 +6953,9 @@ def ordenes_lineas_agregar_multiple(orden_id):
     precios_lista = request.form.getlist("precio_unitario_lista")
     descuento_tipos = request.form.getlist("descuento_tipo")
     descuento_valores = request.form.getlist("descuento_valor")
+    # Ronda BU (2026-10-19, punto 1 del pedido del usuario): nota opcional
+    # por línea -- ver OrdenCompraLinea.nota/descripcion_oc en models.py.
+    notas_linea = request.form.getlist("nota_linea")
 
     creadas = []
     duplicadas = []
@@ -6976,6 +6993,7 @@ def ordenes_lineas_agregar_multiple(orden_id):
             precio_unitario_lista=(float(precios_lista[i]) if i < len(precios_lista) and precios_lista[i].strip() else None),
             descuento_tipo=(desc_tipo_i if desc_tipo_i in ("porcentaje", "monto") else None),
             descuento_valor=(float(descuento_valores[i]) if i < len(descuento_valores) and descuento_valores[i].strip() else None),
+            nota=(notas_linea[i].strip() if i < len(notas_linea) and notas_linea[i].strip() else None),
         )
         db.session.add(linea)
         db.session.flush()
@@ -7032,6 +7050,11 @@ def ordenes_linea_actualizar(orden_id, linea_id):
         linea.fecha_disponibilidad_confirmada = parse_date(fecha_disp)
     if fecha_desp_conf:
         linea.fecha_estimada_despacho_confirmada = parse_date(fecha_desp_conf)
+    # Ronda BU (2026-10-19, punto 1 del pedido del usuario): nota opcional
+    # de la línea, editable igual que el resto de los campos -- se puede
+    # dejar vacía para borrarla. Ver OrdenCompraLinea.nota/descripcion_oc.
+    if "nota_linea" in request.form:
+        linea.nota = (request.form.get("nota_linea") or "").strip() or None
     db.session.commit()
     flash("Linea de la orden actualizada.", "success")
     return redirect(url_for("ordenes_detalle", orden_id=orden_id))
@@ -8358,7 +8381,17 @@ def importaciones_editar(importacion_id):
     imp.moneda_factura = request.form.get("moneda_factura", "EURO")
     imp.condicion_compra = request.form.get("condicion_compra", "EXW")
     imp.tipo_cambio_aduanero = float(request.form.get("tipo_cambio_aduanero") or 0)
-    imp.tipo_cambio_moneda_usd = float(request.form.get("tipo_cambio_moneda_usd") or 1)
+    if (imp.moneda_factura or "").strip().upper() == "USD":
+        # Ronda BU (2026-10-19, punto 3 del pedido del usuario): "cuando la
+        # moeda de la factura es USD en la paridad debe ser 1, aun cuando se
+        # escoja la variable de la tasa del mes registrado, esa paridad
+        # distinta a 1 es cuando la moneda de la factura es Euros." -- si
+        # la factura ya viene en USD no hay conversión que hacer, la
+        # paridad (unidades de moneda_factura por 1 USD) siempre queda en
+        # 1 sin importar lo tipeado/autocompletado en el formulario.
+        imp.tipo_cambio_moneda_usd = 1.0
+    else:
+        imp.tipo_cambio_moneda_usd = float(request.form.get("tipo_cambio_moneda_usd") or 1)
     imp.notas = request.form.get("notas", "").strip()
     db.session.commit()
     flash("Datos de la importación actualizados.", "success")
@@ -14004,6 +14037,86 @@ def pagos_proveedores_registrar_pago(factura_id):
         flash(
             f"Abono registrado -- saldo pendiente de la factura {factura.numero_factura}: "
             f"{factura.saldo_pendiente:,.2f} {factura.moneda}.",
+            "success",
+        )
+    return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+
+@app.route("/pagos-proveedores/<int:factura_id>/editar-valor", methods=["POST"])
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_editar_valor_factura(factura_id):
+    """Ronda BU (2026-10-19, punto 2 del pedido del usuario): "en el reporte
+    pago proveedores dentro del boton ver / Registrar pago debe haber una
+    opcion para editar el valor de la factura y que afecte su saldo
+    pendiente, tengo un documento que tuvo una variacion posterior por
+    flete y seguro. debo ajustarlo."
+
+    A diferencia de pagos_proveedores_aplicar_cargos_pendientes (ronda BR),
+    que exige que la factura esté asociada a una Importación del sistema
+    (la diferencia la calcula comparando contra los cargos ya asignados en
+    el Costeo), esta ruta permite el ajuste manual del valor de la factura
+    aunque NO tenga Importación asociada -- el caso real del usuario es
+    justamente una factura "anterior al módulo, o cargada a mano", según
+    confirmó con una captura de su propia pantalla de Pago Proveedores.
+
+    El usuario ingresa directamente el NUEVO valor total de la factura (no
+    una diferencia) junto con un motivo obligatorio (para dejar rastro de
+    por qué se ajustó a mano). El sistema calcula la diferencia contra el
+    valor actual y la aplica con el mismo mecanismo que ronda BR: sube
+    valor_factura y cargos_adicionales_moneda por esa diferencia (coherente
+    con que el caso típico es flete/seguro que se conoce después), deja una
+    nota con sello de fecha/usuario, y recalcula el estado con
+    _factura_proveedor_estado_por_saldo -- que ya resuelve sola el caso de
+    una factura que estaba "pagada" y vuelve a quedar con saldo pendiente."""
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    if factura.estado == "anulada":
+        flash("Esta factura está anulada -- no se puede editar su valor.", "warning")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    try:
+        nuevo_valor = float((request.form.get("nuevo_valor_factura") or "").replace(",", "."))
+    except ValueError:
+        flash("Valor de factura inválido.", "danger")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    if nuevo_valor <= 0:
+        flash("El nuevo valor de la factura debe ser mayor a 0.", "danger")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    motivo = (request.form.get("motivo") or "").strip()
+    if not motivo:
+        flash("Debes indicar el motivo del ajuste de valor de la factura.", "danger")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    valor_anterior = factura.valor_factura or 0.0
+    diferencia = round(nuevo_valor - valor_anterior, 2)
+    if abs(diferencia) < 0.01:
+        flash("El nuevo valor es igual al valor actual de la factura -- no se aplicó ningún cambio.", "info")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    estaba_pagada = factura.estado == "pagada"
+    sello = f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} · {current_user.nombre_completo}]"
+    factura.valor_factura = round(nuevo_valor, 2)
+    factura.cargos_adicionales_moneda = round((factura.cargos_adicionales_moneda or 0.0) + diferencia, 2)
+    nota = (
+        f"{sello} Ajuste manual del valor de la factura: {valor_anterior:,.2f} -> {factura.valor_factura:,.2f} "
+        f"{factura.moneda} (diferencia {diferencia:,.2f}). Motivo: {motivo}"
+    )
+    factura.notas = f"{factura.notas}\n{nota}" if factura.notas else nota
+    factura.estado = _factura_proveedor_estado_por_saldo(factura)
+    db.session.commit()
+
+    if estaba_pagada and factura.estado != "pagada":
+        flash(
+            f"Se ajustó el valor de la factura a {factura.valor_factura:,.2f} {factura.moneda} -- estaba pagada, "
+            f"así que ahora vuelve a quedar con un saldo pendiente de {factura.saldo_pendiente:,.2f} "
+            f"{factura.moneda} por la diferencia.",
+            "success",
+        )
+    else:
+        flash(
+            f"Se ajustó el valor de la factura a {factura.valor_factura:,.2f} {factura.moneda} -- nuevo saldo "
+            f"pendiente: {factura.saldo_pendiente:,.2f} {factura.moneda}.",
             "success",
         )
     return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))

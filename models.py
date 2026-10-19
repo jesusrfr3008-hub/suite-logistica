@@ -1102,6 +1102,15 @@ class OrdenCompraLinea(db.Model):
     descuento_tipo = db.Column(db.String(12), nullable=True)  # "porcentaje" o "monto"
     descuento_valor = db.Column(db.Float, nullable=True)  # el número ingresado (ej. 10 = 10%, o 5.5 = $5.5/caja)
 
+    # Ronda BU (2026-10-19, punto 1 del pedido del usuario): "En la emision
+    # de la OC al agregar un producto agregar un campo donde se pueda
+    # agregar nota que salga reflejado en la descripcion del producto en la
+    # emision de la OC y su PDF si se le coloca algo" -- nota opcional por
+    # línea, visible SOLO en la emisión/impresión de la OC (ver
+    # descripcion_oc abajo), no en Despacho/Costeo (que siguen usando
+    # descripcion_mostrar, sin la nota).
+    nota = db.Column(db.Text, nullable=True)
+
     producto = db.relationship("Producto")
 
     @property
@@ -1115,6 +1124,19 @@ class OrdenCompraLinea(db.Model):
         """Descripcion a mostrar en pantalla/PDF/Costeo: la de la variante
         elegida si hay una, si no la del producto padre."""
         return self.variante_descripcion or self.producto.descripcion
+
+    @property
+    def descripcion_oc(self):
+        """Descripcion a mostrar en la emisión/impresión de la OC (pantalla
+        y PDF): igual que descripcion_mostrar, con la nota de esta línea
+        agregada al final cuando se cargó una (ronda BU). Deliberadamente
+        DISTINTA de descripcion_mostrar -- esa sigue usándose, sin la nota,
+        para traspasar la línea a Despacho/Costeo (ver
+        despachos_generar_importacion en app.py), porque el usuario pidió
+        la nota solo para la OC, no que se propague más allá."""
+        base = self.descripcion_mostrar
+        nota = (self.nota or "").strip()
+        return f"{base} -- {nota}" if nota else base
 
     @property
     def cantidad_unidades(self):

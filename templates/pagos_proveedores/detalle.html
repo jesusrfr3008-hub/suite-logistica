@@ -47,7 +47,12 @@
           <div class="fw-semibold">{{ factura.fecha_vencimiento.strftime('%d-%m-%Y') if factura.fecha_vencimiento else '--' }}</div>
         </div>
         <div class="col-6 col-md-3">
-          <div class="small text-muted">Valor factura</div>
+          <div class="small text-muted d-flex align-items-center gap-1">
+            Valor factura
+            {% if factura.estado != 'anulada' %}
+            <a href="#" class="small" data-bs-toggle="collapse" data-bs-target="#collapseEditarValorFactura" title="Editar valor de la factura">(editar)</a>
+            {% endif %}
+          </div>
           <div class="fw-semibold">{{ factura.valor_factura|moneda }} {{ factura.moneda }}</div>
           {% if factura.cargos_adicionales_moneda %}
           <div class="text-muted" style="font-size:0.78rem;">
@@ -55,6 +60,41 @@
           </div>
           {% endif %}
         </div>
+        {% if factura.estado != 'anulada' %}
+        <div class="col-12 collapse" id="collapseEditarValorFactura">
+          <!-- Ronda BU (2026-10-19, punto 2 del pedido del usuario): "en el
+               reporte pago proveedores dentro del boton ver / Registrar
+               pago debe haber una opcion para editar el valor de la
+               factura y que afecte su saldo pendiente, tengo un documento
+               que tuvo una variacion posterior por flete y seguro. debo
+               ajustarlo." -- a diferencia de "Aplicar diferencia de
+               cargos" (ronda BR), esto funciona aunque la factura NO
+               tenga Importación asociada del sistema (factura anterior al
+               módulo, o cargada a mano). -->
+          <div class="card p-3 border-warning">
+            <div class="fw-semibold mb-2 small">Editar valor de la factura</div>
+            <form method="post" action="{{ url_for('pagos_proveedores_editar_valor_factura', factura_id=factura.id) }}" class="row g-2 align-items-end">
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Nuevo valor de la factura ({{ factura.moneda }})</label>
+                <input type="text" class="form-control form-control-sm" name="nuevo_valor_factura" value="{{ factura.valor_factura }}" required>
+              </div>
+              <div class="col-md-5">
+                <label class="form-label small mb-0">Motivo del ajuste</label>
+                <input type="text" class="form-control form-control-sm" name="motivo" placeholder="Ej. variación posterior por flete y seguro" required>
+              </div>
+              <div class="col-md-4">
+                <button type="submit" class="btn btn-sm btn-outline-warning">Guardar nuevo valor</button>
+              </div>
+            </form>
+            <div class="text-muted small mt-2">
+              Esto ajusta directo el valor total de la factura y su saldo pendiente (sube el detalle de
+              Flete/Seguro/Handling/Otros por la diferencia) -- queda una nota con fecha, usuario y motivo. Si la
+              factura ya estaba pagada y el nuevo valor es mayor, vuelve a quedar con saldo pendiente por la
+              diferencia.
+            </div>
+          </div>
+        </div>
+        {% endif %}
         <div class="col-6 col-md-3">
           <div class="small text-muted">Saldo pendiente</div>
           <div class="fw-semibold fs-5">{{ factura.saldo_pendiente|moneda }} {{ factura.moneda }}</div>

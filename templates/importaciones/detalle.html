@@ -840,7 +840,11 @@
             <div class="form-text">La factura puede ser de un mes y la internación/recepción de otro — elige acá el mes cuyo tipo de cambio corresponde a esta operación. Sigue siendo editable después.</div>
           </div>
           <div class="col-6"><label class="form-label">TC aduanero (CLP/USD)</label><input type="number" step="0.01" class="form-control" id="campoTcAduaneroEditar" name="tipo_cambio_aduanero" value="{{ imp.tipo_cambio_aduanero }}"></div>
-          <div class="col-6"><label class="form-label">TC moneda factura / USD</label><input type="number" step="0.0001" class="form-control" id="campoTcMonedaEditar" name="tipo_cambio_moneda_usd" value="{{ imp.tipo_cambio_moneda_usd }}"></div>
+          <div class="col-6">
+            <label class="form-label">TC moneda factura / USD</label>
+            <input type="number" step="0.0001" class="form-control" id="campoTcMonedaEditar" name="tipo_cambio_moneda_usd" value="{{ imp.tipo_cambio_moneda_usd }}">
+            <div class="form-text">Si la moneda de la factura es USD, queda fija en 1 (no hay conversión). Solo aplica una paridad distinta de 1 con Euros u otra moneda.</div>
+          </div>
           <div class="col-6">
             <label class="form-label">Condición de compra</label>
             <select class="form-select" name="condicion_compra">
@@ -1413,15 +1417,37 @@ document.querySelectorAll('.campo-moneda-cargo').forEach(sel => {
 // editables despues (punto 4, 2026-09-01).
 (function() {
   const selMes = document.getElementById('selMesOperacionEditar');
-  if (!selMes) return;
   const campoAduanero = document.getElementById('campoTcAduaneroEditar');
   const campoParidad = document.getElementById('campoTcMonedaEditar');
-  selMes.addEventListener('change', () => {
-    const opt = selMes.selectedOptions[0];
-    if (!opt || !opt.value) return;
-    if (opt.dataset.aduanero) campoAduanero.value = opt.dataset.aduanero;
-    if (opt.dataset.paridad) campoParidad.value = opt.dataset.paridad;
-  });
+  const selMoneda = document.querySelector('#modalEditarImportacion select[name="moneda_factura"]');
+  if (!campoParidad || !selMoneda) return;
+
+  // Ronda BU (2026-10-19, punto 3 del pedido del usuario): "cuando la
+  // moeda de la factura es USD en la paridad debe ser 1, aun cuando se
+  // escoja la variable de la tasa del mes registrado, esa paridad
+  // distinta a 1 es cuando la moneda de la factura es Euros." -- si la
+  // factura es en USD no hay conversión que hacer, así que la paridad se
+  // fuerza a 1 y se bloquea para edición; solo con Euros (u otra moneda
+  // no-USD) tiene sentido una paridad distinta.
+  function actualizarParidadSegunMoneda() {
+    if (selMoneda.value === 'USD') {
+      campoParidad.value = 1;
+      campoParidad.readOnly = true;
+    } else {
+      campoParidad.readOnly = false;
+    }
+  }
+  selMoneda.addEventListener('change', actualizarParidadSegunMoneda);
+  actualizarParidadSegunMoneda();
+
+  if (selMes) {
+    selMes.addEventListener('change', () => {
+      const opt = selMes.selectedOptions[0];
+      if (!opt || !opt.value) return;
+      if (opt.dataset.aduanero) campoAduanero.value = opt.dataset.aduanero;
+      if (opt.dataset.paridad && selMoneda.value !== 'USD') campoParidad.value = opt.dataset.paridad;
+    });
+  }
 })();
 
 document.querySelectorAll('.form-mover-parcial').forEach(form => {
