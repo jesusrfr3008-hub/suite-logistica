@@ -6,6 +6,18 @@
    cada producto (histórico + importaciones costeadas acá) y, al abrirlo,
    todo su historial de costeos de 10 en 10. #}
 
+<style>
+  /* Ronda BZ (2026-10-21, punto 2 del pedido del usuario): las fechas y
+     los montos se partían en dos líneas. Se achica un poco la letra de la
+     tabla y se impide el corte en las columnas cortas (fecha, cantidades,
+     montos); la descripción sí puede recortarse con "...". */
+  .tabla-reporte { font-size: .85rem; }
+  .tabla-reporte th, .tabla-reporte td { white-space: nowrap; vertical-align: middle; }
+  .tabla-reporte td.col-descripcion {
+    white-space: nowrap; max-width: 24rem; overflow: hidden; text-overflow: ellipsis;
+  }
+</style>
+
 <h3 class="section-title mb-1">Consulta Costo Producto</h3>
 <p class="text-muted">
   Último costo ingresado de cada producto, combinando el histórico de compras con las importaciones costeadas en
@@ -51,13 +63,14 @@
 
 <div class="card p-3">
   <div class="table-responsive">
-    <table class="table table-hover align-middle mb-0">
+    <table class="table table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
           <th style="width: 2rem;"></th>
           <th>Proveedor</th>
           <th>Código</th>
           <th>Descripción</th>
+          <th>Lote</th>
           <th>Última factura</th>
           <th>Fecha</th>
           <th class="text-end">Unidades</th>
@@ -79,16 +92,17 @@
             </span>
             {% endif %}
           </td>
-          <td title="{{ g.descripcion }}">{{ g.descripcion }}</td>
+          <td class="col-descripcion" title="{{ g.descripcion }}">{{ g.descripcion }}</td>
+          <td title="Lote del último costeo{{ ' -- ' ~ g.lotes_coincidentes|join(', ') if g.lotes_coincidentes }}">{{ g.ultimo.lote or '-' }}</td>
           <td>{{ g.ultimo.factura or '-' }}</td>
           <td>{{ g.ultimo.fecha.strftime('%d-%m-%Y') if g.ultimo.fecha else '-' }}</td>
           <td class="text-end">{{ "%g"|format(g.ultimo.unidades) }}</td>
-          <td class="text-end">{{ g.ultimo.valor_unitario|moneda }} {{ g.ultimo.moneda }}</td>
-          <td class="text-end">{{ g.ultimo.total_invoice|moneda }} {{ g.ultimo.moneda }}</td>
-          <td class="text-end fw-semibold">{{ g.ultimo.costo_unitario_clp|moneda }}</td>
+          <td class="text-end">{{ g.ultimo.moneda|simbolo_moneda }}{{ g.ultimo.valor_unitario|moneda }}</td>
+          <td class="text-end">{{ g.ultimo.moneda|simbolo_moneda }}{{ g.ultimo.total_invoice|moneda }}</td>
+          <td class="text-end fw-semibold">${{ g.ultimo.costo_unitario_clp|moneda }}</td>
         </tr>
         <tr class="collapse" id="hist{{ loop.index }}">
-          <td colspan="10" class="bg-light">
+          <td colspan="11" class="bg-light">
             <div class="small text-muted mb-2">
               {{ g.total_costeos }} costeo(s) de este producto, del más reciente al más antiguo.
             </div>
@@ -96,7 +110,7 @@
                "Ver más") en vez de dejarlo escrito en la página: con el
                histórico completo serían miles de filas cargadas de entrada
                para productos que nadie abrió. #}
-            <table class="table table-sm mb-0 tabla-historial"
+            <table class="table table-sm mb-0 tabla-historial tabla-reporte"
                    data-codigo="{{ g.codigo_producto }}" data-proveedor="{{ g.proveedor }}" data-cargado="0">
               <thead>
                 <tr>
@@ -112,7 +126,7 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="10" class="text-center text-muted py-4">No hay costos cargados con estos filtros.</td></tr>
+        <tr><td colspan="11" class="text-center text-muted py-4">No hay costos cargados con estos filtros.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -149,18 +163,23 @@
   const POR_PAGINA = {{ por_pagina }};
   const EMPRESA_SEL = {{ empresa_sel|tojson }};
 
+  // Simbolo en vez del codigo de moneda (punto 3 del pedido del usuario).
+  const SIMBOLOS = { EUR: '€', EURO: '€', USD: '$', CLP: '$' };
+  const simbolo = m => SIMBOLOS[(m || '').toUpperCase()] || (m || '');
+
   function filaHistorial(e) {
     const fila = document.createElement('tr');
     const factura = e.importacion_id
       ? `<a href="/importaciones/${e.importacion_id}">${e.factura || '(sin número)'}</a>`
       : (e.factura || '-');
     const badge = e.origen === 'Sistema' ? 'bg-primary' : 'bg-secondary';
+    const s = simbolo(e.moneda);
     fila.innerHTML = `<td>${e.fecha}</td><td>${factura}</td>` +
       `<td><span class="badge ${badge}">${e.origen}</span></td><td>${e.empresa || ''}</td>` +
       `<td>${e.lote || '-'}</td><td class="text-end">${e.unidades.toLocaleString('es-CL')}</td>` +
-      `<td class="text-end">${e.valor_unitario.toLocaleString('es-CL')} ${e.moneda}</td>` +
-      `<td class="text-end">${e.total_invoice.toLocaleString('es-CL')} ${e.moneda}</td>` +
-      `<td class="text-end">${e.costo_unitario_clp.toLocaleString('es-CL')}</td>`;
+      `<td class="text-end">${s}${e.valor_unitario.toLocaleString('es-CL')}</td>` +
+      `<td class="text-end">${s}${e.total_invoice.toLocaleString('es-CL')}</td>` +
+      `<td class="text-end">$${e.costo_unitario_clp.toLocaleString('es-CL')}</td>`;
     return fila;
   }
 

@@ -13,9 +13,27 @@
     </div>
   </div>
   <div class="d-flex gap-2">
-    <a href="{{ url_for('stock_consignacion_exportar', proveedor=proveedor_sel) }}" class="btn btn-outline-secondary">
-      <i class="bi bi-download"></i> Reporte para el proveedor
-    </a>
+    {# Ronda BZ (2026-10-21, a pedido del usuario): el mismo botón ahora
+       deja elegir qué bajar -- todo lo que está en consignación (lo de
+       siempre) o solo lo consumido que todavía no se le informó al
+       proveedor. #}
+    <div class="dropdown">
+      <button class="btn btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">
+        <i class="bi bi-download"></i> Reporte para el proveedor
+      </button>
+      <ul class="dropdown-menu">
+        <li>
+          <a class="dropdown-item" href="{{ url_for('stock_consignacion_exportar', proveedor=proveedor_sel, tipo='consignacion') }}">
+            Stock en consignación (todo)
+          </a>
+        </li>
+        <li>
+          <a class="dropdown-item" href="{{ url_for('stock_consignacion_exportar', proveedor=proveedor_sel, tipo='consumo') }}">
+            Consumido, pendiente de informar ({{ pendientes_informar|length }})
+          </a>
+        </li>
+      </ul>
+    </div>
     <button class="btn btn-outline-brand" data-bs-toggle="modal" data-bs-target="#modalCargarConsignacion">
       <i class="bi bi-upload"></i> Cargar archivo
     </button>

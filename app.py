@@ -445,6 +445,19 @@ def filtro_moneda(valor, decimales=2):
     return _formatear_numero(valor, decimales)
 
 
+# Ronda BZ (2026-10-21, a pedido del usuario: "en la moneda no coloques EUR
+# USD puedes suplirlo con el símbolo € o $"): símbolo de cada moneda para
+# los reportes, en vez del código de 3 letras que hacía más anchas las
+# columnas.
+SIMBOLOS_MONEDA = {"EUR": "€", "EURO": "€", "USD": "$", "US$": "$", "CLP": "$"}
+
+
+@app.template_filter("simbolo_moneda")
+def filtro_simbolo_moneda(moneda):
+    codigo = (moneda or "").strip().upper()
+    return SIMBOLOS_MONEDA.get(codigo, codigo)
+
+
 ZONA_CHILE = ZoneInfo("America/Santiago")
 
 
@@ -3452,21 +3465,27 @@ def seed_compras_historicas():
 
 
 def reparar_lotes_historico_ronda_by():
-    """Ronda BY (2026-10-20, punto 2 del pedido del usuario): completa
-    codigo_lote/fecha_vencimiento en las filas de CompraHistorica que YA
-    estaban cargadas antes de esta ronda (producción tiene 6.135 desde la
-    ronda AA) releyendo el MISMO archivo histórico que las creó, en el
-    mismo orden en que el seed las insertó (id ascendente == orden del
-    archivo, ver seed_compras_historicas: una fila del Excel -> un
-    CompraHistorica, en secuencia).
+    """Ronda BY (2026-10-20, punto 2 del pedido del usuario), CORREGIDA en
+    la ronda BZ (2026-10-21): completa codigo_lote/fecha_vencimiento en
+    las filas de CompraHistorica que YA estaban cargadas antes de esta
+    ronda (producción las tiene desde la ronda AA) releyendo el MISMO
+    archivo histórico que las creó.
 
-    Es verificado, no "a ciegas": antes de escribir nada se comprueba que
-    la cantidad de filas calce exactamente y que, fila por fila, el
-    código interno y el número de factura coincidan. Si algo no calza
-    (ej. el usuario cargó un archivo distinto, o se agregaron filas a
-    mano después), NO se toca ninguna fila y se informa por consola --
-    prefiero dejar el lote vacío antes que escribir un lote equivocado,
-    que para consignación/bodega sería peor que no tenerlo.
+    La primera versión alineaba archivo y base por POSICIÓN (id
+    ascendente == orden del archivo) y abortaba si la cantidad de filas no
+    calzaba exactamente. En producción no calza nunca: varias reparaciones
+    posteriores (ej. la reconciliación de consignación de MEDICONTUR)
+    agregaron y reescribieron filas, así que el guard se activaba y NO se
+    cargaba ningún lote -- por eso el usuario vio la Consulta de Costo
+    Producto sin lotes en el histórico.
+
+    Ahora el emparejamiento es por CLAVE: se agrupa archivo y base por
+    (código interno + factura) y, dentro de cada grupo, se asignan los
+    lotes en orden (el archivo trae una fila por lote, así que el orden
+    dentro del grupo es el mismo que insertó el seed). Un grupo cuyo
+    tamaño no calce se completa solo hasta donde hay correspondencia 1:1 y
+    el resto se deja vacío: prefiero una fila sin lote antes que una fila
+    con un lote equivocado, que para consignación/bodega sería peor.
 
     Idempotente: si ya no queda ninguna fila sin lote, no hace nada."""
     if CompraHistorica.query.count() == 0:
@@ -3497,9 +3516,11 @@ def reparar_lotes_historico_ronda_by():
         idx = columnas.get(nombre)
         return row[idx] if idx is not None and idx < len(row) else None
 
-    # Mismo filtrado de filas que seed_compras_historicas, para que la
-    # secuencia resultante sea exactamente la que se insertó en su momento.
-    filas_archivo = []
+    # Mismo filtrado de filas que seed_compras_historicas, agrupadas por
+    # (código interno, factura) y conservando el orden del archivo dentro
+    # de cada grupo.
+    archivo_por_clave = defaultdict(list)
+    filas_archivo = 0
     for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
         if not row or all(v is None for v in row):
             continue
@@ -3509,49 +3530,120 @@ def reparar_lotes_historico_ronda_by():
         codigo = _normalizar_codigo_ergopyme(codigo_crudo)
         if not codigo:
             continue
-        filas_archivo.append((
-            codigo,
-            str(col("FACTURA", row) or "").strip(),
+        clave = (codigo, str(col("FACTURA", row) or "").strip().upper())
+        archivo_por_clave[clave].append((
             _lote_historico_texto(col("COD.DE LOTE", row)),
             _vencimiento_historico_fecha(col("VENCMTO", row)),
         ))
+        filas_archivo += 1
 
-    filas_db = CompraHistorica.query.order_by(CompraHistorica.id).all()
-    if len(filas_db) != len(filas_archivo):
-        print(
-            f"[reparar_ronda_by] El histórico en base tiene {len(filas_db)} fila(s) y el archivo "
-            f"{len(filas_archivo)} -- no se puede alinear con seguridad, se omite la carga de lotes."
-        )
-        return
-    descuadres = sum(
-        1 for fila_db, (codigo, factura, _lote, _vto) in zip(filas_db, filas_archivo)
-        if (fila_db.codigo_interno or "") != codigo or (fila_db.factura or "").strip() != factura
-    )
-    if descuadres:
-        print(
-            f"[reparar_ronda_by] {descuadres} fila(s) del histórico no coinciden con el archivo "
-            "(código/factura) -- no se escribe ningún lote para no cargar datos equivocados."
-        )
-        return
+    base_por_clave = defaultdict(list)
+    for fila_db in CompraHistorica.query.order_by(CompraHistorica.id).all():
+        clave = ((fila_db.codigo_interno or "").strip(), (fila_db.factura or "").strip().upper())
+        base_por_clave[clave].append(fila_db)
 
     actualizadas = 0
     con_lote = 0
-    for fila_db, (_codigo, _factura, lote, vencimiento) in zip(filas_db, filas_archivo):
-        cambio = False
-        if lote and not (fila_db.codigo_lote or "").strip():
-            fila_db.codigo_lote = lote[:120]
-            con_lote += 1
-            cambio = True
-        if vencimiento and fila_db.fecha_vencimiento is None:
-            fila_db.fecha_vencimiento = vencimiento
-            cambio = True
-        if cambio:
-            actualizadas += 1
+    sin_correspondencia = 0
+    for clave, filas_db in base_por_clave.items():
+        datos_archivo = archivo_por_clave.get(clave, [])
+        if not datos_archivo:
+            sin_correspondencia += len(filas_db)
+            continue
+        if len(datos_archivo) != len(filas_db):
+            # Grupo alterado por alguna reparación posterior: se completa
+            # solo la parte con correspondencia 1:1 y el resto se deja sin
+            # lote (nunca se adivina).
+            sin_correspondencia += abs(len(filas_db) - len(datos_archivo))
+        for fila_db, (lote, vencimiento) in zip(filas_db, datos_archivo):
+            cambio = False
+            if lote and not (fila_db.codigo_lote or "").strip():
+                fila_db.codigo_lote = lote[:120]
+                con_lote += 1
+                cambio = True
+            if vencimiento and fila_db.fecha_vencimiento is None:
+                fila_db.fecha_vencimiento = vencimiento
+                cambio = True
+            if cambio:
+                actualizadas += 1
+    # Segunda pasada (ronda BZ): las líneas que nacieron en consignación y
+    # después se facturaron de verdad (fue_consignacion) ya no calzan con
+    # el histórico, porque su número de factura cambió de "CONSIGNACION" al
+    # de la factura real. Sus lotes sí están en el archivo de facturación
+    # de consignación que usó esa reconciliación (columna LONG SN, una
+    # fila por unidad con su propia factura), así que se completan desde
+    # ahí con el mismo criterio por (código interno + factura).
+    con_lote += _completar_lotes_consignacion_facturada()
+
     db.session.commit()
     print(
         f"[reparar_ronda_by] Histórico de compras: {actualizadas} fila(s) completadas con lote/vencimiento "
-        f"({con_lote} con código de lote) -- habilita la búsqueda por lote en la Consulta de Costo Producto."
+        f"({con_lote} con código de lote, de {filas_archivo} fila(s) del archivo; {sin_correspondencia} "
+        "fila(s) de la base sin correspondencia exacta quedaron sin lote) -- habilita la búsqueda por lote "
+        "en la Consulta de Costo Producto."
     )
+
+
+def _completar_lotes_consignacion_facturada():
+    """Ronda BZ (2026-10-21): completa el lote de las líneas históricas que
+    llegaron en consignación y después se facturaron de verdad (ver
+    reparar_facturacion_consignacion_medicontur, que les cambió el número
+    de factura y por eso ya no calzan contra el histórico original).
+
+    El archivo de esa reconciliación trae una fila por UNIDAD con su
+    número de serie/lote (columna LONG SN) y su factura real, y las filas
+    que creó en CompraHistorica son también de una unidad cada una -- así
+    que agrupando por (código interno + factura) se les devuelve su lote
+    sin ambigüedad. Si un grupo no calza en cantidad se completa solo
+    hasta donde alcanza la correspondencia."""
+    if not os.path.isfile(FACTURACION_CONSIGNACION_MEDICONTUR_EXCEL):
+        return 0
+    pendientes = CompraHistorica.query.filter(
+        CompraHistorica.fue_consignacion == True,  # noqa: E712
+        db.or_(CompraHistorica.codigo_lote.is_(None), CompraHistorica.codigo_lote == ""),
+    ).order_by(CompraHistorica.id).all()
+    if not pendientes:
+        return 0
+
+    wb = openpyxl.load_workbook(FACTURACION_CONSIGNACION_MEDICONTUR_EXCEL, read_only=True, data_only=True)
+    ws = wb.worksheets[0]
+    filas = list(ws.iter_rows(values_only=True))
+    if not filas:
+        return 0
+    encabezado = [str(v).strip().upper() if v is not None else "" for v in filas[0]]
+    try:
+        idx_codigo = encabezado.index("CODIGO ERGOPYME")
+        idx_lote = encabezado.index("LONG SN")
+        idx_factura = encabezado.index("INVOICE")
+    except ValueError:
+        return 0
+
+    lotes_por_clave = defaultdict(list)
+    for row in filas[1:]:
+        if not row or row[idx_codigo] is None:
+            continue
+        clave = (
+            _normalizar_codigo_ergopyme(row[idx_codigo]),
+            str(row[idx_factura] or "").strip().upper(),
+        )
+        lote = _lote_historico_texto(row[idx_lote])
+        if lote:
+            lotes_por_clave[clave].append(lote)
+
+    pendientes_por_clave = defaultdict(list)
+    for fila in pendientes:
+        pendientes_por_clave[
+            ((fila.codigo_interno or "").strip(), (fila.factura or "").strip().upper())
+        ].append(fila)
+
+    completadas = 0
+    for clave, filas_db in pendientes_por_clave.items():
+        for fila_db, lote in zip(filas_db, lotes_por_clave.get(clave, [])):
+            fila_db.codigo_lote = lote[:120]
+            completadas += 1
+    if completadas:
+        db.session.commit()
+    return completadas
 
 
 def seed_facturas_proveedor_pendientes():
@@ -12613,6 +12705,50 @@ def stock_consignacion_cargar():
     return redirect(url_for("stock_consignacion_list"))
 
 
+def _exportar_consignacion_consumida(proveedor_sel=""):
+    """Ronda BZ (2026-10-21, a pedido del usuario: "agrega un boton para
+    descargar el reporte de los consignados consumidos, ya que el boton
+    reporte al proveedor descarga todo lo que está en consignacion"):
+    baja a Excel exactamente la lista "Consumido, pendiente de informar al
+    proveedor" de la pantalla de Consignación -- los lotes cuyo consumo ya
+    detectó el sistema (bajaron o desaparecieron del Stock de Ergopyme)
+    pero que todavía no entraron en ningún reporte enviado al proveedor
+    (ver ConsignacionPendienteLote.cantidad_pendiente_informar)."""
+    query = ConsignacionPendienteLote.query
+    if proveedor_sel:
+        query = query.join(Proveedor).filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
+    filas = [
+        f for f in query.order_by(ConsignacionPendienteLote.actualizado_en).all()
+        if f.cantidad_pendiente_informar > 0.0001
+    ]
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Consumido por informar"
+    encabezados = ["Proveedor", "Código proveedor", "Descripción", "Lote", "Consumido sin informar"]
+    for col, titulo in enumerate(encabezados, start=1):
+        ws.cell(row=1, column=col, value=titulo).font = Font(bold=True)
+    for n, f in enumerate(filas, start=2):
+        ws.cell(row=n, column=1, value=f.proveedor.nombre if f.proveedor else "")
+        ws.cell(row=n, column=2, value=f.codigo_proveedor)
+        ws.cell(row=n, column=3, value=f.descripcion)
+        ws.cell(row=n, column=4, value=f.codigo_lote)
+        ws.cell(row=n, column=5, value=f.cantidad_pendiente_informar)
+    ws.auto_filter.ref = f"A1:E{max(len(filas) + 1, 1)}"
+    for col, ancho in enumerate([20, 20, 46, 24, 20], start=1):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    sufijo = f"_{proveedor_sel}" if proveedor_sel else ""
+    nombre_archivo = f"Consignacion_consumido_por_informar{sufijo}_{date.today().isoformat()}.xlsx".replace(" ", "_")
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre_archivo,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 @app.route("/stock-consignacion/exportar")
 @requiere_permiso("reportes")
 def stock_consignacion_exportar():
@@ -12622,7 +12758,17 @@ def stock_consignacion_exportar():
     A propósito NO incluye el costo/PMP (dato interno nuestro, no algo que
     se le manda al proveedor) -- solo código, descripción, lote,
     vencimiento y cantidad, que es lo que el proveedor necesita para
-    conciliar su propio stock en consignación."""
+    conciliar su propio stock en consignación.
+
+    Ronda BZ (2026-10-21, a pedido del usuario): el mismo botón ahora
+    ofrece dos cortes con el parámetro `tipo`. "consignacion" (el de
+    siempre, default) baja TODO lo que está en consignación; "consumo"
+    baja lo consumido que todavía no se le informó al proveedor -- la
+    misma lista que la pantalla muestra en "Consumido, pendiente de
+    informar al proveedor", que antes solo se podía ver en pantalla."""
+    tipo = request.args.get("tipo", "consignacion").strip().lower()
+    if tipo == "consumo":
+        return _exportar_consignacion_consumida(request.args.get("proveedor", "").strip())
     proveedor_sel = request.args.get("proveedor", "").strip()
     query = StockConsignacionVigente.query
     if proveedor_sel:
@@ -12652,244 +12798,6 @@ def stock_consignacion_exportar():
     buffer.seek(0)
     sufijo = f"_{proveedor_sel}" if proveedor_sel else ""
     nombre_archivo = f"Reporte_Consignacion{sufijo}_{date.today().isoformat()}.xlsx".replace(" ", "_")
-    return send_file(
-        buffer, as_attachment=True, download_name=nombre_archivo,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-def _filas_consignacion_detalle(proveedor_sel="", q="", origen_sel=""):
-    """Ronda BY (2026-10-20, punto 1 del pedido del usuario): arma el
-    reporte COMPLETO de lo que está HOY en consignación, producto por
-    producto y lote por lote -- no solo lo que se registró desde este
-    programa, sino todo: las cargas directas hechas acá (badge "Programa")
-    y lo que venía de antes (badge "Histórico").
-
-    Fuente única: ConsignacionPendienteLote con cantidad_en_stock > 0
-    (recibido menos consumido) -- la MISMA que usa Stock Valorizado para
-    separar propio de consignación (ver _consignacion_por_codigo_y_empresa),
-    por eso los totales cuadran entre los dos reportes. Lo ya consumido/
-    informado/facturado queda fuera por definición (el usuario fue
-    explícito: "Me refiero a stock actual no productos que ya fueron
-    reportados y facturados que esos los vemos por el otro reporte").
-
-    El ORIGEN de cada lote se deduce del ledger por Importación
-    (ConsignacionRecepcionImportacion, ronda BR): lo que aparece ahí entró
-    por un Costeo hecho en este programa; el resto de lo recibido viene de
-    la carga histórica/del archivo del proveedor. Un mismo lote puede
-    tener de los dos (se muestran ambos badges con su desglose).
-
-    Además cruza cada lote contra el Stock físico de hoy (StockExistencia)
-    para saber en qué empresa está -- igual que
-    _consignacion_por_codigo_y_empresa -- y contra Stock Valorizado para
-    traer el PMP y valorizar."""
-    programa_por_clave = defaultdict(float)
-    for fila in ConsignacionRecepcionImportacion.query.all():
-        clave = (
-            fila.proveedor_id,
-            (fila.codigo_interno or "").strip(),
-            (fila.codigo_lote or "").strip() or "(sin lote)",
-        )
-        programa_por_clave[clave] += fila.cantidad or 0
-
-    stock_por_lote_empresa = defaultdict(lambda: defaultdict(float))
-    for codigo, lote, empresa_id, stock_fisico in StockExistencia.query.with_entities(
-        StockExistencia.codigo_interno, StockExistencia.codigo_lote,
-        StockExistencia.empresa_id, StockExistencia.stock_fisico,
-    ).all():
-        codigo = (codigo or "").strip()
-        if not codigo or not stock_fisico:
-            continue
-        lote_norm = (lote or "").strip() or "(sin lote)"
-        stock_por_lote_empresa[(codigo, lote_norm)][empresa_id] += stock_fisico or 0
-
-    empresas_por_id = {e.id: e for e in Empresa.query.all()}
-    pmp_por_codigo = {
-        sv.codigo_interno: sv.pmp_total
-        for sv in StockValorizado.query.with_entities(
-            StockValorizado.codigo_interno, StockValorizado.pmp_total
-        ).all()
-    }
-    vencimiento_por_clave = {
-        ((s.codigo_interno_ergopyme or "").strip(), (s.lote or "").strip() or "(sin lote)"): s.fecha_vencimiento
-        for s in StockConsignacionVigente.query.all()
-        if s.fecha_vencimiento
-    }
-
-    q_lower = (q or "").strip().lower()
-    filas = []
-    for fila in ConsignacionPendienteLote.query.all():
-        vigente = fila.cantidad_en_stock
-        if vigente <= 0.0001:
-            continue
-        proveedor_nombre = fila.proveedor.nombre if fila.proveedor else "(sin proveedor)"
-        if proveedor_sel and proveedor_nombre.upper() != proveedor_sel.upper():
-            continue
-        codigo = (fila.codigo_interno or "").strip()
-        lote_norm = (fila.codigo_lote or "").strip() or "(sin lote)"
-        if q_lower and not any(
-            q_lower in (texto or "").lower()
-            for texto in (fila.codigo_proveedor, fila.descripcion, lote_norm, codigo)
-        ):
-            continue
-
-        recibido = fila.cantidad_recibida or 0
-        del_programa = min(programa_por_clave.get((fila.proveedor_id, codigo, lote_norm), 0.0), recibido)
-        del_historico = max(recibido - del_programa, 0.0)
-        if origen_sel == "programa" and del_programa <= 0.0001:
-            continue
-        if origen_sel == "historico" and del_historico <= 0.0001:
-            continue
-
-        # En qué empresa está físicamente este lote hoy (sin inventar
-        # repartos: si está entero en una, va entero a esa -- igual que
-        # _consignacion_por_codigo_y_empresa).
-        stock_empresas = stock_por_lote_empresa.get((codigo, lote_norm)) or {}
-        stock_total_lote = sum(v for v in stock_empresas.values() if v > 0)
-        por_empresa = {}
-        if stock_total_lote > 0:
-            for empresa_id, stock_empresa in stock_empresas.items():
-                if stock_empresa <= 0:
-                    continue
-                nombre_empresa = empresas_por_id[empresa_id].nombre if empresa_id in empresas_por_id else "(sin empresa)"
-                por_empresa[nombre_empresa] = round(vigente * (stock_empresa / stock_total_lote), 4)
-
-        pmp = pmp_por_codigo.get(codigo)
-        filas.append({
-            "proveedor": proveedor_nombre,
-            "codigo_proveedor": (fila.codigo_proveedor or "").strip() or codigo or "(sin código)",
-            "codigo_interno": codigo,
-            "descripcion": fila.descripcion or "",
-            "lote": lote_norm,
-            "sin_lote": lote_norm == "(sin lote)",
-            "fecha_vencimiento": vencimiento_por_clave.get((codigo, lote_norm)),
-            "recibido": round(recibido, 4),
-            "consumido": round(fila.cantidad_consumida or 0, 4),
-            "vigente": round(vigente, 4),
-            "del_programa": round(del_programa, 4),
-            "del_historico": round(del_historico, 4),
-            "empresas": por_empresa,
-            "en_stock_fisico": stock_total_lote > 0,
-            "pmp": pmp,
-            "valor": round(vigente * pmp, 2) if pmp else None,
-        })
-
-    filas.sort(key=lambda f: (f["proveedor"], f["codigo_proveedor"], f["lote"]))
-    return filas
-
-
-def _totales_consignacion_detalle(filas):
-    """Ronda BY (2026-10-20, punto 1: "este reporte debe cuadrar con el
-    total de stock en consignacion y consecuentemente con el stock
-    valorizado, porfa valida"): además de los totales del reporte, deja
-    explícita la cuadratura contra lo que Stock Valorizado descuenta hoy
-    como consignación (_consignacion_por_codigo_y_empresa).
-
-    La diferencia entre ambos, cuando existe, NO es un error: son lotes
-    todavía vigentes en consignación que hoy no aparecen en el Stock
-    físico de ninguna empresa (ej. ya se usaron y todavía no se le
-    reportó el consumo al proveedor -- caso transitorio normal ya
-    documentado en _consignacion_por_codigo_y_empresa). Se muestran
-    aparte, contados y sumados, para que la validación sea verificable en
-    pantalla en vez de un acto de fe."""
-    vigente_total = sum(f["vigente"] for f in filas)
-    sin_stock_fisico = [f for f in filas if not f["en_stock_fisico"]]
-    por_empresa = defaultdict(float)
-    for f in filas:
-        for nombre_empresa, cantidad in f["empresas"].items():
-            por_empresa[nombre_empresa] += cantidad
-
-    # Lo que Stock Valorizado está descontando hoy como consignación, con
-    # su propio cálculo independiente -- si cuadra, cuadran los dos.
-    asignado_stock_valorizado = sum(_consignacion_por_codigo_y_empresa().values())
-
-    return {
-        "lotes": len(filas),
-        "productos": len({(f["proveedor"], f["codigo_proveedor"]) for f in filas}),
-        "unidades": round(vigente_total, 4),
-        "valor": round(sum(f["valor"] or 0 for f in filas), 2),
-        "unidades_por_empresa": {k: round(v, 4) for k, v in sorted(por_empresa.items())},
-        "unidades_en_stock_fisico": round(sum(f["vigente"] for f in filas if f["en_stock_fisico"]), 4),
-        "lotes_sin_stock_fisico": len(sin_stock_fisico),
-        "unidades_sin_stock_fisico": round(sum(f["vigente"] for f in sin_stock_fisico), 4),
-        "asignado_stock_valorizado": round(asignado_stock_valorizado, 4),
-    }
-
-
-@app.route("/reportes/consignacion-detalle")
-@requiere_permiso("reportes")
-def reportes_consignacion_detalle():
-    """Ronda BY (2026-10-20, punto 1 del pedido del usuario): reporte de
-    TODO lo que está hoy en consignación por producto + lote, con badge de
-    origen (Programa / Histórico) y la cuadratura contra Stock Valorizado
-    a la vista. Ver _filas_consignacion_detalle/_totales_consignacion_detalle."""
-    proveedor_sel = request.args.get("proveedor", "").strip()
-    q = request.args.get("q", "").strip()
-    origen_sel = request.args.get("origen", "").strip()
-    filas = _filas_consignacion_detalle(proveedor_sel, q, origen_sel)
-    # Los proveedores ofrecidos salen de lo que de verdad tiene
-    # consignación vigente hoy (sin filtros), no del catálogo completo.
-    proveedores_disponibles = sorted({f["proveedor"] for f in _filas_consignacion_detalle()})
-    return render_template(
-        "reportes/consignacion_detalle.html",
-        filas=filas, totales=_totales_consignacion_detalle(filas),
-        proveedores_disponibles=proveedores_disponibles,
-        proveedor_sel=proveedor_sel, q=q, origen_sel=origen_sel,
-    )
-
-
-@app.route("/reportes/consignacion-detalle/descargar")
-@requiere_permiso("reportes")
-def reportes_consignacion_detalle_descargar():
-    """Ronda BY (2026-10-20, punto 1: "Debe tener un boton de descarga para
-    descargar el total de productos en consignacion"): baja el MISMO corte
-    que se está viendo en pantalla (respeta los filtros aplicados)."""
-    proveedor_sel = request.args.get("proveedor", "").strip()
-    q = request.args.get("q", "").strip()
-    origen_sel = request.args.get("origen", "").strip()
-    filas = _filas_consignacion_detalle(proveedor_sel, q, origen_sel)
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Consignación por lote"
-    encabezados = [
-        "Proveedor", "Código", "Descripción", "Lote", "Vencimiento", "Origen",
-        "Recibido", "Consumido", "En consignación hoy", "Del programa", "Histórico",
-        "Empresa", "PMP", "Valor",
-    ]
-    for col, titulo in enumerate(encabezados, start=1):
-        ws.cell(row=1, column=col, value=titulo).font = Font(bold=True)
-    for n, f in enumerate(filas, start=2):
-        if f["del_programa"] > 0 and f["del_historico"] > 0:
-            origen = "Programa + Histórico"
-        elif f["del_programa"] > 0:
-            origen = "Programa"
-        else:
-            origen = "Histórico"
-        ws.cell(row=n, column=1, value=f["proveedor"])
-        ws.cell(row=n, column=2, value=f["codigo_proveedor"])
-        ws.cell(row=n, column=3, value=f["descripcion"])
-        ws.cell(row=n, column=4, value=f["lote"])
-        ws.cell(row=n, column=5, value=f["fecha_vencimiento"].strftime("%d-%m-%Y") if f["fecha_vencimiento"] else "")
-        ws.cell(row=n, column=6, value=origen)
-        ws.cell(row=n, column=7, value=f["recibido"])
-        ws.cell(row=n, column=8, value=f["consumido"])
-        ws.cell(row=n, column=9, value=f["vigente"])
-        ws.cell(row=n, column=10, value=f["del_programa"])
-        ws.cell(row=n, column=11, value=f["del_historico"])
-        ws.cell(row=n, column=12, value=", ".join(f"{k}: {v:g}" for k, v in f["empresas"].items()))
-        ws.cell(row=n, column=13, value=f["pmp"])
-        ws.cell(row=n, column=14, value=f["valor"])
-    ws.auto_filter.ref = f"A1:N{max(len(filas) + 1, 1)}"
-    anchos = [20, 18, 44, 22, 13, 20, 11, 11, 18, 13, 12, 26, 12, 14]
-    for col, ancho in enumerate(anchos, start=1):
-        ws.column_dimensions[get_column_letter(col)].width = ancho
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    sufijo = f"_{proveedor_sel}" if proveedor_sel else ""
-    nombre_archivo = f"Consignacion_por_lote{sufijo}_{date.today().isoformat()}.xlsx".replace(" ", "_")
     return send_file(
         buffer, as_attachment=True, download_name=nombre_archivo,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -13616,6 +13524,55 @@ def _tipo_flete_normalizado(valor):
     return texto
 
 
+def _tipo_flete_por_despacho(despacho):
+    """Ronda BZ (2026-10-21, punto 5 del pedido del usuario: "figuran
+    productos que solo han sido despachado aereo, cuando se despliega
+    sale sin via"): deduce aéreo/marítimo del propio despacho cuando el
+    Parcial quedó sin vía de embarque cargada. Un número de tracking con
+    forma de Air Waybill (11 dígitos, ver Despacho.awb_prefijo) es por
+    definición carga aérea; un courier de paquetería (DHL/FedEx/UPS/TNT)
+    también. Si no hay ninguna señal, se devuelve vacío y el Reporte
+    Operacional intenta todavía deducirlo de las otras líneas de la misma
+    factura antes de darlo por desconocido."""
+    if despacho is None:
+        return ""
+    if despacho.awb_prefijo:
+        return "AEREO"
+    courier = (despacho.courier or "").strip().upper()
+    if any(c in courier for c in ("DHL", "FEDEX", "UPS", "TNT")):
+        return "AEREO"
+    return ""
+
+
+def _completar_tipo_flete(filas):
+    """Ronda BZ (2026-10-21, punto 5): rellena el tipo de flete que quedó
+    vacío usando el de las OTRAS líneas de la misma factura -- un embarque
+    viaja completo por una vía, así que si el resto de esa factura dice
+    AEREO, esa línea también lo es. Solo se aplica cuando la factura tiene
+    UNA sola vía conocida; si tuviera dos (caso que no debería existir) se
+    deja vacío en vez de inventar.
+
+    El usuario verificó contra su propio archivo que no hay operaciones
+    sin vía, así que cualquier vacío acá viene de filas que el sistema
+    generó o reparó después (ej. la reconciliación de consignación), no
+    del dato original."""
+    vias_por_factura = defaultdict(set)
+    for f in filas:
+        via = (f.get("tipo_flete") or "").strip().upper()
+        if via:
+            vias_por_factura[((f.get("proveedor") or "").upper(), (f.get("factura") or "").strip().upper())].add(via)
+    completadas = 0
+    for f in filas:
+        if (f.get("tipo_flete") or "").strip():
+            continue
+        clave = ((f.get("proveedor") or "").upper(), (f.get("factura") or "").strip().upper())
+        vias = vias_por_factura.get(clave) or set()
+        if len(vias) == 1:
+            f["tipo_flete"] = next(iter(vias))
+            completadas += 1
+    return completadas
+
+
 def _operador_transporte_importacion(importacion):
     """Ronda BY (2026-10-20, punto 3 del pedido del usuario: "si es CIF diga
     Proveedor, sino indique el Operador logistico"): quién puso el
@@ -13688,6 +13645,7 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
         # quien lo puso; si se pagó aparte (Gasto "Flete Int."), fue el
         # operador logístico del despacho.
         transporte_importacion = _operador_transporte_importacion(importacion)
+        tipo_flete_despacho = _tipo_flete_por_despacho(importacion.despacho)
         for info in costeo["lineas"]:
             linea = info["linea"]
             codigo_interno = _codigo_interno_homologado(linea) or ""
@@ -13742,7 +13700,13 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
                 # vía de embarque del Parcial (DIN) de esta línea -- el
                 # equivalente exacto de la columna "TIPO FLETE" del
                 # histórico, que hasta ahora quedaba vacía para el sistema.
-                "tipo_flete": _tipo_flete_normalizado(info["parcial"].via_embarque),
+                # Ronda BZ (2026-10-21): si el parcial quedó sin vía, se
+                # deduce del propio despacho (un número de tracking con
+                # forma de Air Waybill es, por definición, carga aérea)
+                # antes de darla por desconocida -- el usuario reportó
+                # productos que solo han viajado por avión apareciendo
+                # como "(sin vía)".
+                "tipo_flete": _tipo_flete_normalizado(info["parcial"].via_embarque) or tipo_flete_despacho,
                 "homologado": True,
                 "via_ergopyme": False,
                 # Ronda AH (2026-09-16): las compras hechas DESDE la
@@ -14735,6 +14699,11 @@ def reportes_operacional():
     filas = _filas_compras_unificadas(
         empresa=empresa, proveedor=proveedor, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta
     )
+    # Ronda BZ (2026-10-21, punto 5): antes de agrupar, se completa el
+    # tipo de flete que haya quedado vacío con el de las otras líneas de
+    # la misma factura -- ver _completar_tipo_flete.
+    _completar_tipo_flete(filas)
+    lineas_sin_via = sum(1 for f in filas if not (f.get("tipo_flete") or "").strip())
     operadores_disponibles = sorted({(f.get("transporte") or "").strip() for f in filas if f.get("transporte")})
     if transporte_sel:
         filas = [f for f in filas if (f.get("transporte") or "").strip().upper() == transporte_sel.upper()]
@@ -14818,7 +14787,11 @@ def reportes_operacional():
         metricas = _metricas_operacional(filas_producto, factor_moneda)
         metricas["nombre"] = nombre
         metricas["vias"] = _tabla_operacional_por_clave(filas_producto, "tipo_flete", factor_moneda, vacio="(sin vía)")
-        metricas["multiples_vias"] = len(metricas["vias"]) > 1
+        # Ronda BZ (2026-10-21, punto 5): el badge "aérea y marítima" solo
+        # cuenta vías REALES -- antes una fila sin vía contaba como una
+        # segunda vía y marcaba como "aérea y marítima" productos que solo
+        # habían viajado por avión.
+        metricas["multiples_vias"] = len([v for v in metricas["vias"] if v["nombre"] != "(sin vía)"]) > 1
         por_producto.append(metricas)
     por_producto.sort(key=lambda r: (not r["multiples_vias"], -r["total_invoice"]))
     productos_recortados = len(por_producto) > MAX_PRODUCTOS_COSTO
@@ -14830,7 +14803,7 @@ def reportes_operacional():
         por_operador=por_operador, meses=meses, pct_mensual=pct_mensual,
         por_tipo_flete=por_tipo_flete, derechos_por_mes=derechos_por_mes,
         por_producto=por_producto, productos_recortados=productos_recortados,
-        max_productos=MAX_PRODUCTOS_COSTO,
+        max_productos=MAX_PRODUCTOS_COSTO, lineas_sin_via=lineas_sin_via,
         empresas_disponibles=_empresas_compradoras_disponibles(),
         proveedores_disponibles=_proveedores_con_compras(),
         operadores_disponibles=operadores_disponibles,

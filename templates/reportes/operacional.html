@@ -7,13 +7,26 @@
    mantenía a mano en las tablas dinámicas de "Detalle Costos
    Importaciones" (hoja Compras Prov Ext, columnas BA-BU). #}
 
-{% macro fila_metricas(r, moneda) %}
-<td class="text-end">{{ r.total_invoice|moneda }}</td>
-<td class="text-end">{{ r.flete|moneda }}</td>
-<td class="text-end">{{ r.otros_gastos|moneda }}</td>
+{% set simbolo = moneda|simbolo_moneda %}
+
+{% macro fila_metricas(r, simbolo) %}
+<td class="text-end">{{ simbolo }}{{ r.total_invoice|moneda }}</td>
+<td class="text-end">{{ simbolo }}{{ r.flete|moneda }}</td>
+<td class="text-end">{{ simbolo }}{{ r.otros_gastos|moneda }}</td>
 <td class="text-end">{{ "%.1f"|format(r.pct_flete * 100) }}%</td>
 <td class="text-end">{{ "%.1f"|format(r.pct_otros * 100) }}%</td>
 {% endmacro %}
+
+<style>
+  /* Ronda BZ (2026-10-21, punto 2 del pedido del usuario): montos y
+     porcentajes en una sola línea, con letra algo más chica para que
+     quepan todas las columnas sin partirse. */
+  .tabla-reporte { font-size: .85rem; }
+  .tabla-reporte th, .tabla-reporte td { white-space: nowrap; vertical-align: middle; }
+  .tabla-reporte td.col-producto {
+    white-space: nowrap; max-width: 30rem; overflow: hidden; text-overflow: ellipsis;
+  }
+</style>
 
 <div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
   <h3 class="section-title mb-0">Reporte Operacional</h3>
@@ -78,20 +91,20 @@
   <div class="col-sm-6 col-lg-3">
     <div class="card card-stat p-3 h-100">
       <div class="text-muted small">Total Invoice ({{ moneda }})</div>
-      <div class="h4 mb-0">{{ totales.total_invoice|moneda }}</div>
+      <div class="h4 mb-0">{{ simbolo }}{{ totales.total_invoice|moneda }}</div>
     </div>
   </div>
   <div class="col-sm-6 col-lg-3">
     <div class="card card-stat p-3 h-100">
       <div class="text-muted small">Flete ({{ moneda }})</div>
-      <div class="h4 mb-0">{{ totales.flete|moneda }}</div>
+      <div class="h4 mb-0">{{ simbolo }}{{ totales.flete|moneda }}</div>
       <div class="text-muted small">{{ "%.1f"|format(totales.pct_flete * 100) }}% del invoice</div>
     </div>
   </div>
   <div class="col-sm-6 col-lg-3">
     <div class="card card-stat p-3 h-100">
       <div class="text-muted small">Otros gastos ({{ moneda }})</div>
-      <div class="h4 mb-0">{{ totales.otros_gastos|moneda }}</div>
+      <div class="h4 mb-0">{{ simbolo }}{{ totales.otros_gastos|moneda }}</div>
       <div class="text-muted small">{{ "%.1f"|format(totales.pct_otros * 100) }}% del invoice</div>
     </div>
   </div>
@@ -107,27 +120,27 @@
 <div class="card p-3 mb-4">
   <h6 class="mb-3">Fletes y gastos en {{ moneda }} y % por operador</h6>
   <div class="table-responsive">
-    <table class="table table-sm table-hover align-middle mb-0">
+    <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
           <th>Transporte</th>
-          <th class="text-end">Total Invoice {{ moneda }}</th>
+          <th class="text-end">Total Invoice {{ simbolo }}</th>
           <th class="text-end">Flete</th>
-          <th class="text-end">Gastos {{ moneda }}</th>
+          <th class="text-end">Gastos {{ simbolo }}</th>
           <th class="text-end">% Flete</th>
           <th class="text-end">% Otros gastos</th>
         </tr>
       </thead>
       <tbody>
         {% for r in por_operador %}
-        <tr><td>{{ r.nombre }}</td>{{ fila_metricas(r, moneda) }}</tr>
+        <tr><td>{{ r.nombre }}</td>{{ fila_metricas(r, simbolo) }}</tr>
         {% else %}
         <tr><td colspan="6" class="text-center text-muted py-3">Sin datos para estos filtros.</td></tr>
         {% endfor %}
       </tbody>
       {% if por_operador %}
       <tfoot class="table-light fw-semibold">
-        <tr><td>Total general</td>{{ fila_metricas(totales, moneda) }}</tr>
+        <tr><td>Total general</td>{{ fila_metricas(totales, simbolo) }}</tr>
       </tfoot>
       {% endif %}
     </table>
@@ -138,7 +151,7 @@
 <div class="card p-3 mb-4">
   <h6 class="mb-3">Flete % mensual por operador</h6>
   <div class="table-responsive">
-    <table class="table table-sm table-hover align-middle mb-0">
+    <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
           <th>Transporte</th>
@@ -168,24 +181,24 @@
   <div class="mb-3">
     <div class="fw-semibold mb-1">{{ bloque.tipo }}</div>
     <div class="table-responsive">
-      <table class="table table-sm table-hover align-middle mb-0">
+      <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
         <thead>
           <tr>
             <th>Transporte</th>
-            <th class="text-end">Total Invoice {{ moneda }}</th>
+            <th class="text-end">Total Invoice {{ simbolo }}</th>
             <th class="text-end">Flete</th>
-            <th class="text-end">Gastos {{ moneda }}</th>
+            <th class="text-end">Gastos {{ simbolo }}</th>
             <th class="text-end">% Flete</th>
             <th class="text-end">% Otros gastos</th>
           </tr>
         </thead>
         <tbody>
           {% for r in bloque.operadores %}
-          <tr><td>{{ r.nombre }}</td>{{ fila_metricas(r, moneda) }}</tr>
+          <tr><td>{{ r.nombre }}</td>{{ fila_metricas(r, simbolo) }}</tr>
           {% endfor %}
         </tbody>
         <tfoot class="table-light fw-semibold">
-          <tr><td>Total {{ bloque.tipo }}</td>{{ fila_metricas(bloque.totales, moneda) }}</tr>
+          <tr><td>Total {{ bloque.tipo }}</td>{{ fila_metricas(bloque.totales, simbolo) }}</tr>
         </tfoot>
       </table>
     </div>
@@ -206,14 +219,14 @@
     <strong>su propia moneda</strong>.
   </p>
   <div class="table-responsive">
-    <table class="table table-sm table-hover align-middle mb-0">
+    <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
           <th style="width: 2rem;"></th>
           <th>Mes</th>
-          <th class="text-end">Total Invoice {{ moneda }}</th>
+          <th class="text-end">Total Invoice {{ simbolo }}</th>
           <th class="text-end">Flete</th>
-          <th class="text-end">Derechos {{ moneda }}</th>
+          <th class="text-end">Derechos {{ simbolo }}</th>
         </tr>
       </thead>
       <tbody>
@@ -221,13 +234,13 @@
         <tr role="button" data-bs-toggle="collapse" data-bs-target="#derechos{{ loop.index }}">
           <td><i class="bi bi-chevron-right"></i></td>
           <td>{{ m.mes[5:7] }}-{{ m.mes[0:4] }}</td>
-          <td class="text-end">{{ m.total_invoice|moneda }}</td>
-          <td class="text-end">{{ m.flete|moneda }}</td>
-          <td class="text-end fw-semibold">{{ m.derechos|moneda }}</td>
+          <td class="text-end">{{ simbolo }}{{ m.total_invoice|moneda }}</td>
+          <td class="text-end">{{ simbolo }}{{ m.flete|moneda }}</td>
+          <td class="text-end fw-semibold">{{ simbolo }}{{ m.derechos|moneda }}</td>
         </tr>
         <tr class="collapse" id="derechos{{ loop.index }}">
           <td colspan="5" class="bg-light">
-            <table class="table table-sm mb-0">
+            <table class="table table-sm mb-0 tabla-reporte">
               <thead><tr><th>Factura</th><th>Fecha</th><th class="text-end">Total Invoice</th><th class="text-end">Derechos</th></tr></thead>
               <tbody>
                 {% for d in m.facturas %}
@@ -238,8 +251,8 @@
                     {% else %}{{ d.factura }}{% endif %}
                   </td>
                   <td>{{ d.fecha.strftime('%d-%m-%Y') if d.fecha else '-' }}</td>
-                  <td class="text-end">{{ d.total_invoice|moneda }} {{ d.moneda }}</td>
-                  <td class="text-end">{{ d.derechos|moneda }} {{ d.moneda }}</td>
+                  <td class="text-end">{{ d.moneda|simbolo_moneda }}{{ d.total_invoice|moneda }}</td>
+                  <td class="text-end">{{ d.moneda|simbolo_moneda }}{{ d.derechos|moneda }}</td>
                 </tr>
                 {% endfor %}
               </tbody>
@@ -262,15 +275,27 @@
     se han traído por más de una vía.{% if productos_recortados %} Se muestran los primeros {{ max_productos }};
     filtra por proveedor para acotar.{% endif %}
   </p>
+  {% if lineas_sin_via %}
+  {# Ronda BZ (2026-10-21, punto 5): el usuario verificó que en su archivo no
+     hay operaciones sin vía, así que cualquier "(sin vía)" que quede es de
+     datos generados acá -- se explica de dónde sale y cómo corregirlo en vez
+     de dejarlo como una categoría muda. #}
+  <div class="alert alert-light border small">
+    <i class="bi bi-info-circle me-1"></i>
+    Quedan {{ lineas_sin_via }} línea(s) como "(sin vía)": son importaciones hechas en el sistema cuyo parcial no
+    tiene cargada la vía de embarque (Marítimo / Aéreo) y cuyo despacho tampoco permite deducirla. Se corrige
+    editando ese parcial en su Costeo -- el resto ya se dedujo solo de las demás líneas de la misma factura.
+  </div>
+  {% endif %}
   <div class="table-responsive">
-    <table class="table table-sm table-hover align-middle mb-0">
+    <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
           <th style="width: 2rem;"></th>
           <th>Producto</th>
-          <th class="text-end">Total Invoice {{ moneda }}</th>
+          <th class="text-end">Total Invoice {{ simbolo }}</th>
           <th class="text-end">Flete</th>
-          <th class="text-end">Gastos {{ moneda }}</th>
+          <th class="text-end">Gastos {{ simbolo }}</th>
           <th class="text-end">% Flete</th>
           <th class="text-end">% Otros gastos</th>
         </tr>
@@ -279,24 +304,24 @@
         {% for p in por_producto %}
         <tr role="button" data-bs-toggle="collapse" data-bs-target="#prod{{ loop.index }}">
           <td><i class="bi bi-chevron-right"></i></td>
-          <td title="{{ p.nombre }}">
+          <td class="col-producto" title="{{ p.nombre }}">
             {{ p.nombre }}
             {% if p.multiples_vias %}<span class="badge bg-info text-dark">aérea y marítima</span>{% endif %}
           </td>
-          {{ fila_metricas(p, moneda) }}
+          {{ fila_metricas(p, simbolo) }}
         </tr>
         <tr class="collapse" id="prod{{ loop.index }}">
           <td colspan="7" class="bg-light">
-            <table class="table table-sm mb-0">
+            <table class="table table-sm mb-0 tabla-reporte">
               <thead>
                 <tr>
-                  <th>Vía</th><th class="text-end">Total Invoice {{ moneda }}</th><th class="text-end">Flete</th>
-                  <th class="text-end">Gastos {{ moneda }}</th><th class="text-end">% Flete</th><th class="text-end">% Otros gastos</th>
+                  <th>Vía</th><th class="text-end">Total Invoice {{ simbolo }}</th><th class="text-end">Flete</th>
+                  <th class="text-end">Gastos {{ simbolo }}</th><th class="text-end">% Flete</th><th class="text-end">% Otros gastos</th>
                 </tr>
               </thead>
               <tbody>
                 {% for v in p.vias %}
-                <tr><td>{{ v.nombre }}</td>{{ fila_metricas(v, moneda) }}</tr>
+                <tr><td>{{ v.nombre }}</td>{{ fila_metricas(v, simbolo) }}</tr>
                 {% endfor %}
               </tbody>
             </table>

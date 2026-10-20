@@ -89,8 +89,10 @@
               {% if puede_reportes %}
               <li><a class="dropdown-item" href="{{ url_for('stock_valorizado_list') }}">Stock Valorizado</a></li>
               <li><a class="dropdown-item" href="{{ url_for('stock_consignacion_list') }}">Consignación</a></li>
-              {# Ronda BY (2026-10-20, a pedido del usuario): 3 reportes nuevos. #}
-              <li><a class="dropdown-item" href="{{ url_for('reportes_consignacion_detalle') }}">Consignación por producto y lote</a></li>
+              {# Ronda BY (2026-10-20, a pedido del usuario): reportes nuevos.
+                 "Consignación por producto y lote" se retiró en la ronda BZ:
+                 el usuario señaló que la pantalla de Consignación de arriba ya
+                 cubría eso con su propio botón de descarga. #}
               <li><a class="dropdown-item" href="{{ url_for('reportes_costo_producto') }}">Consulta Costo Producto</a></li>
               <li><a class="dropdown-item" href="{{ url_for('reportes_operacional') }}">Reporte Operacional</a></li>
               {% endif %}
