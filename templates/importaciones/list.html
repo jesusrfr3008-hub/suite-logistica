@@ -61,12 +61,16 @@
           <td class="text-end">{{ "%.2f"|format(resumenes[imp.id].fob_usd) }}</td>
           <td class="text-end">{{ "{:,.0f}".format(resumenes[imp.id].costo_total_clp) }}</td>
           <td>
-            {% if emitidas[imp.id] %}
-            <span class="badge bg-success" title="Ya se generó la Cuenta por Pagar (o, si es consignación, ya quedó registrada como recibida) -- no queda nada pendiente en este costeo.">
+            {% if estados[imp.id] == 'emitido' %}
+            <span class="badge bg-success" title="Ya se generó la Cuenta por Pagar (o, si es consignación, ya quedó registrada como recibida, con lote real cargado) -- no queda nada pendiente en este costeo.">
               <i class="bi bi-check-circle"></i> Emitido
             </span>
+            {% elif estados[imp.id] == 'falta_lote' %}
+            <span class="badge bg-warning text-dark" title="Ya se registró en consignación, pero al menos una línea todavía no tiene lote real cargado (quedó en el bucket genérico &quot;sin lote&quot;) -- usa Carga Lotes para completarlo.">
+              <i class="bi bi-exclamation-triangle"></i> Falta lote
+            </span>
             {% else %}
-            <span class="badge bg-warning text-dark" title="Todavía le falta generar factura (o verificar consignación) a este costeo.">
+            <span class="badge bg-secondary" title="Todavía le falta generar factura (o verificar consignación) a este costeo.">
               En proceso
             </span>
             {% endif %}

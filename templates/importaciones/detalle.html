@@ -67,6 +67,12 @@
         Consignación parcial ({{ info_consignacion.total }} línea{{ 's' if info_consignacion.total != 1 }})
       </span>
       {% endif %}
+      {% if lineas_sin_lote %}
+      <span class="badge bg-warning text-dark" data-bs-toggle="tooltip"
+            title="{{ lineas_sin_lote|length }} línea(s) de consignación todavía sin lote real cargado -- ver aviso abajo.">
+        <i class="bi bi-exclamation-triangle"></i> Falta lote
+      </span>
+      {% endif %}
     </h3>
     <div class="text-muted">
       Proveedor: <a href="{{ url_for('proveedores_detalle', proveedor_id=imp.proveedor.id) }}">{{ imp.proveedor.nombre }}</a>
@@ -151,6 +157,57 @@
   {% endif %}
 </div>
 {% endfor %}
+{% endif %}
+
+<!-- Ronda BX (2026-10-20, a pedido del usuario tras revisar la Importación
+     30092026 de MEDICONTUR): aviso + reporte de lo registrado en
+     Consignación para ESTA importación, para que se pueda auditar sin
+     tener que confiar a ciegas en el badge "Emitido". -->
+{% if info_consignacion.tiene %}
+<div class="card p-3 mb-3">
+  <h6 class="mb-2"><i class="bi bi-box-seam me-1"></i>Registrado en Consignación (esta importación)</h6>
+  {% if lineas_sin_lote %}
+  <div class="alert alert-warning d-flex align-items-start gap-2 mb-3">
+    <i class="bi bi-exclamation-triangle-fill mt-1"></i>
+    <div>
+      <strong>{{ lineas_sin_lote|length }} línea{{ 's' if lineas_sin_lote|length != 1 }} de consignación sin lote real cargado todavía.</strong>
+      Mientras tanto, su cantidad se registró igual en el control de consignación (no se pierde ni se duplica), pero
+      bajo un lote genérico "(sin lote)" -- el mismo que compartiría cualquier otro producto igual de otra
+      importación que tampoco tenga lote todavía, lo que no permite distinguir de qué embarque es cada unidad
+      (vencimiento, devoluciones). Usa el botón "Carga Lotes" de arriba para completarlo.
+      <ul class="small mb-0 mt-1">
+        {% for l in lineas_sin_lote %}
+        <li>{{ l.codigo }} -- {{ l.descripcion }} ({{ l.cantidad_unidades }} un.)</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+  {% endif %}
+  {% if registro_consignacion %}
+  <div class="table-responsive">
+    <table class="table table-sm mb-0">
+      <thead><tr><th>Código proveedor</th><th>Descripción</th><th>Lote</th><th class="text-end">Cantidad registrada</th></tr></thead>
+      <tbody>
+        {% for r in registro_consignacion %}
+        <tr class="{{ 'table-warning' if r.sin_lote }}">
+          <td>{{ r.codigo_proveedor }}</td>
+          <td>{{ r.descripcion }}</td>
+          <td>{{ r.lote }}{% if r.sin_lote %} <span class="badge bg-warning text-dark">sin lote real</span>{% endif %}</td>
+          <td class="text-end">{{ "%.0f"|format(r.cantidad) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="form-text mt-2">
+    Esto es lo que esta importación aporta HOY al control de Consignación
+    (<a href="{{ url_for('stock_consignacion_list') }}">ver Consignación pendiente</a>) -- se recalcula solo cada
+    vez que se guarda algo en este costeo (producto, lote, cantidad), nunca duplica lo ya registrado.
+  </div>
+  {% else %}
+  <p class="text-muted small mb-0">Esta importación todavía no tiene ninguna cantidad de consignación registrada -- revisa que sus líneas tengan cantidad cargada.</p>
+  {% endif %}
+</div>
 {% endif %}
 
 <!-- Modal: carga masiva de lotes para TODO el costeo (ronda N, 2026-09-12) -->

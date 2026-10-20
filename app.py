@@ -8266,38 +8266,78 @@ def _despachos_pendientes_de_costeo():
     ]
 
 
-def _importacion_esta_emitida(imp):
-    """Ronda BW (2026-10-20, punto 1 del pedido del usuario: "que las
-    operaciones costeadas que ya se emitieron la factura o se procesó
-    como consignación tenga un badge que diga emitido, así saber cual
-    está lista y cual está en proceso"). Devuelve True si a esta
-    Importación ya NO le queda nada pendiente de generar en el botón
-    "Generar factura" / "Verificar consignación" de su detalle -- o sea:
+def _lineas_consignacion_sin_lote_real(imp):
+    """Ronda BX (2026-10-20, a partir de lo que el usuario encontró
+    revisando la Importación 30092026 de MEDICONTUR, 100% consignación: el
+    badge ya decía "Emitido" aunque recién se le acababan de cargar los
+    lotes -- "¿cómo pudo registrarlo si no tenía los lotes? ... si el lote
+    debía generar alguna alerta no?"). Devuelve las ParcialLinea de
+    consignación de esta Importación que TODAVÍA no tienen un lote real --
+    ni un desglose por lote (ParcialLineaLote, cargado vía "Carga Lotes")
+    ni siquiera el código de lote resumen tipeado a mano
+    (ParcialLinea.codigo_lote).
 
-    - Si tiene líneas normales (no consignación): cada una de sus
-      facturas (una por FacturaEmbarqueImportacion individualizada, o la
-      "implícita" de la Importación si nunca se individualizó ninguna)
-      ya generó su FacturaProveedor (misma lógica de agrupación/dedup que
-      importacion_generar_factura, ver ya_generadas_ids ahí).
-    - Si tiene líneas de consignación, además esas ya deben estar
-      registradas como recibidas (imp.consignacion_registrada -- desde
-      la ronda BR esto se marca solo, apenas se guarda algo en Costeo,
-      ver _sincronizar_consignacion_recibida).
-    - Una Importación sin ninguna línea cargada todavía nunca cuenta como
-      emitida (no hay nada que mostrar como "listo")."""
+    Mientras una línea esté en este estado, lo que se registra en el
+    control de consignación (ConsignacionPendienteLote, ver
+    _sincronizar_consignacion_recibida/_desglose_lotes_linea_consignacion)
+    queda bajo un lote "(sin lote)" genérico -- el mismo bucket que
+    CUALQUIER OTRA línea de CUALQUIER OTRA Importación de ese mismo
+    producto que tampoco tenga lote todavía, mezclando sus cantidades ahí.
+    Eso ya registra la cantidad correctamente (no hay doble conteo, ver
+    ronda BW), pero rompe la trazabilidad por lote que la consignación
+    necesita de verdad (vencimientos, devoluciones, de qué embarque es
+    cada unidad) -- por eso no alcanza para considerar la Importación
+    'Emitido' del todo."""
+    return [
+        l for p in imp.parciales for l in p.lineas
+        if _es_consignacion_parcial_linea(l)
+        and (l.cantidad_unidades or 0) > 0
+        and not l.lotes
+        and not (l.codigo_lote or "").strip()
+    ]
+
+
+def _estado_costeo_importacion(imp):
+    """Ronda BW (2026-10-20, punto 1)/Ronda BX (2026-10-20, corrección a
+    pedido del usuario): estado a mostrar en el badge del listado de
+    Costeo y en el banner del detalle de la Importación. Tres valores
+    posibles:
+
+    - "emitido": no queda nada pendiente.
+    - "falta_lote": lo único que falta es cargar el lote real de alguna(s)
+      línea(s) de consignación (ver _lineas_consignacion_sin_lote_real) --
+      todo lo demás (facturas normales generadas, consignación ya
+      registrada) ya está. Antes de la ronda BX esto se mostraba igual que
+      "emitido", sin avisar que la trazabilidad por lote seguía
+      incompleta.
+    - "en_proceso": falta algo más (factura sin generar, o consignación
+      todavía sin registrar).
+
+    Una Importación sin ninguna línea cargada todavía siempre queda
+    "en_proceso" (no hay nada que mostrar como "listo")."""
     todas_las_lineas = [l for p in imp.parciales for l in p.lineas]
     if not todas_las_lineas:
-        return False
+        return "en_proceso"
     lineas_consignacion = [l for l in todas_las_lineas if _es_consignacion_parcial_linea(l)]
     lineas_normales = [l for l in todas_las_lineas if l not in lineas_consignacion]
     if lineas_normales:
         grupos_normales = {l.factura_embarque_id for l in lineas_normales}
         ya_generadas_ids = {fp.factura_embarque_id for fp in imp.facturas_pago}
         if not grupos_normales.issubset(ya_generadas_ids):
-            return False
-    if lineas_consignacion and not imp.consignacion_registrada:
-        return False
-    return True
+            return "en_proceso"
+    if lineas_consignacion:
+        if not imp.consignacion_registrada:
+            return "en_proceso"
+        if _lineas_consignacion_sin_lote_real(imp):
+            return "falta_lote"
+    return "emitido"
+
+
+def _importacion_esta_emitida(imp):
+    """Atajo para cuando solo hace falta el booleano "sin nada pendiente"
+    (True solo si _estado_costeo_importacion devuelve "emitido") -- ver esa
+    función para el detalle de los 3 estados posibles."""
+    return _estado_costeo_importacion(imp) == "emitido"
 
 
 @app.route("/importaciones")
@@ -8310,15 +8350,15 @@ def importaciones_list():
     importaciones = query.order_by(Importacion.id.desc()).all()
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     resumenes = {}
-    emitidas = {}
+    estados = {}
     for imp in importaciones:
         resultado = costing.calcular_costeo(imp)
         resumenes[imp.id] = resultado["totales"]
-        emitidas[imp.id] = _importacion_esta_emitida(imp)
+        estados[imp.id] = _estado_costeo_importacion(imp)
     hay_despachos_pendientes = bool(_despachos_pendientes_de_costeo())
     return render_template(
         "importaciones/list.html", importaciones=importaciones, proveedores=proveedores,
-        proveedor_sel=proveedor_id, resumenes=resumenes, emitidas=emitidas,
+        proveedor_sel=proveedor_id, resumenes=resumenes, estados=estados,
         hay_despachos_pendientes=hay_despachos_pendientes,
     )
 
@@ -8446,6 +8486,36 @@ def importaciones_detalle(importacion_id):
         "total_lineas": len(todas_las_lineas_imp),
         "es_toda": bool(lineas_consignacion_imp) and len(lineas_consignacion_imp) == len(todas_las_lineas_imp),
     }
+    # Ronda BX (2026-10-20, a pedido del usuario tras revisar la
+    # Importación 30092026 de MEDICONTUR -- "me puedes generar un reporte
+    # de qué se registró?" y "si el lote debía generar alguna alerta no?"):
+    # lineas_sin_lote alimenta el aviso de arriba (y el badge "Falta lote"
+    # del listado, ver _estado_costeo_importacion); registro_consignacion
+    # es el reporte en sí -- EXACTAMENTE lo mismo que
+    # _sincronizar_consignacion_recibida calcula y aplica a
+    # ConsignacionPendienteLote cada vez que se guarda algo en este costeo
+    # (_calcular_consignacion_deseada_importacion), así que es, sin
+    # inventar ningún cálculo nuevo, "lo que esta Importación registró
+    # (o registraría en el próximo guardado) en el control de
+    # Consignación", código + lote + cantidad.
+    lineas_sin_lote = _lineas_consignacion_sin_lote_real(imp) if lineas_consignacion_imp else []
+    registro_consignacion = []
+    if lineas_consignacion_imp:
+        deseado_imp = _calcular_consignacion_deseada_importacion(imp)
+        registro_consignacion = sorted(
+            (
+                {
+                    "codigo_proveedor": info["codigo_proveedor"],
+                    "codigo_interno": codigo_interno,
+                    "descripcion": info["descripcion"],
+                    "lote": codigo_lote,
+                    "cantidad": info["cantidad"],
+                    "sin_lote": codigo_lote == "(sin lote)",
+                }
+                for (_proveedor_id, codigo_interno, codigo_lote), info in deseado_imp.items()
+            ),
+            key=lambda r: (r["codigo_proveedor"], r["lote"]),
+        )
     return render_template(
         "importaciones/detalle.html", imp=imp, resultado=resultado,
         regimenes=REGIMENES_PARCIAL, vias=VIAS_EMBARQUE,
@@ -8455,6 +8525,8 @@ def importaciones_detalle(importacion_id):
         sugerido_correlativo_inventario=sugerido_correlativo_inventario,
         avisos_cargos_pendientes=avisos_cargos_pendientes,
         info_consignacion=info_consignacion,
+        lineas_sin_lote=lineas_sin_lote,
+        registro_consignacion=registro_consignacion,
     )
 
 
