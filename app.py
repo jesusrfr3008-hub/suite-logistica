@@ -8266,6 +8266,40 @@ def _despachos_pendientes_de_costeo():
     ]
 
 
+def _importacion_esta_emitida(imp):
+    """Ronda BW (2026-10-20, punto 1 del pedido del usuario: "que las
+    operaciones costeadas que ya se emitieron la factura o se procesó
+    como consignación tenga un badge que diga emitido, así saber cual
+    está lista y cual está en proceso"). Devuelve True si a esta
+    Importación ya NO le queda nada pendiente de generar en el botón
+    "Generar factura" / "Verificar consignación" de su detalle -- o sea:
+
+    - Si tiene líneas normales (no consignación): cada una de sus
+      facturas (una por FacturaEmbarqueImportacion individualizada, o la
+      "implícita" de la Importación si nunca se individualizó ninguna)
+      ya generó su FacturaProveedor (misma lógica de agrupación/dedup que
+      importacion_generar_factura, ver ya_generadas_ids ahí).
+    - Si tiene líneas de consignación, además esas ya deben estar
+      registradas como recibidas (imp.consignacion_registrada -- desde
+      la ronda BR esto se marca solo, apenas se guarda algo en Costeo,
+      ver _sincronizar_consignacion_recibida).
+    - Una Importación sin ninguna línea cargada todavía nunca cuenta como
+      emitida (no hay nada que mostrar como "listo")."""
+    todas_las_lineas = [l for p in imp.parciales for l in p.lineas]
+    if not todas_las_lineas:
+        return False
+    lineas_consignacion = [l for l in todas_las_lineas if _es_consignacion_parcial_linea(l)]
+    lineas_normales = [l for l in todas_las_lineas if l not in lineas_consignacion]
+    if lineas_normales:
+        grupos_normales = {l.factura_embarque_id for l in lineas_normales}
+        ya_generadas_ids = {fp.factura_embarque_id for fp in imp.facturas_pago}
+        if not grupos_normales.issubset(ya_generadas_ids):
+            return False
+    if lineas_consignacion and not imp.consignacion_registrada:
+        return False
+    return True
+
+
 @app.route("/importaciones")
 @requiere_permiso("generar_costeo", "reportes")
 def importaciones_list():
@@ -8276,13 +8310,15 @@ def importaciones_list():
     importaciones = query.order_by(Importacion.id.desc()).all()
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     resumenes = {}
+    emitidas = {}
     for imp in importaciones:
         resultado = costing.calcular_costeo(imp)
         resumenes[imp.id] = resultado["totales"]
+        emitidas[imp.id] = _importacion_esta_emitida(imp)
     hay_despachos_pendientes = bool(_despachos_pendientes_de_costeo())
     return render_template(
         "importaciones/list.html", importaciones=importaciones, proveedores=proveedores,
-        proveedor_sel=proveedor_id, resumenes=resumenes,
+        proveedor_sel=proveedor_id, resumenes=resumenes, emitidas=emitidas,
         hay_despachos_pendientes=hay_despachos_pendientes,
     )
 
