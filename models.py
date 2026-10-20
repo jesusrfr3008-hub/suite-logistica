@@ -780,6 +780,15 @@ class CompraHistorica(db.Model):
     codigo_interno = db.Column(db.String(40), index=True)
     codigo_proveedor = db.Column(db.String(120))
     descripcion = db.Column(db.String(500))
+    # Ronda BY (2026-10-20, punto 2 del pedido del usuario -- la Consulta de
+    # Costo Producto debe poder buscar "producto / lote ... que pueda buscar
+    # uno o u otro y traiga el producto del lote"): el archivo histórico
+    # SIEMPRE trajo estas dos columnas ("COD.DE LOTE" y "VENCMTO"), pero
+    # hasta esta ronda no se guardaban. Se cargan en el seed y, para las
+    # bases ya cargadas (producción), las completa
+    # reparar_lotes_historico_ronda_by() releyendo el mismo archivo.
+    codigo_lote = db.Column(db.String(120), index=True)
+    fecha_vencimiento = db.Column(db.Date, nullable=True)
     tipo_flete = db.Column(db.String(40))
     unidades = db.Column(db.Float, default=0)
     total_invoice = db.Column(db.Float, default=0)    # en la moneda original de la factura

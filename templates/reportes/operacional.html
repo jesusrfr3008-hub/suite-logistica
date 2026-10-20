@@ -1,0 +1,313 @@
+{% extends "base.html" %}
+{% block title %}Reporte Operacional · Suite Logística{% endblock %}
+{% block content %}
+
+{# Ronda BY (2026-10-20, punto 3 del pedido del usuario): costo de
+   transporte de las importaciones, con las mismas 5 vistas que el usuario
+   mantenía a mano en las tablas dinámicas de "Detalle Costos
+   Importaciones" (hoja Compras Prov Ext, columnas BA-BU). #}
+
+{% macro fila_metricas(r, moneda) %}
+<td class="text-end">{{ r.total_invoice|moneda }}</td>
+<td class="text-end">{{ r.flete|moneda }}</td>
+<td class="text-end">{{ r.otros_gastos|moneda }}</td>
+<td class="text-end">{{ "%.1f"|format(r.pct_flete * 100) }}%</td>
+<td class="text-end">{{ "%.1f"|format(r.pct_otros * 100) }}%</td>
+{% endmacro %}
+
+<div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
+  <h3 class="section-title mb-0">Reporte Operacional</h3>
+  <div class="btn-group">
+    <a class="btn btn-sm {{ 'btn-brand' if moneda == 'USD' else 'btn-outline-secondary' }}"
+       href="{{ url_for('reportes_operacional', empresa=empresa_sel, proveedor=proveedor_sel, transporte=transporte_sel, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, moneda='USD') }}">USD</a>
+    <a class="btn btn-sm {{ 'btn-brand' if moneda == 'EUR' else 'btn-outline-secondary' }}"
+       href="{{ url_for('reportes_operacional', empresa=empresa_sel, proveedor=proveedor_sel, transporte=transporte_sel, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, moneda='EUR') }}">EUR</a>
+  </div>
+</div>
+<p class="text-muted">
+  Costo de transporte de las importaciones: histórico + lo costeado en este sistema.
+  {% if moneda == 'EUR' %}
+  Montos en <strong>EUR</strong>, convertidos desde USD con la paridad representativa del corte
+  ({{ "%.4f"|format(paridad_eur) }} EUR por USD).
+  {% else %}
+  Montos en <strong>USD</strong>: las operaciones en euros ya vienen convertidas con la paridad de cada factura.
+  {% endif %}
+  El flete de las operaciones hechas acá junta el flete de la factura del proveedor (CIF) y el flete internacional
+  cargado como gasto, en un solo número, para poder compararlo con el histórico.
+</p>
+
+<form class="row g-2 mb-3">
+  <input type="hidden" name="moneda" value="{{ moneda }}">
+  <div class="col-auto">
+    <select class="form-select" name="empresa" onchange="this.form.submit()">
+      <option value="">Todas las empresas</option>
+      {% for e in empresas_disponibles %}
+      <option value="{{ e }}" {% if empresa_sel|upper == e %}selected{% endif %}>{{ e }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <select class="form-select" name="proveedor" onchange="this.form.submit()">
+      <option value="">Todos los proveedores</option>
+      {% for p in proveedores_disponibles %}
+      <option value="{{ p }}" {% if proveedor_sel == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <select class="form-select" name="transporte" onchange="this.form.submit()">
+      <option value="">Todos los operadores</option>
+      {% for t in operadores_disponibles %}
+      <option value="{{ t }}" {% if transporte_sel|upper == t|upper %}selected{% endif %}>{{ t }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}">
+  </div>
+  <div class="col-auto">
+    <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}">
+  </div>
+  <div class="col-auto"><button class="btn btn-outline-secondary">Filtrar</button></div>
+  <div class="col-auto">
+    <a class="btn btn-link" href="{{ url_for('reportes_operacional', fecha_desde='', fecha_hasta='', moneda=moneda) }}">Quitar filtros</a>
+  </div>
+</form>
+
+<div class="row g-3 mb-4">
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Total Invoice ({{ moneda }})</div>
+      <div class="h4 mb-0">{{ totales.total_invoice|moneda }}</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Flete ({{ moneda }})</div>
+      <div class="h4 mb-0">{{ totales.flete|moneda }}</div>
+      <div class="text-muted small">{{ "%.1f"|format(totales.pct_flete * 100) }}% del invoice</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Otros gastos ({{ moneda }})</div>
+      <div class="h4 mb-0">{{ totales.otros_gastos|moneda }}</div>
+      <div class="text-muted small">{{ "%.1f"|format(totales.pct_otros * 100) }}% del invoice</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Líneas consideradas</div>
+      <div class="h4 mb-0">{{ totales.lineas }}</div>
+    </div>
+  </div>
+</div>
+
+<!-- (a) Fletes y gastos por operador -->
+<div class="card p-3 mb-4">
+  <h6 class="mb-3">Fletes y gastos en {{ moneda }} y % por operador</h6>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Transporte</th>
+          <th class="text-end">Total Invoice {{ moneda }}</th>
+          <th class="text-end">Flete</th>
+          <th class="text-end">Gastos {{ moneda }}</th>
+          <th class="text-end">% Flete</th>
+          <th class="text-end">% Otros gastos</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in por_operador %}
+        <tr><td>{{ r.nombre }}</td>{{ fila_metricas(r, moneda) }}</tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted py-3">Sin datos para estos filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+      {% if por_operador %}
+      <tfoot class="table-light fw-semibold">
+        <tr><td>Total general</td>{{ fila_metricas(totales, moneda) }}</tr>
+      </tfoot>
+      {% endif %}
+    </table>
+  </div>
+</div>
+
+<!-- (b) Flete % mensual por operador -->
+<div class="card p-3 mb-4">
+  <h6 class="mb-3">Flete % mensual por operador</h6>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Transporte</th>
+          {% for m in meses %}<th class="text-end">{{ m[5:7] }}-{{ m[0:4] }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for fila in pct_mensual %}
+        <tr>
+          <td>{{ fila.operador }}</td>
+          {% for celda in fila.celdas %}
+          <td class="text-end">{% if celda is none %}<span class="text-muted">-</span>{% else %}{{ "%.1f"|format(celda * 100) }}%{% endif %}</td>
+          {% endfor %}
+        </tr>
+        {% else %}
+        <tr><td colspan="{{ meses|length + 1 }}" class="text-center text-muted py-3">Sin datos para estos filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- (c) Por tipo de transporte -->
+<div class="card p-3 mb-4">
+  <h6 class="mb-3">Flete y gastos por tipo de transporte</h6>
+  {% for bloque in por_tipo_flete %}
+  <div class="mb-3">
+    <div class="fw-semibold mb-1">{{ bloque.tipo }}</div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead>
+          <tr>
+            <th>Transporte</th>
+            <th class="text-end">Total Invoice {{ moneda }}</th>
+            <th class="text-end">Flete</th>
+            <th class="text-end">Gastos {{ moneda }}</th>
+            <th class="text-end">% Flete</th>
+            <th class="text-end">% Otros gastos</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in bloque.operadores %}
+          <tr><td>{{ r.nombre }}</td>{{ fila_metricas(r, moneda) }}</tr>
+          {% endfor %}
+        </tbody>
+        <tfoot class="table-light fw-semibold">
+          <tr><td>Total {{ bloque.tipo }}</td>{{ fila_metricas(bloque.totales, moneda) }}</tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+  {% else %}
+  <p class="text-muted mb-0">
+    Sin tipo de transporte cargado en estos datos. En las importaciones hechas acá sale de la vía de embarque del
+    parcial (Marítimo / Aéreo).
+  </p>
+  {% endfor %}
+</div>
+
+<!-- (d) Derechos pagados -->
+<div class="card p-3 mb-4">
+  <h6 class="mb-1">Derechos pagados en las importaciones</h6>
+  <p class="text-muted small">
+    El total de cada mes va en {{ moneda }} para poder sumarlo; al desplegar, cada factura muestra sus derechos en
+    <strong>su propia moneda</strong>.
+  </p>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th style="width: 2rem;"></th>
+          <th>Mes</th>
+          <th class="text-end">Total Invoice {{ moneda }}</th>
+          <th class="text-end">Flete</th>
+          <th class="text-end">Derechos {{ moneda }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in derechos_por_mes %}
+        <tr role="button" data-bs-toggle="collapse" data-bs-target="#derechos{{ loop.index }}">
+          <td><i class="bi bi-chevron-right"></i></td>
+          <td>{{ m.mes[5:7] }}-{{ m.mes[0:4] }}</td>
+          <td class="text-end">{{ m.total_invoice|moneda }}</td>
+          <td class="text-end">{{ m.flete|moneda }}</td>
+          <td class="text-end fw-semibold">{{ m.derechos|moneda }}</td>
+        </tr>
+        <tr class="collapse" id="derechos{{ loop.index }}">
+          <td colspan="5" class="bg-light">
+            <table class="table table-sm mb-0">
+              <thead><tr><th>Factura</th><th>Fecha</th><th class="text-end">Total Invoice</th><th class="text-end">Derechos</th></tr></thead>
+              <tbody>
+                {% for d in m.facturas %}
+                <tr>
+                  <td>
+                    {% if d.importacion_id %}
+                    <a href="{{ url_for('importaciones_detalle', importacion_id=d.importacion_id) }}">{{ d.factura }}</a>
+                    {% else %}{{ d.factura }}{% endif %}
+                  </td>
+                  <td>{{ d.fecha.strftime('%d-%m-%Y') if d.fecha else '-' }}</td>
+                  <td class="text-end">{{ d.total_invoice|moneda }} {{ d.moneda }}</td>
+                  <td class="text-end">{{ d.derechos|moneda }} {{ d.moneda }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-center text-muted py-3">No hay derechos pagados en este corte.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- (e) Productos por vía de transporte -->
+<div class="card p-3 mb-4">
+  <h6 class="mb-1">Productos por vía de transporte (aéreo vs marítimo)</h6>
+  <p class="text-muted small">
+    Para comparar qué cuesta traer el mismo producto por un medio u otro. Se listan primero los productos que
+    se han traído por más de una vía.{% if productos_recortados %} Se muestran los primeros {{ max_productos }};
+    filtra por proveedor para acotar.{% endif %}
+  </p>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th style="width: 2rem;"></th>
+          <th>Producto</th>
+          <th class="text-end">Total Invoice {{ moneda }}</th>
+          <th class="text-end">Flete</th>
+          <th class="text-end">Gastos {{ moneda }}</th>
+          <th class="text-end">% Flete</th>
+          <th class="text-end">% Otros gastos</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in por_producto %}
+        <tr role="button" data-bs-toggle="collapse" data-bs-target="#prod{{ loop.index }}">
+          <td><i class="bi bi-chevron-right"></i></td>
+          <td title="{{ p.nombre }}">
+            {{ p.nombre }}
+            {% if p.multiples_vias %}<span class="badge bg-info text-dark">aérea y marítima</span>{% endif %}
+          </td>
+          {{ fila_metricas(p, moneda) }}
+        </tr>
+        <tr class="collapse" id="prod{{ loop.index }}">
+          <td colspan="7" class="bg-light">
+            <table class="table table-sm mb-0">
+              <thead>
+                <tr>
+                  <th>Vía</th><th class="text-end">Total Invoice {{ moneda }}</th><th class="text-end">Flete</th>
+                  <th class="text-end">Gastos {{ moneda }}</th><th class="text-end">% Flete</th><th class="text-end">% Otros gastos</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for v in p.vias %}
+                <tr><td>{{ v.nombre }}</td>{{ fila_metricas(v, moneda) }}</tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-3">Sin datos para estos filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

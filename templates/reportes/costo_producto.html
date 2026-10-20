@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+{% block title %}Consulta Costo Producto · Suite Logística{% endblock %}
+{% block content %}
+
+{# Ronda BY (2026-10-20, punto 2 del pedido del usuario): último costo de
+   cada producto (histórico + importaciones costeadas acá) y, al abrirlo,
+   todo su historial de costeos de 10 en 10. #}
+
+<h3 class="section-title mb-1">Consulta Costo Producto</h3>
+<p class="text-muted">
+  Último costo ingresado de cada producto, combinando el histórico de compras con las importaciones costeadas en
+  este sistema. Puedes buscar por código, descripción <strong>o número de lote</strong>: si escribes un lote, se
+  trae el producto de ese lote.
+</p>
+
+<form class="row g-2 mb-3">
+  <div class="col-auto">
+    <select class="form-select" name="empresa">
+      <option value="">Todas las empresas</option>
+      {% for e in empresas_disponibles %}
+      <option value="{{ e }}" {% if empresa_sel|upper == e %}selected{% endif %}>{{ e }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <select class="form-select" name="proveedor">
+      <option value="">Todos los proveedores</option>
+      {% for p in proveedores_disponibles %}
+      <option value="{{ p }}" {% if proveedor_sel == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto" style="min-width: 320px;">
+    <input type="search" class="form-control" name="q" id="buscarProducto" value="{{ q }}"
+           list="sugerenciasProducto" autocomplete="off" placeholder="Producto o lote (texto predictivo)">
+    <datalist id="sugerenciasProducto"></datalist>
+  </div>
+  <div class="col-auto"><button class="btn btn-brand">Buscar</button></div>
+  {% if empresa_sel or proveedor_sel or q %}
+  <div class="col-auto"><a class="btn btn-link" href="{{ url_for('reportes_costo_producto') }}">Quitar filtros</a></div>
+  {% endif %}
+</form>
+
+{% if recortado %}
+<div class="alert alert-light border">
+  <i class="bi bi-info-circle me-1"></i>
+  Se encontraron {{ total_productos }} productos y se muestran los {{ max_productos }} con el costeo más reciente.
+  Filtra por proveedor o escribe parte del código/descripción/lote para acotar la búsqueda.
+</div>
+{% endif %}
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th style="width: 2rem;"></th>
+          <th>Proveedor</th>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th>Última factura</th>
+          <th>Fecha</th>
+          <th class="text-end">Unidades</th>
+          <th class="text-end">Unitario FOB</th>
+          <th class="text-end">Total FOB</th>
+          <th class="text-end">Costo unitario CLP</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for g in grupos %}
+        <tr class="fila-producto" role="button" data-bs-toggle="collapse" data-bs-target="#hist{{ loop.index }}">
+          <td><i class="bi bi-chevron-right"></i></td>
+          <td>{{ g.proveedor }}</td>
+          <td>
+            {{ g.codigo_producto }}
+            {% if g.lotes_coincidentes %}
+            <span class="badge bg-info text-dark" title="Lote(s) que calzan con tu búsqueda: {{ g.lotes_coincidentes|join(', ') }}">
+              lote {{ g.lotes_coincidentes[0] }}{% if g.lotes_coincidentes|length > 1 %} +{{ g.lotes_coincidentes|length - 1 }}{% endif %}
+            </span>
+            {% endif %}
+          </td>
+          <td title="{{ g.descripcion }}">{{ g.descripcion }}</td>
+          <td>{{ g.ultimo.factura or '-' }}</td>
+          <td>{{ g.ultimo.fecha.strftime('%d-%m-%Y') if g.ultimo.fecha else '-' }}</td>
+          <td class="text-end">{{ "%g"|format(g.ultimo.unidades) }}</td>
+          <td class="text-end">{{ g.ultimo.valor_unitario|moneda }} {{ g.ultimo.moneda }}</td>
+          <td class="text-end">{{ g.ultimo.total_invoice|moneda }} {{ g.ultimo.moneda }}</td>
+          <td class="text-end fw-semibold">{{ g.ultimo.costo_unitario_clp|moneda }}</td>
+        </tr>
+        <tr class="collapse" id="hist{{ loop.index }}">
+          <td colspan="10" class="bg-light">
+            <div class="small text-muted mb-2">
+              {{ g.total_costeos }} costeo(s) de este producto, del más reciente al más antiguo.
+            </div>
+            {# El historial se trae al abrir el producto (y de 10 en 10 con
+               "Ver más") en vez de dejarlo escrito en la página: con el
+               histórico completo serían miles de filas cargadas de entrada
+               para productos que nadie abrió. #}
+            <table class="table table-sm mb-0 tabla-historial"
+                   data-codigo="{{ g.codigo_producto }}" data-proveedor="{{ g.proveedor }}" data-cargado="0">
+              <thead>
+                <tr>
+                  <th>Fecha</th><th>Factura</th><th>Origen</th><th>Empresa</th><th>Lote</th>
+                  <th class="text-end">Unidades</th><th class="text-end">Unitario FOB</th>
+                  <th class="text-end">Total FOB</th><th class="text-end">Costo unitario CLP</th>
+                </tr>
+              </thead>
+              <tbody><tr class="fila-cargando"><td colspan="9" class="text-muted">Cargando costeos...</td></tr></tbody>
+            </table>
+            <button type="button" class="btn btn-sm btn-outline-secondary mt-2 btn-ver-mas d-none"
+                    data-offset="{{ por_pagina }}">Ver {{ por_pagina }} más</button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="10" class="text-center text-muted py-4">No hay costos cargados con estos filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  // Texto predictivo de producto/lote (punto 2c): consulta liviana, sin
+  // recalcular ningún costeo.
+  (function () {
+    const input = document.getElementById('buscarProducto');
+    const lista = document.getElementById('sugerenciasProducto');
+    if (!input || !lista) return;
+    let timer = null;
+    input.addEventListener('input', () => {
+      clearTimeout(timer);
+      const texto = input.value.trim();
+      if (texto.length < 2) { lista.innerHTML = ''; return; }
+      timer = setTimeout(async () => {
+        try {
+          const resp = await fetch(`{{ url_for('api_costo_producto_sugerencias') }}?q=${encodeURIComponent(texto)}`);
+          if (!resp.ok) return;
+          const data = await resp.json();
+          lista.innerHTML = (data.sugerencias || [])
+            .map(s => `<option value="${s.texto.replace(/"/g, '&quot;')}">${s.tipo === 'lote' ? 'Lote' : 'Producto'}</option>`)
+            .join('');
+        } catch (e) { /* sin sugerencias, el filtro igual funciona al enviar */ }
+      }, 220);
+    });
+  })();
+
+  // Historial de costeos: se trae al abrir el producto y de a 10 con
+  // "Ver más" (punto 2e del pedido del usuario).
+  const POR_PAGINA = {{ por_pagina }};
+  const EMPRESA_SEL = {{ empresa_sel|tojson }};
+
+  function filaHistorial(e) {
+    const fila = document.createElement('tr');
+    const factura = e.importacion_id
+      ? `<a href="/importaciones/${e.importacion_id}">${e.factura || '(sin número)'}</a>`
+      : (e.factura || '-');
+    const badge = e.origen === 'Sistema' ? 'bg-primary' : 'bg-secondary';
+    fila.innerHTML = `<td>${e.fecha}</td><td>${factura}</td>` +
+      `<td><span class="badge ${badge}">${e.origen}</span></td><td>${e.empresa || ''}</td>` +
+      `<td>${e.lote || '-'}</td><td class="text-end">${e.unidades.toLocaleString('es-CL')}</td>` +
+      `<td class="text-end">${e.valor_unitario.toLocaleString('es-CL')} ${e.moneda}</td>` +
+      `<td class="text-end">${e.total_invoice.toLocaleString('es-CL')} ${e.moneda}</td>` +
+      `<td class="text-end">${e.costo_unitario_clp.toLocaleString('es-CL')}</td>`;
+    return fila;
+  }
+
+  async function cargarTramo(tabla, boton, offset) {
+    const cuerpo = tabla.querySelector('tbody');
+    const params = new URLSearchParams({
+      codigo: tabla.dataset.codigo, proveedor: tabla.dataset.proveedor,
+      empresa: EMPRESA_SEL, offset: offset,
+    });
+    const resp = await fetch(`{{ url_for('api_costo_producto_historial') }}?${params.toString()}`);
+    const data = await resp.json();
+    cuerpo.querySelectorAll('.fila-cargando').forEach(f => f.remove());
+    (data.eventos || []).forEach(e => cuerpo.appendChild(filaHistorial(e)));
+    if (data.hay_mas) {
+      boton.dataset.offset = offset + POR_PAGINA;
+      boton.classList.remove('d-none');
+      boton.disabled = false;
+      boton.textContent = `Ver ${POR_PAGINA} más`;
+    } else {
+      boton.classList.add('d-none');
+    }
+  }
+
+  document.querySelectorAll('tr.collapse').forEach(panel => {
+    panel.addEventListener('show.bs.collapse', async () => {
+      const tabla = panel.querySelector('.tabla-historial');
+      if (!tabla || tabla.dataset.cargado === '1') return;
+      tabla.dataset.cargado = '1';
+      const boton = panel.querySelector('.btn-ver-mas');
+      try {
+        await cargarTramo(tabla, boton, 0);
+      } catch (e) {
+        tabla.dataset.cargado = '0';
+        tabla.querySelector('tbody').innerHTML =
+          '<tr class="fila-cargando"><td colspan="9" class="text-danger">No se pudo cargar el historial, vuelve a abrirlo.</td></tr>';
+      }
+    });
+  });
+
+  document.querySelectorAll('.btn-ver-mas').forEach(boton => {
+    boton.addEventListener('click', async () => {
+      const tabla = boton.closest('td').querySelector('.tabla-historial');
+      const offset = parseInt(boton.dataset.offset, 10) || 0;
+      boton.disabled = true;
+      boton.textContent = 'Cargando...';
+      try {
+        await cargarTramo(tabla, boton, offset);
+      } catch (e) {
+        boton.disabled = false;
+        boton.textContent = 'Reintentar';
+      }
+    });
+  });
+</script>
+
+{% endblock %}

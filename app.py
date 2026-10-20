@@ -605,6 +605,11 @@ def ensure_schema_migrations():
         "compras_historicas": [
             ("factura_generada_id", "INTEGER"),
             ("fue_consignacion", "BOOLEAN DEFAULT 0"),
+            # Ronda BY (2026-10-20, punto 2): lote y vencimiento del archivo
+            # histórico, para poder buscar por lote en la Consulta de Costo
+            # Producto -- ver reparar_lotes_historico_ronda_by().
+            ("codigo_lote", "VARCHAR(120)"),
+            ("fecha_vencimiento", "DATE"),
         ],
         "facturas_proveedor": [
             ("origen", "VARCHAR(20) DEFAULT 'manual'"),
@@ -3256,6 +3261,33 @@ def seed_codigos_ergopyme():
     )
 
 
+def _lote_historico_texto(valor):
+    """Ronda BY (2026-10-20, punto 2): normaliza la celda "COD.DE LOTE" del
+    archivo histórico. Varios lotes son numéricos (ej. 3000002021) y Excel
+    los entrega como float -- sin esto quedarían guardados como
+    "3000002021.0" y no calzarían nunca con el lote real al buscarlos."""
+    if valor is None:
+        return ""
+    if isinstance(valor, float) and valor.is_integer():
+        return str(int(valor))
+    if isinstance(valor, int):
+        return str(valor)
+    return str(valor).strip()
+
+
+def _vencimiento_historico_fecha(valor):
+    """Ronda BY (2026-10-20, punto 2): normaliza la celda "VENCMTO" del
+    archivo histórico. Las filas sin vencimiento real traen el "cero" de
+    Excel (30-12-1899, que openpyxl entrega como 1930-12-30 o similar), no
+    una celda vacía -- cualquier fecha anterior a 1990 se descarta como
+    "sin vencimiento" en vez de guardar una fecha falsa."""
+    if isinstance(valor, datetime):
+        valor = valor.date()
+    if not isinstance(valor, date):
+        return None
+    return valor if valor.year >= 1990 else None
+
+
 def seed_compras_historicas():
     """Ronda AA (2026-09-13): carga UNA VEZ el histórico de compras/
     importaciones a proveedores anterior a este sistema, desde
@@ -3385,6 +3417,10 @@ def seed_compras_historicas():
             codigo_interno=codigo,
             codigo_proveedor=codigo_proveedor,
             descripcion=str(col("DESCRIPCION", row) or "").strip(),
+            # Ronda BY (2026-10-20, punto 2): lote y vencimiento, para poder
+            # buscar por lote en la Consulta de Costo Producto.
+            codigo_lote=_lote_historico_texto(col("COD.DE LOTE", row)),
+            fecha_vencimiento=_vencimiento_historico_fecha(col("VENCMTO", row)),
             tipo_flete=str(col("TIPO FLETE", row) or "").strip(),
             unidades=num("UNIDADES"),
             total_invoice=num("TOTAL IVOICE EU"),
@@ -3413,6 +3449,109 @@ def seed_compras_historicas():
     )
     if codigos_sin_homologar:
         print(f"[seed] Códigos históricos sin homologar: {sorted(codigos_sin_homologar)}")
+
+
+def reparar_lotes_historico_ronda_by():
+    """Ronda BY (2026-10-20, punto 2 del pedido del usuario): completa
+    codigo_lote/fecha_vencimiento en las filas de CompraHistorica que YA
+    estaban cargadas antes de esta ronda (producción tiene 6.135 desde la
+    ronda AA) releyendo el MISMO archivo histórico que las creó, en el
+    mismo orden en que el seed las insertó (id ascendente == orden del
+    archivo, ver seed_compras_historicas: una fila del Excel -> un
+    CompraHistorica, en secuencia).
+
+    Es verificado, no "a ciegas": antes de escribir nada se comprueba que
+    la cantidad de filas calce exactamente y que, fila por fila, el
+    código interno y el número de factura coincidan. Si algo no calza
+    (ej. el usuario cargó un archivo distinto, o se agregaron filas a
+    mano después), NO se toca ninguna fila y se informa por consola --
+    prefiero dejar el lote vacío antes que escribir un lote equivocado,
+    que para consignación/bodega sería peor que no tenerlo.
+
+    Idempotente: si ya no queda ninguna fila sin lote, no hace nada."""
+    if CompraHistorica.query.count() == 0:
+        return
+    faltantes = CompraHistorica.query.filter(
+        db.or_(CompraHistorica.codigo_lote.is_(None), CompraHistorica.codigo_lote == "")
+    ).count()
+    if faltantes == 0:
+        return
+    if not os.path.isfile(HISTORICO_COMPRAS_EXCEL):
+        print("[reparar_ronda_by] No se encontró el archivo histórico, se omite la carga de lotes.")
+        return
+
+    wb = openpyxl.load_workbook(HISTORICO_COMPRAS_EXCEL, data_only=True)
+    ws = wb.worksheets[0]
+    fila_inicio, columnas = None, {}
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), start=1):
+        nombres = [str(v).strip().upper() if v is not None else "" for v in row]
+        if "CODIGO" in nombres and "UNIDADES" in nombres:
+            fila_inicio = i + 1
+            columnas = {n: idx for idx, n in enumerate(nombres) if n}
+            break
+    if fila_inicio is None:
+        print("[reparar_ronda_by] No se encontró el encabezado del archivo histórico, se omite.")
+        return
+
+    def col(nombre, row):
+        idx = columnas.get(nombre)
+        return row[idx] if idx is not None and idx < len(row) else None
+
+    # Mismo filtrado de filas que seed_compras_historicas, para que la
+    # secuencia resultante sea exactamente la que se insertó en su momento.
+    filas_archivo = []
+    for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
+        if not row or all(v is None for v in row):
+            continue
+        codigo_crudo = col("CODIGO", row)
+        if codigo_crudo is None:
+            continue
+        codigo = _normalizar_codigo_ergopyme(codigo_crudo)
+        if not codigo:
+            continue
+        filas_archivo.append((
+            codigo,
+            str(col("FACTURA", row) or "").strip(),
+            _lote_historico_texto(col("COD.DE LOTE", row)),
+            _vencimiento_historico_fecha(col("VENCMTO", row)),
+        ))
+
+    filas_db = CompraHistorica.query.order_by(CompraHistorica.id).all()
+    if len(filas_db) != len(filas_archivo):
+        print(
+            f"[reparar_ronda_by] El histórico en base tiene {len(filas_db)} fila(s) y el archivo "
+            f"{len(filas_archivo)} -- no se puede alinear con seguridad, se omite la carga de lotes."
+        )
+        return
+    descuadres = sum(
+        1 for fila_db, (codigo, factura, _lote, _vto) in zip(filas_db, filas_archivo)
+        if (fila_db.codigo_interno or "") != codigo or (fila_db.factura or "").strip() != factura
+    )
+    if descuadres:
+        print(
+            f"[reparar_ronda_by] {descuadres} fila(s) del histórico no coinciden con el archivo "
+            "(código/factura) -- no se escribe ningún lote para no cargar datos equivocados."
+        )
+        return
+
+    actualizadas = 0
+    con_lote = 0
+    for fila_db, (_codigo, _factura, lote, vencimiento) in zip(filas_db, filas_archivo):
+        cambio = False
+        if lote and not (fila_db.codigo_lote or "").strip():
+            fila_db.codigo_lote = lote[:120]
+            con_lote += 1
+            cambio = True
+        if vencimiento and fila_db.fecha_vencimiento is None:
+            fila_db.fecha_vencimiento = vencimiento
+            cambio = True
+        if cambio:
+            actualizadas += 1
+    db.session.commit()
+    print(
+        f"[reparar_ronda_by] Histórico de compras: {actualizadas} fila(s) completadas con lote/vencimiento "
+        f"({con_lote} con código de lote) -- habilita la búsqueda por lote en la Consulta de Costo Producto."
+    )
 
 
 def seed_facturas_proveedor_pendientes():
@@ -3713,6 +3852,7 @@ with app.app_context():
     _paso_arranque_seguro("seed_codigos_ergopyme", seed_codigos_ergopyme)
     _paso_arranque_seguro("reparar_alias_codigo_proveedor_ronda_ao", reparar_alias_codigo_proveedor_ronda_ao)
     _paso_arranque_seguro("seed_compras_historicas", seed_compras_historicas)
+    _paso_arranque_seguro("reparar_lotes_historico_ronda_by", reparar_lotes_historico_ronda_by)
     _paso_arranque_seguro("seed_facturas_proveedor_pendientes", seed_facturas_proveedor_pendientes)
 
 
@@ -12518,6 +12658,244 @@ def stock_consignacion_exportar():
     )
 
 
+def _filas_consignacion_detalle(proveedor_sel="", q="", origen_sel=""):
+    """Ronda BY (2026-10-20, punto 1 del pedido del usuario): arma el
+    reporte COMPLETO de lo que está HOY en consignación, producto por
+    producto y lote por lote -- no solo lo que se registró desde este
+    programa, sino todo: las cargas directas hechas acá (badge "Programa")
+    y lo que venía de antes (badge "Histórico").
+
+    Fuente única: ConsignacionPendienteLote con cantidad_en_stock > 0
+    (recibido menos consumido) -- la MISMA que usa Stock Valorizado para
+    separar propio de consignación (ver _consignacion_por_codigo_y_empresa),
+    por eso los totales cuadran entre los dos reportes. Lo ya consumido/
+    informado/facturado queda fuera por definición (el usuario fue
+    explícito: "Me refiero a stock actual no productos que ya fueron
+    reportados y facturados que esos los vemos por el otro reporte").
+
+    El ORIGEN de cada lote se deduce del ledger por Importación
+    (ConsignacionRecepcionImportacion, ronda BR): lo que aparece ahí entró
+    por un Costeo hecho en este programa; el resto de lo recibido viene de
+    la carga histórica/del archivo del proveedor. Un mismo lote puede
+    tener de los dos (se muestran ambos badges con su desglose).
+
+    Además cruza cada lote contra el Stock físico de hoy (StockExistencia)
+    para saber en qué empresa está -- igual que
+    _consignacion_por_codigo_y_empresa -- y contra Stock Valorizado para
+    traer el PMP y valorizar."""
+    programa_por_clave = defaultdict(float)
+    for fila in ConsignacionRecepcionImportacion.query.all():
+        clave = (
+            fila.proveedor_id,
+            (fila.codigo_interno or "").strip(),
+            (fila.codigo_lote or "").strip() or "(sin lote)",
+        )
+        programa_por_clave[clave] += fila.cantidad or 0
+
+    stock_por_lote_empresa = defaultdict(lambda: defaultdict(float))
+    for codigo, lote, empresa_id, stock_fisico in StockExistencia.query.with_entities(
+        StockExistencia.codigo_interno, StockExistencia.codigo_lote,
+        StockExistencia.empresa_id, StockExistencia.stock_fisico,
+    ).all():
+        codigo = (codigo or "").strip()
+        if not codigo or not stock_fisico:
+            continue
+        lote_norm = (lote or "").strip() or "(sin lote)"
+        stock_por_lote_empresa[(codigo, lote_norm)][empresa_id] += stock_fisico or 0
+
+    empresas_por_id = {e.id: e for e in Empresa.query.all()}
+    pmp_por_codigo = {
+        sv.codigo_interno: sv.pmp_total
+        for sv in StockValorizado.query.with_entities(
+            StockValorizado.codigo_interno, StockValorizado.pmp_total
+        ).all()
+    }
+    vencimiento_por_clave = {
+        ((s.codigo_interno_ergopyme or "").strip(), (s.lote or "").strip() or "(sin lote)"): s.fecha_vencimiento
+        for s in StockConsignacionVigente.query.all()
+        if s.fecha_vencimiento
+    }
+
+    q_lower = (q or "").strip().lower()
+    filas = []
+    for fila in ConsignacionPendienteLote.query.all():
+        vigente = fila.cantidad_en_stock
+        if vigente <= 0.0001:
+            continue
+        proveedor_nombre = fila.proveedor.nombre if fila.proveedor else "(sin proveedor)"
+        if proveedor_sel and proveedor_nombre.upper() != proveedor_sel.upper():
+            continue
+        codigo = (fila.codigo_interno or "").strip()
+        lote_norm = (fila.codigo_lote or "").strip() or "(sin lote)"
+        if q_lower and not any(
+            q_lower in (texto or "").lower()
+            for texto in (fila.codigo_proveedor, fila.descripcion, lote_norm, codigo)
+        ):
+            continue
+
+        recibido = fila.cantidad_recibida or 0
+        del_programa = min(programa_por_clave.get((fila.proveedor_id, codigo, lote_norm), 0.0), recibido)
+        del_historico = max(recibido - del_programa, 0.0)
+        if origen_sel == "programa" and del_programa <= 0.0001:
+            continue
+        if origen_sel == "historico" and del_historico <= 0.0001:
+            continue
+
+        # En qué empresa está físicamente este lote hoy (sin inventar
+        # repartos: si está entero en una, va entero a esa -- igual que
+        # _consignacion_por_codigo_y_empresa).
+        stock_empresas = stock_por_lote_empresa.get((codigo, lote_norm)) or {}
+        stock_total_lote = sum(v for v in stock_empresas.values() if v > 0)
+        por_empresa = {}
+        if stock_total_lote > 0:
+            for empresa_id, stock_empresa in stock_empresas.items():
+                if stock_empresa <= 0:
+                    continue
+                nombre_empresa = empresas_por_id[empresa_id].nombre if empresa_id in empresas_por_id else "(sin empresa)"
+                por_empresa[nombre_empresa] = round(vigente * (stock_empresa / stock_total_lote), 4)
+
+        pmp = pmp_por_codigo.get(codigo)
+        filas.append({
+            "proveedor": proveedor_nombre,
+            "codigo_proveedor": (fila.codigo_proveedor or "").strip() or codigo or "(sin código)",
+            "codigo_interno": codigo,
+            "descripcion": fila.descripcion or "",
+            "lote": lote_norm,
+            "sin_lote": lote_norm == "(sin lote)",
+            "fecha_vencimiento": vencimiento_por_clave.get((codigo, lote_norm)),
+            "recibido": round(recibido, 4),
+            "consumido": round(fila.cantidad_consumida or 0, 4),
+            "vigente": round(vigente, 4),
+            "del_programa": round(del_programa, 4),
+            "del_historico": round(del_historico, 4),
+            "empresas": por_empresa,
+            "en_stock_fisico": stock_total_lote > 0,
+            "pmp": pmp,
+            "valor": round(vigente * pmp, 2) if pmp else None,
+        })
+
+    filas.sort(key=lambda f: (f["proveedor"], f["codigo_proveedor"], f["lote"]))
+    return filas
+
+
+def _totales_consignacion_detalle(filas):
+    """Ronda BY (2026-10-20, punto 1: "este reporte debe cuadrar con el
+    total de stock en consignacion y consecuentemente con el stock
+    valorizado, porfa valida"): además de los totales del reporte, deja
+    explícita la cuadratura contra lo que Stock Valorizado descuenta hoy
+    como consignación (_consignacion_por_codigo_y_empresa).
+
+    La diferencia entre ambos, cuando existe, NO es un error: son lotes
+    todavía vigentes en consignación que hoy no aparecen en el Stock
+    físico de ninguna empresa (ej. ya se usaron y todavía no se le
+    reportó el consumo al proveedor -- caso transitorio normal ya
+    documentado en _consignacion_por_codigo_y_empresa). Se muestran
+    aparte, contados y sumados, para que la validación sea verificable en
+    pantalla en vez de un acto de fe."""
+    vigente_total = sum(f["vigente"] for f in filas)
+    sin_stock_fisico = [f for f in filas if not f["en_stock_fisico"]]
+    por_empresa = defaultdict(float)
+    for f in filas:
+        for nombre_empresa, cantidad in f["empresas"].items():
+            por_empresa[nombre_empresa] += cantidad
+
+    # Lo que Stock Valorizado está descontando hoy como consignación, con
+    # su propio cálculo independiente -- si cuadra, cuadran los dos.
+    asignado_stock_valorizado = sum(_consignacion_por_codigo_y_empresa().values())
+
+    return {
+        "lotes": len(filas),
+        "productos": len({(f["proveedor"], f["codigo_proveedor"]) for f in filas}),
+        "unidades": round(vigente_total, 4),
+        "valor": round(sum(f["valor"] or 0 for f in filas), 2),
+        "unidades_por_empresa": {k: round(v, 4) for k, v in sorted(por_empresa.items())},
+        "unidades_en_stock_fisico": round(sum(f["vigente"] for f in filas if f["en_stock_fisico"]), 4),
+        "lotes_sin_stock_fisico": len(sin_stock_fisico),
+        "unidades_sin_stock_fisico": round(sum(f["vigente"] for f in sin_stock_fisico), 4),
+        "asignado_stock_valorizado": round(asignado_stock_valorizado, 4),
+    }
+
+
+@app.route("/reportes/consignacion-detalle")
+@requiere_permiso("reportes")
+def reportes_consignacion_detalle():
+    """Ronda BY (2026-10-20, punto 1 del pedido del usuario): reporte de
+    TODO lo que está hoy en consignación por producto + lote, con badge de
+    origen (Programa / Histórico) y la cuadratura contra Stock Valorizado
+    a la vista. Ver _filas_consignacion_detalle/_totales_consignacion_detalle."""
+    proveedor_sel = request.args.get("proveedor", "").strip()
+    q = request.args.get("q", "").strip()
+    origen_sel = request.args.get("origen", "").strip()
+    filas = _filas_consignacion_detalle(proveedor_sel, q, origen_sel)
+    # Los proveedores ofrecidos salen de lo que de verdad tiene
+    # consignación vigente hoy (sin filtros), no del catálogo completo.
+    proveedores_disponibles = sorted({f["proveedor"] for f in _filas_consignacion_detalle()})
+    return render_template(
+        "reportes/consignacion_detalle.html",
+        filas=filas, totales=_totales_consignacion_detalle(filas),
+        proveedores_disponibles=proveedores_disponibles,
+        proveedor_sel=proveedor_sel, q=q, origen_sel=origen_sel,
+    )
+
+
+@app.route("/reportes/consignacion-detalle/descargar")
+@requiere_permiso("reportes")
+def reportes_consignacion_detalle_descargar():
+    """Ronda BY (2026-10-20, punto 1: "Debe tener un boton de descarga para
+    descargar el total de productos en consignacion"): baja el MISMO corte
+    que se está viendo en pantalla (respeta los filtros aplicados)."""
+    proveedor_sel = request.args.get("proveedor", "").strip()
+    q = request.args.get("q", "").strip()
+    origen_sel = request.args.get("origen", "").strip()
+    filas = _filas_consignacion_detalle(proveedor_sel, q, origen_sel)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Consignación por lote"
+    encabezados = [
+        "Proveedor", "Código", "Descripción", "Lote", "Vencimiento", "Origen",
+        "Recibido", "Consumido", "En consignación hoy", "Del programa", "Histórico",
+        "Empresa", "PMP", "Valor",
+    ]
+    for col, titulo in enumerate(encabezados, start=1):
+        ws.cell(row=1, column=col, value=titulo).font = Font(bold=True)
+    for n, f in enumerate(filas, start=2):
+        if f["del_programa"] > 0 and f["del_historico"] > 0:
+            origen = "Programa + Histórico"
+        elif f["del_programa"] > 0:
+            origen = "Programa"
+        else:
+            origen = "Histórico"
+        ws.cell(row=n, column=1, value=f["proveedor"])
+        ws.cell(row=n, column=2, value=f["codigo_proveedor"])
+        ws.cell(row=n, column=3, value=f["descripcion"])
+        ws.cell(row=n, column=4, value=f["lote"])
+        ws.cell(row=n, column=5, value=f["fecha_vencimiento"].strftime("%d-%m-%Y") if f["fecha_vencimiento"] else "")
+        ws.cell(row=n, column=6, value=origen)
+        ws.cell(row=n, column=7, value=f["recibido"])
+        ws.cell(row=n, column=8, value=f["consumido"])
+        ws.cell(row=n, column=9, value=f["vigente"])
+        ws.cell(row=n, column=10, value=f["del_programa"])
+        ws.cell(row=n, column=11, value=f["del_historico"])
+        ws.cell(row=n, column=12, value=", ".join(f"{k}: {v:g}" for k, v in f["empresas"].items()))
+        ws.cell(row=n, column=13, value=f["pmp"])
+        ws.cell(row=n, column=14, value=f["valor"])
+    ws.auto_filter.ref = f"A1:N{max(len(filas) + 1, 1)}"
+    anchos = [20, 18, 44, 22, 13, 20, 11, 11, 18, 13, 12, 26, 12, 14]
+    for col, ancho in enumerate(anchos, start=1):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    sufijo = f"_{proveedor_sel}" if proveedor_sel else ""
+    nombre_archivo = f"Consignacion_por_lote{sufijo}_{date.today().isoformat()}.xlsx".replace(" ", "_")
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre_archivo,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 @app.route("/stock/pedidos/cargar", methods=["POST"])
 @requiere_permiso("inventarios")
 def stock_pedidos_cargar():
@@ -13179,6 +13557,24 @@ def _fila_historica_dict(c, homologar):
         "unidades": c.unidades or 0,
         "total_invoice": c.total_invoice or 0,
         "total_usd": c.total_usd or 0,
+        # Ronda BY (2026-10-20, puntos 2 y 3): campos extra para la Consulta
+        # de Costo Producto y el Reporte Operacional. Son AGREGADOS -- nada
+        # de lo que ya existía cambió, así que el reporte de Compras
+        # Proveedor sigue dando exactamente los mismos números.
+        "codigo_lote": (c.codigo_lote or "").strip(),
+        "fecha_vencimiento": c.fecha_vencimiento,
+        "costo_total_clp": c.costo_total_clp or 0,
+        "costo_unitario_clp": c.costo_unitario_clp or 0,
+        "valor_unitario_moneda": ((c.total_invoice or 0) / c.unidades) if c.unidades else 0,
+        "mes_anio": (c.mes_anio or "").strip(),
+        "transporte": (c.transporte or "").strip().upper() or "(sin operador)",
+        # En el histórico el flete SIEMPRE viene en una sola columna (sea
+        # del proveedor dentro del CIF o pagado aparte a un operador), así
+        # que el flete "homologado" del Reporte Operacional es ese mismo.
+        "flete_homologado_usd": c.flete_usd or 0,
+        "otros_gastos_clp": c.otros_gastos_clp or 0,
+        "derechos_clp": c.derechos_clp or 0,
+        "importacion_id": None,
         "moneda_operacion": _moneda_operacion(paridad_efectiva),
         "tipo_cambio": c.tipo_cambio,
         "paridad": paridad_efectiva,
@@ -13204,6 +13600,51 @@ def _fila_historica_dict(c, homologar):
         # CompraHistorica.fue_consignacion.
         "fue_consignacion": bool(c.fue_consignacion),
     }
+
+
+def _tipo_flete_normalizado(valor):
+    """Ronda BY (2026-10-20, punto 3): deja la vía de embarque del Parcial
+    ("Marítimo"/"Aéreo"/"Terrestre") en el mismo vocabulario que usa la
+    columna "TIPO FLETE" del histórico (MARITIMO/AEREO/TERRESTRE), para
+    poder agrupar las dos fuentes juntas en el Reporte Operacional."""
+    texto = (valor or "").strip().upper()
+    if not texto:
+        return ""
+    reemplazos = (("Á", "A"), ("É", "E"), ("Í", "I"), ("Ó", "O"), ("Ú", "U"))
+    for con_tilde, sin_tilde in reemplazos:
+        texto = texto.replace(con_tilde, sin_tilde)
+    return texto
+
+
+def _operador_transporte_importacion(importacion):
+    """Ronda BY (2026-10-20, punto 3 del pedido del usuario: "si es CIF diga
+    Proveedor, sino indique el Operador logistico"): quién puso el
+    transporte de esta Importación, con el mismo vocabulario que la columna
+    "Transporte" del histórico (donde "PROVEEDOR" significa justamente
+    "venía en la factura del proveedor").
+
+    Si el flete entró como ítem de la factura del proveedor
+    (CargoAdicionalImportacion "Flete", parte del CIF) fue el proveedor;
+    si se pagó aparte como Gasto "Flete Int.", fue el operador logístico
+    del despacho (o el courier/embarcador, si no hay operador cargado)."""
+    tiene_flete_en_factura = any(
+        c.concepto == costing.CONCEPTO_ITEM_FLETE and (c.monto_usd or 0) > 0
+        for c in importacion.cargos_adicionales
+    )
+    tiene_flete_gasto = any(
+        g.concepto == costing.CONCEPTO_FLETE_GASTO and (g.monto_clp or 0) > 0
+        for g in importacion.gastos
+    )
+    if tiene_flete_en_factura and not tiene_flete_gasto:
+        return "PROVEEDOR"
+    despacho = importacion.despacho
+    if despacho:
+        operador = (despacho.operador_logistico or "").strip() or (despacho.courier or "").strip()
+        if operador:
+            return operador.upper()
+    if tiene_flete_en_factura:
+        return "PROVEEDOR"
+    return "(sin operador)"
 
 
 def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
@@ -13240,11 +13681,23 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
         tc_moneda_usd = importacion.tipo_cambio_moneda_usd or 1
         moneda_factura = (importacion.moneda_factura or "USD").strip().upper()
         moneda_operacion = "EUR" if moneda_factura.startswith("EUR") else moneda_factura
+        # Ronda BY (2026-10-20, punto 3): quién transportó esta importación.
+        # Regla del usuario: "si es CIF diga Proveedor, sino indique el
+        # Operador logistico". Si el flete vino DENTRO de la factura del
+        # proveedor (ítem Flete del costeo, parte del CIF) fue el proveedor
+        # quien lo puso; si se pagó aparte (Gasto "Flete Int."), fue el
+        # operador logístico del despacho.
+        transporte_importacion = _operador_transporte_importacion(importacion)
         for info in costeo["lineas"]:
             linea = info["linea"]
             codigo_interno = _codigo_interno_homologado(linea) or ""
             derechos_usd = (info["derechos_clp"] / tc_aduanero) if tc_aduanero else 0.0
             otros_usd = (info["otros_gastos_clp"] / tc_aduanero) if tc_aduanero else 0.0
+            # Ronda BY (2026-10-20, punto 3): el flete internacional que en
+            # este programa se carga como GASTO (en CLP) se homologa con el
+            # flete del CIF -- el usuario pidió explícitamente poder
+            # compararlos como un solo número, "no como un flete distinto".
+            flete_gasto_usd = (info.get("flete_gasto_clp", 0) / tc_aduanero) if tc_aduanero else 0.0
             filas.append({
                 "origen": "Sistema",
                 "fecha_factura": importacion.fecha_factura,
@@ -13259,6 +13712,22 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
                 "unidades": linea.cantidad_unidades or 0,
                 "total_invoice": linea.valor_total_moneda,
                 "total_usd": info["valor_usd"],
+                # Ronda BY (2026-10-20, puntos 2 y 3): mismos campos extra que
+                # agrega _fila_historica_dict, para que la Consulta de Costo
+                # Producto y el Reporte Operacional vean las dos fuentes igual.
+                "codigo_lote": (linea.codigo_lote or "").strip(),
+                "fecha_vencimiento": linea.fecha_vencimiento,
+                "costo_total_clp": info.get("costo_total_clp", 0) or 0,
+                "costo_unitario_clp": info.get("costo_unitario_clp", 0) or 0,
+                "valor_unitario_moneda": (
+                    (linea.valor_total_moneda / linea.cantidad_unidades) if linea.cantidad_unidades else 0
+                ),
+                "mes_anio": importacion.fecha_factura.strftime("%m-%Y") if importacion.fecha_factura else "",
+                "transporte": transporte_importacion,
+                "flete_homologado_usd": (info.get("flete_usd", 0) or 0) + flete_gasto_usd,
+                "otros_gastos_clp": info.get("otros_gastos_clp", 0) or 0,
+                "derechos_clp": info.get("derechos_clp", 0) or 0,
+                "importacion_id": importacion.id,
                 "moneda_operacion": moneda_operacion,
                 "tipo_cambio": tc_aduanero,
                 "paridad": tc_moneda_usd,
@@ -13269,7 +13738,11 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
                 "otros_gastos_moneda": otros_usd * tc_moneda_usd,
                 "empresa_compradora": empresa_nombre,
                 "categoria": "",
-                "tipo_flete": "",
+                # Ronda BY (2026-10-20, punto 3): aéreo/marítimo sale de la
+                # vía de embarque del Parcial (DIN) de esta línea -- el
+                # equivalente exacto de la columna "TIPO FLETE" del
+                # histórico, que hasta ahora quedaba vacía para el sistema.
+                "tipo_flete": _tipo_flete_normalizado(info["parcial"].via_embarque),
                 "homologado": True,
                 "via_ergopyme": False,
                 # Ronda AH (2026-09-16): las compras hechas DESDE la
@@ -13920,6 +14393,451 @@ def _redirigir_a_detalle_proveedor(proveedor_nombre):
         "reportes_compras_proveedor_detalle", proveedor=proveedor_nombre,
         fecha_desde=request.form.get("fecha_desde", ""), fecha_hasta=request.form.get("fecha_hasta", ""),
     ))
+
+
+# ---------------------------------------------------------------------------
+# Ronda BY (2026-10-20): Consulta Costo Producto (punto 2 del pedido del
+# usuario) y Reporte Operacional (punto 3). Las dos se arman con las MISMAS
+# dos fuentes que ya usa Compras Proveedor -- el histórico congelado
+# (CompraHistorica, archivo del usuario) y las importaciones costeadas en
+# este programa (vía costing.py) -- sin recargar ni recapturar nada.
+# ---------------------------------------------------------------------------
+
+def _filas_compras_unificadas(empresa="", proveedor="", fecha_desde=None, fecha_hasta=None):
+    """Histórico + importaciones del sistema, ya homologadas y con los
+    campos extra de la ronda BY (lote, costo unitario, transporte, tipo de
+    flete, flete homologado). A diferencia de _filas_reporte_compras, NO
+    incluye notas de crédito, ajustes ni facturas de consignación: estos
+    dos reportes miran el COSTO y el TRANSPORTE de lo que efectivamente
+    entró, no el saldo comercial con el proveedor."""
+    homologar = _construir_homologador_ergopyme()
+    query = CompraHistorica.query
+    if fecha_desde:
+        query = query.filter(CompraHistorica.fecha_factura >= fecha_desde)
+    if fecha_hasta:
+        query = query.filter(CompraHistorica.fecha_factura <= fecha_hasta)
+    filas = [_fila_historica_dict(c, homologar) for c in query.all()]
+    if proveedor:
+        filas = [f for f in filas if (f["proveedor"] or "").upper() == proveedor.upper()]
+    filas += _compras_sistema(
+        proveedor=proveedor or None, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta
+    )
+    if empresa:
+        filas = [f for f in filas if (f.get("empresa_compradora") or "").upper() == empresa.upper()]
+    return filas
+
+
+def _empresas_compradoras_disponibles():
+    """Nombres de empresa compradora que de verdad aparecen en los datos --
+    el histórico los trae como texto (ACCUVISION/ACCUMEDICAL) y el sistema
+    los trae del catálogo de Empresa, así que se unen los dos."""
+    nombres = {
+        (e.nombre or "").strip().upper()
+        for e in Empresa.query.all() if (e.nombre or "").strip()
+    }
+    nombres |= {
+        (fila[0] or "").strip().upper()
+        for fila in CompraHistorica.query.with_entities(CompraHistorica.empresa_compradora).distinct().all()
+        if (fila[0] or "").strip()
+    }
+    return sorted(nombres)
+
+
+def _proveedores_con_compras():
+    """Proveedores que aparecen en el histórico o en el catálogo activo --
+    es la lista que se ofrece como filtro en los dos reportes nuevos."""
+    nombres = {
+        _proveedor_canonico_historico(fila[0])
+        for fila in CompraHistorica.query.with_entities(CompraHistorica.proveedor_original).distinct().all()
+        if (fila[0] or "").strip()
+    }
+    nombres |= {p.nombre for p in Proveedor.query.filter_by(activo=True).all() if p.nombre}
+    return sorted(n for n in nombres if n)
+
+
+def _agrupar_costo_producto(filas, q=""):
+    """Ronda BY (2026-10-20, punto 2 del pedido del usuario): agrupa las
+    líneas de compra por PRODUCTO (proveedor + código de producto) y deja
+    cada grupo con todos sus costeos ordenados del más reciente al más
+    antiguo, que es lo que la pantalla muestra de a 10.
+
+    El filtro de texto (`q`) busca indistintamente por código, descripción
+    o LOTE -- el usuario pidió explícitamente poder "buscar uno o u otro y
+    traiga el producto del lote": si el texto calza con un lote, el
+    producto de ese lote entra completo (con todo su historial), no solo
+    la línea de ese lote."""
+    q_lower = (q or "").strip().lower()
+    grupos = {}
+    for f in filas:
+        unidades = f.get("unidades") or 0
+        if unidades <= 0:
+            continue  # sin unidades no hay costo unitario que mostrar
+        codigo = (f.get("codigo_producto") or "").strip()
+        proveedor = (f.get("proveedor") or "").strip()
+        clave = (proveedor.upper(), codigo.upper())
+        grupo = grupos.get(clave)
+        if grupo is None:
+            grupo = grupos[clave] = {
+                "proveedor": proveedor,
+                "codigo_producto": codigo or "(sin código)",
+                "descripcion": f.get("descripcion") or "",
+                "codigo_interno": f.get("codigo_interno") or "",
+                "eventos": [],
+                "coincide_texto": not q_lower,
+                "lotes_coincidentes": set(),
+            }
+        lote = (f.get("codigo_lote") or "").strip()
+        if q_lower:
+            if q_lower in codigo.lower() or q_lower in (f.get("descripcion") or "").lower():
+                grupo["coincide_texto"] = True
+            if lote and q_lower in lote.lower():
+                grupo["coincide_texto"] = True
+                grupo["lotes_coincidentes"].add(lote)
+        total_invoice = f.get("total_invoice") or 0
+        grupo["eventos"].append({
+            "fecha": f.get("fecha_factura"),
+            "factura": f.get("factura") or "",
+            "origen": f.get("origen") or "",
+            "empresa": f.get("empresa_compradora") or "",
+            "lote": lote,
+            "unidades": unidades,
+            "moneda": f.get("moneda_operacion") or "USD",
+            "valor_unitario": f.get("valor_unitario_moneda") or (total_invoice / unidades if unidades else 0),
+            "total_invoice": total_invoice,
+            "total_usd": f.get("total_usd") or 0,
+            "costo_unitario_clp": f.get("costo_unitario_clp") or 0,
+            "costo_total_clp": f.get("costo_total_clp") or 0,
+            "importacion_id": f.get("importacion_id"),
+        })
+
+    resultado = []
+    for grupo in grupos.values():
+        if not grupo["coincide_texto"]:
+            continue
+        grupo["eventos"].sort(key=lambda e: (e["fecha"] or date.min, e["factura"]), reverse=True)
+        grupo["ultimo"] = grupo["eventos"][0]
+        grupo["total_costeos"] = len(grupo["eventos"])
+        grupo["lotes_coincidentes"] = sorted(grupo["lotes_coincidentes"])
+        resultado.append(grupo)
+    resultado.sort(key=lambda g: (g["ultimo"]["fecha"] or date.min), reverse=True)
+    return resultado
+
+
+# Cuántos costeos se muestran de entrada al abrir un producto, y cuántos
+# agrega cada clic en "Ver más" (punto 2e del pedido del usuario).
+COSTEOS_POR_PAGINA = 10
+# Tope de productos que se listan de una vez -- con filtros amplios el
+# histórico tiene miles de códigos y renderizarlos todos haría la pantalla
+# pesada e inusable. Se avisa en pantalla cuando se recorta.
+MAX_PRODUCTOS_COSTO = 150
+
+
+@app.route("/reportes/costo-producto")
+@requiere_permiso("reportes")
+def reportes_costo_producto():
+    """Ronda BY (2026-10-20, punto 2 del pedido del usuario): consulta del
+    costo de un producto, con el último costo ingresado a la vista y todo
+    su historial de costeos al abrirlo (de 10 en 10, del más reciente al
+    más antiguo). Combina el histórico de compras con las importaciones
+    costeadas acá."""
+    empresa = request.args.get("empresa", "").strip()
+    proveedor = request.args.get("proveedor", "").strip()
+    q = request.args.get("q", "").strip()
+
+    filas = _filas_compras_unificadas(empresa=empresa, proveedor=proveedor)
+    grupos = _agrupar_costo_producto(filas, q=q)
+    total_productos = len(grupos)
+    recortado = total_productos > MAX_PRODUCTOS_COSTO
+    # El historial de cada producto NO se manda en la página: se pide al
+    # abrirlo (api_costo_producto_historial), porque con el histórico
+    # completo serían miles de filas cargadas para productos que nadie
+    # llegaría a abrir.
+    grupos = grupos[:MAX_PRODUCTOS_COSTO]
+
+    return render_template(
+        "reportes/costo_producto.html",
+        grupos=grupos, total_productos=total_productos, recortado=recortado,
+        max_productos=MAX_PRODUCTOS_COSTO, por_pagina=COSTEOS_POR_PAGINA,
+        empresas_disponibles=_empresas_compradoras_disponibles(),
+        proveedores_disponibles=_proveedores_con_compras(),
+        empresa_sel=empresa, proveedor_sel=proveedor, q=q,
+    )
+
+
+@app.route("/api/reportes/costo-producto/historial")
+@requiere_permiso("reportes")
+def api_costo_producto_historial():
+    """Ronda BY (2026-10-20, punto 2e): los siguientes 10 costeos de un
+    producto para el botón "Ver más"."""
+    empresa = request.args.get("empresa", "").strip()
+    proveedor = request.args.get("proveedor", "").strip()
+    codigo = request.args.get("codigo", "").strip()
+    try:
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except (TypeError, ValueError):
+        offset = 0
+
+    filas = _filas_compras_unificadas(empresa=empresa, proveedor=proveedor)
+    grupos = _agrupar_costo_producto(filas)
+    grupo = next(
+        (
+            g for g in grupos
+            if g["codigo_producto"].upper() == codigo.upper()
+            and (not proveedor or g["proveedor"].upper() == proveedor.upper())
+        ),
+        None,
+    )
+    if grupo is None:
+        return jsonify(eventos=[], hay_mas=False)
+
+    tramo = grupo["eventos"][offset:offset + COSTEOS_POR_PAGINA]
+    return jsonify(
+        eventos=[{
+            "fecha": e["fecha"].strftime("%d-%m-%Y") if e["fecha"] else "-",
+            "factura": e["factura"],
+            "origen": e["origen"],
+            "empresa": e["empresa"],
+            "lote": e["lote"],
+            "unidades": e["unidades"],
+            "moneda": e["moneda"],
+            "valor_unitario": round(e["valor_unitario"], 4),
+            "total_invoice": round(e["total_invoice"], 2),
+            "costo_unitario_clp": round(e["costo_unitario_clp"], 2),
+            "importacion_id": e["importacion_id"],
+        } for e in tramo],
+        hay_mas=(offset + COSTEOS_POR_PAGINA) < grupo["total_costeos"],
+    )
+
+
+@app.route("/api/reportes/costo-producto/sugerencias")
+@requiere_permiso("reportes")
+def api_costo_producto_sugerencias():
+    """Ronda BY (2026-10-20, punto 2c, "texto predictivo"): sugerencias de
+    producto Y de lote mientras se escribe. Consulta directo las tablas
+    (sin recalcular ningún costeo) para que responda al instante."""
+    q = request.args.get("q", "").strip()
+    if len(q) < 2:
+        return jsonify(sugerencias=[])
+    like = f"%{q}%"
+    sugerencias = []
+    vistos = set()
+
+    def agregar(texto, tipo):
+        clave = (texto or "").strip()
+        if not clave or clave.lower() in vistos:
+            return
+        vistos.add(clave.lower())
+        sugerencias.append({"texto": clave, "tipo": tipo})
+
+    for codigo, descripcion in CompraHistorica.query.with_entities(
+        CompraHistorica.codigo_proveedor, CompraHistorica.descripcion
+    ).filter(db.or_(
+        CompraHistorica.codigo_proveedor.ilike(like), CompraHistorica.descripcion.ilike(like)
+    )).distinct().limit(40).all():
+        agregar(codigo, "producto")
+        agregar(descripcion, "producto")
+    for (lote,) in CompraHistorica.query.with_entities(CompraHistorica.codigo_lote).filter(
+        CompraHistorica.codigo_lote.ilike(like)
+    ).distinct().limit(20).all():
+        agregar(lote, "lote")
+    for codigo, descripcion in Producto.query.with_entities(
+        Producto.codigo, Producto.descripcion
+    ).filter(db.or_(Producto.codigo.ilike(like), Producto.descripcion.ilike(like))).limit(20).all():
+        agregar(codigo, "producto")
+    for (lote,) in ParcialLinea.query.with_entities(ParcialLinea.codigo_lote).filter(
+        ParcialLinea.codigo_lote.ilike(like)
+    ).distinct().limit(20).all():
+        agregar(lote, "lote")
+
+    return jsonify(sugerencias=sugerencias[:25])
+
+
+def _mes_anio_ordenable(mes_anio):
+    """"07-2026" -> "2026-07", para poder ordenar los meses cronológicamente
+    (el formato del histórico es MM-AAAA, que ordenado como texto mezcla
+    los años)."""
+    texto = (mes_anio or "").strip()
+    if len(texto) == 7 and texto[2] == "-":
+        return f"{texto[3:]}-{texto[:2]}"
+    return texto
+
+
+def _metricas_operacional(filas, factor_moneda=1.0):
+    """Ronda BY (2026-10-20, punto 3): las 5 medidas de las tablas
+    dinámicas del usuario para un grupo de líneas -- Total Invoice, Flete,
+    Otros gastos, % Flete y % Otros gastos.
+
+    El flete es el HOMOLOGADO (ver _compras_sistema): para las operaciones
+    hechas en este programa suma el flete que viene dentro de la factura
+    del proveedor (CIF) y el flete internacional cargado como gasto, "no
+    como un flete distinto", tal como pidió el usuario para poder
+    compararlos contra el histórico."""
+    total_invoice = sum(f.get("total_usd") or 0 for f in filas)
+    flete = sum(f.get("flete_homologado_usd") or 0 for f in filas)
+    otros = sum(f.get("otros_gastos_usd") or 0 for f in filas)
+    return {
+        "total_invoice": round(total_invoice * factor_moneda, 2),
+        "flete": round(flete * factor_moneda, 2),
+        "otros_gastos": round(otros * factor_moneda, 2),
+        "pct_flete": (flete / total_invoice) if total_invoice else 0.0,
+        "pct_otros": (otros / total_invoice) if total_invoice else 0.0,
+        "lineas": len(filas),
+    }
+
+
+def _tabla_operacional_por_clave(filas, clave, factor_moneda=1.0, vacio="(sin dato)"):
+    """Agrupa por una clave (operador, tipo de flete, producto...) y
+    devuelve las métricas de cada grupo más la fila de total general --
+    el equivalente de una de las tablas dinámicas del archivo del
+    usuario."""
+    grupos = defaultdict(list)
+    for f in filas:
+        grupos[(f.get(clave) or "").strip() or vacio].append(f)
+    filas_tabla = []
+    for nombre, filas_grupo in grupos.items():
+        metricas = _metricas_operacional(filas_grupo, factor_moneda)
+        metricas["nombre"] = nombre
+        filas_tabla.append(metricas)
+    filas_tabla.sort(key=lambda r: -r["total_invoice"])
+    return filas_tabla
+
+
+@app.route("/reportes/operacional")
+@requiere_permiso("reportes")
+def reportes_operacional():
+    """Ronda BY (2026-10-20, punto 3 del pedido del usuario): "Reporte
+    Operacional" -- costo de transporte de las importaciones, replicando
+    las tablas dinámicas que el usuario mantiene a mano en
+    'Detalle Costos Importaciones' (hoja Compras Prov Ext, columnas BA-BU):
+
+    a) Fletes y gastos en USD y % por operador.
+    b) Flete % mensual por operador.
+    c) Flete y gastos por tipo de transporte (aéreo/marítimo), abierto por
+       operador dentro de cada uno.
+    d) Derechos pagados, por mes, desplegable a factura + fecha, en la
+       moneda de cada invoice.
+    e) Productos transportados por vía aérea vs marítima, para comparar un
+       medio contra el otro, filtrable por proveedor.
+
+    Todo sale de las mismas dos fuentes de siempre (histórico +
+    importaciones costeadas acá, ver _filas_compras_unificadas), así que
+    cada Costeo nuevo entra solo a este reporte."""
+    empresa = request.args.get("empresa", "").strip()
+    proveedor = request.args.get("proveedor", "").strip()
+    transporte_sel = request.args.get("transporte", "").strip()
+    moneda = request.args.get("moneda", "USD").strip().upper()
+    if moneda not in ("USD", "EUR"):
+        moneda = "USD"
+    fecha_desde_txt, fecha_hasta_txt = _rango_fechas_reporte_compras()
+    fecha_desde = parse_date(fecha_desde_txt)
+    fecha_hasta = parse_date(fecha_hasta_txt)
+
+    filas = _filas_compras_unificadas(
+        empresa=empresa, proveedor=proveedor, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta
+    )
+    operadores_disponibles = sorted({(f.get("transporte") or "").strip() for f in filas if f.get("transporte")})
+    if transporte_sel:
+        filas = [f for f in filas if (f.get("transporte") or "").strip().upper() == transporte_sel.upper()]
+
+    # Los montos nativos de las dos fuentes están en USD. Para verlos en
+    # euros se usa la paridad representativa del propio corte (promedio
+    # ponderado de las facturas que SÍ fueron en EUR) -- el usuario
+    # aclaró que lo normal es convertir euros a dólares y no al revés,
+    # por eso USD es el default y EUR es solo una vista alternativa.
+    paridad_eur = _paridad_representativa_eur(filas)
+    factor_moneda = paridad_eur if moneda == "EUR" else 1.0
+
+    # (a) y (b): por operador, y el % de flete mes a mes.
+    por_operador = _tabla_operacional_por_clave(filas, "transporte", factor_moneda, vacio="(sin operador)")
+    meses = sorted({_mes_anio_ordenable(f.get("mes_anio")) for f in filas if f.get("mes_anio")})
+    pct_mensual = []
+    for operador in [r["nombre"] for r in por_operador]:
+        filas_op = [f for f in filas if ((f.get("transporte") or "").strip() or "(sin operador)") == operador]
+        celdas = []
+        for mes in meses:
+            filas_mes = [f for f in filas_op if _mes_anio_ordenable(f.get("mes_anio")) == mes]
+            total_mes = sum(f.get("total_usd") or 0 for f in filas_mes)
+            flete_mes = sum(f.get("flete_homologado_usd") or 0 for f in filas_mes)
+            celdas.append((flete_mes / total_mes) if total_mes else None)
+        pct_mensual.append({"operador": operador, "celdas": celdas})
+
+    # (c): por tipo de transporte, abierto por operador adentro.
+    por_tipo_flete = []
+    tipos = sorted({(f.get("tipo_flete") or "").strip().upper() for f in filas if (f.get("tipo_flete") or "").strip()})
+    for tipo in tipos:
+        filas_tipo = [f for f in filas if (f.get("tipo_flete") or "").strip().upper() == tipo]
+        por_tipo_flete.append({
+            "tipo": tipo,
+            "totales": _metricas_operacional(filas_tipo, factor_moneda),
+            "operadores": _tabla_operacional_por_clave(filas_tipo, "transporte", factor_moneda, vacio="(sin operador)"),
+        })
+
+    # (d): derechos por mes, desplegable a factura. Se muestran en la
+    # moneda de cada invoice (lo que pidió el usuario); el total del mes
+    # se expresa además en la moneda del reporte para poder sumarlo.
+    derechos_por_mes = []
+    meses_derechos = defaultdict(list)
+    for f in filas:
+        meses_derechos[_mes_anio_ordenable(f.get("mes_anio")) or "(sin fecha)"].append(f)
+    for mes in sorted(meses_derechos.keys(), reverse=True):
+        filas_mes = meses_derechos[mes]
+        facturas = defaultdict(list)
+        for f in filas_mes:
+            facturas[((f.get("factura") or "(sin factura)"), f.get("fecha_factura"))].append(f)
+        detalle = []
+        for (factura, fecha), filas_factura in facturas.items():
+            derechos_moneda = sum(f.get("derechos_moneda") or 0 for f in filas_factura)
+            if abs(derechos_moneda) < 0.005:
+                continue
+            detalle.append({
+                "factura": factura,
+                "fecha": fecha,
+                "moneda": (filas_factura[0].get("moneda_operacion") or "USD"),
+                "total_invoice": round(sum(f.get("total_invoice") or 0 for f in filas_factura), 2),
+                "derechos": round(derechos_moneda, 2),
+                "importacion_id": filas_factura[0].get("importacion_id"),
+            })
+        if not detalle:
+            continue
+        detalle.sort(key=lambda d: (d["fecha"] or date.min), reverse=True)
+        derechos_por_mes.append({
+            "mes": mes,
+            "total_invoice": round(sum(f.get("total_usd") or 0 for f in filas_mes) * factor_moneda, 2),
+            "derechos": round(sum(f.get("derechos_usd") or 0 for f in filas_mes) * factor_moneda, 2),
+            "flete": round(sum(f.get("flete_homologado_usd") or 0 for f in filas_mes) * factor_moneda, 2),
+            "facturas": detalle,
+        })
+
+    # (e): productos por vía aérea vs marítima.
+    productos = defaultdict(list)
+    for f in filas:
+        clave = f"{(f.get('codigo_producto') or '').strip()} {(f.get('descripcion') or '').strip()}".strip()
+        productos[clave or "(sin producto)"].append(f)
+    por_producto = []
+    for nombre, filas_producto in productos.items():
+        metricas = _metricas_operacional(filas_producto, factor_moneda)
+        metricas["nombre"] = nombre
+        metricas["vias"] = _tabla_operacional_por_clave(filas_producto, "tipo_flete", factor_moneda, vacio="(sin vía)")
+        metricas["multiples_vias"] = len(metricas["vias"]) > 1
+        por_producto.append(metricas)
+    por_producto.sort(key=lambda r: (not r["multiples_vias"], -r["total_invoice"]))
+    productos_recortados = len(por_producto) > MAX_PRODUCTOS_COSTO
+    por_producto = por_producto[:MAX_PRODUCTOS_COSTO]
+
+    return render_template(
+        "reportes/operacional.html",
+        totales=_metricas_operacional(filas, factor_moneda),
+        por_operador=por_operador, meses=meses, pct_mensual=pct_mensual,
+        por_tipo_flete=por_tipo_flete, derechos_por_mes=derechos_por_mes,
+        por_producto=por_producto, productos_recortados=productos_recortados,
+        max_productos=MAX_PRODUCTOS_COSTO,
+        empresas_disponibles=_empresas_compradoras_disponibles(),
+        proveedores_disponibles=_proveedores_con_compras(),
+        operadores_disponibles=operadores_disponibles,
+        empresa_sel=empresa, proveedor_sel=proveedor, transporte_sel=transporte_sel,
+        moneda=moneda, paridad_eur=paridad_eur,
+        fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
+    )
 
 
 @app.route("/reportes/compras-proveedor/ajustes/nuevo", methods=["GET", "POST"])

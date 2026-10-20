@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+{% block title %}Consignación por producto y lote · Suite Logística{% endblock %}
+{% block content %}
+
+{# Ronda BY (2026-10-20, punto 1 del pedido del usuario): reporte completo
+   de lo que está HOY en consignación -- lo cargado desde este programa
+   (badge Programa) y lo que venía de antes (badge Histórico) -- con la
+   cuadratura contra Stock Valorizado a la vista y descarga a Excel. #}
+
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <h3 class="section-title mb-0">Consignación por producto y lote</h3>
+  <a class="btn btn-brand"
+     href="{{ url_for('reportes_consignacion_detalle_descargar', proveedor=proveedor_sel, q=q, origen=origen_sel) }}">
+    <i class="bi bi-download me-1"></i>Descargar consignación
+  </a>
+</div>
+
+<p class="text-muted">
+  Todo lo que está en consignación <strong>hoy</strong> (recibido menos lo ya consumido), lote por lote. Lo que ya
+  se informó y se facturó al proveedor no aparece acá -- eso se ve en
+  <a href="{{ url_for('stock_consignacion_list') }}">Consignación</a>.
+</p>
+
+<form class="row g-2 mb-3">
+  <div class="col-auto">
+    <select class="form-select" name="proveedor" onchange="this.form.submit()">
+      <option value="">Todos los proveedores</option>
+      {% for p in proveedores_disponibles %}
+      <option value="{{ p }}" {% if proveedor_sel == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <select class="form-select" name="origen" onchange="this.form.submit()">
+      <option value="">Todo origen</option>
+      <option value="programa" {% if origen_sel == 'programa' %}selected{% endif %}>Solo del programa</option>
+      <option value="historico" {% if origen_sel == 'historico' %}selected{% endif %}>Solo histórico</option>
+    </select>
+  </div>
+  <div class="col-auto">
+    <input type="search" class="form-control" name="q" value="{{ q }}" placeholder="Código, descripción o lote">
+  </div>
+  <div class="col-auto"><button class="btn btn-outline-secondary">Filtrar</button></div>
+  {% if proveedor_sel or q or origen_sel %}
+  <div class="col-auto"><a class="btn btn-link" href="{{ url_for('reportes_consignacion_detalle') }}">Quitar filtros</a></div>
+  {% endif %}
+</form>
+
+<div class="row g-3 mb-3">
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Productos distintos</div>
+      <div class="h4 mb-0">{{ totales.productos }}</div>
+      <div class="text-muted small">{{ totales.lotes }} lote(s)</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Unidades en consignación</div>
+      <div class="h4 mb-0">{{ "%g"|format(totales.unidades) }}</div>
+      <div class="text-muted small">
+        {% for empresa, cantidad in totales.unidades_por_empresa.items() %}{{ empresa }}: {{ "%g"|format(cantidad) }}{{ ", " if not loop.last }}{% endfor %}
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Valorizado (PMP)</div>
+      <div class="h4 mb-0">{{ totales.valor|moneda }}</div>
+      <div class="text-muted small">CLP, con el PMP de Stock Valorizado</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Cuadratura con Stock Valorizado</div>
+      {% if totales.unidades_en_stock_fisico == totales.asignado_stock_valorizado %}
+      <div class="h4 mb-0 text-success"><i class="bi bi-check-circle"></i> Cuadra</div>
+      {% else %}
+      <div class="h4 mb-0 text-warning"><i class="bi bi-exclamation-triangle"></i> Revisar</div>
+      {% endif %}
+      <div class="text-muted small">
+        {{ "%g"|format(totales.unidades_en_stock_fisico) }} un. acá ·
+        {{ "%g"|format(totales.asignado_stock_valorizado) }} un. allá
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if totales.lotes_sin_stock_fisico %}
+<div class="alert alert-light border d-flex align-items-start gap-2">
+  <i class="bi bi-info-circle mt-1"></i>
+  <div>
+    <strong>{{ totales.lotes_sin_stock_fisico }} lote(s) ({{ "%g"|format(totales.unidades_sin_stock_fisico) }} un.)
+    siguen vigentes en consignación pero hoy no aparecen en el Stock físico de ninguna empresa.</strong>
+    Es el caso normal de un lote que ya se usó y cuyo consumo todavía no se le reportó al proveedor. Por eso
+    <a href="{{ url_for('stock_valorizado_list') }}">Stock Valorizado</a> descuenta
+    {{ "%g"|format(totales.asignado_stock_valorizado) }} un. y este reporte muestra
+    {{ "%g"|format(totales.unidades) }} un. en total: la diferencia son exactamente esos lotes (marcados abajo
+    con "sin stock físico").
+  </div>
+</div>
+{% endif %}
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover table-sm align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Proveedor</th>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th>Lote</th>
+          <th>Vencimiento</th>
+          <th>Origen</th>
+          <th class="text-end">Recibido</th>
+          <th class="text-end">Consumido</th>
+          <th class="text-end">En consignación</th>
+          <th>Empresa</th>
+          <th class="text-end">Valor (CLP)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in filas %}
+        <tr>
+          <td>{{ f.proveedor }}</td>
+          <td>{{ f.codigo_proveedor }}</td>
+          <td title="{{ f.descripcion }}">{{ f.descripcion }}</td>
+          <td>
+            {{ f.lote }}
+            {% if f.sin_lote %}
+            <span class="badge bg-warning text-dark" title="Esta cantidad se registró sin lote real -- cárgale el lote en su Costeo para completar la trazabilidad.">sin lote</span>
+            {% endif %}
+          </td>
+          <td>{{ f.fecha_vencimiento.strftime('%d-%m-%Y') if f.fecha_vencimiento else '-' }}</td>
+          <td>
+            {% if f.del_programa > 0 %}
+            <span class="badge bg-primary" title="{{ '%g'|format(f.del_programa) }} un. entraron por un Costeo hecho en este programa.">Programa</span>
+            {% endif %}
+            {% if f.del_historico > 0 %}
+            <span class="badge bg-secondary" title="{{ '%g'|format(f.del_historico) }} un. vienen de la carga histórica / del archivo del proveedor.">Histórico</span>
+            {% endif %}
+          </td>
+          <td class="text-end">{{ "%g"|format(f.recibido) }}</td>
+          <td class="text-end">{{ "%g"|format(f.consumido) }}</td>
+          <td class="text-end fw-semibold">{{ "%g"|format(f.vigente) }}</td>
+          <td>
+            {% if f.empresas %}
+            {% for empresa, cantidad in f.empresas.items() %}{{ empresa }} ({{ "%g"|format(cantidad) }}){{ ", " if not loop.last }}{% endfor %}
+            {% else %}
+            <span class="text-muted" title="Este lote sigue vigente en consignación pero hoy no está en el Stock físico de ninguna empresa.">sin stock físico</span>
+            {% endif %}
+          </td>
+          <td class="text-end">{{ f.valor|moneda if f.valor else '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="11" class="text-center text-muted py-4">No hay nada en consignación con estos filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
