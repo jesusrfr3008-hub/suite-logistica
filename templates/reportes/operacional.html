@@ -26,6 +26,14 @@
   .tabla-reporte td.col-producto {
     white-space: nowrap; max-width: 30rem; overflow: hidden; text-overflow: ellipsis;
   }
+
+  /* Ronda CA (2026-10-21, punto 2 del pedido del usuario): flechas de
+     ordenamiento en los títulos, igual que en la tabla de productos
+     costeados del Costeo de Importaciones. */
+  .tabla-reporte thead th[data-sort] { cursor: pointer; user-select: none; }
+  .tabla-reporte thead th[data-sort]::after { content: " \21C5"; opacity: .45; font-size: .75em; }
+  .tabla-reporte thead th[data-sort].sort-asc::after { content: " \25B2"; opacity: 1; }
+  .tabla-reporte thead th[data-sort].sort-desc::after { content: " \25BC"; opacity: 1; }
 </style>
 
 <div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
@@ -123,12 +131,12 @@
     <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
-          <th>Transporte</th>
-          <th class="text-end">Total Invoice {{ simbolo }}</th>
-          <th class="text-end">Flete</th>
-          <th class="text-end">Gastos {{ simbolo }}</th>
-          <th class="text-end">% Flete</th>
-          <th class="text-end">% Otros gastos</th>
+          <th data-sort="text">Transporte</th>
+          <th class="text-end" data-sort="num">Total Invoice {{ simbolo }}</th>
+          <th class="text-end" data-sort="num">Flete</th>
+          <th class="text-end" data-sort="num">Gastos {{ simbolo }}</th>
+          <th class="text-end" data-sort="num">% Flete</th>
+          <th class="text-end" data-sort="num">% Otros gastos</th>
         </tr>
       </thead>
       <tbody>
@@ -154,7 +162,7 @@
     <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
-          <th>Transporte</th>
+          <th data-sort="text">Transporte</th>
           {% for m in meses %}<th class="text-end">{{ m[5:7] }}-{{ m[0:4] }}</th>{% endfor %}
         </tr>
       </thead>
@@ -184,12 +192,12 @@
       <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
         <thead>
           <tr>
-            <th>Transporte</th>
-            <th class="text-end">Total Invoice {{ simbolo }}</th>
-            <th class="text-end">Flete</th>
-            <th class="text-end">Gastos {{ simbolo }}</th>
-            <th class="text-end">% Flete</th>
-            <th class="text-end">% Otros gastos</th>
+            <th data-sort="text">Transporte</th>
+            <th class="text-end" data-sort="num">Total Invoice {{ simbolo }}</th>
+            <th class="text-end" data-sort="num">Flete</th>
+            <th class="text-end" data-sort="num">Gastos {{ simbolo }}</th>
+            <th class="text-end" data-sort="num">% Flete</th>
+            <th class="text-end" data-sort="num">% Otros gastos</th>
           </tr>
         </thead>
         <tbody>
@@ -223,10 +231,10 @@
       <thead>
         <tr>
           <th style="width: 2rem;"></th>
-          <th>Mes</th>
-          <th class="text-end">Total Invoice {{ simbolo }}</th>
-          <th class="text-end">Flete</th>
-          <th class="text-end">Derechos {{ simbolo }}</th>
+          <th data-sort="text">Mes</th>
+          <th class="text-end" data-sort="num">Total Invoice {{ simbolo }}</th>
+          <th class="text-end" data-sort="num">Flete</th>
+          <th class="text-end" data-sort="num">Derechos {{ simbolo }}</th>
         </tr>
       </thead>
       <tbody>
@@ -241,7 +249,7 @@
         <tr class="collapse" id="derechos{{ loop.index }}">
           <td colspan="5" class="bg-light">
             <table class="table table-sm mb-0 tabla-reporte">
-              <thead><tr><th>Factura</th><th>Fecha</th><th class="text-end">Total Invoice</th><th class="text-end">Derechos</th></tr></thead>
+              <thead><tr><th data-sort="text">Factura</th><th data-sort="text">Fecha</th><th class="text-end" data-sort="num">Total Invoice</th><th class="text-end" data-sort="num">Derechos</th></tr></thead>
               <tbody>
                 {% for d in m.facturas %}
                 <tr>
@@ -271,9 +279,9 @@
 <div class="card p-3 mb-4">
   <h6 class="mb-1">Productos por vía de transporte (aéreo vs marítimo)</h6>
   <p class="text-muted small">
-    Para comparar qué cuesta traer el mismo producto por un medio u otro. Se listan primero los productos que
-    se han traído por más de una vía.{% if productos_recortados %} Se muestran los primeros {{ max_productos }};
-    filtra por proveedor para acotar.{% endif %}
+    Solo aparecen acá los productos que en el período filtrado viajaron por las <strong>dos</strong> vías: es la
+    única comparación que tiene sentido para ver qué cuesta traer el mismo producto por un medio u otro.
+    {%- if productos_recortados %} Se muestran los primeros {{ max_productos }}; filtra por proveedor para acotar.{% endif %}
   </p>
   {% if lineas_sin_via %}
   {# Ronda BZ (2026-10-21, punto 5): el usuario verificó que en su archivo no
@@ -292,12 +300,12 @@
       <thead>
         <tr>
           <th style="width: 2rem;"></th>
-          <th>Producto</th>
-          <th class="text-end">Total Invoice {{ simbolo }}</th>
-          <th class="text-end">Flete</th>
-          <th class="text-end">Gastos {{ simbolo }}</th>
-          <th class="text-end">% Flete</th>
-          <th class="text-end">% Otros gastos</th>
+          <th data-sort="text">Producto</th>
+          <th class="text-end" data-sort="num">Total Invoice {{ simbolo }}</th>
+          <th class="text-end" data-sort="num">Flete</th>
+          <th class="text-end" data-sort="num">Gastos {{ simbolo }}</th>
+          <th class="text-end" data-sort="num">% Flete</th>
+          <th class="text-end" data-sort="num">% Otros gastos</th>
         </tr>
       </thead>
       <tbody>
@@ -315,8 +323,8 @@
             <table class="table table-sm mb-0 tabla-reporte">
               <thead>
                 <tr>
-                  <th>Vía</th><th class="text-end">Total Invoice {{ simbolo }}</th><th class="text-end">Flete</th>
-                  <th class="text-end">Gastos {{ simbolo }}</th><th class="text-end">% Flete</th><th class="text-end">% Otros gastos</th>
+                  <th data-sort="text">Vía</th><th class="text-end" data-sort="num">Total Invoice {{ simbolo }}</th><th class="text-end" data-sort="num">Flete</th>
+                  <th class="text-end" data-sort="num">Gastos {{ simbolo }}</th><th class="text-end" data-sort="num">% Flete</th><th class="text-end" data-sort="num">% Otros gastos</th>
                 </tr>
               </thead>
               <tbody>
@@ -328,11 +336,76 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="7" class="text-center text-muted py-3">Sin datos para estos filtros.</td></tr>
+        <tr><td colspan="7" class="text-center text-muted py-3">
+          Ningún producto viajó por las dos vías en este período, así que no hay nada que comparar.
+        </td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </div>
+
+<script>
+  // Ronda CA (2026-10-21, punto 2 del pedido del usuario): ordenar
+  // cualquiera de las tablas del reporte al hacer clic en un título. A
+  // diferencia del ordenamiento del Costeo, acá hay filas desplegables
+  // (derechos por mes, producto por vía): cada fila se mueve JUNTO con su
+  // fila de detalle, para que al ordenar no se separen.
+  function valorNumerico(texto) {
+    // "$1.234,56" / "12,3%" -> 1234.56 / 12.3
+    const limpio = (texto || '').replace(/[^\d,.\-]/g, '').replace(/\./g, '').replace(',', '.');
+    const n = parseFloat(limpio);
+    return isNaN(n) ? Number.NEGATIVE_INFINITY : n;
+  }
+
+  function valorFecha(texto) {
+    // "30-09-2026" -> 20260930 (si no tiene forma de fecha, devuelve null)
+    const m = (texto || '').trim().match(/^(\d{2})-(\d{2})-(\d{4})$/);
+    return m ? Number(`${m[3]}${m[2]}${m[1]}`) : null;
+  }
+
+  document.querySelectorAll('table.tabla-reporte').forEach(tabla => {
+    const thead = tabla.querySelector('thead');
+    const tbody = tabla.querySelector('tbody');
+    if (!thead || !tbody) return;
+    thead.querySelectorAll('th[data-sort]').forEach(th => {
+      th.addEventListener('click', () => {
+        const idx = Array.prototype.indexOf.call(th.parentNode.children, th);
+        const tipo = th.dataset.sort;
+        const dir = th.classList.contains('sort-asc') ? 'desc' : 'asc';
+        thead.querySelectorAll('th[data-sort]').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+        th.classList.add(dir === 'asc' ? 'sort-asc' : 'sort-desc');
+
+        // Agrupa cada fila con su detalle desplegable (si lo tiene).
+        const bloques = [];
+        Array.from(tbody.children).forEach(tr => {
+          if (tr.classList.contains('collapse') && bloques.length) {
+            bloques[bloques.length - 1].push(tr);
+          } else if (tr.children.length > 1) {
+            bloques.push([tr]);
+          }
+        });
+        if (bloques.length < 2) return;
+
+        bloques.sort((a, b) => {
+          const ta = a[0].children[idx] ? a[0].children[idx].textContent.trim() : '';
+          const tb = b[0].children[idx] ? b[0].children[idx].textContent.trim() : '';
+          let va, vb;
+          if (tipo === 'num') {
+            va = valorNumerico(ta); vb = valorNumerico(tb);
+          } else {
+            const fa = valorFecha(ta), fb = valorFecha(tb);
+            if (fa !== null && fb !== null) { va = fa; vb = fb; }
+            else { va = ta.toLowerCase(); vb = tb.toLowerCase(); }
+          }
+          if (va < vb) return dir === 'asc' ? -1 : 1;
+          if (va > vb) return dir === 'asc' ? 1 : -1;
+          return 0;
+        });
+        bloques.forEach(bloque => bloque.forEach(tr => tbody.appendChild(tr)));
+      });
+    });
+  });
+</script>
 
 {% endblock %}

@@ -16,6 +16,18 @@
   .tabla-reporte td.col-descripcion {
     white-space: nowrap; max-width: 24rem; overflow: hidden; text-overflow: ellipsis;
   }
+
+  /* Ronda CA (2026-10-21, punto 2 del pedido del usuario): el encabezado
+     tiene que quedar siempre a la vista -- la tabla scrollea sola (vertical
+     y horizontal) dentro de su panel y los títulos quedan fijos arriba. */
+  .tabla-scroll-reporte { max-height: 68vh; overflow: auto; }
+  .tabla-scroll-reporte > table > thead > tr > th {
+    position: sticky; top: 0; z-index: 3;
+    background: #fff; box-shadow: inset 0 -1px 0 #dee2e6;
+  }
+  /* El lote de una compra con varios lotes: se muestra el primero y el
+     resto se abre en un modal (punto 1), para no desarmar la fila. */
+  .btn-lotes { font-size: .75rem; text-decoration: none; }
 </style>
 
 <h3 class="section-title mb-1">Consulta Costo Producto</h3>
@@ -62,7 +74,7 @@
 {% endif %}
 
 <div class="card p-3">
-  <div class="table-responsive">
+  <div class="table-responsive tabla-scroll-reporte">
     <table class="table table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
@@ -93,7 +105,19 @@
             {% endif %}
           </td>
           <td class="col-descripcion" title="{{ g.descripcion }}">{{ g.descripcion }}</td>
-          <td title="Lote del último costeo{{ ' -- ' ~ g.lotes_coincidentes|join(', ') if g.lotes_coincidentes }}">{{ g.ultimo.lote or '-' }}</td>
+          {# Ronda CA (2026-10-21, punto 1): una compra puede traer muchos
+             lotes; se muestra el primero y el resto se abre en un modal. #}
+          {% set lotes_ultimo = (g.ultimo.lote or '').split(', ') | select | list %}
+          <td title="Lote del último costeo">
+            {% if lotes_ultimo %}{{ lotes_ultimo[0] }}{% else %}-{% endif %}
+            {% if lotes_ultimo|length > 1 %}
+            <button type="button" class="btn btn-sm btn-link btn-lotes p-0 ms-1"
+                    data-lotes="{{ lotes_ultimo|join('|') }}"
+                    data-titulo="{{ g.codigo_producto }} · factura {{ g.ultimo.factura or '(sin número)' }}">
+              +{{ lotes_ultimo|length - 1 }}
+            </button>
+            {% endif %}
+          </td>
           <td>{{ g.ultimo.factura or '-' }}</td>
           <td>{{ g.ultimo.fecha.strftime('%d-%m-%Y') if g.ultimo.fecha else '-' }}</td>
           <td class="text-end">{{ "%g"|format(g.ultimo.unidades) }}</td>
@@ -133,6 +157,24 @@
   </div>
 </div>
 
+<!-- Ronda CA (2026-10-21, punto 1): todos los lotes de una compra. -->
+<div class="modal fade" id="modalLotes" tabindex="-1">
+  <div class="modal-dialog modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div>
+          <h5 class="modal-title" id="modalLotesTitulo">Lotes de la compra</h5>
+          <div class="text-muted small" id="modalLotesConteo"></div>
+        </div>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <ul class="list-group list-group-flush small" id="modalLotesLista"></ul>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
   // Texto predictivo de producto/lote (punto 2c): consulta liviana, sin
   // recalcular ningún costeo.
@@ -163,9 +205,36 @@
   const POR_PAGINA = {{ por_pagina }};
   const EMPRESA_SEL = {{ empresa_sel|tojson }};
 
-  // Simbolo en vez del codigo de moneda (punto 3 del pedido del usuario).
+  // Simbolo en vez del codigo de moneda (ronda BZ, punto 3).
   const SIMBOLOS = { EUR: '€', EURO: '€', USD: '$', CLP: '$' };
   const simbolo = m => SIMBOLOS[(m || '').toUpperCase()] || (m || '');
+
+  const escaparHtml = t => (t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  // Ronda CA (2026-10-21, punto 1): celda de lote -- el primero a la
+  // vista y el resto detras de un "+N" que abre el modal.
+  function celdaLotes(valor, titulo) {
+    const lotes = (valor || '').split(', ').map(l => l.trim()).filter(Boolean);
+    if (!lotes.length) return '-';
+    if (lotes.length === 1) return escaparHtml(lotes[0]);
+    return `${escaparHtml(lotes[0])} <button type="button" class="btn btn-sm btn-link btn-lotes p-0 ms-1" ` +
+      `data-lotes="${escaparHtml(lotes.join('|'))}" data-titulo="${escaparHtml(titulo)}">+${lotes.length - 1}</button>`;
+  }
+
+  // Un solo modal para todos los "+N" de la pantalla (incluidos los que
+  // se agregan despues al abrir un producto o pedir "Ver mas").
+  document.addEventListener('click', evento => {
+    const boton = evento.target.closest('.btn-lotes');
+    if (!boton) return;
+    const lotes = (boton.dataset.lotes || '').split('|').filter(Boolean);
+    document.getElementById('modalLotesTitulo').textContent = boton.dataset.titulo || 'Lotes de la compra';
+    document.getElementById('modalLotesConteo').textContent =
+      `${lotes.length} lote${lotes.length === 1 ? '' : 's'} en esta compra`;
+    document.getElementById('modalLotesLista').innerHTML =
+      lotes.map(l => `<li class="list-group-item py-1">${escaparHtml(l)}</li>`).join('');
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('modalLotes')).show();
+  });
 
   function filaHistorial(e) {
     const fila = document.createElement('tr');
@@ -176,7 +245,8 @@
     const s = simbolo(e.moneda);
     fila.innerHTML = `<td>${e.fecha}</td><td>${factura}</td>` +
       `<td><span class="badge ${badge}">${e.origen}</span></td><td>${e.empresa || ''}</td>` +
-      `<td>${e.lote || '-'}</td><td class="text-end">${e.unidades.toLocaleString('es-CL')}</td>` +
+      `<td>${celdaLotes(e.lote, `${e.factura || '(sin número)'} · ${e.fecha}`)}</td>` +
+      `<td class="text-end">${e.unidades.toLocaleString('es-CL')}</td>` +
       `<td class="text-end">${s}${e.valor_unitario.toLocaleString('es-CL')}</td>` +
       `<td class="text-end">${s}${e.total_invoice.toLocaleString('es-CL')}</td>` +
       `<td class="text-end">$${e.costo_unitario_clp.toLocaleString('es-CL')}</td>`;

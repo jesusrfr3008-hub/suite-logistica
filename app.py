@@ -14793,7 +14793,13 @@ def reportes_operacional():
         # habían viajado por avión.
         metricas["multiples_vias"] = len([v for v in metricas["vias"] if v["nombre"] != "(sin vía)"]) > 1
         por_producto.append(metricas)
-    por_producto.sort(key=lambda r: (not r["multiples_vias"], -r["total_invoice"]))
+    # Ronda CA (2026-10-21, punto 1 del pedido del usuario): esta vista
+    # existe para COMPARAR un medio de transporte contra el otro, así que
+    # solo tienen sentido acá los productos que en el período filtrado
+    # viajaron por las dos vías. Antes se listaban todos (los de una sola
+    # vía primero abajo), lo que ensuciaba la comparación.
+    por_producto = [p for p in por_producto if p["multiples_vias"]]
+    por_producto.sort(key=lambda r: -r["total_invoice"])
     productos_recortados = len(por_producto) > MAX_PRODUCTOS_COSTO
     por_producto = por_producto[:MAX_PRODUCTOS_COSTO]
 
