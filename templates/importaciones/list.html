@@ -41,6 +41,11 @@
     <table class="table table-hover align-middle mb-0">
       <thead>
         <tr>
+          {# Ronda CB (2026-10-21, a pedido del usuario): empresa compradora
+             y correlativo de la importación en el sistema de Inventarios,
+             para identificar cada costeo sin tener que entrar a verlo. #}
+          <th>Empresa</th>
+          <th>N° Importación</th>
           <th>Proveedor</th>
           <th>N° Factura</th>
           <th>Fecha factura</th>
@@ -54,6 +59,8 @@
       <tbody>
         {% for imp in importaciones %}
         <tr>
+          <td>{{ imp.empresa.nombre if imp.empresa else '-' }}</td>
+          <td>{{ imp.numero_correlativo_inventario or '-' }}</td>
           <td>{{ imp.proveedor.nombre }}</td>
           <td>{{ imp.numero_factura or '-' }}</td>
           <td>{{ imp.fecha_factura or '-' }}</td>
@@ -78,7 +85,7 @@
           <td class="text-end"><a href="{{ url_for('importaciones_detalle', importacion_id=imp.id) }}" class="btn btn-sm btn-outline-primary">Ver costeo</a></td>
         </tr>
         {% else %}
-        <tr><td colspan="8" class="text-center text-muted py-4">No hay importaciones registradas todavía.</td></tr>
+        <tr><td colspan="10" class="text-center text-muted py-4">No hay importaciones registradas todavía.</td></tr>
         {% endfor %}
       </tbody>
     </table>
