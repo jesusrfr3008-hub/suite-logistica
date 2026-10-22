@@ -46,7 +46,11 @@
       </thead>
       <tbody>
         {% for d in despachos %}
-        <tr>
+        {# Ronda CC (2026-10-22, a pedido del usuario): los despachos ya
+           entregados se distinguen a simple vista -- fila en verde suave y
+           badge verde -- para separar lo que está listo de lo que sigue en
+           curso. #}
+        <tr {% if d.status == 'Entregado' %}class="table-success"{% endif %}>
           <td>{{ d.proveedores|map(attribute='nombre')|join(', ') or '-' }}</td>
           <td>
             {{ d.numero_tracking or '-' }}
@@ -61,7 +65,13 @@
           </td>
           <td>{{ d.courier or '-' }}</td>
           <td>{{ d.operador_logistico or '-' }}</td>
-          <td><span class="badge bg-info text-dark">{{ d.status }}</span></td>
+          <td>
+            {% if d.status == 'Entregado' %}
+            <span class="badge bg-success"><i class="bi bi-check-circle"></i> {{ d.status }}</span>
+            {% else %}
+            <span class="badge bg-info text-dark">{{ d.status }}</span>
+            {% endif %}
+          </td>
           <td>{{ d.fecha_envio or '-' }}</td>
           <td>{{ d.fecha_estimada_llegada or '-' }}</td>
           <td>{{ d.ordenes.count() }}</td>

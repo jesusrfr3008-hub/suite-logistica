@@ -124,6 +124,16 @@
             {% if o.tiene_remanente_parcial %}
             <span class="badge bg-warning text-dark" data-bs-toggle="tooltip" title="Incluye línea(s) BO (back order) -- remanente pendiente de una confirmación parcial del proveedor, no un pedido nuevo">BO</span>
             {% endif %}
+            {# Ronda CC (2026-10-22, a pedido del usuario): un producto que el
+               proveedor no confirmó EN ABSOLUTO no es un BO (que es el
+               remanente de una confirmación parcial), pero igual hay que
+               verlo cuando el resto de la orden ya avanzó. #}
+            {% set sin_confirmar = o.lineas_sin_confirmar_en_orden_avanzada %}
+            {% if sin_confirmar %}
+            <span class="badge bg-danger" data-bs-toggle="tooltip" title="{{ sin_confirmar }} producto(s) que el proveedor todavía no confirmó, mientras el resto de la orden ya avanzó. No es un BO: el BO es el remanente de una línea confirmada solo en parte.">
+              {{ sin_confirmar }} sin confirmar
+            </span>
+            {% endif %}
           </td>
           <td class="text-end">{{ o.total_unidades_pendientes|round(1) }}</td>
           <td class="text-end">{{ "%.2f"|format(o.total) }} {{ o.moneda }}</td>

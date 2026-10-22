@@ -14,7 +14,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image as ExcelImage
 from flask import (
@@ -14666,9 +14666,7 @@ def _tabla_operacional_por_clave(filas, clave, factor_moneda=1.0, vacio="(sin da
     return filas_tabla
 
 
-@app.route("/reportes/operacional")
-@requiere_permiso("reportes")
-def reportes_operacional():
+def _contexto_reporte_operacional():
     """Ronda BY (2026-10-20, punto 3 del pedido del usuario): "Reporte
     Operacional" -- costo de transporte de las importaciones, replicando
     las tablas dinámicas que el usuario mantiene a mano en
@@ -14685,7 +14683,11 @@ def reportes_operacional():
 
     Todo sale de las mismas dos fuentes de siempre (histórico +
     importaciones costeadas acá, ver _filas_compras_unificadas), así que
-    cada Costeo nuevo entra solo a este reporte."""
+    cada Costeo nuevo entra solo a este reporte.
+
+    Ronda CC (2026-10-22): el cálculo se separó de la vista para que la
+    pantalla y la descarga a Excel (ver reportes_operacional_descargar)
+    salgan exactamente de los mismos números, sin duplicar la lógica."""
     empresa = request.args.get("empresa", "").strip()
     proveedor = request.args.get("proveedor", "").strip()
     transporte_sel = request.args.get("transporte", "").strip()
@@ -14803,8 +14805,7 @@ def reportes_operacional():
     productos_recortados = len(por_producto) > MAX_PRODUCTOS_COSTO
     por_producto = por_producto[:MAX_PRODUCTOS_COSTO]
 
-    return render_template(
-        "reportes/operacional.html",
+    return dict(
         totales=_metricas_operacional(filas, factor_moneda),
         por_operador=por_operador, meses=meses, pct_mensual=pct_mensual,
         por_tipo_flete=por_tipo_flete, derechos_por_mes=derechos_por_mes,
@@ -14816,6 +14817,223 @@ def reportes_operacional():
         empresa_sel=empresa, proveedor_sel=proveedor, transporte_sel=transporte_sel,
         moneda=moneda, paridad_eur=paridad_eur,
         fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
+    )
+
+
+@app.route("/reportes/operacional")
+@requiere_permiso("reportes")
+def reportes_operacional():
+    return render_template("reportes/operacional.html", **_contexto_reporte_operacional())
+
+
+# --- Ronda CC (2026-10-22, punto 3 del pedido del usuario): descarga del
+# Reporte Operacional a Excel, eligiendo con checkbox qué secciones bajar.
+# Cada sección va en SU PROPIA hoja, con formato de reporte (título,
+# subtítulo con los filtros aplicados, encabezado con fondo, montos y
+# porcentajes con formato de número, totales en negrita y encabezado
+# congelado). Las secciones que en pantalla se despliegan (derechos por
+# mes, productos por vía) bajan con su detalle agrupado con el esquema de
+# Excel: las filas de detalle se pueden plegar y desplegar con los
+# botones +/- de la izquierda, como una tabla dinámica. ---
+
+SECCIONES_OPERACIONAL = [
+    ("operador", "Fletes y gastos por operador"),
+    ("mensual", "Flete % mensual por operador"),
+    ("tipo", "Flete y gastos por tipo de transporte"),
+    ("derechos", "Derechos pagados"),
+    ("productos", "Productos por vía de transporte"),
+]
+
+_RELLENO_ENCABEZADO_REPORTE = PatternFill("solid", fgColor="1F3864")
+_RELLENO_SUBTOTAL_REPORTE = PatternFill("solid", fgColor="DCE6F1")
+_BORDE_FINO = Border(*(Side(style="thin", color="BFBFBF"),) * 4)
+
+
+def _hoja_reporte_operacional(wb, titulo, subtitulo, encabezados, anchos):
+    """Crea una hoja con el encabezado de reporte ya armado y devuelve
+    (hoja, fila_en_la_que_empiezan_los_datos)."""
+    ws = wb.create_sheet(title=titulo[:31])
+    ws.sheet_properties.outlinePr.summaryBelow = False  # el total va ARRIBA de su detalle
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(encabezados))
+    celda_titulo = ws.cell(row=1, column=1, value=titulo)
+    celda_titulo.font = Font(bold=True, size=14, color="1F3864")
+    celda_titulo.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(encabezados))
+    celda_sub = ws.cell(row=2, column=1, value=subtitulo)
+    celda_sub.font = Font(size=9, italic=True, color="595959")
+    celda_sub.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 28
+
+    for col, titulo_col in enumerate(encabezados, start=1):
+        celda = ws.cell(row=4, column=col, value=titulo_col)
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.fill = _RELLENO_ENCABEZADO_REPORTE
+        celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        celda.border = _BORDE_FINO
+    ws.row_dimensions[4].height = 30
+    for col, ancho in enumerate(anchos, start=1):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+    ws.freeze_panes = "A5"
+    return ws, 5
+
+
+def _escribir_fila_reporte(ws, fila, valores, formatos, negrita=False, relleno=None, nivel=0):
+    """Escribe una fila de datos con su formato de número, bordes y, si
+    corresponde, el nivel de agrupación del esquema de Excel."""
+    for col, (valor, formato) in enumerate(zip(valores, formatos), start=1):
+        celda = ws.cell(row=fila, column=col, value=valor)
+        celda.border = _BORDE_FINO
+        if formato:
+            celda.number_format = formato
+            celda.alignment = Alignment(horizontal="right", vertical="center")
+        else:
+            celda.alignment = Alignment(horizontal="left", vertical="center")
+        if negrita:
+            celda.font = Font(bold=True)
+        if relleno is not None:
+            celda.fill = relleno
+    if nivel:
+        ws.row_dimensions[fila].outlineLevel = nivel
+        ws.row_dimensions[fila].hidden = False
+    return fila + 1
+
+
+@app.route("/reportes/operacional/descargar")
+@requiere_permiso("reportes")
+def reportes_operacional_descargar():
+    """Ronda CC (2026-10-22, punto 3): baja a Excel las secciones marcadas
+    del Reporte Operacional, con los MISMOS filtros que se están viendo en
+    pantalla (ver _contexto_reporte_operacional)."""
+    ctx = _contexto_reporte_operacional()
+    seleccionadas = request.args.getlist("seccion") or [clave for clave, _ in SECCIONES_OPERACIONAL]
+    simbolo = SIMBOLOS_MONEDA.get(ctx["moneda"], ctx["moneda"])
+    fmt_monto = f'"{simbolo}"#,##0.00'
+    fmt_pct = "0.0%"
+
+    filtros = []
+    if ctx["empresa_sel"]:
+        filtros.append(f"Empresa: {ctx['empresa_sel']}")
+    if ctx["proveedor_sel"]:
+        filtros.append(f"Proveedor: {ctx['proveedor_sel']}")
+    if ctx["transporte_sel"]:
+        filtros.append(f"Operador: {ctx['transporte_sel']}")
+    if ctx["fecha_desde"] or ctx["fecha_hasta"]:
+        filtros.append(f"Período: {ctx['fecha_desde'] or 'inicio'} a {ctx['fecha_hasta'] or 'hoy'}")
+    filtros.append(f"Moneda: {ctx['moneda']}")
+    if ctx["moneda"] == "EUR":
+        filtros.append(f"paridad {ctx['paridad_eur']:.4f} EUR/USD")
+    procesado = datetime.now(ZONA_CHILE)
+    subtitulo_base = " · ".join(filtros) + f" · Procesado el {procesado.strftime('%d-%m-%Y %H:%M')} (hora de Chile)"
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    encabezados_metricas = [
+        "Total Invoice", "Flete", "Otros gastos", "% Flete", "% Otros gastos",
+    ]
+    formatos_metricas = [fmt_monto, fmt_monto, fmt_monto, fmt_pct, fmt_pct]
+
+    if "operador" in seleccionadas:
+        ws, fila = _hoja_reporte_operacional(
+            wb, "Fletes y gastos por operador", subtitulo_base,
+            ["Transporte"] + encabezados_metricas, [28, 18, 16, 16, 12, 16],
+        )
+        for r in ctx["por_operador"]:
+            fila = _escribir_fila_reporte(
+                ws, fila,
+                [r["nombre"], r["total_invoice"], r["flete"], r["otros_gastos"], r["pct_flete"], r["pct_otros"]],
+                [None] + formatos_metricas,
+            )
+        t = ctx["totales"]
+        _escribir_fila_reporte(
+            ws, fila,
+            ["Total general", t["total_invoice"], t["flete"], t["otros_gastos"], t["pct_flete"], t["pct_otros"]],
+            [None] + formatos_metricas, negrita=True, relleno=_RELLENO_SUBTOTAL_REPORTE,
+        )
+
+    if "mensual" in seleccionadas:
+        meses_txt = [f"{m[5:7]}-{m[0:4]}" for m in ctx["meses"]]
+        ws, fila = _hoja_reporte_operacional(
+            wb, "Flete % mensual por operador", subtitulo_base,
+            ["Transporte"] + meses_txt, [28] + [12] * len(meses_txt),
+        )
+        for r in ctx["pct_mensual"]:
+            fila = _escribir_fila_reporte(
+                ws, fila, [r["operador"]] + list(r["celdas"]), [None] + [fmt_pct] * len(meses_txt),
+            )
+
+    if "tipo" in seleccionadas:
+        ws, fila = _hoja_reporte_operacional(
+            wb, "Por tipo de transporte", subtitulo_base,
+            ["Vía / Transporte"] + encabezados_metricas, [30, 18, 16, 16, 12, 16],
+        )
+        for bloque in ctx["por_tipo_flete"]:
+            t = bloque["totales"]
+            fila = _escribir_fila_reporte(
+                ws, fila,
+                [bloque["tipo"], t["total_invoice"], t["flete"], t["otros_gastos"], t["pct_flete"], t["pct_otros"]],
+                [None] + formatos_metricas, negrita=True, relleno=_RELLENO_SUBTOTAL_REPORTE,
+            )
+            for r in bloque["operadores"]:
+                fila = _escribir_fila_reporte(
+                    ws, fila,
+                    [f"    {r['nombre']}", r["total_invoice"], r["flete"], r["otros_gastos"], r["pct_flete"], r["pct_otros"]],
+                    [None] + formatos_metricas, nivel=1,
+                )
+
+    if "derechos" in seleccionadas:
+        ws, fila = _hoja_reporte_operacional(
+            wb, "Derechos pagados", subtitulo_base,
+            ["Mes / Factura", "Fecha", "Total Invoice", "Flete", "Derechos", "Moneda"],
+            [26, 14, 18, 16, 16, 12],
+        )
+        for m in ctx["derechos_por_mes"]:
+            fila = _escribir_fila_reporte(
+                ws, fila,
+                [f"{m['mes'][5:7]}-{m['mes'][0:4]}", "", m["total_invoice"], m["flete"], m["derechos"], ctx["moneda"]],
+                [None, None, fmt_monto, fmt_monto, fmt_monto, None],
+                negrita=True, relleno=_RELLENO_SUBTOTAL_REPORTE,
+            )
+            for d in m["facturas"]:
+                simbolo_factura = SIMBOLOS_MONEDA.get(d["moneda"], d["moneda"])
+                fmt_factura = f'"{simbolo_factura}"#,##0.00'
+                fila = _escribir_fila_reporte(
+                    ws, fila,
+                    [f"    {d['factura']}", d["fecha"].strftime("%d-%m-%Y") if d["fecha"] else "",
+                     d["total_invoice"], None, d["derechos"], d["moneda"]],
+                    [None, None, fmt_factura, None, fmt_factura, None], nivel=1,
+                )
+
+    if "productos" in seleccionadas:
+        ws, fila = _hoja_reporte_operacional(
+            wb, "Productos por vía", subtitulo_base,
+            ["Producto / Vía"] + encabezados_metricas, [52, 18, 16, 16, 12, 16],
+        )
+        for p in ctx["por_producto"]:
+            fila = _escribir_fila_reporte(
+                ws, fila,
+                [p["nombre"], p["total_invoice"], p["flete"], p["otros_gastos"], p["pct_flete"], p["pct_otros"]],
+                [None] + formatos_metricas, negrita=True, relleno=_RELLENO_SUBTOTAL_REPORTE,
+            )
+            for v in p["vias"]:
+                fila = _escribir_fila_reporte(
+                    ws, fila,
+                    [f"    {v['nombre']}", v["total_invoice"], v["flete"], v["otros_gastos"], v["pct_flete"], v["pct_otros"]],
+                    [None] + formatos_metricas, nivel=1,
+                )
+
+    if not wb.sheetnames:
+        flash("Marca al menos un reporte para descargar.", "warning")
+        return redirect(url_for("reportes_operacional", **request.args.to_dict(flat=True)))
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    nombre_archivo = f"Reporte_Operacional_{procesado.strftime('%Y-%m-%d_%H%M')}.xlsx"
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre_archivo,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 

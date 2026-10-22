@@ -996,6 +996,33 @@ class OrdenCompra(db.Model):
         )
 
     @property
+    def lineas_sin_confirmar_en_orden_avanzada(self):
+        """Ronda CC (2026-10-22, a pedido del usuario, revisando la
+        PO-2026-0005: "se confirmó casi todos los productos y quedó uno
+        solo sin confirmar por el proveedor, me pregunto por que no le
+        salió el badge de BO?"): cantidad de líneas ACTIVAS que el
+        proveedor todavía no confirmó, cuando el resto de la orden YA
+        avanzó.
+
+        No es lo mismo que un BO (ver tiene_remanente_parcial): el BO es
+        el remanente de una línea cuya cantidad se confirmó solo en
+        parte, mientras que esto es un producto que no se confirmó en
+        absoluto. Las dos cosas dejan la línea en "Emisión de Orden",
+        pero son situaciones distintas y el usuario necesita ver las dos.
+
+        Devuelve 0 cuando NINGUNA línea avanzó todavía (una orden recién
+        emitida está entera sin confirmar: ahí no hay nada que destacar)."""
+        activas = [l for l in self.lineas if not l.anulada]
+        sin_confirmar = [
+            l for l in activas
+            if l.etapa == ETAPAS_LINEA[0] and not l.disponibilidad_parcial_pendiente
+        ]
+        if not sin_confirmar:
+            return 0
+        alguna_avanzo = any(l.etapa != ETAPAS_LINEA[0] for l in activas)
+        return len(sin_confirmar) if alguna_avanzo else 0
+
+    @property
     def tiene_remanente_parcial(self):
         """Ronda BQ (2026-10-16, a pedido del usuario): True si alguna linea
         ACTIVA de esta orden es un BO (back order) -- el remanente que quedo
