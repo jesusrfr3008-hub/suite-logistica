@@ -82,6 +82,14 @@
     <h5 class="section-title mb-0">Órdenes en este despacho</h5>
     {% if not solo_seguimiento %}
     <div class="d-flex gap-2">
+      {# Ronda CD (2026-10-23): contraparte del retroceso de etapa -- si una línea
+         se devolvió a "Orden Confirmada" para corregirla, acá se vuelve a marcar
+         despachada dentro del mismo despacho, sin desasociar la orden. #}
+      <form method="post" action="{{ url_for('despachos_despachadas_masivo', despacho_id=despacho.id) }}" onsubmit="return confirm('¿Volver a marcar como despachadas las líneas de este despacho que quedaron en \'Orden Confirmada\'?');">
+        <button type="submit" class="btn btn-sm btn-outline-secondary" data-bs-toggle="tooltip" title="Para líneas que se devolvieron a 'Orden Confirmada' para corregirlas y ya están listas de nuevo.">
+          <i class="bi bi-truck me-1"></i>Marcar despachadas
+        </button>
+      </form>
       <form method="post" action="{{ url_for('despachos_aduana_masivo', despacho_id=despacho.id) }}" onsubmit="return confirm('¿Marcar en internación de aduanas TODAS las líneas de TODAS las órdenes de este despacho que estén en \'Orden Despachada\'?');">
         <button type="submit" class="btn btn-sm btn-outline-primary"><i class="bi bi-bank me-1"></i>Marcar todo en aduana</button>
       </form>

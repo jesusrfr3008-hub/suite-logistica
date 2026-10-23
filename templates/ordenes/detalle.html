@@ -530,10 +530,27 @@
                 <span class="text-muted small">—</span>
                 {% endif %}
               {% elif l.bloqueada %}
-              {# Ya despachada: a partir de aqui el lote avanza (aduana / recibido) y se
-                 gestiona en bloque desde "Acciones sobre seleccionadas" arriba, no linea
-                 por linea -- no hay ninguna accion individual que tenga sentido aqui. #}
+              {# Ya despachada: el avance (aduana / recibido) se gestiona en bloque desde
+                 "Acciones sobre seleccionadas" arriba. Ronda CD (2026-10-23, a pedido del
+                 usuario): lo único que SÍ tiene sentido línea por línea acá es devolverla
+                 a la etapa anterior para corregir algo -- anular y editar siguen
+                 bloqueadas una vez despachada. #}
+              {% if puede_aprobar and orden_aprobada and l.etapa_anterior %}
+              <div class="dropdown">
+                <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">
+                  Acciones
+                </button>
+                <ul class="dropdown-menu dropdown-menu-end">
+                  <li>
+                    <form method="post" action="{{ url_for('ordenes_linea_retroceder', orden_id=orden.id, linea_id=l.id) }}" onsubmit="return confirm('Esta línea ya está despachada. ¿Devolverla a la etapa anterior ({{ l.etapa_anterior }}) para corregirla?');">
+                      <button type="submit" class="dropdown-item">↩ Cambiar estado (etapa anterior)</button>
+                    </form>
+                  </li>
+                </ul>
+              </div>
+              {% else %}
               <span class="text-muted small">—</span>
+              {% endif %}
               {% elif puede_crear or puede_aprobar or puede_despachar %}
               <div class="dropdown">
                 <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">

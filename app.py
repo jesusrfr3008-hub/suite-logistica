@@ -4848,7 +4848,59 @@ def reparar_consignacion_y_codigo_interno_ronda_au():
 ORDEN_ESTADOS_DESPACHO = {nombre: i for i, nombre in enumerate(ESTADOS_DESPACHO)}
 
 
-def _sincronizar_status_despacho(despacho):
+def _linea_esta_costeada(linea):
+    """Ronda CD (2026-10-23): True si esta línea de Orden ya entró a un
+    Costeo de Importación (ver ParcialLinea.orden_compra_linea_id). Una
+    línea así NO se puede devolver a una etapa anterior sin dejar el
+    costeo apuntando a mercadería que, según el sistema, ya no llegó --
+    primero hay que sacarla de ese costeo (o eliminar la importación)."""
+    return db.session.query(
+        ParcialLinea.query.filter(ParcialLinea.orden_compra_linea_id == linea.id).exists()
+    ).scalar()
+
+
+def _retroceder_linea(linea):
+    """Ronda CD (2026-10-23, a pedido del usuario: "no puedo devolver los
+    productos a las etapas anteriores, en caso que necesite realizar una
+    modificacion no me permite... aunque esté marcado despachado puedo
+    retornar la operacion a las etapas iniciales"): mueve la línea UNA
+    etapa hacia atrás y limpia los datos que había dejado la etapa que
+    abandona, para que no queden fechas ni cantidades de un despacho que
+    ya no corresponde.
+
+    Hasta esta ronda, una línea despachada o más adelante estaba
+    bloqueada también para retroceder (ver OrdenCompraLinea.bloqueada):
+    eso sigue valiendo para anular y editar, pero ya no para corregir la
+    etapa, que es justamente lo que el usuario necesita cuando hay que
+    rehacer algo. Devuelve la etapa a la que quedó, o None si no había
+    etapa anterior."""
+    anterior = linea.etapa_anterior
+    if not anterior:
+        return None
+    if linea.etapa == "Recibido":
+        linea.fecha_recepcion_bodega = None
+    elif linea.etapa == "Internación Aduanas":
+        linea.fecha_llegada_aduana = None
+    elif linea.etapa == "Orden Despachada":
+        # Vuelve a "Orden Confirmada": deja de estar despachada, así que
+        # se borra lo que había escrito _marcar_orden_despachada.
+        linea.cantidad_despachada_cajas = 0
+        linea.fecha_despacho_real = None
+    linea.etapa = anterior
+    return anterior
+
+
+def _resincronizar_despachos_de(ordenes):
+    """Tras retroceder líneas, el status del despacho puede haber quedado
+    adelantado (ej. 'En aduana' cuando ya nada está en aduana). Se vuelve
+    a derivar permitiendo que RETROCEDA -- a diferencia del flujo normal,
+    acá el retroceso es deliberado."""
+    despachos = {o.despacho for o in ordenes if o.despacho is not None}
+    for despacho in despachos:
+        _sincronizar_status_despacho(despacho, permitir_retroceso=True)
+
+
+def _sincronizar_status_despacho(despacho, permitir_retroceso=False):
     """Ronda AZ (2026-10-01, a pedido del usuario): Despacho.status es el
     campo manual del selector "Preparando envío/En tránsito/En
     aduana/Entregado" -- hasta ahora NADA en el flujo de avance por etapas
@@ -4865,7 +4917,13 @@ def _sincronizar_status_despacho(despacho):
     quedan "Orden Despachada") y al marcar "todo en aduana"/"todo
     recibido", para que nunca más quede desincronizado. Solo avanza HACIA
     ADELANTE en ESTADOS_DESPACHO -- nunca retrocede un status que el
-    usuario haya adelantado a mano por algún motivo puntual."""
+    usuario haya adelantado a mano por algún motivo puntual.
+
+    Ronda CD (2026-10-23): `permitir_retroceso=True` levanta esa última
+    regla, para el único caso en que corresponde -- cuando el usuario
+    devolvió líneas a una etapa anterior a propósito (ver
+    _resincronizar_despachos_de) y el status quedó adelantado respecto
+    de la realidad."""
     lineas_activas = [l for o in despacho.ordenes for l in o.lineas if not l.anulada]
     if not lineas_activas:
         return
@@ -4876,7 +4934,7 @@ def _sincronizar_status_despacho(despacho):
     else:
         nuevo = "En tránsito"
     actual_idx = ORDEN_ESTADOS_DESPACHO.get(despacho.status, -1)
-    if ORDEN_ESTADOS_DESPACHO[nuevo] > actual_idx:
+    if ORDEN_ESTADOS_DESPACHO[nuevo] > actual_idx or permitir_retroceso:
         despacho.status = nuevo
 
 
@@ -7506,15 +7564,22 @@ def ordenes_linea_retroceder(orden_id, linea_id):
     if not _orden_aprobada(orden):
         flash("Esta orden todavía no está Aprobada.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
-    if linea.bloqueada:
-        flash("Esta línea ya fue despachada: no se puede devolver a una etapa anterior.", "warning")
+    # Ronda CD (2026-10-23): una línea ya despachada SÍ se puede devolver
+    # de etapa (el usuario lo necesita para corregir), salvo que ya esté
+    # dentro de un Costeo -- ver _linea_esta_costeada.
+    if _linea_esta_costeada(linea):
+        flash(
+            "Esta línea ya está incluida en un Costeo de Importación: sácala de ese costeo "
+            "(o elimina la importación) antes de devolverla a una etapa anterior.",
+            "warning",
+        )
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
-    anterior = linea.etapa_anterior
-    if not anterior:
+    if not linea.etapa_anterior:
         flash("Esta linea ya esta en la primera etapa.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
-    linea.etapa = anterior
+    anterior = _retroceder_linea(linea)
     recalcular_estado_orden(orden)
+    _resincronizar_despachos_de([orden])
     db.session.commit()
     flash(f"'{linea.producto.codigo}' devuelto a la etapa '{anterior}'.", "info")
     return redirect(url_for("ordenes_detalle", orden_id=orden_id))
@@ -7553,25 +7618,36 @@ def ordenes_lineas_retroceder_masivo(orden_id):
         flash("Selecciona al menos una linea para devolver a la etapa anterior.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
+    # Ronda CD (2026-10-23, a pedido del usuario): ya NO se omite una línea
+    # por estar despachada -- devolverla de etapa es justamente lo que hace
+    # falta para corregir. Lo único que se sigue respetando es que no se
+    # toque una línea anulada, una que ya está en la primera etapa, o una
+    # que ya entró a un Costeo (ver _linea_esta_costeada).
     retrocedidas = 0
     omitidas = 0
+    costeadas = 0
     for linea in lineas:
-        if linea.anulada or linea.bloqueada:
+        if linea.anulada or not linea.etapa_anterior:
             omitidas += 1
             continue
-        anterior = linea.etapa_anterior
-        if not anterior:
-            omitidas += 1
+        if _linea_esta_costeada(linea):
+            costeadas += 1
             continue
-        linea.etapa = anterior
+        _retroceder_linea(linea)
         retrocedidas += 1
 
     recalcular_estado_orden(orden)
+    _resincronizar_despachos_de([orden])
     db.session.commit()
     mensaje = f"{retrocedidas} línea(s) devuelta(s) a su etapa anterior."
     if omitidas:
-        mensaje += f" {omitidas} se omitieron (anuladas, ya despachadas o ya en la primera etapa)."
-    flash(mensaje, "success")
+        mensaje += f" {omitidas} se omitieron (anuladas o ya en la primera etapa)."
+    if costeadas:
+        mensaje += (
+            f" {costeadas} se omitieron porque ya están en un Costeo de Importación: hay que sacarlas de "
+            "ese costeo (o eliminar la importación) antes de poder devolverlas."
+        )
+    flash(mensaje, "warning" if (omitidas or costeadas) and not retrocedidas else "success")
     return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
 
@@ -8319,6 +8395,33 @@ def _avanzar_lineas_despacho(despacho, etapa_desde, etapa_hasta, campo_fecha):
         if cambiaron:
             recalcular_estado_orden(orden)
     return marcadas
+
+
+@app.route("/despachos/<int:despacho_id>/despachadas-masivo", methods=["POST"])
+@requiere_permiso("actualizar_despacho")
+def despachos_despachadas_masivo(despacho_id):
+    """Ronda CD (2026-10-23): contraparte del retroceso de etapa. Desde
+    esta ronda una línea ya despachada se puede devolver a "Orden
+    Confirmada" para corregirla (ver _retroceder_linea); esta acción la
+    vuelve a marcar "Orden Despachada" dentro del MISMO despacho, sin
+    tener que desasociar y volver a asociar la orden. Sin esto, una línea
+    devuelta quedaba atrapada: dentro de un despacho no había forma de
+    volver a avanzarla."""
+    despacho = Despacho.query.get_or_404(despacho_id)
+    marcadas = _avanzar_lineas_despacho(
+        despacho, "Orden Confirmada", "Orden Despachada", "fecha_despacho_real"
+    )
+    for orden in despacho.ordenes:
+        for linea in orden.lineas:
+            if not linea.anulada and linea.etapa == "Orden Despachada" and not linea.cantidad_despachada_cajas:
+                linea.cantidad_despachada_cajas = linea.cantidad_cajas
+    _sincronizar_status_despacho(despacho)
+    db.session.commit()
+    if marcadas:
+        flash(f"{marcadas} línea(s) volvieron a quedar marcadas como despachadas en este despacho.", "success")
+    else:
+        flash("No había líneas en 'Orden Confirmada' dentro de este despacho.", "info")
+    return redirect(url_for("despachos_detalle", despacho_id=despacho.id))
 
 
 @app.route("/despachos/<int:despacho_id>/aduana-masivo", methods=["POST"])
