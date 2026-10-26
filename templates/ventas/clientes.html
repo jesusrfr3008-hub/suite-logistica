@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}Cliente / Vendedor · Suite Logística{% endblock %}
+{% block content %}
+
+{# Ronda CE (2026-10-26): maestro de a qué vendedor pertenece cada cuenta
+   HOY. Es la asignación vigente, y es la que va a mandar para el promedio
+   "de mis cuentas" del Forecast: al reasignar una cuenta, su historia
+   completa viaja con ella. #}
+
+<div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-0">Cliente / Vendedor</h3>
+    <div class="text-muted">
+      A qué vendedor pertenece cada cuenta hoy. Es lo que define el promedio de ventas que cada vendedor verá en
+      su Forecast: si reasignas una cuenta, su historia completa pasa al nuevo vendedor.
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('ventas_clientes_descargar') }}" class="btn btn-outline-secondary">
+      <i class="bi bi-download"></i> Descargar planilla
+    </a>
+    {% if puede_editar %}
+    <button class="btn btn-outline-brand" data-bs-toggle="modal" data-bs-target="#modalCargarClientes">
+      <i class="bi bi-upload"></i> Subir planilla
+    </button>
+    {% endif %}
+    <a href="{{ url_for('ventas_list') }}" class="btn btn-outline-secondary">Volver a Ventas</a>
+  </div>
+</div>
+
+{% if sin_confirmar %}
+<div class="alert alert-warning d-flex justify-content-between align-items-center flex-wrap gap-2">
+  <div>
+    <i class="bi bi-exclamation-triangle me-1"></i>
+    <strong>{{ sin_confirmar }} cuenta(s) todavía con el vendedor que venía en el archivo de ventas.</strong>
+    Puede ser alguien que ya no está en la empresa -- conviene revisarlas y asignarles su vendedor actual.
+  </div>
+  <a class="btn btn-sm btn-warning" href="{{ url_for('ventas_clientes', sin_confirmar='1') }}">Ver solo esas</a>
+</div>
+{% endif %}
+
+<form class="row g-2 mb-3">
+  {% if solo_sin_confirmar %}<input type="hidden" name="sin_confirmar" value="1">{% endif %}
+  <div class="col-auto"><input type="search" class="form-control" name="q" value="{{ q }}" placeholder="RUT, cliente o vendedor"></div>
+  <div class="col-auto"><button class="btn btn-outline-secondary">Buscar</button></div>
+  {% if q or solo_sin_confirmar %}
+  <div class="col-auto"><a class="btn btn-link" href="{{ url_for('ventas_clientes') }}">Quitar filtros</a></div>
+  {% endif %}
+</form>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-hover table-sm align-middle mb-0">
+      <thead>
+        <tr><th>RUT</th><th>Cliente</th><th>Vendedor asignado</th><th>Estado</th>{% if puede_editar %}<th></th>{% endif %}</tr>
+      </thead>
+      <tbody>
+        {% for c in clientes %}
+        <tr class="{% if not c.asignacion_confirmada %}table-warning{% endif %}">
+          <td>{{ c.rut }}</td>
+          <td>{{ c.nombre_cliente }}</td>
+          <td>{{ c.vendedor or '-' }}</td>
+          <td>
+            {% if c.asignacion_confirmada %}
+            <span class="badge bg-success">Confirmado</span>
+            {% else %}
+            <span class="badge bg-warning text-dark" title="Es el vendedor que venía en el archivo de ventas, nadie lo ha confirmado todavía.">Del archivo</span>
+            {% endif %}
+          </td>
+          {% if puede_editar %}
+          <td class="text-end">
+            <form method="post" action="{{ url_for('ventas_clientes_asignar', cliente_id=c.id, q=q) }}" class="d-flex gap-1 justify-content-end">
+              <input list="listaVendedores" name="vendedor" value="{{ c.vendedor or '' }}" class="form-control form-control-sm" style="max-width: 14rem;">
+              <button class="btn btn-sm btn-outline-primary">Asignar</button>
+            </form>
+          </td>
+          {% endif %}
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-center text-muted py-4">
+          Todavía no hay clientes: se crean solos al cargar el primer reporte de ventas.
+        </td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<datalist id="listaVendedores">
+  {% for v in vendedores %}<option value="{{ v }}"></option>{% endfor %}
+</datalist>
+
+{% if puede_editar %}
+<div class="modal fade" id="modalCargarClientes" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('ventas_clientes_cargar') }}" enctype="multipart/form-data">
+        <div class="modal-header">
+          <h5 class="modal-title">Subir planilla Cliente / Vendedor</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-muted">
+            Descarga la planilla, cambia la columna <strong>Vendedor</strong> y vuelve a subirla. El RUT identifica
+            la cuenta; una fila con un RUT que no exista se crea. Las filas sin vendedor se omiten.
+          </p>
+          <input type="file" class="form-control" name="archivo" accept=".xlsx,.xls" required>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Subir</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

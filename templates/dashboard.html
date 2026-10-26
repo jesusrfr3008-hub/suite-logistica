@@ -83,15 +83,30 @@
     </a>
   </div>
   <div class="col-md-6 col-lg-4">
+    {# Ronda CE (2026-10-26): la tarjeta deja de ser "Próximamente" -- ya
+       están los reportes de compras, costos y operacional, y desde esta
+       ronda el Reporte de Ventas con la rotación. #}
+    {% if current_user.tiene_permiso('reportes') %}
+    <a href="{{ url_for('ventas_list') }}" class="card card-module p-3 h-100 text-decoration-none">
+      <div class="d-flex align-items-center gap-3">
+        <i class="bi bi-bar-chart-fill fs-2 text-brand"></i>
+        <div>
+          <div class="fw-semibold">Reportes y Ventas</div>
+          <div class="text-muted small">Ventas, rotación por producto, compras, costos y reporte operacional.</div>
+        </div>
+      </div>
+    </a>
+    {% else %}
     <div class="card card-module disabled p-3 h-100">
       <div class="d-flex align-items-center gap-3">
         <i class="bi bi-bar-chart-fill fs-2 text-secondary"></i>
         <div>
           <div class="fw-semibold">Reportes y Ventas</div>
-          <div class="text-muted small">Próximamente: reportes de compras, costos, rotación y proyección.</div>
+          <div class="text-muted small">Necesitas el permiso de Reportes para entrar.</div>
         </div>
       </div>
     </div>
+    {% endif %}
   </div>
   <div class="col-md-6 col-lg-4">
     <div class="card card-module disabled p-3 h-100">

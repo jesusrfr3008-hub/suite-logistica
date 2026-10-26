@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block title %}Reporte de Ventas · Suite Logística{% endblock %}
+{% block content %}
+
+{# Ronda CE (2026-10-26): Fase 1 del plan de Ventas/Rotación/Forecast --
+   carga del reporte de ventas de Ergopyme y su lectura por producto, que
+   es lo que alimenta la rotación de Consulta de Stock. #}
+
+<style>
+  .tabla-ventas { font-size: .85rem; }
+  .tabla-ventas th, .tabla-ventas td { white-space: nowrap; vertical-align: middle; }
+  .tabla-ventas td.col-desc { max-width: 26rem; overflow: hidden; text-overflow: ellipsis; }
+  .tabla-scroll-ventas { max-height: 62vh; overflow: auto; }
+  .tabla-scroll-ventas > table > thead > tr > th {
+    position: sticky; top: 0; z-index: 3; background: #fff; box-shadow: inset 0 -1px 0 #dee2e6;
+  }
+</style>
+
+<div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-0">Reporte de Ventas</h3>
+    <div class="text-muted">
+      Ventas del sistema de Inventarios, por documento y producto. Es la base de la rotación que se muestra en
+      <a href="{{ url_for('stock_list') }}">Consulta de Stock</a>.
+      {% if ultima_carga %}Última carga: {{ ultima_carga | hora_cl }} (hora de Chile).{% else %}Todavía no se ha cargado ningún reporte de ventas.{% endif %}
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('ventas_clientes') }}" class="btn btn-outline-secondary">
+      <i class="bi bi-people"></i> Cliente / Vendedor
+    </a>
+    {% if puede_cargar %}
+    <button class="btn btn-brand" data-bs-toggle="modal" data-bs-target="#modalCargarVentas">
+      <i class="bi bi-upload"></i> Cargar reporte
+    </button>
+    {% endif %}
+  </div>
+</div>
+
+<form class="row g-2 mb-3">
+  <div class="col-auto"><input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}"></div>
+  <div class="col-auto"><input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}"></div>
+  <div class="col-auto">
+    <select class="form-select" name="vendedor">
+      <option value="">Todos los vendedores</option>
+      {% for v in vendedores %}
+      <option value="{{ v }}" {% if vendedor_sel|upper == v|upper %}selected{% endif %}>{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto"><input type="search" class="form-control" name="q" value="{{ q }}" placeholder="Código, producto o cliente"></div>
+  <div class="col-auto"><button class="btn btn-outline-secondary">Filtrar</button></div>
+</form>
+
+<div class="row g-3 mb-3">
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Unidades netas</div>
+      <div class="h4 mb-0">{{ "%g"|format(unidades) }}</div>
+      <div class="text-muted small">notas de crédito ya restadas</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Venta neta</div>
+      <div class="h4 mb-0">${{ neto|moneda }}</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Líneas en el corte</div>
+      <div class="h4 mb-0">{{ total_lineas }}</div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card card-stat p-3 h-100">
+      <div class="text-muted small">Productos distintos</div>
+      <div class="h4 mb-0">{{ resumen|length }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3 mb-3">
+  <h6 class="mb-2">Por producto</h6>
+  <p class="text-muted small mb-2">
+    Los códigos que empiezan en {{ prefijos_sin_rotacion }} (equipos, servicios, repuestos) y las líneas sin código
+    (contratos, arriendos, hitos de pago) se muestran acá pero no entran en los promedios de rotación.
+  </p>
+  <div class="table-responsive tabla-scroll-ventas">
+    <table class="table table-hover table-sm align-middle mb-0 tabla-ventas">
+      <thead>
+        <tr>
+          <th>Código</th><th>Descripción</th><th>Marca</th>
+          <th class="text-end">Unidades</th><th class="text-end">Venta neta</th><th>Rotación</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in resumen %}
+        <tr>
+          <td>{{ r.codigo }}</td>
+          <td class="col-desc" title="{{ r.descripcion }}">{{ r.descripcion }}</td>
+          <td>{{ r.marca or '-' }}</td>
+          <td class="text-end">{{ "%g"|format(r.unidades) }}</td>
+          <td class="text-end">${{ r.neto|moneda }}</td>
+          <td>
+            {% if r.rotacion %}<span class="badge bg-success-subtle text-success-emphasis">entra</span>
+            {% else %}<span class="badge bg-secondary">no aplica</span>{% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted py-4">No hay ventas cargadas en este período.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card p-3">
+  <h6 class="mb-2">Detalle de documentos {% if total_lineas > lineas|length %}<span class="text-muted small">(mostrando {{ lineas|length }} de {{ total_lineas }})</span>{% endif %}</h6>
+  <div class="table-responsive tabla-scroll-ventas">
+    <table class="table table-hover table-sm align-middle mb-0 tabla-ventas">
+      <thead>
+        <tr>
+          <th>Fecha</th><th>Documento</th><th>Cliente</th><th>Vendedor</th>
+          <th>Código</th><th>Descripción</th>
+          <th class="text-end">Unidades</th><th class="text-end">Neto</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for l in lineas %}
+        <tr class="{% if (l.unidades or 0) < 0 %}table-warning{% endif %}">
+          <td>{{ l.fecha.strftime('%d-%m-%Y') }}</td>
+          <td>{{ l.tipo_documento }} {{ l.numero_documento }}</td>
+          <td title="{{ l.rut_cliente }}">{{ l.nombre_cliente }}</td>
+          <td>{{ l.vendedor_archivo }}</td>
+          <td>{{ l.codigo_interno or '-' }}</td>
+          <td class="col-desc" title="{{ l.descripcion }}">{{ l.descripcion }}</td>
+          <td class="text-end">{{ "%g"|format(l.unidades or 0) }}</td>
+          <td class="text-end">${{ (l.valor_neto or 0)|moneda }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="text-center text-muted py-4">Sin movimientos en este período.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if puede_cargar %}
+<div class="modal fade" id="modalCargarVentas" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('ventas_cargar') }}" enctype="multipart/form-data">
+        <div class="modal-header">
+          <h5 class="modal-title">Cargar reporte de ventas</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-muted">
+            Sube el .xlsx del reporte de ventas de Ergopyme. Se reemplaza <strong>todo el período</strong> que traiga
+            el archivo, no solo los días nuevos: así una venta modificada con fecha atrás se corrige sola. Se
+            mantienen 13 meses de historia. Los clientes nuevos quedan en el maestro Cliente/Vendedor con el
+            vendedor del archivo como sugerencia, para que los revises.
+          </p>
+          <input type="file" class="form-control" name="archivo" accept=".xlsx,.xls" required>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-brand">Cargar</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

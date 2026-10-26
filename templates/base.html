@@ -94,6 +94,9 @@
                  el usuario señaló que la pantalla de Consignación de arriba ya
                  cubría eso con su propio botón de descarga. #}
               <li><a class="dropdown-item" href="{{ url_for('reportes_costo_producto') }}">Consulta Costo Producto</a></li>
+              {# Ronda CE (2026-10-26): Reporte de Ventas y su maestro Cliente/Vendedor. #}
+              <li><a class="dropdown-item" href="{{ url_for('ventas_list') }}">Reporte de Ventas</a></li>
+              <li><a class="dropdown-item" href="{{ url_for('ventas_clientes') }}">Cliente / Vendedor</a></li>
               <li><a class="dropdown-item" href="{{ url_for('reportes_operacional') }}">Reporte Operacional</a></li>
               {% endif %}
             </ul>

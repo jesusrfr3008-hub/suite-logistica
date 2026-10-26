@@ -750,6 +750,110 @@ class AliasCodigoProveedor(db.Model):
         return f"<AliasCodigoProveedor {self.codigo_alias}>"
 
 
+# Ronda CE (2026-10-26, Fase 1 del plan de Ventas/Rotación/Forecast
+# acordado con el usuario): códigos internos de Ergopyme que NO entran en
+# los promedios de venta para rotación. El primer par de dígitos del
+# código es la línea de producto: 30 equipos, 60 servicios, 80 repuestos y
+# 90 (otros). Regla textual del usuario: "los codigos que empiezan por 30,
+# 60, 80, 90 no los incluyas en los promedios de ventas ya que son
+# equipos, servicio, repuestos y no insumos que debo evaluar... en caso
+# que un vendedor quiera vender un equipo codigo 30 ergopyme lo puede
+# seleccionar en la lista pero no debe traer el promedio de venta".
+PREFIJOS_SIN_ROTACION = ("30", "60", "80", "90")
+
+
+def codigo_cuenta_para_rotacion(codigo_interno):
+    """True si este código entra en los promedios de venta/rotación: tiene
+    código (hay 132 líneas del histórico que son contratos, arriendos e
+    hitos de pago, sin código de producto) y no es de una línea excluida."""
+    codigo = (codigo_interno or "").strip()
+    if not codigo:
+        return False
+    return not codigo.startswith(PREFIJOS_SIN_ROTACION)
+
+
+class VentaLinea(db.Model):
+    """Ronda CE (2026-10-26): una línea de documento de venta del sistema
+    de Inventarios (Ergopyme), tal como viene en el reporte de ventas que
+    hoy se baja a mano y que la automatización va a subir a diario.
+
+    Se carga REEMPLAZANDO EL PERÍODO COMPLETO que trae el archivo (no solo
+    los días nuevos): el usuario advirtió que una venta puede modificarse
+    con fecha atrás, así que reprocesar el mes entero es lo único que la
+    corrige sola. Se mantienen 13 meses de historia; lo anterior se purga
+    al cargar.
+
+    Las notas de crédito vienen con unidades y montos NEGATIVOS en el
+    propio archivo, así que netean solas al sumar -- no hay que restarlas
+    aparte."""
+    __tablename__ = "ventas_lineas"
+
+    id = db.Column(db.Integer, primary_key=True)
+    empresa_id = db.Column(db.Integer, db.ForeignKey("empresas.id"), nullable=True, index=True)
+    fecha = db.Column(db.Date, nullable=False, index=True)
+    tipo_documento = db.Column(db.String(40))      # Factura / Nota de Credito / Boleta / Factura de Exportacion
+    numero_documento = db.Column(db.String(40))
+    sector = db.Column(db.String(80))
+    tipo_cliente = db.Column(db.String(40))
+    rut_cliente = db.Column(db.String(20), index=True)
+    nombre_cliente = db.Column(db.String(200))
+    # Vendedor TAL COMO VIENE EN EL ARCHIVO. El vendedor que manda para los
+    # promedios "de mis cuentas" es el del maestro vigente (ver
+    # ClienteVendedor) -- esta columna queda como respaldo del dato
+    # original y para sembrar el maestro la primera vez.
+    vendedor_archivo = db.Column(db.String(120), index=True)
+    cod_linea = db.Column(db.String(10))
+    descripcion_linea = db.Column(db.String(80))
+    codigo_interno = db.Column(db.String(40), index=True)
+    descripcion = db.Column(db.String(300))
+    cod_marca = db.Column(db.String(20))
+    marca = db.Column(db.String(80))
+    unidades = db.Column(db.Float, default=0)
+    precio_unitario = db.Column(db.Float, default=0)
+    valor_neto = db.Column(db.Float, default=0)
+    costo_unitario = db.Column(db.Float, default=0)
+    costo_total = db.Column(db.Float, default=0)
+    contribucion = db.Column(db.Float, default=0)
+    condicion_venta = db.Column(db.String(40))
+    # Se calcula al cargar (ver codigo_cuenta_para_rotacion) para no tener
+    # que repetir la regla en cada consulta de rotación.
+    cuenta_para_rotacion = db.Column(db.Boolean, default=True, index=True)
+    cargado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    empresa = db.relationship("Empresa")
+
+    def __repr__(self):
+        return f"<VentaLinea {self.fecha} {self.numero_documento} {self.codigo_interno}>"
+
+
+class ClienteVendedor(db.Model):
+    """Ronda CE (2026-10-26): maestro de a qué vendedor pertenece cada
+    cuenta HOY. Es la asignación VIGENTE, y es la que manda para el
+    promedio "de mis cuentas" que ve cada vendedor en el Forecast: si una
+    cuenta se reasigna, su historia completa viaja con ella (decisión
+    explícita del usuario, que necesita repartir las cuentas de los
+    vendedores que ya no están).
+
+    Se siembra solo al cargar ventas -- un RUT nuevo entra con el vendedor
+    que trae el archivo como sugerencia -- y después se mantiene a mano en
+    pantalla o subiendo la planilla editada."""
+    __tablename__ = "clientes_vendedores"
+
+    id = db.Column(db.Integer, primary_key=True)
+    rut = db.Column(db.String(20), nullable=False, unique=True, index=True)
+    nombre_cliente = db.Column(db.String(200))
+    vendedor = db.Column(db.String(120), index=True)
+    # True cuando el vendedor lo asignó una persona (en pantalla o por
+    # planilla). False mientras siga siendo el que vino del archivo: así se
+    # distingue lo ya revisado de lo que todavía arrastra al vendedor
+    # histórico, que puede ser alguien que ya no está.
+    asignacion_confirmada = db.Column(db.Boolean, default=False)
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ClienteVendedor {self.rut} -> {self.vendedor}>"
+
+
 class CompraHistorica(db.Model):
     """Ronda AA (2026-09-13): histórico "congelado" de compras/importaciones
     a proveedores anteriores a este sistema, cargado UNA SOLA VEZ desde el

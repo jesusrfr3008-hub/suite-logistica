@@ -46,6 +46,7 @@ from models import (
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
     AjusteCompraProveedor,
     FacturaEmbarqueImportacion,
+    VentaLinea, ClienteVendedor, codigo_cuenta_para_rotacion, PREFIJOS_SIN_ROTACION,
 )
 from seed_data import seed_from_excel
 import costing
@@ -12257,6 +12258,23 @@ def stock_list():
     # columna (ver JS abajo) sigue disponible y solo dura hasta el próximo
     # cambio de filtro (recarga la página).
     resultado = sorted(grupos.values(), key=lambda g: -(g["stock_total_proyectado"] or 0))
+
+    # Ronda CE (2026-10-26, Fase 1 del plan de Ventas/Rotación): promedio
+    # mensual de venta a 90/180/360 días y días de stock, para validar las
+    # existencias contra lo que de verdad se vende. Los códigos de
+    # equipos/servicios/repuestos (ver PREFIJOS_SIN_ROTACION) no tienen
+    # promedio a propósito -- no son insumos que se evalúen por rotación.
+    rotacion = _rotacion_por_codigo()
+    hay_ventas = bool(rotacion)
+    for grupo in resultado:
+        datos = rotacion.get((grupo.get("codigo_interno") or "").strip(), {})
+        grupo["venta_90"] = datos.get(90)
+        grupo["venta_180"] = datos.get(180)
+        grupo["venta_360"] = datos.get(360)
+        promedio_diario = datos.get("diario") or 0
+        proyectado = grupo.get("stock_total_proyectado") or 0
+        grupo["dias_stock"] = round(proyectado / promedio_diario) if promedio_diario > 0 and proyectado > 0 else None
+
     empresas = Empresa.query.order_by(Empresa.nombre).all()
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     ultima_carga = db.session.query(db.func.max(StockExistencia.cargado_en)).scalar()
@@ -12266,7 +12284,7 @@ def stock_list():
         "stock/list.html", grupos=resultado, empresas=empresas, proveedores=proveedores,
         empresa_sel=empresa_id, proveedor_sel=proveedor_id, q=q,
         ultima_carga=ultima_carga, ultima_carga_pedidos=ultima_carga_pedidos,
-        ultima_carga_bodegas=ultima_carga_bodegas,
+        ultima_carga_bodegas=ultima_carga_bodegas, hay_ventas=hay_ventas,
     )
 
 
@@ -12439,6 +12457,496 @@ def api_stock_cargar_auto():
         lotes_consignacion_consumidos=deteccion_consignacion["consumidos"],
         lotes_consignacion_revividos=deteccion_consignacion["revividos"],
     ), (200 if severidad != "danger" else 422)
+
+
+# ---------------------------------------------------------------------------
+# Ronda CE (2026-10-26): Reporte de Ventas y rotación -- Fase 1 del plan
+# acordado con el usuario (ver claude/plan-ventas-rotacion-forecast.md en
+# el proyecto). Alimenta la rotación de Consulta de Stock y, más adelante,
+# los promedios del Forecast.
+# ---------------------------------------------------------------------------
+
+# El usuario quiere 13 meses de historia de ventas; más atrás no se usa.
+MESES_HISTORIA_VENTAS = 13
+
+# Columnas del reporte de ventas de Ergopyme, tal como vienen en el
+# encabezado (el archivo histórico y el reporte diario traen exactamente
+# las mismas; el diario además lleva una fila de título con la empresa).
+_COLUMNAS_VENTAS = {
+    "anio": "AÑO", "mes": "MES", "dia": "DIA", "tipo_documento": "TIPO DOCTO",
+    "numero_documento": "Nº.DOCTO", "sector": "SECTOR", "tipo_cliente": "TIPO CLIENTE",
+    "rut_cliente": "RUT CLIENTE", "nombre_cliente": "NOMBRE CLIENTE", "vendedor_archivo": "VENDEDOR",
+    "cod_linea": "COD.LINEA", "codigo_interno": "CÓD.PRODUCTO", "descripcion": "DESCRIPCIÓN PRODUCTO",
+    "unidades": "UNIDADES", "precio_unitario": "PCIO.UNITARIO", "valor_neto": "VALOR NETO",
+    "costo_unitario": "COSTO UNITARIO", "condicion_venta": "COND.VTA", "cod_marca": "COD.MARCA",
+    "contribucion": "CONTRIBUCIÓN", "descripcion_linea": "DESCRIPCION LINEA",
+    "marca": "DESCRIPCIÓN MARCA", "costo_total": "COSTO TOTAL",
+}
+
+
+def _empresa_desde_titulo_ventas(titulo):
+    """La primera celda del reporte de ventas no trae solo la empresa:
+    viene como "ACCUVISION SPA              Planilla maestro de venta".
+    Se resuelve buscando qué empresa del catálogo es PREFIJO de ese
+    título (así da igual qué texto venga pegado después), y si eso no
+    calza se prueba con el primer tramo antes del espaciado largo."""
+    texto = re.sub(r"\s+", " ", (titulo or "").strip()).upper()
+    if not texto:
+        return None
+    for empresa in Empresa.query.all():
+        nombre = (empresa.nombre or "").strip().upper()
+        if nombre and texto.startswith(nombre):
+            return empresa
+    primer_tramo = re.split(r"\s{2,}", (titulo or "").strip())[0]
+    return _empresa_por_nombre_reporte(primer_tramo, {})
+
+
+def _corte_historia_ventas(hoy=None):
+    """Primer día del mes de hace 12 meses: así quedan guardados 13 meses
+    CALENDARIO completos (el actual más los 12 anteriores), que es lo que
+    pidió el usuario -- "mantener el historico de 13 meses, mas de ahi no
+    lo consideramos". Se calcula por mes y no por cantidad de días para
+    que el corte sea predecible y no se mueva dentro del mismo mes."""
+    hoy = hoy or date.today()
+    mes = hoy.month - 12
+    anio = hoy.year
+    while mes <= 0:
+        mes += 12
+        anio -= 1
+    return date(anio, mes, 1)
+
+
+def _numero_venta(valor):
+    """Los números del reporte pueden venir como texto (con coma decimal)
+    o como número real, según cómo se exporte."""
+    if valor is None:
+        return 0.0
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    texto = str(valor).strip()
+    if not texto:
+        return 0.0
+    if "," in texto and "." in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    elif "," in texto:
+        texto = texto.replace(",", ".")
+    try:
+        return float(texto)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _leer_filas_reporte_ventas(ws):
+    """Lee el reporte de ventas de Ergopyme. Ubica el encabezado buscando
+    la fila que trae 'Año' y 'Unidades' (el reporte diario trae encima una
+    fila con el nombre de la empresa, el histórico no), y devuelve
+    (nombre_empresa_del_titulo, [dict por línea])."""
+    filas = list(ws.iter_rows(values_only=True))
+    if not filas:
+        return "", []
+    fila_encabezado = None
+    columnas = {}
+    for i, fila in enumerate(filas[:6]):
+        nombres = [str(v).strip().upper() if v is not None else "" for v in fila]
+        if "AÑO" in nombres and "UNIDADES" in nombres:
+            fila_encabezado = i
+            columnas = {n: idx for idx, n in enumerate(nombres) if n}
+            break
+    if fila_encabezado is None:
+        return "", []
+
+    nombre_empresa = ""
+    if fila_encabezado > 0:
+        primera = filas[0]
+        nombre_empresa = str(primera[0]).strip() if primera and primera[0] else ""
+
+    def col(fila, clave):
+        idx = columnas.get(_COLUMNAS_VENTAS[clave])
+        return fila[idx] if idx is not None and idx < len(fila) else None
+
+    leidas = []
+    for fila in filas[fila_encabezado + 1:]:
+        if not fila or all(v is None for v in fila):
+            continue
+        try:
+            anio = int(_numero_venta(col(fila, "anio")))
+            mes = int(_numero_venta(col(fila, "mes")))
+            dia = int(_numero_venta(col(fila, "dia")))
+            fecha = date(anio, mes, dia)
+        except (TypeError, ValueError):
+            continue
+        codigo = str(col(fila, "codigo_interno") or "").strip()
+        if codigo.endswith(".0"):
+            codigo = codigo[:-2]
+        leidas.append({
+            "fecha": fecha,
+            "tipo_documento": str(col(fila, "tipo_documento") or "").strip(),
+            "numero_documento": str(col(fila, "numero_documento") or "").strip(),
+            "sector": str(col(fila, "sector") or "").strip(),
+            "tipo_cliente": str(col(fila, "tipo_cliente") or "").strip(),
+            "rut_cliente": str(col(fila, "rut_cliente") or "").strip(),
+            "nombre_cliente": str(col(fila, "nombre_cliente") or "").strip(),
+            "vendedor_archivo": str(col(fila, "vendedor_archivo") or "").strip(),
+            "cod_linea": str(col(fila, "cod_linea") or "").strip(),
+            "descripcion_linea": str(col(fila, "descripcion_linea") or "").strip(),
+            "codigo_interno": codigo,
+            "descripcion": str(col(fila, "descripcion") or "").strip(),
+            "cod_marca": str(col(fila, "cod_marca") or "").strip(),
+            "marca": str(col(fila, "marca") or "").strip(),
+            "unidades": _numero_venta(col(fila, "unidades")),
+            "precio_unitario": _numero_venta(col(fila, "precio_unitario")),
+            "valor_neto": _numero_venta(col(fila, "valor_neto")),
+            "costo_unitario": _numero_venta(col(fila, "costo_unitario")),
+            "costo_total": _numero_venta(col(fila, "costo_total")),
+            "contribucion": _numero_venta(col(fila, "contribucion")),
+            "condicion_venta": str(col(fila, "condicion_venta") or "").strip(),
+        })
+    return nombre_empresa, leidas
+
+
+def _cargar_reporte_ventas(nombre_empresa, leidas):
+    """Guarda las líneas leídas REEMPLAZANDO el período completo que trae
+    el archivo (de su fecha mínima a su máxima, para esa empresa), que es
+    la única forma de que una venta modificada con fecha atrás se corrija
+    sola -- el usuario lo pidió explícitamente: "es posible que haya una
+    venta que se modifique con fecha atras, por lo que se recomienda
+    siempre volver a considerar el mes de proceso".
+
+    Además siembra el maestro cliente/vendedor con los RUT nuevos y purga
+    lo que quede fuera de los 13 meses de historia."""
+    empresa = _empresa_desde_titulo_ventas(nombre_empresa)
+    desde = min(f["fecha"] for f in leidas)
+    hasta = max(f["fecha"] for f in leidas)
+
+    # Qué se reemplaza dentro del período: si el archivo dice de qué
+    # empresa es, se borran SUS líneas y además las que quedaron sin
+    # empresa (vienen de una carga histórica sin título, y este archivo
+    # las reemplaza). Si el archivo NO trae empresa, se borra todo el
+    # período: no hay forma de distinguir, y sin esto el mismo mes
+    # quedaría cargado dos veces -- una sin empresa y otra con ella.
+    borradas = VentaLinea.query.filter(VentaLinea.fecha >= desde, VentaLinea.fecha <= hasta)
+    if empresa:
+        borradas = borradas.filter(db.or_(
+            VentaLinea.empresa_id == empresa.id, VentaLinea.empresa_id.is_(None)
+        ))
+    borradas = borradas.delete(synchronize_session=False)
+
+    for f in leidas:
+        db.session.add(VentaLinea(
+            empresa_id=empresa.id if empresa else None,
+            cuenta_para_rotacion=codigo_cuenta_para_rotacion(f["codigo_interno"]),
+            **f,
+        ))
+
+    # Maestro cliente/vendedor: los RUT nuevos entran con el vendedor del
+    # archivo como sugerencia (sin confirmar), los ya existentes no se
+    # tocan -- la asignación vigente la decide el usuario.
+    existentes = {c.rut for c in ClienteVendedor.query.with_entities(ClienteVendedor.rut).all()}
+    nuevos = 0
+    for f in leidas:
+        rut = f["rut_cliente"]
+        if not rut or rut in existentes:
+            continue
+        db.session.add(ClienteVendedor(
+            rut=rut, nombre_cliente=f["nombre_cliente"],
+            vendedor=f["vendedor_archivo"], asignacion_confirmada=False,
+        ))
+        existentes.add(rut)
+        nuevos += 1
+
+    purgadas = VentaLinea.query.filter(VentaLinea.fecha < _corte_historia_ventas()).delete(
+        synchronize_session=False
+    )
+    db.session.commit()
+    return {
+        "empresa": empresa, "nombre_empresa": nombre_empresa,
+        "desde": desde, "hasta": hasta,
+        "insertadas": len(leidas), "reemplazadas": borradas,
+        "clientes_nuevos": nuevos, "purgadas": purgadas,
+    }
+
+
+def _unidades_vendidas_por_codigo(dias, vendedor=None):
+    """Unidades netas vendidas por código interno en los últimos `dias`
+    días (las notas de crédito restan solas, vienen en negativo). Solo
+    códigos que cuentan para rotación.
+
+    `vendedor` acota a las cuentas que HOY pertenecen a ese vendedor según
+    el maestro vigente (ClienteVendedor) -- no al vendedor que figuraba en
+    la factura."""
+    desde = date.today() - timedelta(days=dias)
+    query = VentaLinea.query.filter(
+        VentaLinea.fecha >= desde,
+        VentaLinea.cuenta_para_rotacion == True,  # noqa: E712
+    )
+    if vendedor:
+        ruts = [
+            c.rut for c in ClienteVendedor.query.filter(
+                db.func.upper(ClienteVendedor.vendedor) == vendedor.strip().upper()
+            ).all()
+        ]
+        if not ruts:
+            return {}
+        query = query.filter(VentaLinea.rut_cliente.in_(ruts))
+    totales = defaultdict(float)
+    for codigo, unidades in query.with_entities(VentaLinea.codigo_interno, VentaLinea.unidades).all():
+        totales[(codigo or "").strip()] += unidades or 0
+    return dict(totales)
+
+
+def _rotacion_por_codigo(ventanas=(90, 180, 360)):
+    """Promedio MENSUAL de unidades vendidas por código, en cada ventana
+    de días. Devuelve {codigo: {90: x, 180: y, 360: z, "diario": d}} --
+    "diario" sale de la ventana de 90 días y es el que usa el cálculo de
+    días de stock."""
+    resultado = defaultdict(dict)
+    for dias in ventanas:
+        for codigo, unidades in _unidades_vendidas_por_codigo(dias).items():
+            resultado[codigo][dias] = round(unidades / (dias / 30.0), 1)
+    ventana_corta = min(ventanas)
+    for codigo, datos in resultado.items():
+        promedio_mensual = datos.get(ventana_corta, 0)
+        datos["diario"] = round(promedio_mensual / 30.0, 4) if promedio_mensual > 0 else 0
+    return resultado
+
+
+@app.route("/ventas")
+@requiere_permiso("reportes")
+def ventas_list():
+    """Ronda CE (2026-10-26): Reporte de Ventas -- reemplaza la tarjeta
+    "Reportes y Ventas / Próximamente" del dashboard. Es la base de la
+    rotación que se muestra en Consulta de Stock y, en la Fase 2, de los
+    promedios del Forecast."""
+    desde_txt = request.args.get("fecha_desde", "")
+    hasta_txt = request.args.get("fecha_hasta", "")
+    vendedor_sel = request.args.get("vendedor", "").strip()
+    q = request.args.get("q", "").strip()
+    if not desde_txt and not hasta_txt and "fecha_desde" not in request.args:
+        desde_txt = (date.today() - timedelta(days=90)).isoformat()
+        hasta_txt = date.today().isoformat()
+
+    query = VentaLinea.query
+    desde, hasta = parse_date(desde_txt), parse_date(hasta_txt)
+    if desde:
+        query = query.filter(VentaLinea.fecha >= desde)
+    if hasta:
+        query = query.filter(VentaLinea.fecha <= hasta)
+    if vendedor_sel:
+        query = query.filter(db.func.upper(VentaLinea.vendedor_archivo) == vendedor_sel.upper())
+    if q:
+        like = f"%{q}%"
+        query = query.filter(db.or_(
+            VentaLinea.codigo_interno.ilike(like), VentaLinea.descripcion.ilike(like),
+            VentaLinea.nombre_cliente.ilike(like), VentaLinea.rut_cliente.ilike(like),
+        ))
+    lineas = query.order_by(VentaLinea.fecha.desc(), VentaLinea.numero_documento.desc()).all()
+
+    # Resumen por producto (lo que de verdad se mira para comprar), con el
+    # promedio mensual del propio corte.
+    por_producto = defaultdict(lambda: {"unidades": 0.0, "neto": 0.0, "descripcion": "", "marca": "", "rotacion": True})
+    for l in lineas:
+        clave = (l.codigo_interno or "").strip() or "(sin código)"
+        fila = por_producto[clave]
+        fila["unidades"] += l.unidades or 0
+        fila["neto"] += l.valor_neto or 0
+        fila["descripcion"] = fila["descripcion"] or l.descripcion
+        fila["marca"] = fila["marca"] or l.marca
+        fila["rotacion"] = bool(l.cuenta_para_rotacion)
+    resumen = sorted(
+        ({"codigo": k, **v} for k, v in por_producto.items()),
+        key=lambda r: -r["neto"],
+    )[:300]
+
+    ultima_carga = db.session.query(db.func.max(VentaLinea.cargado_en)).scalar()
+    vendedores = sorted({
+        (v[0] or "").strip()
+        for v in VentaLinea.query.with_entities(VentaLinea.vendedor_archivo).distinct().all()
+        if (v[0] or "").strip()
+    })
+    return render_template(
+        "ventas/list.html", lineas=lineas[:500], total_lineas=len(lineas), resumen=resumen,
+        unidades=sum(l.unidades or 0 for l in lineas), neto=sum(l.valor_neto or 0 for l in lineas),
+        vendedores=vendedores, vendedor_sel=vendedor_sel, q=q,
+        fecha_desde=desde_txt, fecha_hasta=hasta_txt, ultima_carga=ultima_carga,
+        puede_cargar=current_user.tiene_permiso("inventarios"),
+        prefijos_sin_rotacion=", ".join(PREFIJOS_SIN_ROTACION),
+    )
+
+
+@app.route("/ventas/cargar", methods=["POST"])
+@requiere_permiso("inventarios")
+def ventas_cargar():
+    """Sube el reporte de ventas de Ergopyme. Mismo perfil que carga el
+    Stock (decisión del usuario). Reemplaza el período completo que trae
+    el archivo -- ver _cargar_reporte_ventas."""
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona el archivo del reporte de ventas.", "warning")
+        return redirect(url_for("ventas_list"))
+    if os.path.splitext(archivo.filename)[1].lower() not in (".xlsx", ".xls"):
+        flash("Formato no soportado. Sube el archivo .xlsx del reporte de ventas.", "danger")
+        return redirect(url_for("ventas_list"))
+    try:
+        wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
+        nombre_empresa, leidas = _leer_filas_reporte_ventas(wb.worksheets[0])
+    except Exception:
+        flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
+        return redirect(url_for("ventas_list"))
+
+    if not leidas:
+        flash(
+            "El archivo no tiene líneas de venta reconocibles (se esperan las columnas Año, mes, dia, "
+            "Cód.Producto, Unidades, Valor Neto) -- no se cambió nada.",
+            "warning",
+        )
+        return redirect(url_for("ventas_list"))
+
+    resumen = _cargar_reporte_ventas(nombre_empresa, leidas)
+    mensaje = (
+        f"{resumen['insertadas']} línea(s) de venta cargadas del período "
+        f"{resumen['desde'].strftime('%d-%m-%Y')} al {resumen['hasta'].strftime('%d-%m-%Y')}"
+    )
+    if resumen["empresa"]:
+        mensaje += f" ({resumen['empresa'].nombre})"
+    if resumen["reemplazadas"]:
+        mensaje += f", reemplazando {resumen['reemplazadas']} que ya estaban en ese período"
+    mensaje += "."
+    if resumen["clientes_nuevos"]:
+        mensaje += (
+            f" {resumen['clientes_nuevos']} cliente(s) nuevo(s) quedaron en el maestro con el vendedor del "
+            "archivo como sugerencia -- revísalos en Cliente/Vendedor."
+        )
+    if resumen["purgadas"]:
+        mensaje += f" Se purgaron {resumen['purgadas']} línea(s) fuera de los {MESES_HISTORIA_VENTAS} meses de historia."
+    if not resumen["empresa"] and nombre_empresa:
+        mensaje += f" Ojo: '{nombre_empresa}' no calza con ninguna empresa del catálogo, las líneas quedaron sin empresa."
+    flash(mensaje, "success")
+    return redirect(url_for("ventas_list"))
+
+
+@app.route("/ventas/clientes")
+@requiere_permiso("reportes")
+def ventas_clientes():
+    """Maestro cliente/vendedor: la asignación VIGENTE, que es la que
+    manda para los promedios "de mis cuentas"."""
+    q = request.args.get("q", "").strip()
+    solo_sin_confirmar = request.args.get("sin_confirmar", "") == "1"
+    query = ClienteVendedor.query
+    if q:
+        like = f"%{q}%"
+        query = query.filter(db.or_(
+            ClienteVendedor.rut.ilike(like), ClienteVendedor.nombre_cliente.ilike(like),
+            ClienteVendedor.vendedor.ilike(like),
+        ))
+    if solo_sin_confirmar:
+        query = query.filter(ClienteVendedor.asignacion_confirmada == False)  # noqa: E712
+    clientes = query.order_by(ClienteVendedor.nombre_cliente).all()
+    vendedores = sorted({
+        (c.vendedor or "").strip() for c in ClienteVendedor.query.all() if (c.vendedor or "").strip()
+    })
+    return render_template(
+        "ventas/clientes.html", clientes=clientes, vendedores=vendedores, q=q,
+        solo_sin_confirmar=solo_sin_confirmar,
+        sin_confirmar=ClienteVendedor.query.filter(ClienteVendedor.asignacion_confirmada == False).count(),  # noqa: E712
+        puede_editar=current_user.tiene_permiso("inventarios"),
+    )
+
+
+@app.route("/ventas/clientes/<int:cliente_id>/asignar", methods=["POST"])
+@requiere_permiso("inventarios")
+def ventas_clientes_asignar(cliente_id):
+    cliente = ClienteVendedor.query.get_or_404(cliente_id)
+    vendedor = request.form.get("vendedor", "").strip()
+    if not vendedor:
+        flash("Indica el vendedor que queda a cargo de la cuenta.", "warning")
+        return redirect(url_for("ventas_clientes"))
+    cliente.vendedor = vendedor
+    cliente.asignacion_confirmada = True
+    db.session.commit()
+    flash(f"{cliente.nombre_cliente or cliente.rut} quedó asignado a {vendedor}.", "success")
+    return redirect(url_for("ventas_clientes", q=request.args.get("q", "")))
+
+
+@app.route("/ventas/clientes/descargar")
+@requiere_permiso("reportes")
+def ventas_clientes_descargar():
+    """Baja el maestro para editarlo en Excel y volver a subirlo."""
+    clientes = ClienteVendedor.query.order_by(ClienteVendedor.nombre_cliente).all()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Cliente-Vendedor"
+    for col, titulo in enumerate(["RUT", "Cliente", "Vendedor", "Confirmado"], start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.fill = _RELLENO_ENCABEZADO_REPORTE
+        celda.alignment = Alignment(horizontal="center")
+    for n, c in enumerate(clientes, start=2):
+        ws.cell(row=n, column=1, value=c.rut)
+        ws.cell(row=n, column=2, value=c.nombre_cliente)
+        ws.cell(row=n, column=3, value=c.vendedor)
+        ws.cell(row=n, column=4, value="Sí" if c.asignacion_confirmada else "No")
+    ws.auto_filter.ref = f"A1:D{max(len(clientes) + 1, 1)}"
+    for col, ancho in enumerate([16, 48, 28, 14], start=1):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+    ws.freeze_panes = "A2"
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return send_file(
+        buffer, as_attachment=True,
+        download_name=f"Cliente_Vendedor_{date.today().isoformat()}.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/ventas/clientes/cargar", methods=["POST"])
+@requiere_permiso("inventarios")
+def ventas_clientes_cargar():
+    """Sube la planilla del maestro ya editada. Solo toca el vendedor: el
+    RUT identifica la cuenta y un RUT que no exista se crea."""
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona la planilla de Cliente/Vendedor.", "warning")
+        return redirect(url_for("ventas_clientes"))
+    try:
+        wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
+        filas = list(wb.worksheets[0].iter_rows(values_only=True))
+    except Exception:
+        flash("No se pudo leer la planilla. Verifica que no esté dañada o abierta en otro programa.", "danger")
+        return redirect(url_for("ventas_clientes"))
+
+    actualizados = 0
+    creados = 0
+    sin_vendedor = 0
+    existentes = {c.rut: c for c in ClienteVendedor.query.all()}
+    for fila in filas[1:]:
+        if not fila or not fila[0]:
+            continue
+        rut = str(fila[0]).strip()
+        nombre = str(fila[1]).strip() if len(fila) > 1 and fila[1] else ""
+        vendedor = str(fila[2]).strip() if len(fila) > 2 and fila[2] else ""
+        if not vendedor:
+            sin_vendedor += 1
+            continue
+        cliente = existentes.get(rut)
+        if cliente is None:
+            db.session.add(ClienteVendedor(
+                rut=rut, nombre_cliente=nombre, vendedor=vendedor, asignacion_confirmada=True,
+            ))
+            creados += 1
+        elif (cliente.vendedor or "").strip().upper() != vendedor.upper() or not cliente.asignacion_confirmada:
+            cliente.vendedor = vendedor
+            cliente.asignacion_confirmada = True
+            actualizados += 1
+    db.session.commit()
+    mensaje = f"Maestro actualizado: {actualizados} cuenta(s) reasignada(s) o confirmada(s), {creados} nueva(s)."
+    if sin_vendedor:
+        mensaje += f" {sin_vendedor} fila(s) se omitieron por venir sin vendedor."
+    flash(mensaje, "success")
+    return redirect(url_for("ventas_clientes"))
+
+
+@app.route("/stock-valorizado")
 
 
 @app.route("/stock-valorizado")

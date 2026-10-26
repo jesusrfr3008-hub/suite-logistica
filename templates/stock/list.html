@@ -126,6 +126,25 @@
           </th>
           <!-- Ronda AD: orden por defecto del backend (mayor Stock total primero) -- se marca aquí la flecha ya activa. -->
           <th class="text-end ordenable" data-col="stock_total" data-tipo="num">Stock total <span class="icono-orden orden-activo">▼</span></th>
+          {# Ronda CE (2026-10-26): rotación a partir del reporte de ventas. #}
+          {% if hay_ventas %}
+          <th class="text-end ordenable" data-col="venta_90" data-tipo="num" data-bs-toggle="tooltip"
+              title="Promedio mensual de unidades vendidas en los últimos 90 días (las notas de crédito ya vienen restadas).">
+            Vta/mes 90d <span class="icono-orden">⇅</span>
+          </th>
+          <th class="text-end ordenable" data-col="venta_180" data-tipo="num" data-bs-toggle="tooltip"
+              title="Promedio mensual de unidades vendidas en los últimos 180 días.">
+            Vta/mes 180d <span class="icono-orden">⇅</span>
+          </th>
+          <th class="text-end ordenable" data-col="venta_360" data-tipo="num" data-bs-toggle="tooltip"
+              title="Promedio mensual de unidades vendidas en los últimos 360 días.">
+            Vta/mes 360d <span class="icono-orden">⇅</span>
+          </th>
+          <th class="text-end ordenable" data-col="dias_stock" data-tipo="num" data-bs-toggle="tooltip"
+              title="Cuántos días alcanza el stock total proyectado al ritmo de venta de los últimos 90 días.">
+            Días stock <span class="icono-orden">⇅</span>
+          </th>
+          {% endif %}
           <th class="ordenable" data-col="vencimiento" data-tipo="text">Próximo vencimiento <span class="icono-orden">⇅</span></th>
           <th class="text-end">Cantidad Licitación</th>
           <th></th>
@@ -155,6 +174,17 @@
           </td>
           <td class="text-end" data-col="pedido" data-value="{{ g.pedido }}">{{ g.pedido }}</td>
           <td class="text-end fw-semibold" data-col="stock_total" data-value="{{ g.stock_total_proyectado }}">{{ g.stock_total_proyectado }}</td>
+          {% if hay_ventas %}
+          <td class="text-end" data-col="venta_90" data-value="{{ g.venta_90 or 0 }}">{{ g.venta_90 if g.venta_90 is not none else '-' }}</td>
+          <td class="text-end" data-col="venta_180" data-value="{{ g.venta_180 or 0 }}">{{ g.venta_180 if g.venta_180 is not none else '-' }}</td>
+          <td class="text-end" data-col="venta_360" data-value="{{ g.venta_360 or 0 }}">{{ g.venta_360 if g.venta_360 is not none else '-' }}</td>
+          <td class="text-end {% if g.dias_stock is not none and g.dias_stock < 30 %}text-danger fw-semibold{% endif %}"
+              data-col="dias_stock" data-value="{{ g.dias_stock if g.dias_stock is not none else -1 }}">
+            {% if g.dias_stock is not none %}{{ g.dias_stock }}{% else %}
+            <span class="text-muted" data-bs-toggle="tooltip" title="Sin ventas en los últimos 90 días, o es un código de equipos/servicios/repuestos que no se evalúa por rotación.">-</span>
+            {% endif %}
+          </td>
+          {% endif %}
           <td data-col="vencimiento" data-value="{{ g.proximo_vencimiento.strftime('%Y-%m-%d') if g.proximo_vencimiento else '' }}">{{ g.proximo_vencimiento.strftime('%d-%m-%Y') if g.proximo_vencimiento else '-' }}</td>
           <td class="text-end text-muted" title="Próximamente">-</td>
           <td class="text-end">
