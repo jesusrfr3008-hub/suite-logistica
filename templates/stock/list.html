@@ -153,7 +153,17 @@
       <tbody>
         {% for g in grupos %}
         <tr class="{% if not g.homologado %}text-muted{% endif %} {% if g.sin_stock_cargado %}table-warning{% endif %}">
-          <td data-col="empresa" data-value="{{ (g.empresa.nombre if g.empresa else '')|lower }}">{{ g.empresa.nombre if g.empresa else '' }}</td>
+          {# Ronda CF (2026-10-27): con "Todas las empresas" la fila viene
+             consolidada y el desglose por empresa va en el tooltip. #}
+          <td data-col="empresa" data-value="{{ (g.empresa.nombre if g.empresa else 'todas')|lower }}">
+            {% if g.empresa %}{{ g.empresa.nombre }}
+            {% elif g.stock_por_empresa %}
+            <span data-bs-toggle="tooltip" style="cursor: help; border-bottom: 1px dotted;"
+                  title="{% for emp, cant in g.stock_por_empresa.items() %}{{ emp }}: {{ cant }}{{ ' · ' if not loop.last }}{% endfor %}">
+              Todas
+            </span>
+            {% else %}<span class="text-muted">-</span>{% endif %}
+          </td>
           <td data-col="proveedor" data-value="{{ (g.proveedor_nombre or '')|lower }}">
             {% if g.sin_stock_cargado and not g.proveedor_nombre %}
             <span data-bs-toggle="tooltip" title="Este código tiene unidades pendientes en Notas de pedido, pero nunca apareció en el último reporte de Stock cargado, y tampoco está en el mapeo de códigos Ergopyme.">(pedido sin stock cargado)</span>

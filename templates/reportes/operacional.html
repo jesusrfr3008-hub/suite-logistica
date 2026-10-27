@@ -49,7 +49,8 @@
       <div class="dropdown-menu p-3" style="min-width: 22rem;">
         <form method="get" action="{{ url_for('reportes_operacional_descargar') }}">
           <input type="hidden" name="empresa" value="{{ empresa_sel }}">
-          <input type="hidden" name="proveedor" value="{{ proveedor_sel }}">
+          {% for p in proveedores_sel %}<input type="hidden" name="proveedor" value="{{ p }}">{% endfor %}
+          {% for p in productos_sel %}<input type="hidden" name="producto" value="{{ p }}">{% endfor %}
           <input type="hidden" name="transporte" value="{{ transporte_sel }}">
           <input type="hidden" name="fecha_desde" value="{{ fecha_desde }}">
           <input type="hidden" name="fecha_hasta" value="{{ fecha_hasta }}">
@@ -78,10 +79,12 @@
       </div>
     </div>
     <div class="btn-group">
+    {# El cambio de moneda conserva los filtros actuales, incluidos los múltiples. #}
+    {% set qs_filtros %}empresa={{ empresa_sel|urlencode }}&transporte={{ transporte_sel|urlencode }}&fecha_desde={{ fecha_desde }}&fecha_hasta={{ fecha_hasta }}{% for p in proveedores_sel %}&proveedor={{ p|urlencode }}{% endfor %}{% for p in productos_sel %}&producto={{ p|urlencode }}{% endfor %}{% endset %}
     <a class="btn btn-sm {{ 'btn-brand' if moneda == 'USD' else 'btn-outline-secondary' }}"
-       href="{{ url_for('reportes_operacional', empresa=empresa_sel, proveedor=proveedor_sel, transporte=transporte_sel, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, moneda='USD') }}">USD</a>
+       href="{{ url_for('reportes_operacional') }}?{{ qs_filtros }}&moneda=USD">USD</a>
     <a class="btn btn-sm {{ 'btn-brand' if moneda == 'EUR' else 'btn-outline-secondary' }}"
-       href="{{ url_for('reportes_operacional', empresa=empresa_sel, proveedor=proveedor_sel, transporte=transporte_sel, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, moneda='EUR') }}">EUR</a>
+       href="{{ url_for('reportes_operacional') }}?{{ qs_filtros }}&moneda=EUR">EUR</a>
     </div>
   </div>
 </div>
@@ -107,13 +110,41 @@
       {% endfor %}
     </select>
   </div>
+  {# Ronda CF (2026-10-27, a pedido del usuario): proveedor y producto con
+     selección múltiple, en un panel con casillas y buscador. #}
   <div class="col-auto">
-    <select class="form-select" name="proveedor" onchange="this.form.submit()">
-      <option value="">Todos los proveedores</option>
-      {% for p in proveedores_disponibles %}
-      <option value="{{ p }}" {% if proveedor_sel == p %}selected{% endif %}>{{ p }}</option>
-      {% endfor %}
-    </select>
+    <div class="dropdown">
+      <button class="btn btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside">
+        {% if proveedores_sel %}{{ proveedores_sel|length }} proveedor(es){% else %}Todos los proveedores{% endif %}
+      </button>
+      <div class="dropdown-menu p-2" style="min-width: 20rem; max-height: 22rem; overflow: auto;">
+        <input type="search" class="form-control form-control-sm mb-2 filtro-lista" placeholder="Buscar proveedor...">
+        {% for p in proveedores_disponibles %}
+        <div class="form-check opcion-lista">
+          <input class="form-check-input" type="checkbox" name="proveedor" value="{{ p }}" id="prov{{ loop.index }}"
+                 {% if p in proveedores_sel %}checked{% endif %}>
+          <label class="form-check-label small" for="prov{{ loop.index }}">{{ p }}</label>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  <div class="col-auto">
+    <div class="dropdown">
+      <button class="btn btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside">
+        {% if productos_sel %}{{ productos_sel|length }} producto(s){% else %}Todos los productos{% endif %}
+      </button>
+      <div class="dropdown-menu p-2" style="min-width: 26rem; max-height: 22rem; overflow: auto;">
+        <input type="search" class="form-control form-control-sm mb-2 filtro-lista" placeholder="Buscar producto...">
+        {% for p in productos_disponibles %}
+        <div class="form-check opcion-lista">
+          <input class="form-check-input" type="checkbox" name="producto" value="{{ p }}" id="prod{{ loop.index }}"
+                 {% if p in productos_sel %}checked{% endif %}>
+          <label class="form-check-label small" for="prod{{ loop.index }}">{{ p }}</label>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
   </div>
   <div class="col-auto">
     <select class="form-select" name="transporte" onchange="this.form.submit()">
@@ -171,6 +202,7 @@
     <table class="table table-sm table-hover align-middle mb-0 tabla-reporte">
       <thead>
         <tr>
+          <th style="width: 2rem;"></th>
           <th data-sort="text">Transporte</th>
           <th class="text-end" data-sort="num">Total Invoice {{ simbolo }}</th>
           <th class="text-end" data-sort="num">Flete</th>
@@ -180,15 +212,59 @@
         </tr>
       </thead>
       <tbody>
+        {# Ronda CF (2026-10-27): cada operador se despliega a las facturas
+           que lo componen, para poder auditar de dónde sale cada número --
+           en particular las que quedaron sin operador. #}
         {% for r in por_operador %}
-        <tr><td>{{ r.nombre }}</td>{{ fila_metricas(r, simbolo) }}</tr>
+        <tr role="button" data-bs-toggle="collapse" data-bs-target="#oper{{ loop.index }}">
+          <td><i class="bi bi-chevron-right"></i></td>
+          <td>
+            {{ r.nombre }}
+            {% if r.nombre == '(sin operador)' %}
+            <i class="bi bi-question-circle text-warning" data-bs-toggle="tooltip"
+               title="Facturas donde no se pudo determinar quién transportó: en el histórico la columna Transporte venía vacía, y en las importaciones hechas acá el despacho no tiene operador logístico cargado ni el flete vino como ítem de la factura."></i>
+            {% endif %}
+          </td>
+          {{ fila_metricas(r, simbolo) }}
+        </tr>
+        <tr class="collapse" id="oper{{ loop.index }}">
+          <td colspan="7" class="bg-light">
+            <table class="table table-sm mb-0 tabla-reporte">
+              <thead>
+                <tr>
+                  <th>Factura</th><th>Fecha</th><th>Proveedor</th><th>Origen</th><th>Vía</th>
+                  <th class="text-end">Total Invoice {{ simbolo }}</th><th class="text-end">Flete</th>
+                  <th class="text-end">Gastos {{ simbolo }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for d in detalle_por_operador.get(r.nombre, []) %}
+                <tr>
+                  <td>
+                    {% if d.importacion_id %}
+                    <a href="{{ url_for('importaciones_detalle', importacion_id=d.importacion_id) }}">{{ d.factura }}</a>
+                    {% else %}{{ d.factura }}{% endif %}
+                  </td>
+                  <td>{{ d.fecha.strftime('%d-%m-%Y') if d.fecha else '-' }}</td>
+                  <td>{{ d.proveedor }}</td>
+                  <td><span class="badge {{ 'bg-primary' if d.origen == 'Sistema' else 'bg-secondary' }}">{{ d.origen }}</span></td>
+                  <td>{{ d.tipo_flete }}</td>
+                  <td class="text-end">{{ simbolo }}{{ d.total_invoice|moneda }}</td>
+                  <td class="text-end">{{ simbolo }}{{ d.flete|moneda }}</td>
+                  <td class="text-end">{{ simbolo }}{{ d.otros_gastos|moneda }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </td>
+        </tr>
         {% else %}
-        <tr><td colspan="6" class="text-center text-muted py-3">Sin datos para estos filtros.</td></tr>
+        <tr><td colspan="7" class="text-center text-muted py-3">Sin datos para estos filtros.</td></tr>
         {% endfor %}
       </tbody>
       {% if por_operador %}
       <tfoot class="table-light fw-semibold">
-        <tr><td>Total general</td>{{ fila_metricas(totales, simbolo) }}</tr>
+        <tr><td></td><td>Total general</td>{{ fila_metricas(totales, simbolo) }}</tr>
       </tfoot>
       {% endif %}
     </table>
@@ -403,6 +479,21 @@
     const m = (texto || '').trim().match(/^(\d{2})-(\d{2})-(\d{4})$/);
     return m ? Number(`${m[3]}${m[2]}${m[1]}`) : null;
   }
+
+  // Ronda CF (2026-10-27): buscador dentro de los panales de selección
+  // múltiple de proveedor y producto.
+  document.querySelectorAll('.filtro-lista').forEach(input => {
+    input.addEventListener('input', () => {
+      const texto = input.value.trim().toLowerCase();
+      input.closest('.dropdown-menu').querySelectorAll('.opcion-lista').forEach(opcion => {
+        const etiqueta = (opcion.textContent || '').toLowerCase();
+        opcion.classList.toggle('d-none', texto !== '' && !etiqueta.includes(texto));
+      });
+    });
+    // Que escribir en el buscador no cierre el panel ni envíe el formulario.
+    input.addEventListener('click', e => e.stopPropagation());
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
+  });
 
   document.querySelectorAll('table.tabla-reporte').forEach(tabla => {
     const thead = tabla.querySelector('thead');

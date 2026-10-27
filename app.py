@@ -12257,6 +12257,48 @@ def stock_list():
     # tenga que volver a ordenar a mano -- el ordenamiento manual por
     # columna (ver JS abajo) sigue disponible y solo dura hasta el próximo
     # cambio de filtro (recarga la página).
+    # Ronda CF (2026-10-27, a pedido del usuario): con "Todas las
+    # empresas" el mismo producto aparecía dos veces (una fila por
+    # empresa), cuando lo que se quiere ver es el stock de la compañía
+    # como un solo saldo. Se consolidan las filas del mismo producto y el
+    # desglose por empresa queda en el tooltip; al filtrar por una
+    # empresa puntual se sigue mostrando separado, como siempre.
+    #
+    # Esto además corrige un doble conteo: el Tránsito se calcula por
+    # (producto, variante) SIN empresa, así que cuando el producto estaba
+    # en las dos empresas cada fila mostraba el tránsito completo y la
+    # suma visual quedaba al doble.
+    if not empresa_id:
+        consolidados = {}
+        for clave, grupo in grupos.items():
+            clave_consolidada = clave[:-1]  # todas las claves terminan en empresa_id
+            base = consolidados.get(clave_consolidada)
+            if base is None:
+                base = dict(grupo)
+                base["lotes"] = list(grupo["lotes"])
+                base["stock_por_empresa"] = {}
+                consolidados[clave_consolidada] = base
+            else:
+                base["stock_total"] += grupo["stock_total"]
+                base["pedido"] += grupo["pedido"]
+                base["lotes"].extend(grupo["lotes"])
+                base["sin_stock_cargado"] = base.get("sin_stock_cargado") and grupo.get("sin_stock_cargado")
+                if grupo["proximo_vencimiento"] and (
+                    base["proximo_vencimiento"] is None
+                    or grupo["proximo_vencimiento"] < base["proximo_vencimiento"]
+                ):
+                    base["proximo_vencimiento"] = grupo["proximo_vencimiento"]
+            if grupo["empresa"] is not None and grupo["stock_total"]:
+                nombre_empresa = grupo["empresa"].nombre
+                base["stock_por_empresa"][nombre_empresa] = (
+                    base["stock_por_empresa"].get(nombre_empresa, 0) + grupo["stock_total"]
+                )
+        for base in consolidados.values():
+            base["empresa"] = None
+            base["stock_actual"] = base["stock_total"]
+            base["stock_total_proyectado"] = base["stock_actual"] + base["transito"] - base["pedido"]
+        grupos = consolidados
+
     resultado = sorted(grupos.values(), key=lambda g: -(g["stock_total_proyectado"] or 0))
 
     # Ronda CE (2026-10-26, Fase 1 del plan de Ventas/Rotación): promedio
@@ -15300,7 +15342,11 @@ def _contexto_reporte_operacional():
     pantalla y la descarga a Excel (ver reportes_operacional_descargar)
     salgan exactamente de los mismos números, sin duplicar la lógica."""
     empresa = request.args.get("empresa", "").strip()
-    proveedor = request.args.get("proveedor", "").strip()
+    # Ronda CF (2026-10-27, a pedido del usuario): proveedor y producto
+    # admiten selección MÚLTIPLE. Se mantiene compatibilidad con el
+    # parámetro simple ?proveedor=X que usaban los enlaces anteriores.
+    proveedores_sel = [p.strip() for p in request.args.getlist("proveedor") if p.strip()]
+    productos_sel = [p.strip() for p in request.args.getlist("producto") if p.strip()]
     transporte_sel = request.args.get("transporte", "").strip()
     moneda = request.args.get("moneda", "USD").strip().upper()
     if moneda not in ("USD", "EUR"):
@@ -15309,9 +15355,25 @@ def _contexto_reporte_operacional():
     fecha_desde = parse_date(fecha_desde_txt)
     fecha_hasta = parse_date(fecha_hasta_txt)
 
+    # Con un solo proveedor se filtra en la consulta (más barato); con
+    # varios se trae todo y se acota en memoria.
     filas = _filas_compras_unificadas(
-        empresa=empresa, proveedor=proveedor, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta
+        empresa=empresa,
+        proveedor=proveedores_sel[0] if len(proveedores_sel) == 1 else "",
+        fecha_desde=fecha_desde, fecha_hasta=fecha_hasta,
     )
+    if len(proveedores_sel) > 1:
+        buscados = {p.upper() for p in proveedores_sel}
+        filas = [f for f in filas if (f.get("proveedor") or "").upper() in buscados]
+    # El catálogo de productos del selector sale de lo que hay en el
+    # período (antes de aplicar el filtro de producto, para no quedarse
+    # con un solo elemento después de elegir).
+    productos_disponibles = sorted({
+        (f.get("codigo_producto") or "").strip() for f in filas if (f.get("codigo_producto") or "").strip()
+    })
+    if productos_sel:
+        buscados_prod = {p.upper() for p in productos_sel}
+        filas = [f for f in filas if (f.get("codigo_producto") or "").strip().upper() in buscados_prod]
     # Ronda BZ (2026-10-21, punto 5): antes de agrupar, se completa el
     # tipo de flete que haya quedado vacío con el de las otras líneas de
     # la misma factura -- ver _completar_tipo_flete.
@@ -15331,6 +15393,34 @@ def _contexto_reporte_operacional():
 
     # (a) y (b): por operador, y el % de flete mes a mes.
     por_operador = _tabla_operacional_por_clave(filas, "transporte", factor_moneda, vacio="(sin operador)")
+    # Ronda CF (2026-10-27, a pedido del usuario: "salen una dato de flete
+    # y gastos (Sin operador) cual sería esa informacion... me puedes
+    # listar los datos de la Invoice, proveedor para yo validar"): cada
+    # operador se puede desplegar a las facturas que lo componen, para
+    # poder auditar de dónde sale cada número -- en particular las que
+    # quedaron sin operador.
+    detalle_por_operador = defaultdict(dict)
+    for f in filas:
+        operador = (f.get("transporte") or "").strip() or "(sin operador)"
+        clave = ((f.get("factura") or "(sin factura)"), f.get("fecha_factura"))
+        fila_detalle = detalle_por_operador[operador].setdefault(clave, {
+            "factura": clave[0], "fecha": clave[1],
+            "proveedor": f.get("proveedor") or "", "origen": f.get("origen") or "",
+            "tipo_flete": (f.get("tipo_flete") or "").strip() or "(sin vía)",
+            "importacion_id": f.get("importacion_id"),
+            "total_invoice": 0.0, "flete": 0.0, "otros_gastos": 0.0,
+        })
+        fila_detalle["total_invoice"] += (f.get("total_usd") or 0) * factor_moneda
+        fila_detalle["flete"] += (f.get("flete_homologado_usd") or 0) * factor_moneda
+        fila_detalle["otros_gastos"] += (f.get("otros_gastos_usd") or 0) * factor_moneda
+    detalle_por_operador = {
+        operador: sorted(
+            ({**d, "total_invoice": round(d["total_invoice"], 2), "flete": round(d["flete"], 2),
+              "otros_gastos": round(d["otros_gastos"], 2)} for d in facturas.values()),
+            key=lambda d: -d["total_invoice"],
+        )
+        for operador, facturas in detalle_por_operador.items()
+    }
     meses = sorted({_mes_anio_ordenable(f.get("mes_anio")) for f in filas if f.get("mes_anio")})
     pct_mensual = []
     for operador in [r["nombre"] for r in por_operador]:
@@ -15425,7 +15515,10 @@ def _contexto_reporte_operacional():
         empresas_disponibles=_empresas_compradoras_disponibles(),
         proveedores_disponibles=_proveedores_con_compras(),
         operadores_disponibles=operadores_disponibles,
-        empresa_sel=empresa, proveedor_sel=proveedor, transporte_sel=transporte_sel,
+        productos_disponibles=productos_disponibles,
+        detalle_por_operador=detalle_por_operador,
+        empresa_sel=empresa, proveedores_sel=proveedores_sel, productos_sel=productos_sel,
+        transporte_sel=transporte_sel,
         moneda=moneda, paridad_eur=paridad_eur,
         fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
     )
@@ -15526,8 +15619,13 @@ def reportes_operacional_descargar():
     filtros = []
     if ctx["empresa_sel"]:
         filtros.append(f"Empresa: {ctx['empresa_sel']}")
-    if ctx["proveedor_sel"]:
-        filtros.append(f"Proveedor: {ctx['proveedor_sel']}")
+    if ctx["proveedores_sel"]:
+        filtros.append("Proveedor: " + ", ".join(ctx["proveedores_sel"]))
+    if ctx["productos_sel"]:
+        filtros.append(
+            f"{len(ctx['productos_sel'])} producto(s)" if len(ctx["productos_sel"]) > 3
+            else "Producto: " + ", ".join(ctx["productos_sel"])
+        )
     if ctx["transporte_sel"]:
         filtros.append(f"Operador: {ctx['transporte_sel']}")
     if ctx["fecha_desde"] or ctx["fecha_hasta"]:
