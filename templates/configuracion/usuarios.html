@@ -25,6 +25,7 @@
           <th>Correo</th>
           <th>Perfil</th>
           <th>Estado</th>
+          <th>Vendedor (Forecast)</th>
           <th>Último acceso</th>
           <th></th>
         </tr>
@@ -41,6 +42,7 @@
           <td>
             {% if u.activo %}<span class="badge text-bg-success">Activo</span>{% else %}<span class="badge text-bg-secondary">Desactivado</span>{% endif %}
           </td>
+          <td class="small">{{ u.vendedor or '—' }}</td>
           <td class="text-muted small">{{ (u.ultimo_acceso | hora_cl) if u.ultimo_acceso else 'Nunca' }}</td>
           <td class="text-end">
             <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarUsuario{{ u.id }}">Editar</button>
@@ -76,6 +78,15 @@
             </select>
           </div>
           <div class="col-12">
+            <label class="form-label">Vendedor (Forecast)</label>
+            <input class="form-control" name="vendedor" list="vendedoresConocidos"
+                   placeholder="Nombre tal como aparece en el reporte de ventas">
+            <div class="form-text">
+              Enlaza esta cuenta con sus clientes para el Forecast: con esto ve su propia hoja y el
+              promedio de SUS cuentas. Déjalo vacío si no carga forecast.
+            </div>
+          </div>
+          <div class="col-12">
             <label class="form-label">Contraseña *</label>
             <input type="password" class="form-control" name="password" required minlength="6">
             <div class="form-text">Al menos 6 caracteres. El usuario podrá cambiarla luego desde "Mi cuenta".</div>
@@ -104,6 +115,12 @@
             </select>
           </div>
           <div class="col-12">
+            <label class="form-label">Vendedor (Forecast)</label>
+            <input class="form-control" name="vendedor" list="vendedoresConocidos" value="{{ u.vendedor or '' }}"
+                   placeholder="Nombre tal como aparece en el reporte de ventas">
+            <div class="form-text">Déjalo vacío si esta cuenta no carga forecast.</div>
+          </div>
+          <div class="col-12">
             <div class="form-check">
               <input class="form-check-input" type="checkbox" name="activo" id="editActivo{{ u.id }}" {% if u.activo %}checked{% endif %} {% if u.id == current_user.id %}disabled{% endif %}>
               <label class="form-check-label" for="editActivo{{ u.id }}">Usuario activo</label>
@@ -122,5 +139,9 @@
   </div>
 </div>
 {% endfor %}
+
+<datalist id="vendedoresConocidos">
+  {% for v in vendedores_conocidos %}<option value="{{ v }}">{% endfor %}
+</datalist>
 
 {% endblock %}

@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Forecast · Suite Logística{% endblock %}
+{% block content %}
+
+{# Ronda CH (2026-10-27), Fase 2 del plan de Ventas/Forecast: portada del
+   módulo S&OP. El administrador ve el tablero completo de cada ciclo
+   (quién entregó y quién no); un ejecutivo ve solo su propia hoja. #}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="section-title mb-0">Forecast · Proyección de ventas (S&OP)</h3>
+  {% if es_admin %}
+  <button class="btn btn-primary" data-bs-toggle="collapse" data-bs-target="#panelCiclo">
+    <i class="bi bi-calendar-plus me-1"></i> Abrir ciclo
+  </button>
+  {% endif %}
+</div>
+
+{% if es_admin %}
+<div class="collapse mb-4" id="panelCiclo">
+  <div class="card p-3">
+    <form method="post" action="{{ url_for('forecast_ciclo_nuevo') }}" class="row g-3">
+      <div class="col-md-3">
+        <label class="form-label small fw-semibold">Mes del ciclo</label>
+        <input type="month" name="mes_objetivo" class="form-control" required
+               value="{{ '%04d-%02d'|format(hoy.year, hoy.month) }}">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small fw-semibold">Fecha tope</label>
+        <input type="date" name="fecha_tope" class="form-control" required value="{{ hoy }}">
+        <div class="form-text">
+          Las 13 semanas (lunes a viernes) arrancan el lunes siguiente a esta fecha.
+          Al llegar la fecha tope, lo que siga en preparación se cierra solo con lo que haya.
+        </div>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label small fw-semibold">Vendedores que cargan forecast</label>
+        <div class="border rounded p-2" style="max-height: 220px; overflow-y: auto;">
+          {% for v in vendedores %}
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" name="vendedor" value="{{ v }}"
+                   id="vend{{ loop.index }}" {% if v in sugeridos %}checked{% endif %}>
+            <label class="form-check-label" for="vend{{ loop.index }}">{{ v }}</label>
+          </div>
+          {% endfor %}
+        </div>
+        <div class="form-text">
+          El forecast de cada uno arranca copiado del ciclo anterior: solo hay que corregir, agregar o eliminar.
+        </div>
+      </div>
+      <div class="col-12">
+        <button class="btn btn-primary"><i class="bi bi-check2 me-1"></i> Abrir ciclo</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endif %}
+
+{% if not tablero %}
+<div class="card p-4 text-center text-muted">
+  <i class="bi bi-calendar-x fs-1 mb-2"></i>
+  {% if es_admin %}
+  <p class="mb-0">Todavía no hay ciclos de forecast. Abre el primero con el botón de arriba.</p>
+  {% else %}
+  <p class="mb-0">Todavía no hay un ciclo de forecast abierto. Te avisamos por la campanita cuando se abra.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% for bloque in tablero %}
+{% set ciclo = bloque.ciclo %}
+<div class="card p-3 mb-3">
+  <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
+    <div>
+      <h5 class="section-title mb-1">
+        {{ ciclo.nombre }}
+        {% if ciclo.abierto %}
+        <span class="badge bg-success ms-1">Abierto</span>
+        {% else %}
+        <span class="badge bg-secondary ms-1">Cerrado</span>
+        {% if ciclo.cerrado_automaticamente %}<span class="badge bg-warning text-dark ms-1">Cierre automático</span>{% endif %}
+        {% endif %}
+      </h5>
+      <div class="text-muted small">
+        Fecha tope <strong>{{ ciclo.fecha_tope.strftime('%d-%m-%Y') }}</strong> ·
+        13 semanas desde el {{ bloque.semanas[0].inicio.strftime('%d-%m-%Y') }}
+        hasta el {{ bloque.semanas[-1].fin.strftime('%d-%m-%Y') }} ·
+        {{ bloque.enviados }} de {{ bloque.total }} enviado(s) ·
+        {{ "%.0f"|format(bloque.unidades) }} unidades proyectadas
+      </div>
+    </div>
+    {% if es_admin %}
+    <div class="d-flex gap-2">
+      {% if ciclo.abierto %}
+      <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('forecast_recordatorio', ciclo_id=ciclo.id) }}">
+        <i class="bi bi-envelope me-1"></i> Recordar por correo
+      </a>
+      <form method="post" action="{{ url_for('forecast_ciclo_cerrar', ciclo_id=ciclo.id) }}"
+            onsubmit="return confirm('Cerrar el ciclo {{ ciclo.nombre }}? Lo que siga en preparación se cierra con lo que tenga cargado.');">
+        <button class="btn btn-sm btn-outline-danger"><i class="bi bi-lock me-1"></i> Cerrar ciclo</button>
+      </form>
+      {% else %}
+      <form method="post" action="{{ url_for('forecast_ciclo_reabrir', ciclo_id=ciclo.id) }}" class="d-flex gap-1">
+        <input type="date" name="fecha_tope" class="form-control form-control-sm" required
+               value="{{ hoy }}" title="Nueva fecha tope">
+        <button class="btn btn-sm btn-outline-secondary"><i class="bi bi-unlock me-1"></i> Reabrir</button>
+      </form>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Vendedor</th>
+          <th>Estado</th>
+          <th class="text-end">Productos</th>
+          <th class="text-end">Unidades 13 sem.</th>
+          <th>Enviado</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for envio in bloque.envios %}
+        {% set lineas = envio.lineas.all() %}
+        <tr>
+          <td class="fw-semibold">{{ envio.vendedor }}</td>
+          <td>
+            {% if envio.enviado and envio.cerrado_automaticamente %}
+            <span class="badge bg-warning text-dark">Cerrado sin confirmar</span>
+            {% elif envio.enviado %}
+            <span class="badge bg-success">Enviado</span>
+            {% else %}
+            <span class="badge bg-secondary">Preparación</span>
+            {% endif %}
+            {% if envio.edicion_autorizada %}<span class="badge bg-info text-dark ms-1">Edición autorizada</span>{% endif %}
+          </td>
+          <td class="text-end">{{ lineas|length }}</td>
+          <td class="text-end">{{ "%.0f"|format(lineas|sum(attribute='total')) }}</td>
+          <td class="text-muted small">{{ envio.enviado_en.strftime('%d-%m-%Y %H:%M') if envio.enviado_en else '—' }}</td>
+          <td class="text-end">
+            <a class="btn btn-sm btn-outline-primary" href="{{ url_for('forecast_envio', envio_id=envio.id) }}">
+              {% if envio.editable %}Cargar{% else %}Ver{% endif %}
+            </a>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-muted">Este ciclo no tiene tu hoja de forecast.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endfor %}
+
+{% endblock %}

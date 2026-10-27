@@ -109,12 +109,36 @@
     {% endif %}
   </div>
   <div class="col-md-6 col-lg-4">
+    {# Ronda CH (2026-10-27), Fase 2: Forecast (S&OP). #}
+    {% if current_user.tiene_permiso('forecast') %}
+    <a href="{{ url_for('forecast_index') }}" class="card card-module p-3 h-100 text-decoration-none">
+      <div class="d-flex align-items-center gap-3">
+        <i class="bi bi-graph-up-arrow fs-2 text-brand"></i>
+        <div>
+          <div class="fw-semibold">Forecast / Proyección de ventas</div>
+          <div class="text-muted small">Estimación a 13 semanas por ejecutivo, con su promedio de 6 meses y clase A/B/C.</div>
+        </div>
+      </div>
+    </a>
+    {% else %}
+    <div class="card card-module disabled p-3 h-100">
+      <div class="d-flex align-items-center gap-3">
+        <i class="bi bi-graph-up-arrow fs-2 text-secondary"></i>
+        <div>
+          <div class="fw-semibold">Forecast / Proyección de ventas</div>
+          <div class="text-muted small">Necesitas el permiso de Forecast para entrar.</div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+  <div class="col-md-6 col-lg-4">
     <div class="card card-module disabled p-3 h-100">
       <div class="d-flex align-items-center gap-3">
         <i class="bi bi-bell-fill fs-2 text-secondary"></i>
         <div>
           <div class="fw-semibold">Dashboards y Notificaciones</div>
-          <div class="text-muted small">Próximamente: control y alertas automáticas.</div>
+          <div class="text-muted small">La campanita ya avisa del Forecast; faltan los tableros de control.</div>
         </div>
       </div>
     </div>

@@ -22,7 +22,7 @@ from flask import (
     send_file, abort
 )
 from flask_login import (
-    LoginManager, UserMixin, login_user, logout_user, current_user,
+    LoginManager, UserMixin, login_user, logout_user, current_user, login_required,
 )
 from markupsafe import escape
 
@@ -47,6 +47,8 @@ from models import (
     AjusteCompraProveedor,
     FacturaEmbarqueImportacion,
     VentaLinea, ClienteVendedor, codigo_cuenta_para_rotacion, PREFIJOS_SIN_ROTACION,
+    ForecastCiclo, ForecastEnvio, ForecastLinea, ForecastCambio, Notificacion,
+    SEMANAS_FORECAST,
 )
 from seed_data import seed_from_excel
 import costing
@@ -613,6 +615,14 @@ def ensure_schema_migrations():
         "roles": [
             ("permiso_consultar_stock", "BOOLEAN DEFAULT 0"),
             ("permiso_pagos_proveedores", "BOOLEAN DEFAULT 0"),
+            # Ronda CH (2026-10-27): permiso propio del Forecast (S&OP).
+            ("permiso_forecast", "BOOLEAN DEFAULT 0"),
+        ],
+        # Ronda CH (2026-10-27): puente entre la cuenta de acceso y el
+        # nombre del ejecutivo en el reporte de ventas -- ver
+        # Usuario.vendedor en models.py.
+        "usuarios": [
+            ("vendedor", "VARCHAR(120)"),
         ],
         # Ronda AK (2026-09-19): ajustes a Pago Proveedores -- facturar
         # consignacion, notas de credito y crédito por Proveedor.
@@ -11614,7 +11624,10 @@ def roles_eliminar(rol_id):
 def usuarios_list():
     usuarios = Usuario.query.order_by(Usuario.nombre_completo).all()
     roles = Rol.query.order_by(Rol.nombre).all()
-    return render_template("configuracion/usuarios.html", usuarios=usuarios, roles=roles)
+    # Ronda CH (2026-10-27): el campo "Vendedor" enlaza la cuenta con sus
+    # clientes para el Forecast -- ver Usuario.vendedor en models.py.
+    return render_template("configuracion/usuarios.html", usuarios=usuarios, roles=roles,
+                           vendedores_conocidos=_vendedores_conocidos())
 
 
 @app.route("/configuracion/usuarios/nuevo", methods=["POST"])
@@ -11633,7 +11646,8 @@ def usuarios_nuevo():
     if Usuario.query.filter(db.func.lower(Usuario.email) == email).first():
         flash(f"Ya existe un usuario con el correo '{email}'.", "warning")
         return redirect(url_for("usuarios_list"))
-    usuario = Usuario(nombre_completo=nombre_completo, email=email, rol_id=int(rol_id), activo=True)
+    usuario = Usuario(nombre_completo=nombre_completo, email=email, rol_id=int(rol_id), activo=True,
+                      vendedor=(request.form.get("vendedor", "").strip() or None))
     usuario.set_password(password)
     db.session.add(usuario)
     db.session.commit()
@@ -11685,6 +11699,8 @@ def usuarios_editar(usuario_id):
     usuario.nombre_completo = nombre_completo
     usuario.rol_id = int(rol_id)
     usuario.activo = nueva_activa
+    # Ronda CH (2026-10-27): puente con el Forecast -- ver Usuario.vendedor.
+    usuario.vendedor = request.form.get("vendedor", "").strip() or None
     nueva_password = request.form.get("password", "")
     if nueva_password:
         if len(nueva_password) < 6:
@@ -12988,7 +13004,721 @@ def ventas_clientes_cargar():
     return redirect(url_for("ventas_clientes"))
 
 
-@app.route("/stock-valorizado")
+# ---------------------------------------------------------------------------
+# Modulo: Forecast / S&OP (ronda CH, 2026-10-27) -- Fase 2 del plan de
+# Ventas/Rotacion/Forecast acordado con el usuario el 2026-10-26.
+# ---------------------------------------------------------------------------
+# Reemplaza el archivo "SOP_Accuvision.xlsb" que hoy se lleva a mano: una
+# hoja por vendedor con 13 semanas en columnas, su "Venta promedio 6UM" y
+# la clasificacion A/B/C. Decisiones que manda el usuario:
+#   - Semana de lunes a viernes; la FECHA TOPE que fija el administrador es
+#     el punto de partida para contar las 13 semanas.
+#   - Ciclo MENSUAL que no arranca de cero: se copia del ciclo anterior y el
+#     vendedor corrige, agrega o elimina. Cada variacion queda registrada.
+#   - El promedio que ve cada vendedor es el de SUS cuentas segun el maestro
+#     Cliente/Vendedor VIGENTE (no el vendedor que figuraba en la factura).
+#   - Si llega la fecha tope con el forecast en preparacion, se cierra solo
+#     con lo que haya cargado y se avisa a la gerencia.
+
+MESES_ES = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
+            "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+MESES_ES_CORTO = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul",
+                  "Ago", "Sep", "Oct", "Nov", "Dic"]
+
+# Los cinco que hacen forecast, segun el usuario (los dos ultimos son
+# gerencia, que tambien carga el suyo). Es solo la lista que viene marcada
+# por defecto al abrir un ciclo -- el administrador puede marcar otros.
+VENDEDORES_FORECAST_SUGERIDOS = [
+    "Felipe Bravo", "Mariana Perez", "Marianela Iriarte",
+    "Danilo Campos", "Marcel El Husein",
+]
+
+# Cuantos productos propone el motor de sugerencias al entrar a elaborar.
+MAX_SUGERENCIAS_FORECAST = 25
+
+
+def _semanas_forecast(ciclo):
+    """Las 13 semanas del ciclo, lunes a viernes, contadas desde la fecha
+    tope (que es el "punto de partida" que pidio el usuario).
+
+    La semana 1 arranca el LUNES SIGUIENTE a la fecha tope -- o ese mismo
+    dia si la fecha tope cae lunes. Es lo que corresponde: lo que se
+    proyecta son las semanas que vienen DESPUES del cierre, no la semana en
+    curso, que ya esta vendida cuando el vendedor carga.
+
+    Se devuelven con sus fechas reales para que en pantalla se vea
+    exactamente que periodo esta estimando cada columna."""
+    dias_al_lunes = (7 - ciclo.fecha_tope.weekday()) % 7
+    inicio = ciclo.fecha_tope + timedelta(days=dias_al_lunes)
+    semanas = []
+    for n in range(1, SEMANAS_FORECAST + 1):
+        lunes = inicio + timedelta(days=7 * (n - 1))
+        viernes = lunes + timedelta(days=4)
+        semanas.append({
+            "n": n,
+            "inicio": lunes,
+            "fin": viernes,
+            "semana_iso": lunes.isocalendar()[1],
+            "etiqueta": f"S{lunes.isocalendar()[1]}",
+            "rango": (f"{lunes.day:02d} {MESES_ES_CORTO[lunes.month]}" if lunes.month == viernes.month
+                      else f"{lunes.day:02d} {MESES_ES_CORTO[lunes.month]} - {viernes.day:02d} {MESES_ES_CORTO[viernes.month]}"),
+            "rango_largo": f"{lunes.strftime('%d-%m')} al {viernes.strftime('%d-%m-%Y')}",
+        })
+    return semanas
+
+
+def _primer_dia_mes_hace(meses):
+    """Primer dia del mes de hace `meses` meses (inclusive). Se trabaja con
+    meses calendario, no con bloques de 30 dias, porque el usuario compara
+    contra el "promedio 6UM" de su SOP, que es mensual."""
+    hoy = date.today()
+    mes = hoy.month - meses
+    anio = hoy.year
+    while mes <= 0:
+        mes += 12
+        anio -= 1
+    return date(anio, mes, 1)
+
+
+def _ventas_vendedor_por_codigo(vendedor, desde):
+    """{codigo_interno: {"unidades": x, "monto": y}} de las cuentas que HOY
+    son de `vendedor` (maestro vigente), desde `desde` hasta hoy. Solo
+    codigos que cuentan para rotacion -- quedan fuera equipos (30),
+    servicios (60), repuestos (80) y 90, por regla del usuario.
+
+    Sin `vendedor` toma todas las cuentas (lo usa la gerencia)."""
+    query = VentaLinea.query.filter(
+        VentaLinea.fecha >= desde,
+        VentaLinea.cuenta_para_rotacion == True,  # noqa: E712
+    )
+    if vendedor:
+        ruts = [
+            c.rut for c in ClienteVendedor.query.filter(
+                db.func.upper(ClienteVendedor.vendedor) == vendedor.strip().upper()
+            ).all()
+        ]
+        if not ruts:
+            return {}
+        query = query.filter(VentaLinea.rut_cliente.in_(ruts))
+    totales = defaultdict(lambda: {"unidades": 0.0, "monto": 0.0, "descripcion": ""})
+    filas = query.with_entities(
+        VentaLinea.codigo_interno, VentaLinea.descripcion,
+        VentaLinea.unidades, VentaLinea.valor_neto,
+    ).all()
+    for codigo, descripcion, unidades, monto in filas:
+        clave = (codigo or "").strip()
+        if not clave:
+            continue
+        totales[clave]["unidades"] += unidades or 0
+        totales[clave]["monto"] += monto or 0
+        if descripcion and not totales[clave]["descripcion"]:
+            totales[clave]["descripcion"] = descripcion
+    return dict(totales)
+
+
+def _clasificacion_abc(ventas_12m):
+    """Pareto 80/90/100 sobre el MONTO de los ultimos 12 meses: A hasta el
+    80% acumulado, B hasta el 90%, C el resto. Es el mismo criterio que la
+    columna A/B/C de la hoja FCST del SOP."""
+    positivos = {c: d["monto"] for c, d in ventas_12m.items() if (d.get("monto") or 0) > 0}
+    total = sum(positivos.values())
+    if total <= 0:
+        return {}
+    clases, acumulado = {}, 0.0
+    for codigo, monto in sorted(positivos.items(), key=lambda kv: -kv[1]):
+        acumulado += monto
+        pct = acumulado / total
+        clases[codigo] = "A" if pct <= 0.80 else ("B" if pct <= 0.90 else "C")
+    return clases
+
+
+def _distribuir_sugerencia(promedio_mensual):
+    """Motor deterministico de sugerencia: 13 semanas son ~3 meses, asi que
+    se propone `promedio_mensual x 3` unidades repartidas lo mas parejo
+    posible en UNIDADES ENTERAS (metodo del resto mayor).
+
+    Repartir en enteros y no dividir en decimales es a proposito: lo que
+    sale de aqui termina en una orden de compra, y un producto que vende 2
+    al mes tiene que proponer "1 unidad en 6 semanas", no "0,46 por
+    semana" (que redondeado a entero seria cero y lo dejaria fuera)."""
+    total = int(round((promedio_mensual or 0) * 3))
+    if total <= 0:
+        return [0] * SEMANAS_FORECAST
+    base, resto = divmod(total, SEMANAS_FORECAST)
+    semanas = [base] * SEMANAS_FORECAST
+    if resto:
+        # Las unidades sobrantes se reparten espaciadas, no todas al inicio.
+        paso = SEMANAS_FORECAST / float(resto)
+        for i in range(resto):
+            semanas[min(SEMANAS_FORECAST - 1, int(round(i * paso)))] += 1
+    return semanas
+
+
+def _panorama_forecast_vendedor(vendedor):
+    """Todo lo que necesita la pantalla de captura de un vendedor, en una
+    sola pasada: por codigo, su promedio mensual de 6 meses ("6UM"), su
+    clase A/B/C (12 meses), descripcion, proveedor y la sugerencia semanal
+    del motor deterministico."""
+    ventas_6m = _ventas_vendedor_por_codigo(vendedor, _primer_dia_mes_hace(5))
+    ventas_12m = _ventas_vendedor_por_codigo(vendedor, _primer_dia_mes_hace(11))
+    clases = _clasificacion_abc(ventas_12m)
+    homologar = _construir_homologador_ergopyme()
+    panorama = {}
+    for codigo, datos in ventas_12m.items():
+        unidades_6m = ventas_6m.get(codigo, {}).get("unidades", 0)
+        promedio = round(unidades_6m / 6.0, 1) if unidades_6m > 0 else 0.0
+        homologado = homologar(codigo)
+        reparto = _distribuir_sugerencia(promedio)
+        panorama[codigo] = {
+            "codigo": codigo,
+            "descripcion": datos.get("descripcion") or (homologado[3] if homologado else ""),
+            "proveedor": homologado[0] if homologado else "",
+            "promedio_6um": promedio,
+            "sugerencia": reparto,
+            "sugerencia_total": sum(reparto),
+            "clase_abc": clases.get(codigo, "C"),
+            "monto_12m": round(datos.get("monto") or 0, 0),
+            "unidades_12m": round(datos.get("unidades") or 0, 1),
+        }
+    return panorama
+
+
+def _datos_producto_para_forecast(codigo, panorama):
+    """Resuelve descripcion/proveedor de un codigo que el vendedor agrega a
+    mano. Si nunca lo vendio (no esta en su panorama) igual se puede
+    agregar -- el usuario pidio que un equipo se pueda elegir aunque no
+    traiga promedio -- y los datos salen del catalogo homologado."""
+    if codigo in panorama:
+        return panorama[codigo]
+    homologado = _construir_homologador_ergopyme()(codigo)
+    ergo = CodigoErgopyme.query.filter(
+        db.func.upper(CodigoErgopyme.codigo_interno) == codigo.upper()
+    ).first()
+    return {
+        "codigo": codigo,
+        "descripcion": (homologado[3] if homologado else None) or (ergo.descripcion if ergo else ""),
+        "proveedor": (homologado[0] if homologado else None) or (ergo.proveedor_nombre if ergo else ""),
+        "promedio_6um": 0.0, "sugerencia": [0] * SEMANAS_FORECAST, "sugerencia_total": 0,
+        "clase_abc": "C",
+        "monto_12m": 0, "unidades_12m": 0,
+    }
+
+
+def _url_forecast(envio_id=None):
+    """Ruta para los avisos de la campanita. Se arma a mano (y no con
+    url_for) porque el mantenimiento automatico corre en el arranque, fuera
+    de una request, donde url_for no puede construir la URL."""
+    return f"/forecast/envios/{envio_id}" if envio_id else "/forecast"
+
+
+def _notificar(usuarios, titulo, mensaje, url=None, icono="bell", clave_unica=None, modulo="forecast"):
+    """Deja un aviso en la campanita de cada usuario. `clave_unica` evita
+    repetir el mismo aviso si el chequeo vuelve a correr (el recordatorio
+    de fecha tope se revisa en cada arranque y en cada entrada al modulo)."""
+    creadas = 0
+    for usuario in usuarios:
+        if not usuario:
+            continue
+        clave = f"{clave_unica}:{usuario.id}" if clave_unica else None
+        if clave and Notificacion.query.filter_by(clave_unica=clave).first():
+            continue
+        db.session.add(Notificacion(
+            usuario_id=usuario.id, titulo=titulo, mensaje=mensaje,
+            url=url, icono=icono, clave_unica=clave, modulo=modulo,
+        ))
+        creadas += 1
+    return creadas
+
+
+def _usuarios_administradores():
+    return Usuario.query.join(Rol).filter(
+        Rol.es_administrador.is_(True), Usuario.activo.is_(True)
+    ).all()
+
+
+def _usuario_de_vendedor(vendedor):
+    if not vendedor:
+        return None
+    return Usuario.query.filter(
+        db.func.upper(Usuario.vendedor) == vendedor.strip().upper(), Usuario.activo.is_(True)
+    ).first()
+
+
+def _vendedores_conocidos():
+    """Los nombres de vendedor que existen hoy: los del maestro
+    Cliente/Vendedor, mas los cinco que nombro el usuario, mas los que ya
+    estan enganchados a una cuenta de acceso."""
+    nombres = {v.strip() for (v,) in db.session.query(ClienteVendedor.vendedor).distinct().all() if (v or "").strip()}
+    nombres.update(VENDEDORES_FORECAST_SUGERIDOS)
+    nombres.update({u.vendedor.strip() for u in Usuario.query.filter(Usuario.vendedor.isnot(None)).all() if (u.vendedor or "").strip()})
+    return sorted(nombres, key=lambda s: s.upper())
+
+
+def _usuario_actual_id():
+    """El id del usuario logueado, o None si no hay request (el
+    mantenimiento automatico corre en el arranque, sin sesion)."""
+    try:
+        return current_user.id if current_user and current_user.is_authenticated else None
+    except Exception:
+        return None
+
+
+def _registrar_cambio_forecast(envio, codigo, semana, anterior, nuevo, accion, usuario_id="auto"):
+    db.session.add(ForecastCambio(
+        envio_id=envio.id, codigo_interno=codigo, semana=semana,
+        valor_anterior=anterior or 0, valor_nuevo=nuevo or 0, accion=accion,
+        usuario_id=_usuario_actual_id() if usuario_id == "auto" else usuario_id,
+    ))
+
+
+def _abrir_ciclo_forecast(nombre, mes_objetivo, fecha_tope, vendedores, usuario_id=None):
+    """Crea el ciclo y el forecast de cada vendedor, COPIADO del ciclo
+    anterior (el usuario fue explicito: "el forecast no se pide de cero").
+    Lo copiado queda en la bitacora como 'copia_ciclo_anterior', para poder
+    distinguir despues lo que el vendedor efectivamente corrigio."""
+    ciclo = ForecastCiclo(
+        nombre=nombre, mes_objetivo=mes_objetivo, fecha_tope=fecha_tope,
+        estado="Abierto", creado_por_id=usuario_id,
+    )
+    db.session.add(ciclo)
+    db.session.flush()
+
+    anterior = ForecastCiclo.query.filter(ForecastCiclo.id != ciclo.id).order_by(
+        ForecastCiclo.mes_objetivo.desc(), ForecastCiclo.id.desc()
+    ).first()
+    copiadas_total = 0
+    for vendedor in vendedores:
+        usuario_vendedor = _usuario_de_vendedor(vendedor)
+        envio = ForecastEnvio(
+            ciclo_id=ciclo.id, vendedor=vendedor, estado="Preparación",
+            usuario_id=usuario_vendedor.id if usuario_vendedor else None,
+        )
+        db.session.add(envio)
+        db.session.flush()
+        if anterior:
+            envio_previo = ForecastEnvio.query.filter_by(ciclo_id=anterior.id, vendedor=vendedor).first()
+            if envio_previo:
+                panorama = _panorama_forecast_vendedor(vendedor)
+                for linea in envio_previo.lineas.all():
+                    datos = panorama.get(linea.codigo_interno, {})
+                    nueva = ForecastLinea(
+                        envio_id=envio.id, codigo_interno=linea.codigo_interno,
+                        descripcion=linea.descripcion, proveedor=linea.proveedor,
+                        # La clase y el promedio se RECALCULAN con los datos
+                        # de hoy: lo que se arrastra son las cantidades.
+                        clase_abc=datos.get("clase_abc", linea.clase_abc),
+                        promedio_6um=datos.get("promedio_6um", linea.promedio_6um),
+                    )
+                    for n in range(1, SEMANAS_FORECAST + 1):
+                        setattr(nueva, f"s{n}", getattr(linea, f"s{n}") or 0)
+                    db.session.add(nueva)
+                    db.session.flush()
+                    _registrar_cambio_forecast(
+                        envio, linea.codigo_interno, None, 0, nueva.total,
+                        "copia_ciclo_anterior", usuario_id=usuario_id)
+                    copiadas_total += 1
+
+    destinatarios = [u for u in (_usuario_de_vendedor(v) for v in vendedores) if u]
+    _notificar(
+        destinatarios,
+        f"Forecast {ciclo.nombre}: ciclo abierto",
+        f"Tienes hasta el {fecha_tope.strftime('%d-%m-%Y')} para enviar tu proyección de 13 semanas.",
+        url=_url_forecast(), icono="calendar-check",
+        clave_unica=f"ciclo_abierto:{ciclo.id}",
+    )
+    db.session.commit()
+    return ciclo, copiadas_total
+
+
+def _cerrar_envios_forecast_vencidos():
+    """Pasada la fecha tope, los forecast que siguen en preparacion se
+    cierran solos con lo que haya (opcion elegida por el usuario) y la
+    gerencia recibe el aviso de que se cerraron sin confirmar.
+
+    Corre en el arranque y tambien al entrar al modulo, para que no dependa
+    de que la aplicacion se haya reiniciado ese dia."""
+    hoy = date.today()
+    vencidos = ForecastCiclo.query.filter(
+        ForecastCiclo.estado == "Abierto", ForecastCiclo.fecha_tope < hoy
+    ).all()
+    cerrados = 0
+    for ciclo in vencidos:
+        sin_enviar = []
+        for envio in ciclo.envios.all():
+            if envio.estado != "Enviado":
+                envio.estado = "Enviado"
+                envio.enviado_en = datetime.utcnow()
+                envio.cerrado_automaticamente = True
+                envio.edicion_autorizada = False
+                _registrar_cambio_forecast(
+                    envio, None, None, 0, 0, "cierre_automatico", usuario_id=None)
+                sin_enviar.append(envio.vendedor)
+                cerrados += 1
+        ciclo.estado = "Cerrado"
+        ciclo.cerrado_en = datetime.utcnow()
+        ciclo.cerrado_automaticamente = True
+        texto = (f"Se cerró en la fecha tope ({ciclo.fecha_tope.strftime('%d-%m-%Y')}). "
+                 + (f"Cerrados sin confirmar: {', '.join(sin_enviar)}." if sin_enviar
+                    else "Todos los vendedores habían enviado."))
+        _notificar(_usuarios_administradores(), f"Forecast {ciclo.nombre}: ciclo cerrado",
+                   texto, url=_url_forecast(), icono="lock",
+                   clave_unica=f"ciclo_cerrado:{ciclo.id}")
+    if vencidos:
+        db.session.commit()
+    return cerrados
+
+
+def _recordatorios_forecast_pendientes():
+    """Avisa por campanita a los vendedores que no han enviado cuando
+    faltan 3 dias o menos para la fecha tope. El aviso por CORREO lo
+    dispara el administrador desde la pantalla (boton "Recordar por
+    correo"), porque la app no tiene servidor de correo propio -- usa el
+    cliente de correo del usuario, igual que el envio de las OC."""
+    hoy = date.today()
+    avisados = 0
+    for ciclo in ForecastCiclo.query.filter(ForecastCiclo.estado == "Abierto").all():
+        dias = (ciclo.fecha_tope - hoy).days
+        if dias < 0 or dias > 3:
+            continue
+        for envio in ciclo.envios.filter(ForecastEnvio.estado != "Enviado").all():
+            usuario = _usuario_de_vendedor(envio.vendedor)
+            if not usuario:
+                continue
+            cuando = "hoy" if dias == 0 else f"en {dias} día(s)"
+            avisados += _notificar(
+                [usuario], f"Forecast {ciclo.nombre}: vence {cuando}",
+                f"Tu proyección sigue en preparación. La fecha tope es el {ciclo.fecha_tope.strftime('%d-%m-%Y')}.",
+                url=_url_forecast(envio.id), icono="alarm",
+                clave_unica=f"recordatorio:{ciclo.id}:{dias}:{envio.id}")
+    if avisados:
+        db.session.commit()
+    return avisados
+
+
+def _mantenimiento_forecast():
+    """Las dos revisiones automaticas juntas, protegidas: que una falla de
+    datos nunca deje al usuario sin poder entrar al modulo."""
+    try:
+        _cerrar_envios_forecast_vencidos()
+        _recordatorios_forecast_pendientes()
+    except Exception as exc:  # pragma: no cover - defensivo
+        db.session.rollback()
+        app.logger.warning("Mantenimiento de forecast omitido: %s", exc)
+
+
+@app.context_processor
+def _inyectar_notificaciones():
+    """La campanita de la barra superior. Ronda CH (2026-10-27)."""
+    if not current_user.is_authenticated:
+        return {}
+    try:
+        pendientes = Notificacion.query.filter_by(
+            usuario_id=current_user.id, leida=False
+        ).order_by(Notificacion.creada_en.desc()).limit(15).all()
+    except Exception:  # la tabla puede no existir aun en el primer arranque
+        return {"notificaciones_pendientes": [], "notificaciones_count": 0}
+    return {
+        "notificaciones_pendientes": pendientes,
+        "notificaciones_count": len(pendientes),
+    }
+
+
+@app.route("/notificaciones/leer", methods=["POST"])
+@login_required
+def notificaciones_leer():
+    notificacion_id = request.form.get("id")
+    query = Notificacion.query.filter_by(usuario_id=current_user.id, leida=False)
+    if notificacion_id:
+        query = query.filter_by(id=int(notificacion_id))
+    for notificacion in query.all():
+        notificacion.leida = True
+    db.session.commit()
+    destino = request.form.get("destino") or request.referrer or url_for("dashboard")
+    return redirect(destino)
+
+
+@app.route("/forecast")
+@requiere_permiso("forecast")
+def forecast_index():
+    """Portada del modulo: el administrador/gerencia ve el tablero de todos
+    los ciclos y quien entrego; un ejecutivo ve directamente su hoja."""
+    _mantenimiento_forecast()
+    es_admin = bool(current_user.rol and current_user.rol.es_administrador)
+    ciclos = ForecastCiclo.query.order_by(
+        ForecastCiclo.mes_objetivo.desc(), ForecastCiclo.id.desc()).limit(12).all()
+    mi_vendedor = (current_user.vendedor or "").strip()
+    tablero = []
+    for ciclo in ciclos:
+        envios = ciclo.envios.order_by(ForecastEnvio.vendedor).all()
+        if not es_admin and mi_vendedor:
+            envios = [e for e in envios if e.vendedor.strip().upper() == mi_vendedor.upper()]
+        tablero.append({
+            "ciclo": ciclo,
+            "envios": envios,
+            "semanas": _semanas_forecast(ciclo),
+            "enviados": sum(1 for e in envios if e.enviado),
+            "total": len(envios),
+            "unidades": sum(l.total for e in envios for l in e.lineas.all()),
+        })
+    return render_template(
+        "forecast/index.html", tablero=tablero, es_admin=es_admin,
+        mi_vendedor=mi_vendedor, vendedores=_vendedores_conocidos(),
+        sugeridos=VENDEDORES_FORECAST_SUGERIDOS, hoy=date.today(),
+        meses=MESES_ES,
+    )
+
+
+@app.route("/forecast/ciclos/nuevo", methods=["POST"])
+@requiere_admin
+def forecast_ciclo_nuevo():
+    mes_txt = request.form.get("mes_objetivo", "").strip()        # "2026-11"
+    fecha_tope = parse_date(request.form.get("fecha_tope", ""))
+    vendedores = [v.strip() for v in request.form.getlist("vendedor") if v.strip()]
+    if not (mes_txt and fecha_tope and vendedores):
+        flash("Mes del ciclo, fecha tope y al menos un vendedor son obligatorios.", "warning")
+        return redirect(url_for("forecast_index"))
+    try:
+        anio, mes = (int(p) for p in mes_txt.split("-")[:2])
+        mes_objetivo = date(anio, mes, 1)
+    except (ValueError, TypeError):
+        flash("El mes del ciclo no es válido.", "warning")
+        return redirect(url_for("forecast_index"))
+    nombre = f"{MESES_ES[mes_objetivo.month]} {mes_objetivo.year}"
+    if ForecastCiclo.query.filter(db.func.upper(ForecastCiclo.nombre) == nombre.upper()).first():
+        flash(f"Ya existe el ciclo '{nombre}'.", "warning")
+        return redirect(url_for("forecast_index"))
+    ciclo, copiadas = _abrir_ciclo_forecast(nombre, mes_objetivo, fecha_tope, vendedores, current_user.id)
+    mensaje = f"Ciclo '{ciclo.nombre}' abierto para {len(vendedores)} vendedor(es), fecha tope {fecha_tope.strftime('%d-%m-%Y')}."
+    if copiadas:
+        mensaje += f" Se copiaron {copiadas} línea(s) del ciclo anterior para que solo haya que corregirlas."
+    flash(mensaje, "success")
+    return redirect(url_for("forecast_index"))
+
+
+@app.route("/forecast/ciclos/<int:ciclo_id>/cerrar", methods=["POST"])
+@requiere_admin
+def forecast_ciclo_cerrar(ciclo_id):
+    ciclo = ForecastCiclo.query.get_or_404(ciclo_id)
+    pendientes = [e.vendedor for e in ciclo.envios.filter(ForecastEnvio.estado != "Enviado").all()]
+    for envio in ciclo.envios.filter(ForecastEnvio.estado != "Enviado").all():
+        envio.estado = "Enviado"
+        envio.enviado_en = datetime.utcnow()
+        envio.cerrado_automaticamente = True
+        _registrar_cambio_forecast(envio, None, None, 0, 0, "cierre_manual")
+    ciclo.estado = "Cerrado"
+    ciclo.cerrado_en = datetime.utcnow()
+    db.session.commit()
+    aviso = f"Ciclo '{ciclo.nombre}' cerrado."
+    if pendientes:
+        aviso += f" Se cerraron sin confirmar: {', '.join(pendientes)}."
+    flash(aviso, "success")
+    return redirect(url_for("forecast_index"))
+
+
+@app.route("/forecast/ciclos/<int:ciclo_id>/reabrir", methods=["POST"])
+@requiere_admin
+def forecast_ciclo_reabrir(ciclo_id):
+    ciclo = ForecastCiclo.query.get_or_404(ciclo_id)
+    nueva_tope = parse_date(request.form.get("fecha_tope", "")) or ciclo.fecha_tope
+    if nueva_tope < date.today():
+        flash("Para reabrir el ciclo, la nueva fecha tope tiene que ser de hoy en adelante "
+              "(si no, se vuelve a cerrar solo).", "warning")
+        return redirect(url_for("forecast_index"))
+    ciclo.estado = "Abierto"
+    ciclo.fecha_tope = nueva_tope
+    ciclo.cerrado_en = None
+    ciclo.cerrado_automaticamente = False
+    db.session.commit()
+    flash(f"Ciclo '{ciclo.nombre}' reabierto con fecha tope {nueva_tope.strftime('%d-%m-%Y')}.", "success")
+    return redirect(url_for("forecast_index"))
+
+
+@app.route("/forecast/ciclos/<int:ciclo_id>/recordatorio")
+@requiere_admin
+def forecast_recordatorio(ciclo_id):
+    """Recordatorio por CORREO de la fecha tope. Abre el cliente de correo
+    del administrador con los pendientes en copia -- la app no tiene
+    servidor de correo propio, igual que el envio de Ordenes de Compra."""
+    ciclo = ForecastCiclo.query.get_or_404(ciclo_id)
+    pendientes = ciclo.envios.filter(ForecastEnvio.estado != "Enviado").all()
+    if not pendientes:
+        flash("No hay forecast pendientes en este ciclo: todos enviaron.", "info")
+        return redirect(url_for("forecast_index"))
+    correos, sin_correo = [], []
+    for envio in pendientes:
+        usuario = _usuario_de_vendedor(envio.vendedor)
+        (correos.append(usuario.email) if usuario and usuario.email else sin_correo.append(envio.vendedor))
+    nombres = ", ".join(e.vendedor for e in pendientes)
+    asunto = f"Recordatorio Forecast {ciclo.nombre} - fecha tope {ciclo.fecha_tope.strftime('%d-%m-%Y')}"
+    cuerpo = (
+        f"Hola,\n\nTe recuerdo que el forecast de {ciclo.nombre} tiene fecha tope el "
+        f"{ciclo.fecha_tope.strftime('%d-%m-%Y')} y tu proyección de 13 semanas sigue en preparación.\n\n"
+        "Al llegar la fecha tope el sistema cierra el ciclo con lo que esté cargado en ese momento.\n\n"
+        "Puedes cargarla en la Suite Logística, en el menú Forecast.\n\nGracias."
+    )
+    _notificar([_usuario_de_vendedor(e.vendedor) for e in pendientes],
+               f"Forecast {ciclo.nombre}: recordatorio enviado",
+               f"{current_user.nombre_completo} envió un recordatorio de la fecha tope.",
+               url=url_for("forecast_index"), icono="envelope",
+               clave_unica=f"recordatorio_manual:{ciclo.id}:{date.today().isoformat()}")
+    db.session.commit()
+    if sin_correo:
+        flash("Sin cuenta de acceso con correo (no se pueden incluir): " + ", ".join(sin_correo)
+              + ". Puedes enlazarlos en Configuración > Usuarios con el campo 'Vendedor'.", "warning")
+    if not correos:
+        flash(f"Ninguno de los pendientes ({nombres}) tiene correo cargado.", "warning")
+        return redirect(url_for("forecast_index"))
+    return redirect(f"mailto:{','.join(correos)}?subject={quote(asunto)}&body={quote(cuerpo)}")
+
+
+def _puede_ver_envio(envio):
+    if current_user.rol and current_user.rol.es_administrador:
+        return True
+    mio = (current_user.vendedor or "").strip().upper()
+    return bool(mio) and mio == envio.vendedor.strip().upper()
+
+
+@app.route("/forecast/envios/<int:envio_id>")
+@requiere_permiso("forecast")
+def forecast_envio(envio_id):
+    """La hoja de captura: productos en filas, las 13 semanas en columnas.
+    Replica la hoja FCST del SOP, con el promedio 6UM y la clase A/B/C al
+    lado de cada producto para poder estimar mirando el dato."""
+    _mantenimiento_forecast()
+    envio = ForecastEnvio.query.get_or_404(envio_id)
+    if not _puede_ver_envio(envio):
+        flash("Ese forecast es de otro ejecutivo.", "danger")
+        return redirect(url_for("forecast_index"))
+    panorama = _panorama_forecast_vendedor(envio.vendedor)
+    lineas = envio.lineas.order_by(ForecastLinea.clase_abc, ForecastLinea.codigo_interno).all()
+    codigos_cargados = {l.codigo_interno for l in lineas}
+    # Motor deterministico de sugerencias: lo que mas vende y todavia no
+    # esta en la hoja, ordenado por monto de los ultimos 12 meses.
+    sugerencias = sorted(
+        (d for c, d in panorama.items() if c not in codigos_cargados and d["promedio_6um"] > 0),
+        key=lambda d: -d["monto_12m"],
+    )[:MAX_SUGERENCIAS_FORECAST]
+    historial = ForecastCambio.query.filter_by(envio_id=envio.id).order_by(
+        ForecastCambio.momento.desc()).limit(80).all()
+    return render_template(
+        "forecast/envio.html", envio=envio, ciclo=envio.ciclo,
+        semanas=_semanas_forecast(envio.ciclo), lineas=lineas,
+        panorama=panorama, sugerencias=sugerencias, historial=historial,
+        es_admin=bool(current_user.rol and current_user.rol.es_administrador),
+        total_semanas=SEMANAS_FORECAST,
+    )
+
+
+@app.route("/forecast/envios/<int:envio_id>/guardar", methods=["POST"])
+@requiere_permiso("forecast")
+def forecast_envio_guardar(envio_id):
+    envio = ForecastEnvio.query.get_or_404(envio_id)
+    if not _puede_ver_envio(envio):
+        flash("Ese forecast es de otro ejecutivo.", "danger")
+        return redirect(url_for("forecast_index"))
+    if not envio.editable:
+        flash("Este forecast ya no se puede editar: está enviado o el ciclo se cerró. "
+              "Un administrador puede autorizar la edición.", "warning")
+        return redirect(url_for("forecast_envio", envio_id=envio.id))
+
+    cambios = 0
+    for linea in envio.lineas.all():
+        for n in range(1, SEMANAS_FORECAST + 1):
+            campo = f"u_{linea.id}_{n}"
+            if campo not in request.form:
+                continue
+            nuevo = parse_int(request.form.get(campo), 0)
+            anterior = getattr(linea, f"s{n}") or 0
+            if abs(nuevo - anterior) > 0.0001:
+                setattr(linea, f"s{n}", nuevo)
+                _registrar_cambio_forecast(envio, linea.codigo_interno, n, anterior, nuevo, "edicion")
+                cambios += 1
+    enviar = request.form.get("accion") == "enviar"
+    if enviar:
+        envio.estado = "Enviado"
+        envio.enviado_en = datetime.utcnow()
+        envio.edicion_autorizada = False
+        _registrar_cambio_forecast(envio, None, None, 0, 0, "envio")
+        _notificar(_usuarios_administradores(),
+                   f"Forecast {envio.ciclo.nombre}: {envio.vendedor} envió su proyección",
+                   f"{sum(l.total for l in envio.lineas.all()):,.0f} unidades en 13 semanas.".replace(",", "."),
+                   url=url_for("forecast_envio", envio_id=envio.id), icono="send-check")
+    db.session.commit()
+    if enviar:
+        flash(f"Forecast enviado. Se guardaron {cambios} cambio(s).", "success")
+    else:
+        flash(f"Borrador guardado ({cambios} cambio(s)).", "success")
+    return redirect(url_for("forecast_envio", envio_id=envio.id))
+
+
+@app.route("/forecast/envios/<int:envio_id>/agregar", methods=["POST"])
+@requiere_permiso("forecast")
+def forecast_envio_agregar(envio_id):
+    envio = ForecastEnvio.query.get_or_404(envio_id)
+    if not _puede_ver_envio(envio) or not envio.editable:
+        flash("No se puede agregar productos a este forecast.", "warning")
+        return redirect(url_for("forecast_envio", envio_id=envio.id))
+    codigos = [c.strip() for c in request.form.getlist("codigo") if c.strip()]
+    aplicar_sugerencia = request.form.get("aplicar_sugerencia") == "on"
+    panorama = _panorama_forecast_vendedor(envio.vendedor)
+    agregados, repetidos = 0, 0
+    for codigo in codigos:
+        if envio.lineas.filter(db.func.upper(ForecastLinea.codigo_interno) == codigo.upper()).first():
+            repetidos += 1
+            continue
+        datos = _datos_producto_para_forecast(codigo, panorama)
+        linea = ForecastLinea(
+            envio_id=envio.id, codigo_interno=codigo,
+            descripcion=(datos.get("descripcion") or "")[:300],
+            proveedor=(datos.get("proveedor") or "")[:120],
+            clase_abc=datos.get("clase_abc"), promedio_6um=datos.get("promedio_6um") or 0,
+        )
+        if aplicar_sugerencia and (datos.get("sugerencia_total") or 0) > 0:
+            for n, unidades in enumerate(datos["sugerencia"], start=1):
+                setattr(linea, f"s{n}", unidades)
+        db.session.add(linea)
+        db.session.flush()
+        _registrar_cambio_forecast(envio, codigo, None, 0, linea.total, "alta")
+        agregados += 1
+    db.session.commit()
+    mensaje = f"{agregados} producto(s) agregado(s)."
+    if repetidos:
+        mensaje += f" {repetidos} ya estaba(n) en la hoja."
+    flash(mensaje, "success" if agregados else "warning")
+    return redirect(url_for("forecast_envio", envio_id=envio.id))
+
+
+@app.route("/forecast/lineas/<int:linea_id>/eliminar", methods=["POST"])
+@requiere_permiso("forecast")
+def forecast_linea_eliminar(linea_id):
+    linea = ForecastLinea.query.get_or_404(linea_id)
+    envio = linea.envio
+    if not _puede_ver_envio(envio) or not envio.editable:
+        flash("No se puede quitar productos de este forecast.", "warning")
+        return redirect(url_for("forecast_envio", envio_id=envio.id))
+    _registrar_cambio_forecast(envio, linea.codigo_interno, None, linea.total, 0, "baja")
+    db.session.delete(linea)
+    db.session.commit()
+    flash(f"Producto {linea.codigo_interno} quitado del forecast.", "success")
+    return redirect(url_for("forecast_envio", envio_id=envio.id))
+
+
+@app.route("/forecast/envios/<int:envio_id>/autorizar-edicion", methods=["POST"])
+@requiere_admin
+def forecast_autorizar_edicion(envio_id):
+    envio = ForecastEnvio.query.get_or_404(envio_id)
+    autorizar = request.form.get("autorizar", "1") == "1"
+    envio.edicion_autorizada = autorizar
+    envio.autorizado_por_id = current_user.id if autorizar else None
+    envio.autorizado_en = datetime.utcnow() if autorizar else None
+    if autorizar:
+        _notificar([_usuario_de_vendedor(envio.vendedor)],
+                   f"Forecast {envio.ciclo.nombre}: edición autorizada",
+                   f"{current_user.nombre_completo} te autorizó a corregir tu proyección ya enviada.",
+                   url=url_for("forecast_envio", envio_id=envio.id), icono="unlock")
+    db.session.commit()
+    flash(("Edición autorizada: " if autorizar else "Edición revocada: ") + envio.vendedor, "success")
+    return redirect(url_for("forecast_envio", envio_id=envio.id))
 
 
 @app.route("/stock-valorizado")
@@ -16803,6 +17533,15 @@ def pagos_proveedores_facturar_consignacion():
         pendientes_lote=pendientes_lote,
         empresas=Empresa.query.order_by(Empresa.nombre).all(),
     )
+
+
+# Ronda CH (2026-10-27): el mantenimiento del Forecast (cerrar los ciclos
+# cuya fecha tope ya pasó y avisar a los que no han enviado) corre acá y no
+# en el bloque de arranque de más arriba porque las funciones del módulo se
+# definen después. Igual vuelve a correr al entrar al módulo, para que no
+# dependa de que la aplicación se haya reiniciado ese día.
+with app.app_context():
+    _paso_arranque_seguro("mantenimiento_forecast", _mantenimiento_forecast)
 
 
 if __name__ == "__main__":

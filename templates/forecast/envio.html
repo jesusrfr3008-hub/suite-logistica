@@ -1,0 +1,322 @@
+{% extends "base.html" %}
+{% block title %}Forecast {{ envio.vendedor }} · {{ ciclo.nombre }}{% endblock %}
+{% block content %}
+
+{# Ronda CH (2026-10-27): hoja de captura del forecast de un vendedor.
+   Replica la hoja FCST del SOP que hoy se lleva en Excel: productos en
+   filas, 13 semanas en columnas, con el promedio 6UM y la clase A/B/C al
+   lado para poder estimar mirando el dato. #}
+
+<div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
+  <div>
+    <h3 class="section-title mb-1">
+      Forecast · {{ envio.vendedor }}
+      {% if envio.enviado and envio.cerrado_automaticamente %}
+      <span class="badge bg-warning text-dark">Cerrado sin confirmar</span>
+      {% elif envio.enviado %}
+      <span class="badge bg-success">Enviado</span>
+      {% else %}
+      <span class="badge bg-secondary">Preparación</span>
+      {% endif %}
+      {% if envio.edicion_autorizada %}<span class="badge bg-info text-dark">Edición autorizada</span>{% endif %}
+    </h3>
+    <div class="text-muted small">
+      Ciclo <strong>{{ ciclo.nombre }}</strong> · fecha tope {{ ciclo.fecha_tope.strftime('%d-%m-%Y') }} ·
+      semanas del {{ semanas[0].inicio.strftime('%d-%m-%Y') }} al {{ semanas[-1].fin.strftime('%d-%m-%Y') }}
+      (lunes a viernes)
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <a class="btn btn-outline-secondary" href="{{ url_for('forecast_index') }}">
+      <i class="bi bi-arrow-left me-1"></i> Volver
+    </a>
+    {% if es_admin and envio.enviado and ciclo.abierto %}
+    <form method="post" action="{{ url_for('forecast_autorizar_edicion', envio_id=envio.id) }}">
+      <input type="hidden" name="autorizar" value="{{ '0' if envio.edicion_autorizada else '1' }}">
+      <button class="btn btn-outline-{{ 'danger' if envio.edicion_autorizada else 'warning' }}">
+        <i class="bi bi-{{ 'lock' if envio.edicion_autorizada else 'unlock' }} me-1"></i>
+        {{ 'Revocar edición' if envio.edicion_autorizada else 'Autorizar edición' }}
+      </button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+{% if not envio.editable %}
+<div class="alert alert-secondary">
+  <i class="bi bi-lock me-1"></i>
+  {% if not ciclo.abierto %}
+  El ciclo está cerrado, así que esta hoja quedó solo de consulta.
+  {% else %}
+  Ya enviaste este forecast. Para corregirlo necesitas que un administrador autorice la edición.
+  {% endif %}
+</div>
+{% endif %}
+
+<form method="post" action="{{ url_for('forecast_envio_guardar', envio_id=envio.id) }}" id="formForecast">
+<div class="card p-0 mb-3">
+  <div class="table-responsive" style="max-height: 65vh;">
+    <table class="table table-sm table-bordered align-middle mb-0" id="tablaForecast">
+      <thead class="table-light" style="position: sticky; top: 0; z-index: 3;">
+        <tr>
+          <th style="min-width: 260px;">Producto</th>
+          <th class="text-center" title="Clase A/B/C: Pareto 80/90/100 sobre el monto de tus cuentas en los últimos 12 meses">ABC</th>
+          <th class="text-end" title="Promedio mensual de unidades de los últimos 6 meses, solo de tus cuentas">6UM</th>
+          {% for s in semanas %}
+          <th class="text-center" style="min-width: 62px;" title="{{ s.rango_largo }}">
+            <div class="small fw-semibold">{{ s.etiqueta }}</div>
+            <div class="text-muted" style="font-size: .7rem;">{{ s.rango }}</div>
+          </th>
+          {% endfor %}
+          <th class="text-end" style="min-width: 70px;">Total</th>
+          <th style="min-width: 70px;"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for linea in lineas %}
+        {% set datos = panorama.get(linea.codigo_interno) %}
+        <tr data-fila="{{ linea.id }}">
+          <td>
+            <div class="fw-semibold">{{ linea.codigo_interno }}</div>
+            <div class="text-muted small">{{ linea.descripcion or '—' }}</div>
+            {% if linea.proveedor %}<div class="text-muted" style="font-size: .72rem;">{{ linea.proveedor }}</div>{% endif %}
+          </td>
+          <td class="text-center">
+            <span class="badge bg-{{ 'danger' if linea.clase_abc == 'A' else ('warning text-dark' if linea.clase_abc == 'B' else 'secondary') }}">
+              {{ linea.clase_abc or 'C' }}
+            </span>
+          </td>
+          <td class="text-end">{{ "%.1f"|format(linea.promedio_6um or 0) }}</td>
+          {% for s in semanas %}
+          <td class="p-1">
+            <input type="number" min="0" step="1" class="form-control form-control-sm text-end celda-forecast"
+                   name="u_{{ linea.id }}_{{ s.n }}" value="{{ (linea['s' ~ s.n] or 0)|round|int }}"
+                   {% if not envio.editable %}readonly{% endif %}>
+          </td>
+          {% endfor %}
+          <td class="text-end fw-semibold total-fila">{{ "%.0f"|format(linea.total) }}</td>
+          <td class="text-end">
+            {% if envio.editable %}
+            {% if datos and datos.sugerencia_total %}
+            <button type="button" class="btn btn-sm btn-outline-secondary btn-sugerir"
+                    data-sugerencia="{{ datos.sugerencia|join(',') }}"
+                    title="Aplicar la sugerencia del sistema: {{ datos.sugerencia_total }} unidades en 13 semanas, a partir de tu promedio de 6 meses">
+              <i class="bi bi-magic"></i>
+            </button>
+            {% endif %}
+            <button type="button" class="btn btn-sm btn-outline-danger btn-eliminar"
+                    data-url="{{ url_for('forecast_linea_eliminar', linea_id=linea.id) }}"
+                    data-codigo="{{ linea.codigo_interno }}" title="Quitar del forecast">
+              <i class="bi bi-trash"></i>
+            </button>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="{{ semanas|length + 5 }}" class="text-center text-muted py-4">
+            Esta hoja está vacía. Agrega productos desde el panel de sugerencias de abajo.
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      {% if lineas %}
+      <tfoot class="table-light" style="position: sticky; bottom: 0;">
+        <tr class="fw-semibold">
+          <td colspan="3" class="text-end">Total</td>
+          {% for s in semanas %}<td class="text-end total-semana" data-semana="{{ s.n }}">0</td>{% endfor %}
+          <td class="text-end" id="totalGeneral">0</td>
+          <td></td>
+        </tr>
+      </tfoot>
+      {% endif %}
+    </table>
+  </div>
+</div>
+
+{% if envio.editable %}
+<div class="d-flex flex-wrap gap-2 mb-4">
+  <button class="btn btn-outline-primary" name="accion" value="borrador">
+    <i class="bi bi-save me-1"></i> Guardar borrador
+  </button>
+  <button class="btn btn-success" name="accion" value="enviar"
+          onclick="return confirm('Enviar el forecast de {{ ciclo.nombre }}? Después solo podrás corregirlo si un administrador te lo autoriza.');">
+    <i class="bi bi-send-check me-1"></i> Enviar forecast
+  </button>
+</div>
+{% endif %}
+</form>
+
+{% if envio.editable %}
+<div class="card p-3 mb-3">
+  <h5 class="section-title">Agregar productos</h5>
+  <p class="text-muted small">
+    El sistema propone primero lo que más vendes y todavía no está en tu hoja, ordenado por monto de
+    los últimos 12 meses. La sugerencia de unidades es tu promedio mensual de 6 meses repartido en las
+    13 semanas. Igual puedes escribir cualquier código del catálogo: un equipo (códigos 30, 60, 80 y 90)
+    se puede proyectar, solo que no trae promedio porque no entra en el análisis de rotación.
+  </p>
+  <form method="post" action="{{ url_for('forecast_envio_agregar', envio_id=envio.id) }}">
+    <div class="row g-2 align-items-end mb-3">
+      <div class="col-md-5">
+        <label class="form-label small fw-semibold">Código del producto</label>
+        <input type="text" name="codigo" class="form-control" list="codigosForecast"
+               placeholder="Escribe o pega un código interno">
+        <datalist id="codigosForecast">
+          {% for codigo, d in panorama.items() %}
+          <option value="{{ codigo }}">{{ d.descripcion }}</option>
+          {% endfor %}
+        </datalist>
+      </div>
+      <div class="col-md-4">
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" name="aplicar_sugerencia" id="aplicarSug" checked>
+          <label class="form-check-label small" for="aplicarSug">
+            Precargar las 13 semanas con la sugerencia del sistema
+          </label>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <button class="btn btn-primary w-100"><i class="bi bi-plus-lg me-1"></i> Agregar seleccionados</button>
+      </div>
+    </div>
+
+    {% if sugerencias %}
+    <div class="table-responsive" style="max-height: 320px;">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead class="table-light" style="position: sticky; top: 0;">
+          <tr>
+            <th style="width: 36px;"><input type="checkbox" class="form-check-input" id="marcarTodos"></th>
+            <th>Código</th>
+            <th>Descripción</th>
+            <th>Proveedor</th>
+            <th class="text-center">ABC</th>
+            <th class="text-end">6UM</th>
+            <th class="text-end">Sugerido 13 sem.</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in sugerencias %}
+          <tr>
+            <td><input class="form-check-input chk-sugerencia" type="checkbox" name="codigo" value="{{ d.codigo }}"></td>
+            <td class="fw-semibold">{{ d.codigo }}</td>
+            <td class="small">{{ d.descripcion or '—' }}</td>
+            <td class="small text-muted">{{ d.proveedor or '—' }}</td>
+            <td class="text-center">
+              <span class="badge bg-{{ 'danger' if d.clase_abc == 'A' else ('warning text-dark' if d.clase_abc == 'B' else 'secondary') }}">{{ d.clase_abc }}</span>
+            </td>
+            <td class="text-end">{{ "%.1f"|format(d.promedio_6um) }}</td>
+            <td class="text-end">{{ d.sugerencia_total }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="text-muted mb-0">No quedan productos con venta en los últimos 12 meses fuera de tu hoja.</p>
+    {% endif %}
+  </form>
+</div>
+{% endif %}
+
+<div class="card p-3">
+  <h5 class="section-title mb-2">
+    <a class="text-decoration-none" data-bs-toggle="collapse" href="#historialForecast">
+      <i class="bi bi-clock-history me-1"></i> Historial de cambios ({{ historial|length }})
+    </a>
+  </h5>
+  <div class="collapse" id="historialForecast">
+    {% if historial %}
+    <div class="table-responsive" style="max-height: 320px;">
+      <table class="table table-sm mb-0">
+        <thead class="table-light" style="position: sticky; top: 0;">
+          <tr><th>Momento</th><th>Quién</th><th>Acción</th><th>Producto</th><th class="text-center">Semana</th><th class="text-end">Antes</th><th class="text-end">Después</th></tr>
+        </thead>
+        <tbody>
+          {% for c in historial %}
+          <tr>
+            <td class="small text-muted">{{ c.momento.strftime('%d-%m-%Y %H:%M') }}</td>
+            <td class="small">{{ c.usuario.nombre_completo if c.usuario else 'Sistema' }}</td>
+            <td class="small">{{ c.accion }}</td>
+            <td class="small">{{ c.codigo_interno or '—' }}</td>
+            <td class="text-center small">{{ ('S' ~ c.semana) if c.semana else '—' }}</td>
+            <td class="text-end small">{{ "%.0f"|format(c.valor_anterior or 0) }}</td>
+            <td class="text-end small">{{ "%.0f"|format(c.valor_nuevo or 0) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="text-muted mb-0">Todavía no hay cambios registrados en esta hoja.</p>
+    {% endif %}
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const tabla = document.getElementById("tablaForecast");
+  if (!tabla) return;
+  const semanas = {{ total_semanas }};
+
+  function recalcular() {
+    const totalesSemana = new Array(semanas + 1).fill(0);
+    let general = 0;
+    tabla.querySelectorAll("tbody tr[data-fila]").forEach(function (fila) {
+      let totalFila = 0;
+      fila.querySelectorAll("input.celda-forecast").forEach(function (input, indice) {
+        const valor = parseFloat(input.value) || 0;
+        totalFila += valor;
+        totalesSemana[indice + 1] += valor;
+      });
+      const celda = fila.querySelector(".total-fila");
+      if (celda) celda.textContent = totalFila.toFixed(0);
+      general += totalFila;
+    });
+    tabla.querySelectorAll(".total-semana").forEach(function (celda) {
+      celda.textContent = (totalesSemana[parseInt(celda.dataset.semana, 10)] || 0).toFixed(0);
+    });
+    const totalGeneral = document.getElementById("totalGeneral");
+    if (totalGeneral) totalGeneral.textContent = general.toFixed(0);
+  }
+
+  tabla.addEventListener("input", function (evento) {
+    if (evento.target.classList.contains("celda-forecast")) recalcular();
+  });
+
+  // Aplicar la sugerencia del sistema a una fila completa.
+  tabla.addEventListener("click", function (evento) {
+    const sugerir = evento.target.closest(".btn-sugerir");
+    if (sugerir) {
+      const valores = (sugerir.dataset.sugerencia || "").split(",");
+      const inputs = sugerir.closest("tr").querySelectorAll("input.celda-forecast");
+      inputs.forEach(function (input, indice) { input.value = valores[indice] || 0; });
+      recalcular();
+      return;
+    }
+    const eliminar = evento.target.closest(".btn-eliminar");
+    if (eliminar) {
+      if (confirm("Quitar " + eliminar.dataset.codigo + " del forecast? Los cambios no guardados de esta pantalla se pierden.")) {
+        const formulario = document.createElement("form");
+        formulario.method = "post";
+        formulario.action = eliminar.dataset.url;
+        document.body.appendChild(formulario);
+        formulario.submit();
+      }
+    }
+  });
+
+  const marcarTodos = document.getElementById("marcarTodos");
+  if (marcarTodos) {
+    marcarTodos.addEventListener("change", function () {
+      document.querySelectorAll(".chk-sugerencia").forEach(function (chk) { chk.checked = marcarTodos.checked; });
+    });
+  }
+
+  recalcular();
+})();
+</script>
+{% endblock %}

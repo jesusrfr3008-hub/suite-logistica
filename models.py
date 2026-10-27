@@ -37,6 +37,11 @@ PERMISOS_DISPONIBLES = [
     # sensible (montos y fechas de vencimiento de pago a proveedores) que no
     # todo el que ve Reportes deberia poder ver/operar.
     ("pagos_proveedores", "Pago Proveedores"),
+    # Ronda CH (2026-10-27), Fase 2 del plan de Ventas/Forecast: permiso
+    # PROPIO, separado de "reportes", porque lo necesitan los ejecutivos
+    # comerciales (que no ven costos ni compras) y porque la gerencia
+    # consolida sobre el mismo modulo.
+    ("forecast", "Forecast / Proyección de Ventas (S&OP)"),
 ]
 
 
@@ -66,6 +71,8 @@ class Rol(db.Model):
     permiso_consultar_stock = db.Column(db.Boolean, default=False)
     # Ronda AJ (2026-09-18): ver PERMISOS_DISPONIBLES arriba.
     permiso_pagos_proveedores = db.Column(db.Boolean, default=False)
+    # Ronda CH (2026-10-27): ver PERMISOS_DISPONIBLES arriba.
+    permiso_forecast = db.Column(db.Boolean, default=False)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
 
     usuarios = db.relationship("Usuario", backref="rol", lazy="dynamic")
@@ -100,6 +107,12 @@ class Usuario(UserMixin, db.Model):
     activo = db.Column(db.Boolean, default=True)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
     ultimo_acceso = db.Column(db.DateTime, nullable=True)
+    # Ronda CH (2026-10-27): nombre del vendedor TAL COMO APARECE en el
+    # reporte de ventas / maestro Cliente-Vendedor. Es el puente entre la
+    # cuenta de acceso y las cuentas comerciales: con esto el ejecutivo
+    # entra a /forecast y ve SU hoja y el promedio de SUS clientes, sin
+    # tener que elegirse de una lista. Vacio = no hace forecast propio.
+    vendedor = db.Column(db.String(120), nullable=True, index=True)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -2538,3 +2551,193 @@ class AjusteCompraProveedor(db.Model):
 
     def __repr__(self):
         return f"<AjusteCompraProveedor proveedor={self.proveedor_id} {self.codigo_producto} {self.valor}>"
+
+
+# ---------------------------------------------------------------------------
+# Fase 2 del plan de Ventas/Forecast (ronda CH, 2026-10-27): S&OP
+# ---------------------------------------------------------------------------
+# Reemplaza el Excel "SOP_Accuvision.xlsb" que hoy se lleva a mano: una hoja
+# FCST por vendedor con 13 semanas en columnas. Las decisiones de diseño
+# estan en el doc del proyecto "plan-ventas-rotacion-forecast.md".
+
+# Horizonte fijo acordado con el usuario.
+SEMANAS_FORECAST = 13
+
+ESTADOS_ENVIO_FORECAST = ("Preparación", "Enviado")
+
+
+class ForecastCiclo(db.Model):
+    """Un ciclo MENSUAL de captura de forecast. El administrador lo abre,
+    fija la fecha tope, y esa fecha tope es el punto de partida para contar
+    las 13 semanas (lunes a viernes) -- decision explicita del usuario.
+
+    El ciclo no se pide de cero: al abrirlo, el forecast de cada vendedor
+    arranca copiado del ciclo anterior para que solo tenga que corregir,
+    agregar o eliminar (ver _abrir_ciclo_forecast en app.py)."""
+    __tablename__ = "forecast_ciclos"
+
+    id = db.Column(db.Integer, primary_key=True)
+    nombre = db.Column(db.String(60), nullable=False, unique=True)   # ej. "Noviembre 2026"
+    mes_objetivo = db.Column(db.Date, nullable=False)                 # dia 1 del mes del ciclo
+    fecha_tope = db.Column(db.Date, nullable=False)
+    estado = db.Column(db.String(20), default="Abierto")              # Abierto / Cerrado
+    cerrado_en = db.Column(db.DateTime, nullable=True)
+    cerrado_automaticamente = db.Column(db.Boolean, default=False)
+    creado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    creado_por = db.relationship("Usuario")
+    envios = db.relationship("ForecastEnvio", backref="ciclo", lazy="dynamic",
+                             cascade="all, delete-orphan")
+
+    @property
+    def abierto(self):
+        return self.estado == "Abierto"
+
+    def __repr__(self):
+        return f"<ForecastCiclo {self.nombre} tope={self.fecha_tope}>"
+
+
+class ForecastEnvio(db.Model):
+    """El forecast de UN vendedor dentro de UN ciclo. Pasa de 'Preparación'
+    a 'Enviado' cuando el vendedor lo manda; despues solo se puede editar si
+    un administrador lo autoriza (edicion_autorizada).
+
+    Si llega la fecha tope y sigue en preparacion, el sistema lo cierra solo
+    con lo que haya cargado y lo marca cerrado_automaticamente (opcion
+    elegida por el usuario), avisando a la gerencia por la campanita."""
+    __tablename__ = "forecast_envios"
+    __table_args__ = (db.UniqueConstraint("ciclo_id", "vendedor", name="uq_forecast_envio_ciclo_vendedor"),)
+
+    id = db.Column(db.Integer, primary_key=True)
+    ciclo_id = db.Column(db.Integer, db.ForeignKey("forecast_ciclos.id"), nullable=False, index=True)
+    vendedor = db.Column(db.String(120), nullable=False, index=True)
+    usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    estado = db.Column(db.String(20), default="Preparación")
+    enviado_en = db.Column(db.DateTime, nullable=True)
+    cerrado_automaticamente = db.Column(db.Boolean, default=False)
+    edicion_autorizada = db.Column(db.Boolean, default=False)
+    autorizado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    autorizado_en = db.Column(db.DateTime, nullable=True)
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    usuario = db.relationship("Usuario", foreign_keys=[usuario_id])
+    autorizado_por = db.relationship("Usuario", foreign_keys=[autorizado_por_id])
+    lineas = db.relationship("ForecastLinea", backref="envio", lazy="dynamic",
+                             cascade="all, delete-orphan")
+
+    @property
+    def enviado(self):
+        return self.estado == "Enviado"
+
+    @property
+    def editable(self):
+        """Puede cargar cantidades si el ciclo esta abierto y o bien sigue
+        en preparacion, o un administrador le autorizo la edicion."""
+        if not self.ciclo or not self.ciclo.abierto:
+            return False
+        return (not self.enviado) or self.edicion_autorizada
+
+    def __repr__(self):
+        return f"<ForecastEnvio {self.vendedor} ciclo={self.ciclo_id} {self.estado}>"
+
+
+class ForecastLinea(db.Model):
+    """Un producto dentro del forecast de un vendedor, con sus 13 semanas.
+
+    Las semanas van en 13 columnas y no en 13 filas a proposito: la pantalla
+    es una grilla producto x semana y asi se lee y se guarda de una sola vez,
+    igual que la hoja de Excel que reemplaza. El horizonte es fijo
+    (SEMANAS_FORECAST)."""
+    __tablename__ = "forecast_lineas"
+    __table_args__ = (db.UniqueConstraint("envio_id", "codigo_interno", name="uq_forecast_linea_envio_codigo"),)
+
+    id = db.Column(db.Integer, primary_key=True)
+    envio_id = db.Column(db.Integer, db.ForeignKey("forecast_envios.id"), nullable=False, index=True)
+    codigo_interno = db.Column(db.String(40), nullable=False, index=True)
+    descripcion = db.Column(db.String(300))
+    proveedor = db.Column(db.String(120), index=True)
+    # Clase A/B/C calculada al abrir la pantalla (Pareto 80/90/100 sobre el
+    # monto de los ultimos 12 meses de las cuentas del vendedor) y guardada
+    # para que el historico del ciclo quede con la clase que se vio.
+    clase_abc = db.Column(db.String(1))
+    # Promedio mensual de unidades de los ultimos 6 meses ("6UM" del SOP)
+    # de las cuentas del vendedor, congelado al crear la linea.
+    promedio_6um = db.Column(db.Float, default=0)
+    s1 = db.Column(db.Float, default=0)
+    s2 = db.Column(db.Float, default=0)
+    s3 = db.Column(db.Float, default=0)
+    s4 = db.Column(db.Float, default=0)
+    s5 = db.Column(db.Float, default=0)
+    s6 = db.Column(db.Float, default=0)
+    s7 = db.Column(db.Float, default=0)
+    s8 = db.Column(db.Float, default=0)
+    s9 = db.Column(db.Float, default=0)
+    s10 = db.Column(db.Float, default=0)
+    s11 = db.Column(db.Float, default=0)
+    s12 = db.Column(db.Float, default=0)
+    s13 = db.Column(db.Float, default=0)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @property
+    def semanas(self):
+        return [getattr(self, f"s{n}") or 0 for n in range(1, SEMANAS_FORECAST + 1)]
+
+    @property
+    def total(self):
+        return sum(self.semanas)
+
+    def __repr__(self):
+        return f"<ForecastLinea envio={self.envio_id} {self.codigo_interno} total={self.total}>"
+
+
+class ForecastCambio(db.Model):
+    """Bitacora de variaciones (pedido explicito del usuario: "cada
+    variacion queda registrada para seguimiento y estadistica").
+
+    Se escribe una fila por celda que cambio de valor: quien, cuando, de
+    cuanto a cuanto y por que via (carga del vendedor, copia del ciclo
+    anterior, cierre automatico, edicion autorizada)."""
+    __tablename__ = "forecast_cambios"
+
+    id = db.Column(db.Integer, primary_key=True)
+    envio_id = db.Column(db.Integer, db.ForeignKey("forecast_envios.id"), nullable=False, index=True)
+    codigo_interno = db.Column(db.String(40), index=True)
+    semana = db.Column(db.Integer)          # 1..13, o NULL si es un cambio de la linea entera
+    valor_anterior = db.Column(db.Float, default=0)
+    valor_nuevo = db.Column(db.Float, default=0)
+    accion = db.Column(db.String(40))       # edicion / alta / baja / copia_ciclo_anterior / envio / cierre_automatico
+    usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    momento = db.Column(db.DateTime, default=datetime.utcnow)
+
+    usuario = db.relationship("Usuario")
+
+    def __repr__(self):
+        return f"<ForecastCambio envio={self.envio_id} {self.codigo_interno} S{self.semana}>"
+
+
+class Notificacion(db.Model):
+    """Campanita (ronda CH, 2026-10-27). Nace para el Forecast -- apertura
+    de ciclo, recordatorio de fecha tope, envio recibido, cierre automatico
+    -- pero es generica a proposito: cualquier modulo puede dejar un aviso
+    dirigido a un usuario."""
+    __tablename__ = "notificaciones"
+
+    id = db.Column(db.Integer, primary_key=True)
+    usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=False, index=True)
+    titulo = db.Column(db.String(160), nullable=False)
+    mensaje = db.Column(db.String(500))
+    url = db.Column(db.String(300))
+    icono = db.Column(db.String(40), default="bell")
+    modulo = db.Column(db.String(40), default="forecast", index=True)
+    # Evita duplicar el mismo aviso si el chequeo corre varias veces
+    # (ej. el recordatorio de fecha tope, que se revisa en cada arranque).
+    clave_unica = db.Column(db.String(120), index=True)
+    leida = db.Column(db.Boolean, default=False, index=True)
+    creada_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    usuario = db.relationship("Usuario")
+
+    def __repr__(self):
+        return f"<Notificacion {self.usuario_id} {self.titulo!r}>"
