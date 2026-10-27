@@ -100,6 +100,22 @@
   cargado como gasto, en un solo número, para poder compararlo con el histórico.
 </p>
 
+{% if lineas_sin_transporte %}
+{# Ronda CG (2026-10-27, a pedido del usuario): se dice en pantalla qué
+   quedó fuera y por qué, en vez de descontarlo en silencio. #}
+<div class="alert alert-light border small">
+  <i class="bi bi-funnel me-1"></i>
+  Quedaron fuera de este reporte {{ lineas_sin_transporte }} línea(s) por
+  {{ simbolo }}{{ monto_sin_transporte|moneda }}: son unidades de consignación que se facturaron de verdad pero
+  cuyo embarque físico es anterior al archivo histórico de importaciones, así que no tienen operador, vía ni flete
+  que analizar. Siguen contando como compra en
+  <a href="{{ url_for('reportes_compras_proveedor') }}">Compras Proveedor</a>; acá solo falseaban el % de flete.
+  {% if facturas_sin_transporte|length <= 12 %}
+  <span class="text-muted">Facturas: {{ facturas_sin_transporte|join(', ') }}.</span>
+  {% endif %}
+</div>
+{% endif %}
+
 <form class="row g-2 mb-3">
   <input type="hidden" name="moneda" value="{{ moneda }}">
   <div class="col-auto">

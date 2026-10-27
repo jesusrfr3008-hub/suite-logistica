@@ -14197,6 +14197,30 @@ def _tipo_flete_por_despacho(despacho):
     return ""
 
 
+def _fila_es_embarque(fila):
+    """Ronda CG (2026-10-27): True si esta línea corresponde a una
+    operación que de verdad se transportó, y por lo tanto tiene sentido
+    dentro del Reporte Operacional (que mide costo de transporte).
+
+    Una línea sin NINGÚN dato de transporte -- sin operador, sin vía, sin
+    flete y sin otros gastos -- no es un embarque: en la práctica son las
+    unidades de consignación que se facturaron de verdad pero cuyo
+    embarque físico es anterior al archivo histórico de importaciones
+    (ver reparar_facturacion_consignacion_medicontur, que las crea sin
+    esos datos porque el sistema no sabe cómo llegaron). Son compras
+    legítimas y siguen contando en Compras Proveedor; acá solo
+    distorsionaban el denominador del % de flete."""
+    operador = (fila.get("transporte") or "").strip()
+    if operador and operador != "(sin operador)":
+        return True
+    if (fila.get("tipo_flete") or "").strip():
+        return True
+    return (
+        abs(fila.get("flete_homologado_usd") or 0) > 0.005
+        or abs(fila.get("otros_gastos_usd") or 0) > 0.005
+    )
+
+
 def _completar_tipo_flete(filas):
     """Ronda BZ (2026-10-21, punto 5): rellena el tipo de flete que quedó
     vacío usando el de las OTRAS líneas de la misma factura -- un embarque
@@ -15374,6 +15398,25 @@ def _contexto_reporte_operacional():
     if productos_sel:
         buscados_prod = {p.upper() for p in productos_sel}
         filas = [f for f in filas if (f.get("codigo_producto") or "").strip().upper() in buscados_prod]
+    # Ronda CG (2026-10-27, a pedido del usuario: "si no es importaciones
+    # que estaban en el historico no tienen que afectar este reporte"):
+    # fuera las líneas que NO son un embarque. Son las que la
+    # reconciliación de consignación (ver
+    # reparar_facturacion_consignacion_medicontur) creó para unidades que
+    # se facturaron de verdad pero cuyo embarque físico no está en el
+    # archivo histórico -- llegaron después del corte de ese archivo. Son
+    # compras reales, y por eso siguen en el reporte de Compras
+    # Proveedor, pero no tienen transporte propio: sin esto solo
+    # engrosaban el Total Invoice (falseando el % de flete) y armaban un
+    # "(sin operador)" que no se podía corregir con ningún dato.
+    #
+    # El filtro corre ANTES de completar la vía a propósito: si corriera
+    # después, estas líneas heredarían la vía de las otras líneas de su
+    # misma factura (que sí embarcaron) y volverían a colarse.
+    lineas_sin_transporte = [f for f in filas if not _fila_es_embarque(f)]
+    monto_sin_transporte_usd = sum(f.get("total_usd") or 0 for f in lineas_sin_transporte)
+    filas = [f for f in filas if _fila_es_embarque(f)]
+
     # Ronda BZ (2026-10-21, punto 5): antes de agrupar, se completa el
     # tipo de flete que haya quedado vacío con el de las otras líneas de
     # la misma factura -- ver _completar_tipo_flete.
@@ -15517,6 +15560,11 @@ def _contexto_reporte_operacional():
         operadores_disponibles=operadores_disponibles,
         productos_disponibles=productos_disponibles,
         detalle_por_operador=detalle_por_operador,
+        lineas_sin_transporte=len(lineas_sin_transporte),
+        monto_sin_transporte=round(monto_sin_transporte_usd * factor_moneda, 2),
+        facturas_sin_transporte=sorted({
+            (f.get("factura") or "(sin factura)") for f in lineas_sin_transporte
+        }),
         empresa_sel=empresa, proveedores_sel=proveedores_sel, productos_sel=productos_sel,
         transporte_sel=transporte_sel,
         moneda=moneda, paridad_eur=paridad_eur,
