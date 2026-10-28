@@ -33,19 +33,40 @@
         </div>
       </div>
       <div class="col-md-6">
+        {# Ronda CJ (2026-10-28): la lista son los USUARIOS del programa con
+           su vendedor asignado -- uno por persona, sin los nombres sueltos
+           del maestro de ventas que ya no venden. #}
         <label class="form-label small fw-semibold">Vendedores que cargan forecast</label>
         <div class="border rounded p-2" style="max-height: 220px; overflow-y: auto;">
-          {% for v in vendedores %}
+          {% for nombre, usuario in vendedores %}
           <div class="form-check">
-            <input class="form-check-input" type="checkbox" name="vendedor" value="{{ v }}"
-                   id="vend{{ loop.index }}" {% if v in sugeridos %}checked{% endif %}>
-            <label class="form-check-label" for="vend{{ loop.index }}">{{ v }}</label>
+            <input class="form-check-input" type="checkbox" name="vendedor" value="{{ nombre }}"
+                   id="vend{{ loop.index }}" checked>
+            <label class="form-check-label" for="vend{{ loop.index }}">
+              {{ usuario.nombre_completo }}
+              <span class="text-muted small">· {{ usuario.rol.nombre if usuario.rol else 'sin perfil' }}</span>
+            </label>
+          </div>
+          {% else %}
+          <div class="text-muted small">
+            Ningún usuario tiene asignado su vendedor todavía. Hazlo en
+            <a href="{{ url_for('usuarios_list') }}">Configuración &gt; Usuarios</a>,
+            campo "Vendedor (Forecast)".
           </div>
           {% endfor %}
         </div>
         <div class="form-text">
+          Son los usuarios del programa que tienen su vendedor asignado.
           El forecast de cada uno arranca copiado del ciclo anterior: solo hay que corregir, agregar o eliminar.
         </div>
+        {% if vendedores_sin_usuario %}
+        <div class="form-text text-muted">
+          <i class="bi bi-info-circle me-1"></i>
+          En el maestro de ventas hay además {{ vendedores_sin_usuario|length }} nombre(s) sin usuario en el
+          programa, que por eso no pueden cargar forecast:
+          <span class="fst-italic">{{ vendedores_sin_usuario|join(', ') }}</span>.
+        </div>
+        {% endif %}
       </div>
       <div class="col-12">
         <button class="btn btn-primary"><i class="bi bi-check2 me-1"></i> Abrir ciclo</button>

@@ -66,7 +66,20 @@ VENDEDORES_FORECAST_SUGERIDOS = [
     "Felipe Bravo", "Mariana Perez", "Marianela Iriarte",
     "Danilo Campos", "Marcel El Husein",
 ]
-VERSION_SUITE = "CI"
+def _normalizar_nombre(texto):
+    """Ronda CJ (2026-10-28): nombre comparable -- sin tildes, en
+    mayusculas y con los espacios colapsados. Es lo que permite reconocer
+    que "MARIANA PÉREZ" (como viene del sistema de Inventarios) y
+    "Mariana Perez" (como esta escrita la cuenta de acceso) son la misma
+    persona, en vez de tratarlas como dos vendedores distintos."""
+    if not texto:
+        return ""
+    limpio = unicodedata.normalize("NFKD", str(texto))
+    limpio = "".join(c for c in limpio if not unicodedata.combining(c))
+    return " ".join(limpio.upper().split())
+
+
+VERSION_SUITE = "CJ"
 VERSION_SUITE_FECHA = "2026-10-28"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -3200,24 +3213,17 @@ def reparar_usuarios_vendedores_ronda_ci():
     que proyecten sobre SUS cuentas pero vean las estimaciones del resto."""
     GERENTES = {"DANILO CAMPOS", "MARCEL EL HUSEIN"}
 
-    def _normalizar(texto):
-        if not texto:
-            return ""
-        limpio = unicodedata.normalize("NFKD", str(texto))
-        limpio = "".join(c for c in limpio if not unicodedata.combining(c))
-        return " ".join(limpio.upper().split())
-
     # Nombres de vendedor que existen hoy: los del maestro Cliente/Vendedor
     # (lo que el usuario acaba de actualizar) mas los cinco que nombro.
     nombres = {v.strip() for (v,) in db.session.query(ClienteVendedor.vendedor).distinct().all() if (v or "").strip()}
     nombres.update(VENDEDORES_FORECAST_SUGERIDOS)
     por_nombre = {}
     for nombre in nombres:
-        por_nombre.setdefault(_normalizar(nombre), nombre)
+        por_nombre.setdefault(_normalizar_nombre(nombre), nombre)
 
     enlazados, gerencia = [], []
     for usuario in Usuario.query.filter(Usuario.activo.is_(True)).all():
-        clave = _normalizar(usuario.nombre_completo)
+        clave = _normalizar_nombre(usuario.nombre_completo)
         if not (usuario.vendedor or "").strip() and clave in por_nombre:
             usuario.vendedor = por_nombre[clave]
             enlazados.append(f"{usuario.nombre_completo} -> {usuario.vendedor}")
@@ -11708,8 +11714,16 @@ def usuarios_list():
     roles = Rol.query.order_by(Rol.nombre).all()
     # Ronda CH (2026-10-27): el campo "Vendedor" enlaza la cuenta con sus
     # clientes para el Forecast -- ver Usuario.vendedor en models.py.
+    # Ronda CJ (2026-10-28): ademas se cuenta cuantas cuentas le quedan
+    # asignadas a cada uno, para que un nombre mal escrito (que deja al
+    # ejecutivo sin promedio de venta) se note aca mismo y no recien al
+    # abrir el Forecast.
+    cuentas_por_usuario = {
+        u.id: len(_ruts_del_vendedor(u.vendedor)) for u in usuarios if (u.vendedor or "").strip()
+    }
     return render_template("configuracion/usuarios.html", usuarios=usuarios, roles=roles,
-                           vendedores_conocidos=_vendedores_conocidos())
+                           vendedores_conocidos=_vendedores_conocidos(),
+                           cuentas_por_usuario=cuentas_por_usuario)
 
 
 @app.route("/configuracion/usuarios/nuevo", methods=["POST"])
@@ -12820,11 +12834,8 @@ def _unidades_vendidas_por_codigo(dias, vendedor=None):
         VentaLinea.cuenta_para_rotacion == True,  # noqa: E712
     )
     if vendedor:
-        ruts = [
-            c.rut for c in ClienteVendedor.query.filter(
-                db.func.upper(ClienteVendedor.vendedor) == vendedor.strip().upper()
-            ).all()
-        ]
+        # Ronda CJ (2026-10-28): mismo criterio sin tildes que el Forecast.
+        ruts = _ruts_del_vendedor(vendedor)
         if not ruts:
             return {}
         query = query.filter(VentaLinea.rut_cliente.in_(ruts))
@@ -13154,6 +13165,19 @@ def _primer_dia_mes_hace(meses):
     return date(anio, mes, 1)
 
 
+def _ruts_del_vendedor(vendedor):
+    """Los RUT que HOY pertenecen a ese vendedor segun el maestro vigente.
+    Ronda CJ (2026-10-28): se compara sin tildes ni mayusculas -- ver
+    _normalizar_nombre."""
+    clave = _normalizar_nombre(vendedor)
+    if not clave:
+        return []
+    return [
+        c.rut for c in ClienteVendedor.query.all()
+        if _normalizar_nombre(c.vendedor) == clave
+    ]
+
+
 def _ventas_vendedor_por_codigo(vendedor, desde):
     """{codigo_interno: {"unidades": x, "monto": y}} de las cuentas que HOY
     son de `vendedor` (maestro vigente), desde `desde` hasta hoy. Solo
@@ -13166,11 +13190,7 @@ def _ventas_vendedor_por_codigo(vendedor, desde):
         VentaLinea.cuenta_para_rotacion == True,  # noqa: E712
     )
     if vendedor:
-        ruts = [
-            c.rut for c in ClienteVendedor.query.filter(
-                db.func.upper(ClienteVendedor.vendedor) == vendedor.strip().upper()
-            ).all()
-        ]
+        ruts = _ruts_del_vendedor(vendedor)
         if not ruts:
             return {}
         query = query.filter(VentaLinea.rut_cliente.in_(ruts))
@@ -13311,21 +13331,71 @@ def _usuarios_administradores():
 
 
 def _usuario_de_vendedor(vendedor):
-    if not vendedor:
+    """La cuenta de acceso de ese vendedor. Ronda CJ (2026-10-28): la
+    comparacion es SIN TILDES ni mayusculas, porque el maestro
+    Cliente/Vendedor viene del sistema de Inventarios en mayusculas y a
+    veces con tilde ("MARIANA PÉREZ") mientras la cuenta de acceso lo
+    escribe normal ("Mariana Perez"); comparando crudo no se encontraban y
+    el ejecutivo se quedaba sin promedio."""
+    clave = _normalizar_nombre(vendedor)
+    if not clave:
         return None
-    return Usuario.query.filter(
-        db.func.upper(Usuario.vendedor) == vendedor.strip().upper(), Usuario.activo.is_(True)
-    ).first()
+    for usuario in Usuario.query.filter(Usuario.activo.is_(True), Usuario.vendedor.isnot(None)).all():
+        if _normalizar_nombre(usuario.vendedor) == clave:
+            return usuario
+    return None
+
+
+def _vendedores_del_sistema():
+    """Ronda CJ (2026-10-28, a pedido del usuario: "Manda los usuarios del
+    programa"): los vendedores que pueden cargar forecast son los USUARIOS
+    ACTIVOS que tienen un vendedor asignado -- ni mas ni menos.
+
+    Antes la lista salia del maestro Cliente/Vendedor, que trae nombres de
+    gente que ya no vende (y que no tiene cuenta), y ademas los traia
+    duplicados: "DANILO CAMPOS" del maestro y "Danilo Campos" de la cuenta
+    son la misma persona escritos distinto.
+
+    Devuelve [(nombre_de_vendedor, usuario)] ordenado por nombre."""
+    vistos, salida = set(), []
+    for usuario in Usuario.query.filter(
+        Usuario.activo.is_(True), Usuario.vendedor.isnot(None)
+    ).order_by(Usuario.nombre_completo).all():
+        nombre = (usuario.vendedor or "").strip()
+        clave = _normalizar_nombre(nombre)
+        if not clave or clave in vistos:
+            continue
+        vistos.add(clave)
+        salida.append((nombre, usuario))
+    return sorted(salida, key=lambda par: _normalizar_nombre(par[0]))
+
+
+def _vendedores_sin_usuario():
+    """Nombres del maestro Cliente/Vendedor que NO tienen cuenta de acceso.
+    No pueden cargar forecast; se muestran al administrador solo para que
+    sepa que existen (puede crearles usuario o reasignar sus cuentas)."""
+    con_usuario = {_normalizar_nombre(u.vendedor) for u in Usuario.query.filter(
+        Usuario.activo.is_(True), Usuario.vendedor.isnot(None)).all()}
+    sueltos = {}
+    for (nombre,) in db.session.query(ClienteVendedor.vendedor).distinct().all():
+        clave = _normalizar_nombre(nombre)
+        if clave and clave not in con_usuario:
+            sueltos.setdefault(clave, (nombre or "").strip())
+    return sorted(sueltos.values(), key=_normalizar_nombre)
 
 
 def _vendedores_conocidos():
-    """Los nombres de vendedor que existen hoy: los del maestro
-    Cliente/Vendedor, mas los cinco que nombro el usuario, mas los que ya
-    estan enganchados a una cuenta de acceso."""
-    nombres = {v.strip() for (v,) in db.session.query(ClienteVendedor.vendedor).distinct().all() if (v or "").strip()}
-    nombres.update(VENDEDORES_FORECAST_SUGERIDOS)
-    nombres.update({u.vendedor.strip() for u in Usuario.query.filter(Usuario.vendedor.isnot(None)).all() if (u.vendedor or "").strip()})
-    return sorted(nombres, key=lambda s: s.upper())
+    """Para el desplegable "Vendedor (Forecast)" de Configuración >
+    Usuarios: los nombres del maestro Cliente/Vendedor (que es contra lo
+    que hay que calzar), sin duplicados por mayusculas o tildes."""
+    nombres = {}
+    for (nombre,) in db.session.query(ClienteVendedor.vendedor).distinct().all():
+        clave = _normalizar_nombre(nombre)
+        if clave:
+            nombres.setdefault(clave, (nombre or "").strip())
+    for nombre in VENDEDORES_FORECAST_SUGERIDOS:
+        nombres.setdefault(_normalizar_nombre(nombre), nombre)
+    return sorted(nombres.values(), key=_normalizar_nombre)
 
 
 def _usuario_actual_id():
@@ -13537,9 +13607,13 @@ def forecast_index():
         })
     return render_template(
         "forecast/index.html", tablero=tablero, es_admin=es_admin, ve_equipo=ve_equipo,
-        mi_vendedor=mi_vendedor, vendedores=_vendedores_conocidos(),
-        sugeridos=VENDEDORES_FORECAST_SUGERIDOS, hoy=date.today(),
-        meses=MESES_ES,
+        mi_vendedor=mi_vendedor,
+        # Ronda CJ (2026-10-28): la lista de quien puede cargar forecast
+        # sale de los USUARIOS del programa, no del maestro de ventas.
+        vendedores=_vendedores_del_sistema() if es_admin else [],
+        vendedores_sin_usuario=_vendedores_sin_usuario() if es_admin else [],
+        sugeridos=[_normalizar_nombre(n) for n in VENDEDORES_FORECAST_SUGERIDOS],
+        hoy=date.today(), meses=MESES_ES,
     )
 
 
@@ -13548,9 +13622,26 @@ def forecast_index():
 def forecast_ciclo_nuevo():
     mes_txt = request.form.get("mes_objetivo", "").strip()        # "2026-11"
     fecha_tope = parse_date(request.form.get("fecha_tope", ""))
-    vendedores = [v.strip() for v in request.form.getlist("vendedor") if v.strip()]
+    pedidos = [v.strip() for v in request.form.getlist("vendedor") if v.strip()]
+    # Ronda CJ (2026-10-28): solo entran vendedores con cuenta de acceso en
+    # el programa, y uno solo por persona aunque el nombre venga escrito de
+    # dos formas distintas (ver _vendedores_del_sistema).
+    validos = {_normalizar_nombre(nombre): nombre for nombre, _ in _vendedores_del_sistema()}
+    vendedores, descartados = [], []
+    for nombre in pedidos:
+        clave = _normalizar_nombre(nombre)
+        if clave in validos and validos[clave] not in vendedores:
+            vendedores.append(validos[clave])
+        elif clave not in validos:
+            descartados.append(nombre)
+    if descartados:
+        flash("Se omitieron por no tener usuario activo en el programa: "
+              + ", ".join(sorted(set(descartados)))
+              + ". Créales el usuario en Configuración > Usuarios con su campo 'Vendedor (Forecast)'.",
+              "warning")
     if not (mes_txt and fecha_tope and vendedores):
-        flash("Mes del ciclo, fecha tope y al menos un vendedor son obligatorios.", "warning")
+        flash("Mes del ciclo, fecha tope y al menos un vendedor con usuario en el programa "
+              "son obligatorios.", "warning")
         return redirect(url_for("forecast_index"))
     try:
         anio, mes = (int(p) for p in mes_txt.split("-")[:2])

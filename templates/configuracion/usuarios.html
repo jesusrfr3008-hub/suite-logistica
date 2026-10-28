@@ -42,7 +42,17 @@
           <td>
             {% if u.activo %}<span class="badge text-bg-success">Activo</span>{% else %}<span class="badge text-bg-secondary">Desactivado</span>{% endif %}
           </td>
-          <td class="small">{{ u.vendedor or '—' }}</td>
+          <td class="small">
+            {% if u.vendedor %}
+            {{ u.vendedor }}
+            {% set cuentas = cuentas_por_usuario.get(u.id, 0) %}
+            {% if cuentas %}
+            <span class="badge text-bg-light border" title="Cuentas asignadas hoy en el maestro Cliente/Vendedor">{{ cuentas }} cuenta(s)</span>
+            {% else %}
+            <span class="badge text-bg-warning" title="Ninguna cuenta del maestro Cliente/Vendedor calza con este nombre: sin esto no tiene promedio de venta en el Forecast">sin cuentas</span>
+            {% endif %}
+            {% else %}—{% endif %}
+          </td>
           <td class="text-muted small">{{ (u.ultimo_acceso | hora_cl) if u.ultimo_acceso else 'Nunca' }}</td>
           <td class="text-end">
             <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalEditarUsuario{{ u.id }}">Editar</button>
