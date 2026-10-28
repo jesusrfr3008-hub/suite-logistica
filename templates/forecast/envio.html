@@ -42,10 +42,12 @@
   </div>
 </div>
 
-{% if not envio.editable %}
+{% if not puede_editar %}
 <div class="alert alert-secondary">
   <i class="bi bi-lock me-1"></i>
-  {% if not ciclo.abierto %}
+  {% if not es_mio %}
+  Estás viendo el forecast de {{ envio.vendedor }} en modo consulta: la carga es del propio ejecutivo.
+  {% elif not ciclo.abierto %}
   El ciclo está cerrado, así que esta hoja quedó solo de consulta.
   {% else %}
   Ya enviaste este forecast. Para corregirlo necesitas que un administrador autorice la edición.
@@ -91,12 +93,12 @@
           <td class="p-1">
             <input type="number" min="0" step="1" class="form-control form-control-sm text-end celda-forecast"
                    name="u_{{ linea.id }}_{{ s.n }}" value="{{ (linea['s' ~ s.n] or 0)|round|int }}"
-                   {% if not envio.editable %}readonly{% endif %}>
+                   {% if not puede_editar %}readonly{% endif %}>
           </td>
           {% endfor %}
           <td class="text-end fw-semibold total-fila">{{ "%.0f"|format(linea.total) }}</td>
           <td class="text-end">
-            {% if envio.editable %}
+            {% if puede_editar %}
             {% if datos and datos.sugerencia_total %}
             <button type="button" class="btn btn-sm btn-outline-secondary btn-sugerir"
                     data-sugerencia="{{ datos.sugerencia|join(',') }}"
@@ -134,7 +136,7 @@
   </div>
 </div>
 
-{% if envio.editable %}
+{% if puede_editar %}
 <div class="d-flex flex-wrap gap-2 mb-4">
   <button class="btn btn-outline-primary" name="accion" value="borrador">
     <i class="bi bi-save me-1"></i> Guardar borrador
@@ -147,7 +149,7 @@
 {% endif %}
 </form>
 
-{% if envio.editable %}
+{% if puede_editar %}
 <div class="card p-3 mb-3">
   <h5 class="section-title">Agregar productos</h5>
   <p class="text-muted small">

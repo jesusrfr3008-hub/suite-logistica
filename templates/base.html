@@ -157,6 +157,9 @@
             </a>
             <ul class="dropdown-menu dropdown-menu-end">
               <li><span class="dropdown-item-text text-muted small">{{ current_user.rol.nombre if current_user.rol else '' }}</span></li>
+              {# Ronda CI (2026-10-28): versión a la vista, para saber si el
+                 despliegue ya trae la última ronda entregada. #}
+              <li><span class="dropdown-item-text text-muted" style="font-size: .75rem;">Versión {{ version_suite }} · {{ version_suite_fecha }}</span></li>
               <li><hr class="dropdown-divider"></li>
               <li><a class="dropdown-item" href="{{ url_for('mi_cuenta') }}">Mi cuenta</a></li>
               <li><a class="dropdown-item" href="{{ url_for('configuracion_index') }}">Configuración</a></li>

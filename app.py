@@ -54,6 +54,20 @@ from seed_data import seed_from_excel
 import costing
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Ronda CI (2026-10-28): marcador de versión visible. El usuario despliega a
+# mano (railway up) y no tenía forma de saber, mirando la aplicación, si lo
+# que está corriendo trae la última ronda entregada -- pasó con el Forecast
+# de la ronda CH, que "no aparecía en ningún menú" simplemente porque el
+# despliegue todavía no lo incluía. ACTUALIZAR EN CADA RONDA.
+# Los cinco que hacen forecast, segun el usuario (los dos ultimos son
+# gerencia, que tambien carga el suyo). Es solo la lista que viene marcada
+# por defecto al abrir un ciclo -- el administrador puede marcar otros.
+VENDEDORES_FORECAST_SUGERIDOS = [
+    "Felipe Bravo", "Mariana Perez", "Marianela Iriarte",
+    "Danilo Campos", "Marcel El Husein",
+]
+VERSION_SUITE = "CI"
+VERSION_SUITE_FECHA = "2026-10-28"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -297,6 +311,14 @@ def _requerir_login():
     if not current_user.is_authenticated:
         return redirect(url_for("login", next=request.path))
     return None
+
+
+@app.context_processor
+def _inyectar_version():
+    """Ronda CI (2026-10-28): la versión queda a la vista en el menú de la
+    cuenta, para poder confirmar de un vistazo si el despliegue ya trae la
+    última ronda entregada."""
+    return {"version_suite": VERSION_SUITE, "version_suite_fecha": VERSION_SUITE_FECHA}
 
 
 @app.context_processor
@@ -617,6 +639,8 @@ def ensure_schema_migrations():
             ("permiso_pagos_proveedores", "BOOLEAN DEFAULT 0"),
             # Ronda CH (2026-10-27): permiso propio del Forecast (S&OP).
             ("permiso_forecast", "BOOLEAN DEFAULT 0"),
+            # Ronda CI (2026-10-28): gerencia ve el forecast de todo el equipo.
+            ("permiso_forecast_gerencia", "BOOLEAN DEFAULT 0"),
         ],
         # Ronda CH (2026-10-27): puente entre la cuenta de acceso y el
         # nombre del ejecutivo en el reporte de ventas -- ver
@@ -3159,6 +3183,63 @@ def reparar_variantes_physiol_ronda_ae():
         )
 
 
+def reparar_usuarios_vendedores_ronda_ci():
+    """Ronda CI (2026-10-28, a pedido del usuario): engancha las cuentas de
+    acceso con su nombre de vendedor para el Forecast ("Asocia esos
+    vendedores con los usuarios indicados").
+
+    El enganche se hace por NOMBRE COMPLETO, comparando sin tildes ni
+    mayusculas, porque es el unico dato que las dos puntas comparten: el
+    reporte de ventas trae el nombre del ejecutivo y la cuenta de acceso
+    trae el suyo. Solo rellena lo que este vacio -- si alguien ya tiene un
+    vendedor asignado a mano, no se toca.
+
+    Danilo Campos (Gerente Comercial) y Marcel El Husein (Gerente General)
+    son gerentes Y vendedores: ademas del enganche se les deja el permiso
+    de ver el forecast de todo el equipo (ver "forecast_gerencia"), para
+    que proyecten sobre SUS cuentas pero vean las estimaciones del resto."""
+    GERENTES = {"DANILO CAMPOS", "MARCEL EL HUSEIN"}
+
+    def _normalizar(texto):
+        if not texto:
+            return ""
+        limpio = unicodedata.normalize("NFKD", str(texto))
+        limpio = "".join(c for c in limpio if not unicodedata.combining(c))
+        return " ".join(limpio.upper().split())
+
+    # Nombres de vendedor que existen hoy: los del maestro Cliente/Vendedor
+    # (lo que el usuario acaba de actualizar) mas los cinco que nombro.
+    nombres = {v.strip() for (v,) in db.session.query(ClienteVendedor.vendedor).distinct().all() if (v or "").strip()}
+    nombres.update(VENDEDORES_FORECAST_SUGERIDOS)
+    por_nombre = {}
+    for nombre in nombres:
+        por_nombre.setdefault(_normalizar(nombre), nombre)
+
+    enlazados, gerencia = [], []
+    for usuario in Usuario.query.filter(Usuario.activo.is_(True)).all():
+        clave = _normalizar(usuario.nombre_completo)
+        if not (usuario.vendedor or "").strip() and clave in por_nombre:
+            usuario.vendedor = por_nombre[clave]
+            enlazados.append(f"{usuario.nombre_completo} -> {usuario.vendedor}")
+        # El permiso de gerencia va por ROL, no por usuario: se marca el rol
+        # del gerente (si no es ya un rol administrador, que lo tiene todo).
+        if clave in GERENTES and usuario.rol and not usuario.rol.es_administrador:
+            if not usuario.rol.permiso_forecast:
+                usuario.rol.permiso_forecast = True
+            if not usuario.rol.permiso_forecast_gerencia:
+                usuario.rol.permiso_forecast_gerencia = True
+                gerencia.append(f"{usuario.nombre_completo} (perfil {usuario.rol.nombre})")
+    if enlazados or gerencia:
+        db.session.commit()
+    if enlazados:
+        print(f"[reparar_ronda_ci] Usuarios enganchados a su vendedor para el Forecast: {enlazados}")
+    if gerencia:
+        print(f"[reparar_ronda_ci] Perfiles con 'ver el forecast de todo el equipo': {gerencia}")
+    if not enlazados and not gerencia:
+        print("[reparar_ronda_ci] Nada que enganchar: los usuarios ya tienen su vendedor asignado.")
+    return len(enlazados)
+
+
 def reparar_codigo_padre_ankoris_ronda_au():
     """Ronda AU (2026-09-24, a pedido del usuario): 2 variantes de ANKORIS
     (lentes BVI PHYSIOL) habían quedado cargadas bajo el código padre
@@ -3957,6 +4038,7 @@ with app.app_context():
     _paso_arranque_seguro("seed_compras_historicas", seed_compras_historicas)
     _paso_arranque_seguro("reparar_lotes_historico_ronda_by", reparar_lotes_historico_ronda_by)
     _paso_arranque_seguro("seed_facturas_proveedor_pendientes", seed_facturas_proveedor_pendientes)
+    _paso_arranque_seguro("reparar_usuarios_vendedores_ronda_ci", reparar_usuarios_vendedores_ronda_ci)
 
 
 # ---------------------------------------------------------------------------
@@ -13025,14 +13107,6 @@ MESES_ES = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
 MESES_ES_CORTO = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul",
                   "Ago", "Sep", "Oct", "Nov", "Dic"]
 
-# Los cinco que hacen forecast, segun el usuario (los dos ultimos son
-# gerencia, que tambien carga el suyo). Es solo la lista que viene marcada
-# por defecto al abrir un ciclo -- el administrador puede marcar otros.
-VENDEDORES_FORECAST_SUGERIDOS = [
-    "Felipe Bravo", "Mariana Perez", "Marianela Iriarte",
-    "Danilo Campos", "Marcel El Husein",
-]
-
 # Cuantos productos propone el motor de sugerencias al entrar a elaborar.
 MAX_SUGERENCIAS_FORECAST = 25
 
@@ -13444,14 +13518,15 @@ def forecast_index():
     los ciclos y quien entrego; un ejecutivo ve directamente su hoja."""
     _mantenimiento_forecast()
     es_admin = bool(current_user.rol and current_user.rol.es_administrador)
+    ve_equipo = _ve_todo_el_equipo()
     ciclos = ForecastCiclo.query.order_by(
         ForecastCiclo.mes_objetivo.desc(), ForecastCiclo.id.desc()).limit(12).all()
     mi_vendedor = (current_user.vendedor or "").strip()
     tablero = []
     for ciclo in ciclos:
         envios = ciclo.envios.order_by(ForecastEnvio.vendedor).all()
-        if not es_admin and mi_vendedor:
-            envios = [e for e in envios if e.vendedor.strip().upper() == mi_vendedor.upper()]
+        if not ve_equipo:
+            envios = [e for e in envios if mi_vendedor and e.vendedor.strip().upper() == mi_vendedor.upper()]
         tablero.append({
             "ciclo": ciclo,
             "envios": envios,
@@ -13461,7 +13536,7 @@ def forecast_index():
             "unidades": sum(l.total for e in envios for l in e.lineas.all()),
         })
     return render_template(
-        "forecast/index.html", tablero=tablero, es_admin=es_admin,
+        "forecast/index.html", tablero=tablero, es_admin=es_admin, ve_equipo=ve_equipo,
         mi_vendedor=mi_vendedor, vendedores=_vendedores_conocidos(),
         sugeridos=VENDEDORES_FORECAST_SUGERIDOS, hoy=date.today(),
         meses=MESES_ES,
@@ -13571,11 +13646,32 @@ def forecast_recordatorio(ciclo_id):
     return redirect(f"mailto:{','.join(correos)}?subject={quote(asunto)}&body={quote(cuerpo)}")
 
 
-def _puede_ver_envio(envio):
-    if current_user.rol and current_user.rol.es_administrador:
-        return True
+def _ve_todo_el_equipo():
+    """Ronda CI (2026-10-28): el Gerente Comercial y el Gerente General
+    cargan su propio forecast como cualquier vendedor (con el promedio de
+    SUS cuentas), pero ademas ven el de todo el equipo."""
+    return bool(
+        (current_user.rol and current_user.rol.es_administrador)
+        or current_user.tiene_permiso("forecast_gerencia")
+    )
+
+
+def _es_mi_envio(envio):
     mio = (current_user.vendedor or "").strip().upper()
     return bool(mio) and mio == envio.vendedor.strip().upper()
+
+
+def _puede_ver_envio(envio):
+    return _es_mi_envio(envio) or _ve_todo_el_equipo()
+
+
+def _puede_editar_envio(envio):
+    """Cargar cantidades es cosa del dueño de la hoja. Un gerente ve las de
+    los demas, pero no las modifica (salvo que ademas sea administrador):
+    el forecast tiene que seguir siendo del ejecutivo que lo firma."""
+    if not envio.editable:
+        return False
+    return _es_mi_envio(envio) or bool(current_user.rol and current_user.rol.es_administrador)
 
 
 @app.route("/forecast/envios/<int:envio_id>")
@@ -13605,6 +13701,7 @@ def forecast_envio(envio_id):
         semanas=_semanas_forecast(envio.ciclo), lineas=lineas,
         panorama=panorama, sugerencias=sugerencias, historial=historial,
         es_admin=bool(current_user.rol and current_user.rol.es_administrador),
+        puede_editar=_puede_editar_envio(envio), es_mio=_es_mi_envio(envio),
         total_semanas=SEMANAS_FORECAST,
     )
 
@@ -13616,9 +13713,9 @@ def forecast_envio_guardar(envio_id):
     if not _puede_ver_envio(envio):
         flash("Ese forecast es de otro ejecutivo.", "danger")
         return redirect(url_for("forecast_index"))
-    if not envio.editable:
-        flash("Este forecast ya no se puede editar: está enviado o el ciclo se cerró. "
-              "Un administrador puede autorizar la edición.", "warning")
+    if not _puede_editar_envio(envio):
+        flash("Este forecast no se puede editar: es de otro ejecutivo, ya está enviado o el "
+              "ciclo se cerró. Un administrador puede autorizar la edición.", "warning")
         return redirect(url_for("forecast_envio", envio_id=envio.id))
 
     cambios = 0
@@ -13655,7 +13752,7 @@ def forecast_envio_guardar(envio_id):
 @requiere_permiso("forecast")
 def forecast_envio_agregar(envio_id):
     envio = ForecastEnvio.query.get_or_404(envio_id)
-    if not _puede_ver_envio(envio) or not envio.editable:
+    if not _puede_editar_envio(envio):
         flash("No se puede agregar productos a este forecast.", "warning")
         return redirect(url_for("forecast_envio", envio_id=envio.id))
     codigos = [c.strip() for c in request.form.getlist("codigo") if c.strip()]
@@ -13693,7 +13790,7 @@ def forecast_envio_agregar(envio_id):
 def forecast_linea_eliminar(linea_id):
     linea = ForecastLinea.query.get_or_404(linea_id)
     envio = linea.envio
-    if not _puede_ver_envio(envio) or not envio.editable:
+    if not _puede_editar_envio(envio):
         flash("No se puede quitar productos de este forecast.", "warning")
         return redirect(url_for("forecast_envio", envio_id=envio.id))
     _registrar_cambio_forecast(envio, linea.codigo_interno, None, linea.total, 0, "baja")

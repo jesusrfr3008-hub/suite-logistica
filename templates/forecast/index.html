@@ -141,12 +141,14 @@
           <td class="text-muted small">{{ envio.enviado_en.strftime('%d-%m-%Y %H:%M') if envio.enviado_en else '—' }}</td>
           <td class="text-end">
             <a class="btn btn-sm btn-outline-primary" href="{{ url_for('forecast_envio', envio_id=envio.id) }}">
-              {% if envio.editable %}Cargar{% else %}Ver{% endif %}
+              {% if envio.editable and (es_admin or envio.vendedor == mi_vendedor) %}Cargar{% else %}Ver{% endif %}
             </a>
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="6" class="text-muted">Este ciclo no tiene tu hoja de forecast.</td></tr>
+        <tr><td colspan="6" class="text-muted">
+          {% if ve_equipo %}Este ciclo no tiene vendedores cargados.{% else %}Este ciclo no tiene tu hoja de forecast.{% endif %}
+        </td></tr>
         {% endfor %}
       </tbody>
     </table>

@@ -42,6 +42,12 @@ PERMISOS_DISPONIBLES = [
     # comerciales (que no ven costos ni compras) y porque la gerencia
     # consolida sobre el mismo modulo.
     ("forecast", "Forecast / Proyección de Ventas (S&OP)"),
+    # Ronda CI (2026-10-28, a pedido del usuario): el Gerente Comercial y el
+    # Gerente General TAMBIEN son vendedores -- cargan su propio forecast con
+    # el promedio de SUS cuentas, pero ademas tienen que ver las estimaciones
+    # del resto del equipo. Este permiso es justamente esa segunda parte, y
+    # va aparte de "forecast" para que un ejecutivo no la tenga.
+    ("forecast_gerencia", "Forecast: ver el de todo el equipo comercial"),
 ]
 
 
@@ -73,6 +79,8 @@ class Rol(db.Model):
     permiso_pagos_proveedores = db.Column(db.Boolean, default=False)
     # Ronda CH (2026-10-27): ver PERMISOS_DISPONIBLES arriba.
     permiso_forecast = db.Column(db.Boolean, default=False)
+    # Ronda CI (2026-10-28): ver PERMISOS_DISPONIBLES arriba.
+    permiso_forecast_gerencia = db.Column(db.Boolean, default=False)
     creado_en = db.Column(db.DateTime, default=datetime.utcnow)
 
     usuarios = db.relationship("Usuario", backref="rol", lazy="dynamic")
