@@ -57,6 +57,114 @@
 </div>
 
 {% if ver == 'repetidos' %}
+{# Ronda CN (2026-10-30, punto 4): cruce entre el catálogo y el mapeo
+   maestro de Inventarios, para cazar las inconsistencias que hacen que un
+   mismo producto se vea dos veces en el S&OP. #}
+{% if inconsistencias %}
+<div class="card p-3 mb-3">
+  <h5 class="section-title mb-2"><i class="bi bi-diagram-3 me-1"></i> Cruce catálogo ↔ Inventarios</h5>
+
+  {% if inconsistencias.discrepancia %}
+  <div class="alert alert-danger">
+    <strong>{{ inconsistencias.discrepancia|length }} producto(s) con códigos internos en conflicto.</strong>
+    El producto tiene un código escrito y el mapeo maestro dice otro para ese mismo proveedor y código
+    de proveedor. Uno de los dos está mal: mientras no se decida, la venta puede estar cruzándose al
+    producto equivocado.
+  </div>
+  <div class="table-responsive mb-3" style="max-height: 300px; overflow-y: auto;">
+    <table class="table table-sm mb-0">
+      <thead class="sticky-top bg-white">
+        <tr><th>Proveedor</th><th>Código</th><th>Descripción</th>
+            <th>En el producto</th><th>En el maestro</th></tr>
+      </thead>
+      <tbody>
+        {% for f in inconsistencias.discrepancia %}
+        <tr>
+          <td class="small text-muted">{{ f.proveedor }}</td>
+          <td class="small">{{ f.codigo }}</td>
+          <td class="small" style="max-width: 340px;">{{ f.descripcion }}</td>
+          <td class="small fw-semibold">{{ f.codigo_interno }}</td>
+          <td class="small fw-semibold text-danger">{{ f.codigo_maestro }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if inconsistencias.solo_maestro %}
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+    <div class="text-muted small flex-grow-1">
+      <strong>{{ inconsistencias.solo_maestro|length }} producto(s) se cruzan con la venta solo gracias
+      al mapeo maestro</strong>, sin tener el código interno escrito encima. Funciona, pero si ese
+      archivo cambia el cruce se pierde sin avisar. Escribirlo en el producto lo deja firme.
+    </div>
+    <form method="post" action="{{ url_for('stock_homologacion_escribir_codigo_maestro') }}"
+          onsubmit="return confirm('Escribir el código interno del maestro en {{ inconsistencias.solo_maestro|length }} producto(s)?');">
+      <button class="btn btn-sm btn-primary text-nowrap">
+        <i class="bi bi-pencil-square me-1"></i> Escribirlo en los productos
+      </button>
+    </form>
+  </div>
+  <div class="table-responsive mt-2" style="max-height: 260px; overflow-y: auto;">
+    <table class="table table-sm mb-0">
+      <thead class="sticky-top bg-white">
+        <tr><th>Proveedor</th><th>Código</th><th>Descripción</th><th>Código interno (maestro)</th></tr>
+      </thead>
+      <tbody>
+        {% for f in inconsistencias.solo_maestro %}
+        <tr>
+          <td class="small text-muted">{{ f.proveedor }}</td>
+          <td class="small">{{ f.codigo }}</td>
+          <td class="small" style="max-width: 340px;">{{ f.descripcion }}</td>
+          <td class="small">{{ f.codigo_maestro }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if inconsistencias.maestro_sin_producto %}
+  <hr>
+  <div class="text-muted small mb-2">
+    <strong>{{ inconsistencias.maestro_sin_producto|length }} código(s) del mapeo maestro no existen en
+    el catálogo</strong>{% if inconsistencias.con_venta_sin_producto %}, y
+    {{ inconsistencias.con_venta_sin_producto }} de ellos <strong>tienen venta</strong>: son los que
+    aparecen sueltos en el S&amp;OP, sin producto al que colgarse. Hay que crear el producto en el
+    catálogo del proveedor, o corregir el código de proveedor del maestro{% endif %}.
+  </div>
+  <div class="table-responsive" style="max-height: 260px; overflow-y: auto;">
+    <table class="table table-sm mb-0">
+      <thead class="sticky-top bg-white">
+        <tr><th>Código interno</th><th>Proveedor</th><th>Código proveedor</th>
+            <th>Descripción</th><th class="text-center">Venta</th></tr>
+      </thead>
+      <tbody>
+        {% for f in inconsistencias.maestro_sin_producto[:300] %}
+        <tr>
+          <td class="small fw-semibold">{{ f.codigo_interno }}</td>
+          <td class="small text-muted">{{ f.proveedor }}</td>
+          <td class="small">{{ f.codigo }}</td>
+          <td class="small" style="max-width: 320px;">{{ f.descripcion }}</td>
+          <td class="text-center">
+            {% if f.con_venta %}<span class="badge bg-danger">con venta</span>
+            {% else %}<span class="text-muted small">—</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if not inconsistencias.discrepancia and not inconsistencias.solo_maestro
+        and not inconsistencias.maestro_sin_producto %}
+  <p class="text-muted mb-0">El catálogo y el mapeo maestro están alineados.</p>
+  {% endif %}
+</div>
+{% endif %}
+
 {# Ronda CM (2026-10-29, a pedido del usuario: "puedes revisar en qué otros
    códigos esto está duplicado?"): códigos internos de Inventarios que
    quedaron en más de un registro del catálogo. #}
@@ -206,9 +314,15 @@
           {% for p in proveedores %}<option value="{{ p.nombre }}">{{ p.nombre }}</option>{% endfor %}
         </select>
         <button class="btn btn-outline-primary text-nowrap">
-          <i class="bi bi-download me-1"></i> Descargar
+          <i class="bi bi-download me-1"></i> Faltantes
         </button>
       </form>
+      {# Ronda CN (2026-10-30, punto 3): faltaba poder bajar los que YA
+         tienen su código interno asignado. #}
+      <a class="btn btn-outline-success text-nowrap mt-2 d-inline-block"
+         href="{{ url_for('stock_homologacion_descargar_homologados') }}">
+        <i class="bi bi-check2-square me-1"></i> Descargar los ya homologados
+      </a>
     </div>
     <div class="col-md-7">
       <form method="post" action="{{ url_for('stock_homologacion_cargar_faltantes') }}"

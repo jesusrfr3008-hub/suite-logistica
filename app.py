@@ -92,8 +92,24 @@ def _firma_producto(texto):
     return _normalizar_nombre(texto).replace(" ", "")
 
 
-VERSION_SUITE = "CM"
-VERSION_SUITE_FECHA = "2026-10-29"
+def _firma_codigo(texto):
+    """Ronda CN (2026-10-30): codigo comparable. Ademas de lo que hace
+    _firma_producto (tildes, mayusculas, espacios) quita los SEPARADORES
+    -- punto, guion, barra, guion bajo y coma.
+
+    Es lo que permite reconocer que 'ILMB-05-S' y 'ILMB.05.S' son el mismo
+    codigo de DORC, o que 'SIL-1000-S' y 'SIL1000.S' son el mismo producto:
+    el catalogo del proveedor y el maestro de Inventarios escriben el mismo
+    codigo con distinta puntuacion, y por eso el mismo producto aparecia dos
+    veces en el S&OP con el mismo promedio de venta."""
+    limpio = _firma_producto(texto)
+    for separador in ".-_/,":
+        limpio = limpio.replace(separador, "")
+    return limpio
+
+
+VERSION_SUITE = "CN"
+VERSION_SUITE_FECHA = "2026-10-30"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -682,6 +698,8 @@ def ensure_schema_migrations():
         # catalogo, no por codigo interno de Ergopyme -- ver ForecastLinea.
         "forecast_lineas": [
             ("clave_producto", "VARCHAR(60)"),
+            # Ronda CN (2026-10-30): nota del vendedor por linea.
+            ("nota", "TEXT"),
             ("producto_id", "INTEGER"),
             ("variante_id", "INTEGER"),
             ("codigo_proveedor", "VARCHAR(120)"),
@@ -3261,7 +3279,7 @@ def reparar_duplicados_catalogo_ronda_cl():
         # _firma_producto. Dentro de un MISMO producto padre, dos variantes
         # que solo se diferencian en un espacio son la misma.
         grupos[(variante.producto_id,
-                _firma_producto(variante.codigo),
+                _firma_codigo(variante.codigo),
                 _firma_producto(variante.descripcion))].append(variante)
     repetidos = {k: v for k, v in grupos.items() if len(v) > 1}
     if not repetidos:
@@ -3301,7 +3319,7 @@ def reparar_duplicados_catalogo_ronda_cl():
                 0 if v.id in referenciadas else 1,
                 # Ronda CM: a igualdad de condiciones se prefiere la grafia
                 # que coincide con el mapeo maestro de Ergopyme.
-                0 if _firma_producto(v.codigo) == _firma_producto(
+                0 if _firma_codigo(v.codigo) == _firma_codigo(
                     (codigos_maestros.get((v.codigo_interno_inventario or "").strip()) or "")) else 1,
                 v.id,
             )
@@ -13542,35 +13560,84 @@ def _catalogo_para_forecast(proveedor_nombre=None):
     return catalogo
 
 
+def _indice_ergopyme_por_codigo_proveedor():
+    """{(firma del proveedor, firma del codigo de proveedor): codigo interno}
+    segun el mapeo maestro de Inventarios (ronda CN, 2026-10-30).
+
+    Es el puente que faltaba: la venta llega con el codigo INTERNO, y el
+    catalogo tiene el codigo DEL PROVEEDOR. Cuando el producto del catalogo
+    no tiene su codigo interno escrito encima, este indice permite igual
+    reconocer de que producto es esa venta -- que es lo que el usuario
+    pedia: "se supone que debe estar el codigo del proveedor, no el que
+    esta en venta"."""
+    indice = {}
+    # Orden estable: si el maestro trae dos codigos internos para el mismo
+    # proveedor + codigo, manda siempre el mismo (y la discrepancia se ve
+    # en Homologación > Códigos repetidos).
+    for fila in sorted(CodigoErgopyme.query.all(), key=lambda f: (f.codigo_interno or "")):
+        proveedor = _firma_producto(fila.proveedor_nombre)
+        codigo = _firma_codigo(fila.codigo_proveedor)
+        interno = (fila.codigo_interno or "").strip().upper()
+        if proveedor and codigo and interno:
+            indice.setdefault((proveedor, codigo), interno)
+    return indice
+
+
 def _productos_para_forecast(vendedor, proveedor_nombre=None):
     """Junta el catalogo del proveedor con la historia de venta del
     vendedor: cada producto del catalogo queda con su promedio 6UM, su
     clase A/B/C y la sugerencia del sistema cuando hay venta, y en cero
     cuando no la hay (igual se puede proyectar).
 
-    Tambien entran los codigos que el vendedor SI vendio pero que no estan
-    homologados contra el catalogo -- si se dejaran afuera, su venta
-    desapareceria de la vista."""
+    El cruce con la venta se intenta por DOS caminos (ronda CN, 2026-10-30):
+      1) el codigo interno escrito en el propio producto del catalogo;
+      2) si no lo tiene, el mapeo maestro de Inventarios, buscando por
+         proveedor + codigo de proveedor con los separadores normalizados.
+    Sin el segundo camino, un producto ya homologado en el maestro pero sin
+    el codigo escrito encima salia DOS VECES en la lista: una como producto
+    del catalogo sin promedio y otra como codigo suelto con la venta. Es lo
+    que le pasaba al usuario con BIOVISC 3,0% / 4010210026 y con
+    SIL-1000-S / SIL1000.S.
+
+    Lo vendido que de verdad no calza con ningun producto del catalogo
+    entra igual, marcado como no homologado, para que su venta no
+    desaparezca de la vista."""
     panorama = _panorama_forecast_vendedor(vendedor)
-    # Codigo interno de Ergopyme -> datos de venta, para cruzar.
     ventas_por_interno = {(c or "").strip().upper(): d for c, d in panorama.items()}
+    indice_maestro = _indice_ergopyme_por_codigo_proveedor()
 
     filas, internos_usados = {}, set()
     for clave, datos in _catalogo_para_forecast(proveedor_nombre).items():
         interno = (datos.get("codigo_interno") or "").strip().upper()
         venta = ventas_por_interno.get(interno) if interno else None
-        if venta:
+        por_maestro = False
+        if venta is None:
+            # Camino 2: el maestro sabe que codigo interno le corresponde a
+            # este proveedor + codigo de proveedor.
+            interno_maestro = indice_maestro.get(
+                (_firma_producto(datos.get("proveedor")), _firma_codigo(datos.get("codigo"))))
+            if interno_maestro:
+                venta = ventas_por_interno.get(interno_maestro)
+                if venta is not None or not interno:
+                    interno = interno_maestro
+                    por_maestro = True
+        if venta is not None and interno:
             internos_usados.add(interno)
         promedio = (venta or {}).get("promedio_6um", 0) or 0
         reparto = _distribuir_sugerencia(promedio)
         filas[clave] = {
             **datos,
+            "codigo_interno": interno,
             "promedio_6um": promedio,
             "clase_abc": (venta or {}).get("clase_abc", "C"),
             "monto_12m": (venta or {}).get("monto_12m", 0) or 0,
             "unidades_12m": (venta or {}).get("unidades_12m", 0) or 0,
             "sugerencia": reparto, "sugerencia_total": sum(reparto),
             "homologado": bool(interno),
+            # True cuando el codigo interno salio del maestro y no esta
+            # escrito en el producto: conviene escribirlo para que el cruce
+            # no dependa del maestro (ver Homologación).
+            "homologado_solo_en_maestro": por_maestro,
         }
 
     # Lo vendido que no calza con el catalogo: solo cuando se mira "todos
@@ -13593,9 +13660,49 @@ def _productos_para_forecast(vendedor, proveedor_nombre=None):
                 "monto_12m": venta.get("monto_12m", 0) or 0,
                 "unidades_12m": venta.get("unidades_12m", 0) or 0,
                 "sugerencia": reparto, "sugerencia_total": sum(reparto),
-                "homologado": False,
+                "homologado": False, "homologado_solo_en_maestro": False,
             }
-    return filas
+    return _unificar_productos_duplicados(filas)
+
+
+def _unificar_productos_duplicados(filas):
+    """Ronda CN (2026-10-30, punto 4 del pedido del usuario: "¿por qué lo
+    repites?"): un mismo producto cargado dos veces en el catalogo con el
+    codigo escrito distinto ('SIL-1000-S' y 'SIL1000.S') salia dos veces en
+    la lista del S&OP, con el mismo promedio de venta.
+
+    Acá se muestra UNA sola vez. No se borra nada del catalogo -- esa
+    decision es del usuario y esta en Homologación > Códigos repetidos --
+    pero la pantalla de proyeccion deja de mostrar el mismo producto
+    repetido. Se conserva la fila que ya tiene su codigo interno escrito
+    (si hay varias, la de clave menor, que es estable).
+
+    La fila que queda recuerda cuantos registros del catalogo representa
+    ("duplicados"), para poder avisarlo en pantalla."""
+    por_firma = {}
+    for clave, datos in filas.items():
+        firma = (_firma_producto(datos.get("proveedor")), _firma_codigo(datos.get("codigo")))
+        if not firma[1]:
+            # Sin codigo de proveedor no hay como saber si es el mismo:
+            # se deja tal cual.
+            por_firma[(clave,)] = [datos]
+            continue
+        por_firma.setdefault(firma, []).append(datos)
+
+    unificadas = {}
+    for grupo in por_firma.values():
+        if len(grupo) == 1:
+            elegida = grupo[0]
+        else:
+            elegida = sorted(
+                grupo,
+                key=lambda d: (0 if (d.get("codigo_interno") or "").strip() else 1,
+                               0 if d.get("producto_id") or d.get("variante_id") else 1,
+                               d.get("clave") or ""),
+            )[0]
+            elegida = {**elegida, "duplicados": len(grupo)}
+        unificadas[elegida["clave"]] = elegida
+    return unificadas
 
 
 def _url_forecast(envio_id=None):
@@ -13786,12 +13893,41 @@ def _usuario_actual_id():
         return None
 
 
-def _registrar_cambio_forecast(envio, codigo, semana, anterior, nuevo, accion, usuario_id="auto"):
+def _registrar_cambio_forecast(envio, codigo, semana, anterior, nuevo, accion,
+                               usuario_id="auto", nota=None, semana_inicio=None):
     db.session.add(ForecastCambio(
         envio_id=envio.id, codigo_interno=codigo, semana=semana,
         valor_anterior=anterior or 0, valor_nuevo=nuevo or 0, accion=accion,
+        nota=(nota or None), semana_inicio=semana_inicio,
         usuario_id=_usuario_actual_id() if usuario_id == "auto" else usuario_id,
     ))
+
+
+def _informado_en_ciclo_anterior(envio):
+    """Ronda CN (2026-10-30, punto 7 del pedido del usuario): lo que este
+    vendedor YA INFORMO para cada semana del calendario, en el ciclo
+    anterior que alcanzo a enviar.
+
+    Devuelve {(clave_producto, lunes de la semana): unidades}. Se compara
+    por FECHA de la semana y no por numero de columna, porque los ciclos
+    se corren un mes: la semana 1 del ciclo nuevo puede ser la semana 5 del
+    anterior."""
+    anterior = ForecastCiclo.query.filter(
+        ForecastCiclo.id != envio.ciclo_id,
+        ForecastCiclo.mes_objetivo <= envio.ciclo.mes_objetivo,
+    ).order_by(ForecastCiclo.mes_objetivo.desc(), ForecastCiclo.id.desc()).first()
+    if not anterior:
+        return {}
+    envio_previo = ForecastEnvio.query.filter_by(
+        ciclo_id=anterior.id, vendedor=envio.vendedor).first()
+    if not envio_previo or not envio_previo.enviado:
+        return {}
+    semanas = _semanas_forecast(anterior)
+    informado = {}
+    for linea in envio_previo.lineas.all():
+        for semana in semanas:
+            informado[(linea.clave_producto, semana["inicio"])] = getattr(linea, f"s{semana['n']}") or 0
+    return informado
 
 
 def _abrir_ciclo_forecast(nombre, mes_objetivo, fecha_tope, vendedores, usuario_id=None):
@@ -13839,9 +13975,10 @@ def _abrir_ciclo_forecast(nombre, mes_objetivo, fecha_tope, vendedores, usuario_
                         setattr(nueva, f"s{n}", getattr(linea, f"s{n}") or 0)
                     db.session.add(nueva)
                     db.session.flush()
-                    _registrar_cambio_forecast(
-                        envio, nueva.codigo_visible, None, 0, nueva.total,
-                        "copia_ciclo_anterior", usuario_id=usuario_id)
+                    # Ronda CN: la copia del ciclo anterior ya no se
+                    # registra como "cambio" -- es el punto de partida, no
+                    # una variacion. La comparacion con lo informado antes
+                    # se hace al guardar (ver _informado_en_ciclo_anterior).
                     copiadas_total += 1
 
     destinatarios = [u for u in (_usuario_de_vendedor(v) for v in vendedores) if u]
@@ -14226,33 +14363,63 @@ def forecast_envio_guardar(envio_id):
               "ciclo se cerró. Un administrador puede autorizar la edición.", "warning")
         return redirect(url_for("forecast_envio", envio_id=envio.id))
 
-    cambios = 0
+    # Ronda CN (2026-10-30, punto 7): el historial NO registra cada tecla
+    # que toca el vendedor mientras prepara su hoja. Registra:
+    #   a) las CORRECCIONES hechas despues de haber enviado (con
+    #      autorizacion del administrador), y
+    #   b) los cambios sobre semanas que YA se habian informado en el ciclo
+    #      anterior -- comparando por fecha de semana, porque los ciclos se
+    #      corren un mes y la semana 1 de hoy fue la 5 del ciclo pasado.
+    # En los dos casos se guarda la variacion y la nota explicativa.
+    ya_enviado = envio.enviado
+    informado_antes = _informado_en_ciclo_anterior(envio)
+    semanas = _semanas_forecast(envio.ciclo)
+    lunes_por_semana = {semana["n"]: semana["inicio"] for semana in semanas}
+
+    cambios, registrados = 0, 0
     for linea in envio.lineas.all():
+        nota_linea = (request.form.get(f"nota_{linea.id}") or "").strip()
+        if nota_linea and nota_linea != (linea.nota or "").strip():
+            linea.nota = nota_linea
         for n in range(1, SEMANAS_FORECAST + 1):
             campo = f"u_{linea.id}_{n}"
             if campo not in request.form:
                 continue
             nuevo = parse_int(request.form.get(campo), 0)
             anterior = getattr(linea, f"s{n}") or 0
-            if abs(nuevo - anterior) > 0.0001:
-                setattr(linea, f"s{n}", nuevo)
-                _registrar_cambio_forecast(envio, linea.codigo_visible, n, anterior, nuevo, "edicion")
-                cambios += 1
+            if abs(nuevo - anterior) <= 0.0001:
+                continue
+            setattr(linea, f"s{n}", nuevo)
+            cambios += 1
+            lunes = lunes_por_semana.get(n)
+            previo = informado_antes.get((linea.clave_producto, lunes))
+            if ya_enviado:
+                _registrar_cambio_forecast(
+                    envio, linea.codigo_visible, n, anterior, nuevo, "correccion",
+                    nota=linea.nota, semana_inicio=lunes)
+                registrados += 1
+            elif previo is not None and abs(nuevo - previo) > 0.0001:
+                _registrar_cambio_forecast(
+                    envio, linea.codigo_visible, n, previo, nuevo, "cambio_vs_ciclo_anterior",
+                    nota=linea.nota, semana_inicio=lunes)
+                registrados += 1
     enviar = request.form.get("accion") == "enviar"
     if enviar:
         envio.estado = "Enviado"
         envio.enviado_en = datetime.utcnow()
         envio.edicion_autorizada = False
-        _registrar_cambio_forecast(envio, None, None, 0, 0, "envio")
+        _registrar_cambio_forecast(envio, None, None, 0,
+                                   sum(l.total for l in envio.lineas.all()), "envio")
         _notificar(_usuarios_administradores(),
                    f"Forecast {envio.ciclo.nombre}: {envio.vendedor} envió su proyección",
                    f"{sum(l.total for l in envio.lineas.all()):,.0f} unidades en 13 semanas.".replace(",", "."),
                    url=url_for("forecast_envio", envio_id=envio.id), icono="send-check")
     db.session.commit()
+    detalle = f" {registrados} quedaron registrados en el historial." if registrados else ""
     if enviar:
-        flash(f"Forecast enviado. Se guardaron {cambios} cambio(s).", "success")
+        flash(f"Forecast enviado. Se guardaron {cambios} cambio(s).{detalle}", "success")
     else:
-        flash(f"Borrador guardado ({cambios} cambio(s)).", "success")
+        flash(f"Borrador guardado ({cambios} cambio(s)).{detalle}", "success")
     return redirect(url_for("forecast_envio", envio_id=envio.id))
 
 
@@ -14320,7 +14487,9 @@ def forecast_envio_agregar(envio_id):
                 setattr(linea, f"s{n}", unidades)
         db.session.add(linea)
         db.session.flush()
-        _registrar_cambio_forecast(envio, linea.codigo_visible, None, 0, linea.total, "alta")
+        if envio.enviado:   # solo si ya habia sido enviado: es una correccion
+            _registrar_cambio_forecast(envio, linea.codigo_visible, None, 0, linea.total,
+                                       "alta", nota=linea.nota)
         agregados += 1
     db.session.commit()
     mensaje = f"{agregados} producto(s) agregado(s)."
@@ -14341,11 +14510,37 @@ def forecast_linea_eliminar(linea_id):
     if not _puede_editar_envio(envio):
         flash("No se puede quitar productos de este forecast.", "warning")
         return redirect(url_for("forecast_envio", envio_id=envio.id))
-    _registrar_cambio_forecast(envio, linea.codigo_visible, None, linea.total, 0, "baja")
+    if envio.enviado:
+        _registrar_cambio_forecast(envio, linea.codigo_visible, None, linea.total, 0,
+                                   "baja", nota=linea.nota)
     db.session.delete(linea)
     db.session.commit()
     flash(f"Producto {linea.codigo_visible} quitado del forecast.", "success")
     return redirect(url_for("forecast_envio", envio_id=envio.id))
+
+
+@app.route("/forecast/lineas/<int:linea_id>/nota", methods=["POST"])
+@requiere_sop
+def forecast_linea_nota(linea_id):
+    """Ronda CN (2026-10-30, punto 6 del pedido del usuario): la nota de una
+    linea se escribe en un modal, no en un campo de la grilla. Se lee
+    pasando el mouse por encima y acompaña a cada variacion del historial."""
+    linea = ForecastLinea.query.get_or_404(linea_id)
+    envio = linea.envio
+    if not _puede_editar_envio(envio):
+        flash("No se puede editar la nota de este forecast.", "warning")
+        return redirect(url_for("forecast_envio", envio_id=envio.id))
+    anterior = (linea.nota or "").strip()
+    linea.nota = (request.form.get("nota") or "").strip() or None
+    # Si la hoja ya fue enviada, cambiar la nota tambien es una correccion
+    # y queda registrada.
+    if envio.enviado and (linea.nota or "") != anterior:
+        _registrar_cambio_forecast(envio, linea.codigo_visible, None, 0, 0,
+                                   "nota", nota=linea.nota)
+    db.session.commit()
+    flash(f"Nota de {linea.codigo_visible} guardada.", "success")
+    return redirect(url_for("forecast_envio", envio_id=envio.id,
+                            proveedor=request.form.get("proveedor") or None))
 
 
 @app.route("/forecast/envios/<int:envio_id>/autorizar-edicion", methods=["POST"])
@@ -15151,21 +15346,23 @@ def stock_homologacion():
             codigo = (producto.codigo or "").strip()
             if not codigo or codigo == "-":
                 continue
-            grupos[(producto.proveedor_id, codigo.upper())].append(producto)
-        for (proveedor_id, codigo), productos_grupo in grupos.items():
+            # Ronda CN: por FIRMA, asi 'ILMB-05-S' y 'ILMB.05.S' caen juntos.
+            grupos[(producto.proveedor_id, _firma_codigo(codigo))].append(producto)
+        for (proveedor_id, _firma), productos_grupo in grupos.items():
             if len(productos_grupo) < 2:
                 continue
             proveedor = Proveedor.query.get(proveedor_id)
-            descripciones = {(p.descripcion or "").strip().upper() for p in productos_grupo}
+            descripciones = {_firma_producto(p.descripcion) for p in productos_grupo}
             repetidos.append({
                 "proveedor": proveedor.nombre if proveedor else "",
-                "codigo": codigo,
+                "codigo": " / ".join(sorted({(p.codigo or "").strip() for p in productos_grupo})),
                 "productos": sorted(productos_grupo, key=lambda p: p.id),
                 "misma_descripcion": len(descripciones) == 1,
             })
         repetidos.sort(key=lambda r: (not r["misma_descripcion"], _normalizar_nombre(r["proveedor"]),
                                       _normalizar_nombre(r["codigo"])))
     internos_repetidos = _codigos_internos_repetidos() if ver == "repetidos" else []
+    inconsistencias = _inconsistencias_homologacion() if ver == "repetidos" else None
     total_repetidos = len(repetidos) if ver == "repetidos" else None
 
     return render_template(
@@ -15174,7 +15371,7 @@ def stock_homologacion():
         sin_codigo_productos=sin_codigo_productos, sin_codigo_variantes=sin_codigo_variantes,
         total_sin_codigo_interno=total_sin_codigo_interno,
         grupos_sin_codigo=grupos_sin_codigo, repetidos=repetidos, total_repetidos=total_repetidos,
-        internos_repetidos=internos_repetidos,
+        internos_repetidos=internos_repetidos, inconsistencias=inconsistencias,
     )
 
 
@@ -15214,7 +15411,7 @@ def _codigos_internos_repetidos():
             continue
         firmas = {
             (padre.proveedor_id if padre else None,
-             _firma_producto(objeto.codigo),
+             _firma_codigo(objeto.codigo),
              _firma_producto(objeto.descripcion))
             for _, objeto, padre in entradas
         }
@@ -15284,6 +15481,202 @@ def stock_homologacion_descargar_internos_repetidos():
         download_name=f"Codigos_internos_repetidos_{date.today().isoformat()}.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+def _catalogo_homologado():
+    """Ronda CN (2026-10-30, punto 3 del pedido del usuario): todos los
+    productos del catalogo CON su codigo interno de Inventarios, para poder
+    descargar y revisar lo que ya esta homologado (hasta ahora solo se
+    podia bajar lo que faltaba).
+
+    Marca de donde sale cada cruce: escrito en el propio producto, o solo
+    presente en el mapeo maestro -- este ultimo caso funciona, pero deja el
+    cruce dependiendo de un archivo externo."""
+    indice = _indice_ergopyme_por_codigo_proveedor()
+    filas = []
+
+    def _agregar(tipo, objeto, padre):
+        proveedor = padre.proveedor.nombre if padre and padre.proveedor else ""
+        propio = (objeto.codigo_interno_inventario or "").strip()
+        del_maestro = indice.get((_firma_producto(proveedor), _firma_codigo(objeto.codigo)))
+        if not propio and not del_maestro:
+            return
+        if propio and del_maestro and propio.upper() != del_maestro.upper():
+            origen = "Discrepancia: producto y maestro dicen códigos distintos"
+        elif propio:
+            origen = "Escrito en el producto"
+        else:
+            origen = "Solo en el mapeo maestro"
+        filas.append({
+            "tipo": tipo, "id": objeto.id, "proveedor": proveedor,
+            "codigo": (objeto.codigo or "").strip(),
+            "descripcion": (objeto.descripcion or "").strip(),
+            "codigo_interno": propio or del_maestro,
+            "codigo_interno_maestro": del_maestro or "",
+            "origen": origen,
+        })
+
+    con_variantes = {pid for (pid,) in db.session.query(ProductoVariante.producto_id).distinct().all()}
+    for producto in Producto.query.filter(Producto.activo.is_(True)).all():
+        if producto.id in con_variantes:
+            continue
+        _agregar("Producto", producto, producto)
+    for variante in ProductoVariante.query.join(Producto).filter(
+        Producto.activo.is_(True),
+        db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+    ).all():
+        _agregar("Variante", variante, variante.producto)
+    filas.sort(key=lambda f: (_normalizar_nombre(f["proveedor"]), _firma_codigo(f["codigo"])))
+    return filas
+
+
+def _inconsistencias_homologacion():
+    """Ronda CN (2026-10-30, punto 4 del pedido del usuario: "clave evitar
+    estas fallas, muestran inconsistencias de la data... busquemos y
+    crucemos estas inconsistencias con todos los productos").
+
+    Tres cruces entre el catalogo y el mapeo maestro de Inventarios:
+
+    - "solo_maestro": el producto se cruza bien con la venta, pero el
+      codigo interno NO esta escrito encima: sale del archivo maestro. Si
+      ese archivo cambia, el cruce se pierde en silencio. Se arregla con un
+      boton (escribirselo al producto).
+    - "discrepancia": el producto tiene un codigo interno escrito y el
+      maestro dice OTRO para ese mismo proveedor + codigo. Uno de los dos
+      esta mal y hay que decidir cual.
+    - "maestro_sin_producto": el maestro conoce un proveedor + codigo que
+      NO existe en el catalogo. Es el caso de un codigo interno que trae
+      venta pero no tiene producto al que colgarse."""
+    indice = _indice_ergopyme_por_codigo_proveedor()
+    solo_maestro, discrepancia = [], []
+    firmas_catalogo = set()
+
+    def _revisar(tipo, objeto, padre):
+        proveedor = padre.proveedor.nombre if padre and padre.proveedor else ""
+        firma = (_firma_producto(proveedor), _firma_codigo(objeto.codigo))
+        firmas_catalogo.add(firma)
+        del_maestro = indice.get(firma)
+        propio = (objeto.codigo_interno_inventario or "").strip()
+        fila = {"tipo": tipo, "id": objeto.id, "proveedor": proveedor,
+                "codigo": (objeto.codigo or "").strip(),
+                "descripcion": (objeto.descripcion or "").strip(),
+                "codigo_interno": propio, "codigo_maestro": del_maestro or ""}
+        if del_maestro and not propio:
+            solo_maestro.append(fila)
+        elif del_maestro and propio and propio.upper() != del_maestro.upper():
+            discrepancia.append(fila)
+
+    con_variantes = {pid for (pid,) in db.session.query(ProductoVariante.producto_id).distinct().all()}
+    for producto in Producto.query.filter(Producto.activo.is_(True)).all():
+        if producto.id not in con_variantes:
+            _revisar("Producto", producto, producto)
+    for variante in ProductoVariante.query.join(Producto).filter(
+        Producto.activo.is_(True),
+        db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+    ).all():
+        _revisar("Variante", variante, variante.producto)
+
+    # Codigos del maestro que no tienen producto en el catalogo. Solo
+    # interesan los que ADEMAS tienen venta: son los que ensucian el S&OP.
+    internos_con_venta = {
+        (c or "").strip().upper()
+        for (c,) in db.session.query(VentaLinea.codigo_interno).distinct().all() if c
+    }
+    maestro_sin_producto = []
+    for fila in CodigoErgopyme.query.all():
+        firma = (_firma_producto(fila.proveedor_nombre), _firma_codigo(fila.codigo_proveedor))
+        if not firma[0] or not firma[1] or firma in firmas_catalogo:
+            continue
+        interno = (fila.codigo_interno or "").strip().upper()
+        maestro_sin_producto.append({
+            "codigo_interno": fila.codigo_interno,
+            "proveedor": fila.proveedor_nombre or "",
+            "codigo": fila.codigo_proveedor or "",
+            "descripcion": (fila.descripcion or "")[:160],
+            "con_venta": interno in internos_con_venta,
+        })
+    maestro_sin_producto.sort(key=lambda f: (not f["con_venta"], _normalizar_nombre(f["proveedor"]),
+                                             _firma_codigo(f["codigo"])))
+    return {
+        "solo_maestro": sorted(solo_maestro, key=lambda f: (_normalizar_nombre(f["proveedor"]),
+                                                            _firma_codigo(f["codigo"]))),
+        "discrepancia": sorted(discrepancia, key=lambda f: (_normalizar_nombre(f["proveedor"]),
+                                                            _firma_codigo(f["codigo"]))),
+        "maestro_sin_producto": maestro_sin_producto,
+        "con_venta_sin_producto": sum(1 for f in maestro_sin_producto if f["con_venta"]),
+    }
+
+
+@app.route("/stock/homologacion/homologados/descargar")
+@requiere_permiso("inventarios")
+def stock_homologacion_descargar_homologados():
+    """Ronda CN (2026-10-30, punto 3): descarga de los productos que YA
+    tienen codigo interno asignado, con el origen de cada cruce."""
+    filas = _catalogo_homologado()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Homologados"
+    encabezados = ["Proveedor", "Codigo Proveedor", "Descripcion", "Tipo",
+                   "CODIGO INTERNO ERGOPYME", "Origen del cruce", "ID"]
+    for col, titulo in enumerate(encabezados, start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.fill = PatternFill("solid", fgColor="1F6F43")
+        celda.alignment = Alignment(horizontal="center", vertical="center")
+    naranja = PatternFill("solid", fgColor="FCE4D6")
+    rojo = PatternFill("solid", fgColor="FFC7CE")
+    for i, fila in enumerate(filas, start=2):
+        ws.cell(row=i, column=1, value=fila["proveedor"])
+        ws.cell(row=i, column=2, value=fila["codigo"])
+        ws.cell(row=i, column=3, value=fila["descripcion"])
+        ws.cell(row=i, column=4, value=fila["tipo"])
+        ws.cell(row=i, column=5, value=fila["codigo_interno"])
+        celda = ws.cell(row=i, column=6, value=fila["origen"])
+        if fila["origen"].startswith("Discrepancia"):
+            celda.fill = rojo
+        elif fila["origen"].startswith("Solo"):
+            celda.fill = naranja
+        ws.cell(row=i, column=7, value=f"{fila['tipo'][0]}{fila['id']}")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:G{max(len(filas) + 1, 2)}"
+    for col, ancho in zip(range(1, 8), (22, 26, 58, 11, 26, 42, 10)):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return send_file(
+        buffer, as_attachment=True,
+        download_name=f"Homologacion_codigos_asignados_{date.today().isoformat()}.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/stock/homologacion/escribir-codigo-maestro", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_homologacion_escribir_codigo_maestro():
+    """Ronda CN (2026-10-30): escribe en los productos el codigo interno
+    que hoy solo esta en el mapeo maestro, para que el cruce con la venta
+    no dependa de un archivo externo."""
+    datos = _inconsistencias_homologacion()
+    objetivos = request.form.getlist("clave") or [
+        f"{f['tipo'][0]}{f['id']}" for f in datos["solo_maestro"]
+    ]
+    por_clave = {f"{f['tipo'][0]}{f['id']}": f for f in datos["solo_maestro"]}
+    escritos = 0
+    for clave in objetivos:
+        fila = por_clave.get(clave)
+        if not fila:
+            continue
+        objetivo = (Producto.query.get(fila["id"]) if clave[:1] == "P"
+                    else ProductoVariante.query.get(fila["id"]))
+        if objetivo is None:
+            continue
+        objetivo.codigo_interno_inventario = fila["codigo_maestro"]
+        escritos += 1
+    db.session.commit()
+    flash(f"{escritos} producto(s) quedaron con su código interno escrito: el cruce con la venta "
+          "ya no depende del archivo maestro.", "success" if escritos else "warning")
+    return redirect(url_for("stock_homologacion", ver="repetidos"))
 
 
 @app.route("/stock/homologacion/producto/<int:producto_id>/desactivar", methods=["POST"])

@@ -65,7 +65,7 @@
           <th class="text-center" title="Clase A/B/C: Pareto 80/90/100 sobre el monto de tus cuentas en los últimos 12 meses">ABC</th>
           <th class="text-end" title="Promedio mensual de unidades de los últimos 6 meses, solo de tus cuentas">6UM</th>
           {% for s in semanas %}
-          <th class="text-center" style="min-width: 62px;" title="{{ s.rango_largo }}">
+          <th class="text-center" style="min-width: 86px;" title="{{ s.rango_largo }}">
             <div class="small fw-semibold">{{ s.etiqueta }}</div>
             <div class="text-muted" style="font-size: .7rem;">{{ s.rango }}</div>
           </th>
@@ -94,13 +94,31 @@
           <td class="text-end">{{ "%.1f"|format(linea.promedio_6um or 0) }}</td>
           {% for s in semanas %}
           <td class="p-1">
-            <input type="number" min="0" step="1" class="form-control form-control-sm text-end celda-forecast"
+            {# Ronda CN (punto 5): campo más ancho, para que se vea la cifra
+               completa aunque sean cuatro dígitos. #}
+            <input type="number" min="0" step="1"
+                   class="form-control form-control-sm text-end celda-forecast"
+                   style="min-width: 76px; font-size: .95rem;"
                    name="u_{{ linea.id }}_{{ s.n }}" value="{{ (linea['s' ~ s.n] or 0)|round|int }}"
                    {% if not puede_editar %}readonly{% endif %}>
           </td>
           {% endfor %}
           <td class="text-end fw-semibold total-fila">{{ "%.0f"|format(linea.total) }}</td>
-          <td class="text-end">
+          <td class="text-end text-nowrap">
+            {# Ronda CN (punto 6): la nota se escribe en un modal y se lee
+               pasando el mouse por el ícono. #}
+            {% if linea.nota %}
+            <button type="button" class="btn btn-sm btn-outline-info" data-bs-toggle="modal"
+                    data-bs-target="#modalNota{{ linea.id }}"
+                    title="{{ linea.nota }}">
+              <i class="bi bi-sticky-fill"></i>
+            </button>
+            {% elif puede_editar %}
+            <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal"
+                    data-bs-target="#modalNota{{ linea.id }}" title="Agregar una nota a esta línea">
+              <i class="bi bi-sticky"></i>
+            </button>
+            {% endif %}
             {% if puede_editar %}
             {% if sugerida and sugerida|sum %}
             <button type="button" class="btn btn-sm btn-outline-secondary btn-sugerir"
@@ -241,6 +259,12 @@
               <i class="bi bi-exclamation-triangle text-warning small"
                  title="Este producto no tiene código interno de Inventarios: no se le puede cruzar la venta. Complétalo en Consulta de Stock > Homologación."></i>
               {% endif %}
+              {% if d.duplicados %}
+              {# Ronda CN (punto 4): el catálogo tiene el mismo producto
+                 varias veces; acá se muestra una sola. #}
+              <i class="bi bi-files text-muted small"
+                 title="Este producto está {{ d.duplicados }} veces en el catálogo con el código escrito distinto. Se muestra una sola vez; revísalo en Consulta de Stock > Homologación > Códigos repetidos."></i>
+              {% endif %}
             </td>
             <td class="small" data-valor="{{ d.descripcion }}">{{ d.descripcion or '—' }}</td>
             <td class="small text-muted" data-valor="{{ d.proveedor }}">{{ d.proveedor or '—' }}</td>
@@ -266,18 +290,53 @@
 </div>
 {% endif %}
 
+{% for linea in lineas %}
+{% if puede_editar or linea.nota %}
+<div class="modal fade" id="modalNota{{ linea.id }}" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('forecast_linea_nota', linea_id=linea.id) }}">
+        <input type="hidden" name="proveedor" value="{{ proveedor_sel }}">
+        <div class="modal-header">
+          <h5 class="modal-title">Nota · {{ linea.codigo_visible }}</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">{{ linea.descripcion or '' }}</p>
+          <textarea class="form-control" name="nota" rows="4"
+                    placeholder="Por qué proyectas esta cantidad, o por qué la cambiaste. Se ve en el historial y en los reportes."
+                    {% if not puede_editar %}readonly{% endif %}>{{ linea.nota or '' }}</textarea>
+        </div>
+        {% if puede_editar %}
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancelar</button>
+          <button class="btn btn-primary">Guardar nota</button>
+        </div>
+        {% endif %}
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endfor %}
+
 <div class="card p-3">
   <h5 class="section-title mb-2">
     <a class="text-decoration-none" data-bs-toggle="collapse" href="#historialForecast">
-      <i class="bi bi-clock-history me-1"></i> Historial de cambios ({{ historial|length }})
+      <i class="bi bi-clock-history me-1"></i> Historial de variaciones ({{ historial|length }})
     </a>
   </h5>
   <div class="collapse" id="historialForecast">
+    <p class="text-muted small">
+      Acá no queda lo que cargas mientras preparas tu hoja. Quedan las <strong>correcciones hechas
+      después de enviarla</strong> y los <strong>cambios sobre semanas que ya habías informado en el
+      ciclo anterior</strong>, con la variación y tu nota explicativa.
+    </p>
     {% if historial %}
     <div class="table-responsive" style="max-height: 320px;">
       <table class="table table-sm mb-0">
         <thead class="table-light" style="position: sticky; top: 0;">
-          <tr><th>Momento</th><th>Quién</th><th>Acción</th><th>Producto</th><th class="text-center">Semana</th><th class="text-end">Antes</th><th class="text-end">Después</th></tr>
+          <tr><th>Momento</th><th>Quién</th><th>Acción</th><th>Producto</th><th class="text-center">Semana</th><th class="text-end">Antes</th><th class="text-end">Después</th><th class="text-end">Variación</th><th>Nota</th></tr>
         </thead>
         <tbody>
           {% for c in historial %}
@@ -286,16 +345,28 @@
             <td class="small">{{ c.usuario.nombre_completo if c.usuario else 'Sistema' }}</td>
             <td class="small">{{ c.accion }}</td>
             <td class="small">{{ c.codigo_interno or '—' }}</td>
-            <td class="text-center small">{{ ('S' ~ c.semana) if c.semana else '—' }}</td>
+            <td class="text-center small">
+              {% if c.semana %}S{{ c.semana }}{% endif %}
+              {% if c.semana_inicio %}<div class="text-muted" style="font-size: .7rem;">{{ c.semana_inicio.strftime('%d-%m') }}</div>{% endif %}
+              {% if not c.semana and not c.semana_inicio %}—{% endif %}
+            </td>
             <td class="text-end small">{{ "%.0f"|format(c.valor_anterior or 0) }}</td>
             <td class="text-end small">{{ "%.0f"|format(c.valor_nuevo or 0) }}</td>
+            {% set variacion = (c.valor_nuevo or 0) - (c.valor_anterior or 0) %}
+            <td class="text-end small fw-semibold {{ 'text-success' if variacion > 0 else ('text-danger' if variacion < 0 else 'text-muted') }}">
+              {{ '+' if variacion > 0 else '' }}{{ "%.0f"|format(variacion) }}
+            </td>
+            <td class="small" style="max-width: 280px;">{{ c.nota or '' }}</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
     {% else %}
-    <p class="text-muted mb-0">Todavía no hay cambios registrados en esta hoja.</p>
+    <p class="text-muted mb-0">
+      Todavía no hay variaciones que registrar: no has enviado esta hoja, o no has cambiado ninguna
+      semana respecto de lo que informaste en el ciclo anterior.
+    </p>
     {% endif %}
   </div>
 </div>

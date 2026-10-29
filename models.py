@@ -2716,6 +2716,11 @@ class ForecastLinea(db.Model):
     # monto de los ultimos 12 meses de las cuentas del vendedor) y guardada
     # para que el historico del ciclo quede con la clase que se vio.
     clase_abc = db.Column(db.String(1))
+    # Ronda CN (2026-10-30, punto 6 del pedido del usuario): nota del
+    # vendedor sobre esta linea (por que proyecta lo que proyecta, o por
+    # que lo cambio). Se escribe en un modal, se lee pasando el mouse por
+    # encima en la grilla, y acompaña a cada variacion en el historial.
+    nota = db.Column(db.Text)
     # Promedio mensual de unidades de los ultimos 6 meses ("6UM" del SOP)
     # de las cuentas del vendedor, congelado al crear la linea.
     promedio_6um = db.Column(db.Float, default=0)
@@ -2770,7 +2775,13 @@ class ForecastCambio(db.Model):
     semana = db.Column(db.Integer)          # 1..13, o NULL si es un cambio de la linea entera
     valor_anterior = db.Column(db.Float, default=0)
     valor_nuevo = db.Column(db.Float, default=0)
-    accion = db.Column(db.String(40))       # edicion / alta / baja / copia_ciclo_anterior / envio / cierre_automatico
+    accion = db.Column(db.String(40))       # correccion / alta / baja / envio / cierre / cambio_vs_ciclo_anterior
+    # Ronda CN (2026-10-30, punto 7): la nota explicativa de ESA variacion.
+    # El historial deja de ser el registro de cada tecla y pasa a ser el de
+    # las correcciones despues de enviar y de los cambios sobre semanas que
+    # ya se habian informado en el ciclo anterior.
+    nota = db.Column(db.Text)
+    semana_inicio = db.Column(db.Date)      # el lunes de la semana afectada
     usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
     momento = db.Column(db.DateTime, default=datetime.utcnow)
 
