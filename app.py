@@ -79,7 +79,20 @@ def _normalizar_nombre(texto):
     return " ".join(limpio.upper().split())
 
 
-VERSION_SUITE = "CL"
+def _firma_producto(texto):
+    """Ronda CM (2026-10-29): texto comparable para decidir si dos filas del
+    catalogo son el MISMO producto. Ademas de quitar tildes y mayusculas
+    (ver _normalizar_nombre), quita TODOS los espacios.
+
+    Hace falta por un caso real: la misma variante de BVI PHYSIOL esta
+    cargada como 'MICROPURE 123 +07.0D' y como 'MICROPURE 123 +07.0 D'. Es
+    el mismo lente escrito de dos formas, y comparando con el espacio en
+    medio quedaban como productos distintos, lo que hacia ver una
+    "colision" de codigo interno donde en realidad hay una duplicacion."""
+    return _normalizar_nombre(texto).replace(" ", "")
+
+
+VERSION_SUITE = "CM"
 VERSION_SUITE_FECHA = "2026-10-29"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -3244,9 +3257,12 @@ def reparar_duplicados_catalogo_ronda_cl():
         return 0
     grupos = defaultdict(list)
     for variante in variantes:
+        # Ronda CM: la comparacion ignora espacios y tildes -- ver
+        # _firma_producto. Dentro de un MISMO producto padre, dos variantes
+        # que solo se diferencian en un espacio son la misma.
         grupos[(variante.producto_id,
-                (variante.codigo or "").strip().upper(),
-                (variante.descripcion or "").strip().upper())].append(variante)
+                _firma_producto(variante.codigo),
+                _firma_producto(variante.descripcion))].append(variante)
     repetidos = {k: v for k, v in grupos.items() if len(v) > 1}
     if not repetidos:
         return 0
@@ -3268,12 +3284,25 @@ def reparar_duplicados_catalogo_ronda_cl():
     except Exception:
         referenciadas = set(ids_sobrantes)  # ante la duda, no se borra nada
 
+    # Grafia "oficial" de cada codigo interno segun el mapeo maestro.
+    codigos_maestros = {}
+    try:
+        for fila in CodigoErgopyme.query.all():
+            if fila.codigo_interno:
+                codigos_maestros[fila.codigo_interno.strip()] = fila.codigo_proveedor or ""
+    except Exception:
+        codigos_maestros = {}
+
     borradas, desactivadas, grupos_limpiados = 0, 0, 0
     for grupo in repetidos.values():
         def _prioridad(v):
             return (
                 0 if (v.codigo_interno_inventario or "").strip() else 1,
                 0 if v.id in referenciadas else 1,
+                # Ronda CM: a igualdad de condiciones se prefiere la grafia
+                # que coincide con el mapeo maestro de Ergopyme.
+                0 if _firma_producto(v.codigo) == _firma_producto(
+                    (codigos_maestros.get((v.codigo_interno_inventario or "").strip()) or "")) else 1,
                 v.id,
             )
         ordenadas = sorted(grupo, key=_prioridad)
@@ -3361,10 +3390,19 @@ def reparar_usuarios_vendedores_ronda_ci():
 
     # Nombres de vendedor que existen hoy: los del maestro Cliente/Vendedor
     # (lo que el usuario acaba de actualizar) mas los cinco que nombro.
-    nombres = {v.strip() for (v,) in db.session.query(ClienteVendedor.vendedor).distinct().all() if (v or "").strip()}
-    nombres.update(VENDEDORES_FORECAST_SUGERIDOS)
+    # Ronda CM (2026-10-29): el orden importa y tiene que ser ESTABLE. Si el
+    # mismo nombre esta escrito de dos formas ("Mariana Perez" en la lista
+    # de referencia y "MARIÁNA PÉREZ" en el maestro), manda la grafia del
+    # MAESTRO Cliente/Vendedor, que es contra lo que se cruzan las cuentas.
+    # Antes se recorria un `set`, cuyo orden cambia entre arranques, asi que
+    # el nombre asignado podia salir distinto cada vez.
     por_nombre = {}
-    for nombre in nombres:
+    for (nombre,) in sorted(db.session.query(ClienteVendedor.vendedor).distinct().all(),
+                            key=lambda fila: (fila[0] or "")):
+        limpio = (nombre or "").strip()
+        if limpio:
+            por_nombre.setdefault(_normalizar_nombre(limpio), limpio)
+    for nombre in VENDEDORES_FORECAST_SUGERIDOS:
         por_nombre.setdefault(_normalizar_nombre(nombre), nombre)
 
     enlazados, gerencia = [], []
@@ -13729,7 +13767,8 @@ def _vendedores_conocidos():
     Usuarios: los nombres del maestro Cliente/Vendedor (que es contra lo
     que hay que calzar), sin duplicados por mayusculas o tildes."""
     nombres = {}
-    for (nombre,) in db.session.query(ClienteVendedor.vendedor).distinct().all():
+    for (nombre,) in sorted(db.session.query(ClienteVendedor.vendedor).distinct().all(),
+                            key=lambda fila: (fila[0] or "")):
         clave = _normalizar_nombre(nombre)
         if clave:
             nombres.setdefault(clave, (nombre or "").strip())
@@ -15126,6 +15165,7 @@ def stock_homologacion():
             })
         repetidos.sort(key=lambda r: (not r["misma_descripcion"], _normalizar_nombre(r["proveedor"]),
                                       _normalizar_nombre(r["codigo"])))
+    internos_repetidos = _codigos_internos_repetidos() if ver == "repetidos" else []
     total_repetidos = len(repetidos) if ver == "repetidos" else None
 
     return render_template(
@@ -15134,6 +15174,115 @@ def stock_homologacion():
         sin_codigo_productos=sin_codigo_productos, sin_codigo_variantes=sin_codigo_variantes,
         total_sin_codigo_interno=total_sin_codigo_interno,
         grupos_sin_codigo=grupos_sin_codigo, repetidos=repetidos, total_repetidos=total_repetidos,
+        internos_repetidos=internos_repetidos,
+    )
+
+
+def _codigos_internos_repetidos():
+    """Ronda CM (2026-10-29, a pedido del usuario: "puedes revisar en que
+    otros codigos esto esta duplicado?"): codigos internos de Inventarios
+    (Ergopyme) que estan asignados a MAS DE UN registro del catalogo.
+
+    Distingue los dos casos, que se resuelven de forma muy distinta:
+
+    - "copias": todos los registros son el MISMO producto (mismo proveedor,
+      mismo codigo de proveedor y misma descripcion). No es un error de
+      homologacion: es la duplicacion del catalogo. La limpieza automatica
+      (ver reparar_duplicados_catalogo_ronda_cl) las deja en una sola.
+    - "colision": el mismo codigo interno quedo en productos DISTINTOS. Eso
+      si hay que corregirlo a mano, porque significa que la venta de uno se
+      le esta cruzando al otro.
+
+    Devuelve la lista ordenada dejando primero las colisiones, que son las
+    que de verdad piden atencion."""
+    registros = defaultdict(list)
+    for producto in Producto.query.filter(Producto.activo.is_(True)).all():
+        codigo = (producto.codigo_interno_inventario or "").strip()
+        if codigo:
+            registros[codigo].append(("Producto", producto, producto))
+    for variante in ProductoVariante.query.join(Producto).filter(
+        Producto.activo.is_(True),
+        db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+    ).all():
+        codigo = (variante.codigo_interno_inventario or "").strip()
+        if codigo:
+            registros[codigo].append(("Variante", variante, variante.producto))
+
+    salida = []
+    for codigo, entradas in registros.items():
+        if len(entradas) < 2:
+            continue
+        firmas = {
+            (padre.proveedor_id if padre else None,
+             _firma_producto(objeto.codigo),
+             _firma_producto(objeto.descripcion))
+            for _, objeto, padre in entradas
+        }
+        detalle = []
+        for tipo, objeto, padre in entradas:
+            detalle.append({
+                "tipo": tipo,
+                "id": objeto.id,
+                "proveedor": padre.proveedor.nombre if padre and padre.proveedor else "",
+                "codigo": (objeto.codigo or "").strip(),
+                "descripcion": (objeto.descripcion or "").strip(),
+            })
+        detalle.sort(key=lambda d: (d["tipo"], d["id"]))
+        salida.append({
+            "codigo_interno": codigo,
+            "entradas": detalle,
+            "copias": len(firmas) == 1,
+            "cuantos": len(entradas),
+        })
+    salida.sort(key=lambda r: (r["copias"], -r["cuantos"], r["codigo_interno"]))
+    return salida
+
+
+@app.route("/stock/homologacion/internos-repetidos/descargar")
+@requiere_permiso("inventarios")
+def stock_homologacion_descargar_internos_repetidos():
+    """Ronda CM (2026-10-29): la misma lista de codigos internos repetidos,
+    en Excel, para poder revisarla fuera de la pantalla."""
+    filas = _codigos_internos_repetidos()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Codigos repetidos"
+    encabezados = ["Codigo interno", "Caso", "Registros", "Tipo", "Proveedor",
+                   "Codigo proveedor", "Descripcion", "ID"]
+    for col, titulo in enumerate(encabezados, start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.fill = PatternFill("solid", fgColor="C00000")
+        celda.alignment = Alignment(horizontal="center", vertical="center")
+    rojo = PatternFill("solid", fgColor="FFC7CE")
+    fila = 2
+    for grupo in filas:
+        for entrada in grupo["entradas"]:
+            ws.cell(row=fila, column=1, value=grupo["codigo_interno"])
+            celda_caso = ws.cell(
+                row=fila, column=2,
+                value="Copias del mismo producto" if grupo["copias"] else "COLISION: productos distintos")
+            if not grupo["copias"]:
+                celda_caso.fill = rojo
+            ws.cell(row=fila, column=3, value=grupo["cuantos"])
+            ws.cell(row=fila, column=4, value=entrada["tipo"])
+            ws.cell(row=fila, column=5, value=entrada["proveedor"])
+            ws.cell(row=fila, column=6, value=entrada["codigo"])
+            ws.cell(row=fila, column=7, value=entrada["descripcion"])
+            ws.cell(row=fila, column=8, value=f"{entrada['tipo'][0]}{entrada['id']}")
+            fila += 1
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:H{max(fila - 1, 2)}"
+    for col, ancho in zip(range(1, 9), (22, 30, 11, 11, 20, 26, 56, 10)):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return send_file(
+        buffer, as_attachment=True,
+        download_name=f"Codigos_internos_repetidos_{date.today().isoformat()}.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 

@@ -57,11 +57,76 @@
 </div>
 
 {% if ver == 'repetidos' %}
+{# Ronda CM (2026-10-29, a pedido del usuario: "puedes revisar en qué otros
+   códigos esto está duplicado?"): códigos internos de Inventarios que
+   quedaron en más de un registro del catálogo. #}
+<div class="card p-3 mb-3">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+    <h5 class="section-title mb-0">
+      Códigos internos en más de un producto
+      {% if internos_repetidos %}
+      <span class="badge bg-secondary">{{ internos_repetidos|length }}</span>
+      {% set colisiones = internos_repetidos|selectattr('copias', 'equalto', false)|list %}
+      {% if colisiones %}<span class="badge bg-danger">{{ colisiones|length }} colisión(es)</span>{% endif %}
+      {% endif %}
+    </h5>
+    {% if internos_repetidos %}
+    <a class="btn btn-sm btn-outline-primary"
+       href="{{ url_for('stock_homologacion_descargar_internos_repetidos') }}">
+      <i class="bi bi-download me-1"></i> Descargar en Excel
+    </a>
+    {% endif %}
+  </div>
+  {% if not internos_repetidos %}
+  <p class="text-muted mb-0">Ningún código interno está asignado a más de un producto.</p>
+  {% else %}
+  <p class="text-muted small">
+    Son dos casos muy distintos. <strong>Copias del mismo producto</strong>: el código quedó en
+    varios registros que son el mismo producto (mismo proveedor, mismo código y misma descripción)
+    — no es un error de homologación, es la duplicación del catálogo, y la limpieza automática los
+    deja en uno solo al arrancar. <strong>Colisión</strong>: el mismo código interno quedó en
+    productos distintos, y eso sí hay que corregirlo: la venta de uno se le está cruzando al otro.
+  </p>
+  <div class="table-responsive" style="max-height: 520px; overflow-y: auto;">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="sticky-top bg-white">
+        <tr><th>Código interno</th><th>Tipo</th><th>Proveedor</th><th>Código proveedor</th><th>Descripción</th></tr>
+      </thead>
+      <tbody>
+        {% for grupo in internos_repetidos %}
+        <tr class="table-light">
+          <td colspan="5" class="fw-semibold">
+            {{ grupo.codigo_interno }}
+            <span class="badge bg-secondary">{{ grupo.cuantos }} registros</span>
+            {% if grupo.copias %}
+            <span class="badge bg-warning text-dark">Copias del mismo producto</span>
+            {% else %}
+            <span class="badge bg-danger">Colisión: productos distintos</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% for e in grupo.entradas %}
+        <tr>
+          <td></td>
+          <td class="small"><span class="badge bg-light text-dark border">{{ e.tipo }}</span></td>
+          <td class="small text-muted">{{ e.proveedor }}</td>
+          <td class="small">{{ e.codigo }}</td>
+          <td class="small" style="max-width: 420px;">{{ e.descripcion }}</td>
+        </tr>
+        {% endfor %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+
   {% if not repetidos %}
   <div class="alert alert-success">
     No hay códigos repetidos: cada código de proveedor está una sola vez en el catálogo.
   </div>
   {% else %}
+  <h5 class="section-title">Códigos de proveedor repetidos en el catálogo</h5>
   <div class="alert alert-info">
     <i class="bi bi-info-circle me-1"></i>
     Las copias idénticas de una variante (mismo padre, mismo código y misma descripción) se limpian
