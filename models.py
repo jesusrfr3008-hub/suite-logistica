@@ -242,6 +242,14 @@ class Producto(db.Model):
     # de verdad para costos).
     unidad_medida = db.Column(db.String(30))
 
+    # Ronda CL (2026-10-29, a pedido del usuario: "los que no tienen puede
+    # que nunca se hayan importado por lo que no se le ha creado tal
+    # codigo"): marcado a mano (o escribiendo NO APLICA en la planilla de
+    # homologacion) para que ese producto deje de figurar entre los
+    # pendientes. No es lo mismo que "todavia no lo homologo": es "este
+    # producto no tiene ni va a tener codigo en Inventarios".
+    no_requiere_codigo_interno = db.Column(db.Boolean, default=False)
+
     # Ronda V (2026-09-12): codigo interno con el que este producto se
     # identifica en el OTRO sistema de la empresa (ventas/inventario,
     # "Ergopyme") -- se homologa una vez (ver seed_homologacion_y_stock_
@@ -285,6 +293,9 @@ class ProductoVariante(db.Model):
     producto_id = db.Column(db.Integer, db.ForeignKey("productos.id"), nullable=False)
     codigo = db.Column(db.String(120), nullable=False)
     descripcion = db.Column(db.String(500), nullable=False)
+
+    # Ronda CL (2026-10-29): ver Producto.no_requiere_codigo_interno.
+    no_requiere_codigo_interno = db.Column(db.Boolean, default=False)
 
     # Ronda V (2026-09-12): mismo proposito que Producto.codigo_interno_
     # inventario, pero a nivel de variante -- en el sistema de Inventarios

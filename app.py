@@ -79,7 +79,7 @@ def _normalizar_nombre(texto):
     return " ".join(limpio.upper().split())
 
 
-VERSION_SUITE = "CK"
+VERSION_SUITE = "CL"
 VERSION_SUITE_FECHA = "2026-10-29"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -642,10 +642,14 @@ def ensure_schema_migrations():
         "productos": [
             ("codigo_interno_inventario", "VARCHAR(40)"),
             ("unidad_medida", "VARCHAR(30)"),
+            # Ronda CL (2026-10-29): ver Producto.no_requiere_codigo_interno.
+            ("no_requiere_codigo_interno", "BOOLEAN DEFAULT 0"),
         ],
         "producto_variantes": [
             ("codigo_interno_inventario", "VARCHAR(40)"),
             ("activo", "BOOLEAN DEFAULT 1"),
+            # Ronda CL (2026-10-29): ver Producto.no_requiere_codigo_interno.
+            ("no_requiere_codigo_interno", "BOOLEAN DEFAULT 0"),
         ],
         "roles": [
             ("permiso_consultar_stock", "BOOLEAN DEFAULT 0"),
@@ -3209,6 +3213,92 @@ def reparar_variantes_physiol_ronda_ae():
         )
 
 
+def reparar_duplicados_catalogo_ronda_cl():
+    """Ronda CL (2026-10-29, a pedido del usuario: "hay codigos de productos
+    que estan muy repetidos, solo debe haber 1 solo codigo por producto").
+
+    Limpia las VARIANTES fantasma: filas con el MISMO producto padre, el
+    MISMO codigo y la MISMA descripcion. No son productos distintos -- son
+    copias que se fueron acumulando cada vez que corrieron las siembras de
+    variantes (PHYSIOL/ANKORIS) sobre una base que ya las tenia. En el
+    archivo que mando el usuario habia 76 copias de 'ANKORIS 21.5D 3.00C' y
+    otras 76 de 'ANKORIS 25.0D 1.50C'.
+
+    Se queda UNA por grupo, eligiendo en este orden: la que ya tiene codigo
+    interno de Inventarios, si no la que esta referenciada en alguna orden
+    de compra, si no la mas antigua (menor id). Las demas se borran cuando
+    no las referencia nada, y si algo las referencia se desactivan en vez de
+    borrarlas -- nunca se rompe una orden ya emitida.
+
+    NO toca los productos con el mismo codigo pero DESCRIPCION distinta:
+    esos son colisiones reales del catalogo del proveedor y hay que mirarlos
+    uno por uno (salen listados en Homologación > Códigos repetidos)."""
+    try:
+        # Solo las ACTIVAS: una copia ya desactivada en una pasada anterior
+        # es un caso resuelto, no un duplicado por resolver (si no, la
+        # reparacion volveria a "encontrar" el mismo grupo en cada arranque).
+        variantes = ProductoVariante.query.filter(
+            db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None))
+        ).all()
+    except Exception:
+        return 0
+    grupos = defaultdict(list)
+    for variante in variantes:
+        grupos[(variante.producto_id,
+                (variante.codigo or "").strip().upper(),
+                (variante.descripcion or "").strip().upper())].append(variante)
+    repetidos = {k: v for k, v in grupos.items() if len(v) > 1}
+    if not repetidos:
+        return 0
+
+    sobrantes = [v for grupo in repetidos.values() for v in grupo]
+    ids_sobrantes = {v.id for v in sobrantes}
+    # Que variantes estan referenciadas desde otra tabla: esas NO se borran.
+    # (Las lineas de Orden de Compra guardan el codigo de la variante como
+    # texto, no su id, asi que no entran aca -- ver
+    # OrdenCompraLinea.variante_codigo.)
+    referenciadas = set()
+    try:
+        for modelo in (HomologacionStock, StockExistencia, ForecastLinea):
+            for (vid,) in db.session.query(modelo.variante_id).filter(
+                modelo.variante_id.in_(ids_sobrantes)
+            ).distinct().all():
+                if vid:
+                    referenciadas.add(vid)
+    except Exception:
+        referenciadas = set(ids_sobrantes)  # ante la duda, no se borra nada
+
+    borradas, desactivadas, grupos_limpiados = 0, 0, 0
+    for grupo in repetidos.values():
+        def _prioridad(v):
+            return (
+                0 if (v.codigo_interno_inventario or "").strip() else 1,
+                0 if v.id in referenciadas else 1,
+                v.id,
+            )
+        ordenadas = sorted(grupo, key=_prioridad)
+        quedarse = ordenadas[0]
+        # Si alguna copia traia el codigo interno y la elegida no, se hereda.
+        if not (quedarse.codigo_interno_inventario or "").strip():
+            for otra in ordenadas[1:]:
+                if (otra.codigo_interno_inventario or "").strip():
+                    quedarse.codigo_interno_inventario = otra.codigo_interno_inventario
+                    break
+        for otra in ordenadas[1:]:
+            if otra.id in referenciadas:
+                otra.activo = False
+                desactivadas += 1
+            else:
+                db.session.delete(otra)
+                borradas += 1
+        grupos_limpiados += 1
+    db.session.commit()
+    print(f"[reparar_ronda_cl] Catálogo: {grupos_limpiados} grupo(s) de variantes duplicadas "
+          f"resueltos -- {borradas} borrada(s), {desactivadas} desactivada(s) por estar "
+          f"referenciadas desde Stock, Homologación o un forecast.")
+    return borradas + desactivadas
+
+
 def reparar_forecast_claves_ronda_ck():
     """Ronda CK (2026-10-29): las lineas de forecast creadas antes de esta
     ronda se identificaban por el codigo interno de Ergopyme. Ahora se
@@ -4111,6 +4201,7 @@ with app.app_context():
     _paso_arranque_seguro("reparar_lotes_historico_ronda_by", reparar_lotes_historico_ronda_by)
     _paso_arranque_seguro("seed_facturas_proveedor_pendientes", seed_facturas_proveedor_pendientes)
     _paso_arranque_seguro("reparar_usuarios_vendedores_ronda_ci", reparar_usuarios_vendedores_ronda_ci)
+    _paso_arranque_seguro("reparar_duplicados_catalogo_ronda_cl", reparar_duplicados_catalogo_ronda_cl)
     _paso_arranque_seguro("reparar_forecast_claves_ronda_ck", reparar_forecast_claves_ronda_ck)
 
 
@@ -14971,7 +15062,9 @@ def stock_homologacion():
     encontrarlos y asignarlos proactivamente en vez de descubrirlos recién
     al armar el Costeo."""
     ver = request.args.get("ver", "pendiente").strip().lower()
-    if ver == "todos":
+    if ver == "repetidos":
+        estados = []
+    elif ver == "todos":
         estados = ["pendiente", "sin_marca"]
     elif ver == "sin_marca":
         estados = ["sin_marca"]
@@ -14991,22 +15084,72 @@ def stock_homologacion():
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
 
     sin_codigo_productos = (
-        Producto.query.filter(Producto.activo.is_(True), Producto.codigo_interno_inventario.is_(None))
+        Producto.query.filter(Producto.activo.is_(True), Producto.codigo_interno_inventario.is_(None),
+                              db.or_(Producto.no_requiere_codigo_interno.is_(False),
+                                     Producto.no_requiere_codigo_interno.is_(None)))
         .order_by(Producto.codigo).all()
     )
     sin_codigo_variantes = (
         ProductoVariante.query.join(Producto)
-        .filter(Producto.activo.is_(True), ProductoVariante.codigo_interno_inventario.is_(None))
+        .filter(Producto.activo.is_(True), ProductoVariante.codigo_interno_inventario.is_(None),
+                db.or_(ProductoVariante.no_requiere_codigo_interno.is_(False),
+                       ProductoVariante.no_requiere_codigo_interno.is_(None)))
         .order_by(ProductoVariante.codigo).all()
     )
-    total_sin_codigo_interno = len(sin_codigo_productos) + len(sin_codigo_variantes)
+    # Ronda CL (2026-10-29): la cuenta que manda es la de CÓDIGOS distintos
+    # por completar, no la de registros del catálogo -- un mismo código
+    # puede estar repetido y se homologa una sola vez.
+    grupos_sin_codigo = _grupos_sin_codigo_interno() if ver == "sin_codigo_interno" else []
+    total_sin_codigo_interno = len(_grupos_sin_codigo_interno())
+
+    # Ronda CL: códigos que están más de una vez en el catálogo del mismo
+    # proveedor. Los que además traen descripciones distintas son colisiones
+    # reales y hay que mirarlos uno por uno.
+    repetidos = []
+    if ver == "repetidos":
+        grupos = defaultdict(list)
+        for producto in Producto.query.join(Proveedor).filter(Producto.activo.is_(True)).all():
+            codigo = (producto.codigo or "").strip()
+            if not codigo or codigo == "-":
+                continue
+            grupos[(producto.proveedor_id, codigo.upper())].append(producto)
+        for (proveedor_id, codigo), productos_grupo in grupos.items():
+            if len(productos_grupo) < 2:
+                continue
+            proveedor = Proveedor.query.get(proveedor_id)
+            descripciones = {(p.descripcion or "").strip().upper() for p in productos_grupo}
+            repetidos.append({
+                "proveedor": proveedor.nombre if proveedor else "",
+                "codigo": codigo,
+                "productos": sorted(productos_grupo, key=lambda p: p.id),
+                "misma_descripcion": len(descripciones) == 1,
+            })
+        repetidos.sort(key=lambda r: (not r["misma_descripcion"], _normalizar_nombre(r["proveedor"]),
+                                      _normalizar_nombre(r["codigo"])))
+    total_repetidos = len(repetidos) if ver == "repetidos" else None
 
     return render_template(
         "stock/homologacion.html", pendientes=pendientes, proveedores=proveedores,
         ver=ver, total_sin_marca=total_sin_marca, total_pendiente=total_pendiente,
         sin_codigo_productos=sin_codigo_productos, sin_codigo_variantes=sin_codigo_variantes,
         total_sin_codigo_interno=total_sin_codigo_interno,
+        grupos_sin_codigo=grupos_sin_codigo, repetidos=repetidos, total_repetidos=total_repetidos,
     )
+
+
+@app.route("/stock/homologacion/producto/<int:producto_id>/desactivar", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_homologacion_desactivar_producto(producto_id):
+    """Ronda CL (2026-10-29): sacar del catálogo una de las copias de un
+    código repetido. Se DESACTIVA, no se borra: deja de aparecer en
+    búsquedas y listas, pero las órdenes y costeos que ya lo usaron siguen
+    intactos, y se puede volver a activar desde el catálogo del proveedor."""
+    producto = Producto.query.get_or_404(producto_id)
+    producto.activo = False
+    db.session.commit()
+    flash(f"Producto '{producto.codigo} — {(producto.descripcion or '')[:60]}' desactivado. "
+          "Puedes volver a activarlo desde el catálogo del proveedor.", "success")
+    return redirect(url_for("stock_homologacion", ver="repetidos"))
 
 
 @app.route("/stock/homologacion/asignar-codigo-interno", methods=["POST"])
@@ -15066,35 +15209,39 @@ def stock_homologacion_asignar_codigo_interno():
 
 
 _ENCABEZADOS_HOMOLOGACION_FALTANTES = [
-    "Proveedor", "Codigo Proveedor", "Descripcion", "Tipo",
+    "Proveedor", "Codigo Proveedor", "Descripcion", "Tipo", "Items",
     "CODIGO INTERNO ERGOPYME", "ID",
 ]
 
+# Lo que el usuario puede escribir en la columna del codigo para decir "este
+# producto no lleva codigo de Inventarios" (nunca se importo, no se vende
+# por ese sistema): deja de figurar entre los pendientes.
+_MARCAS_NO_APLICA = {"NO APLICA", "N/A", "NA", "NO", "-", "SIN CODIGO", "NO APLICA."}
 
-@app.route("/stock/homologacion/faltantes/descargar")
-@requiere_permiso("inventarios")
-def stock_homologacion_descargar_faltantes():
-    """Ronda CK (2026-10-29, punto 5 del pedido del usuario): planilla con
-    TODOS los productos del catalogo que todavia no tienen su codigo interno
-    de Inventarios (Ergopyme), para completarla afuera y volver a subirla.
 
-    Sin ese codigo no hay forma de cruzar la venta contra el producto del
-    proveedor, asi que en el S&OP esos productos aparecen sin promedio -- es
-    justamente lo que el usuario quiere dejar resuelto antes de empezar a
-    proyectar.
+def _grupos_sin_codigo_interno(proveedor_sel=None):
+    """Ronda CL (2026-10-29, a pedido del usuario: "solo debe haber 1 solo
+    codigo por producto"): los faltantes AGRUPADOS por proveedor + codigo +
+    descripcion, en vez de una fila por cada registro del catalogo.
 
-    La columna ID es la que permite volver a encontrar exactamente la misma
-    fila al subir el archivo: no hay que tocarla."""
-    proveedor_sel = request.args.get("proveedor", "").strip()
+    El mismo codigo puede estar varias veces en el catalogo (copias de una
+    siembra repetida, o el mismo codigo cargado con dos descripciones). Para
+    homologar no hay que escribirlo N veces: se completa UNA vez y se aplica
+    a todos los registros de ese grupo.
 
+    Devuelve [(proveedor, codigo, descripcion, tipo, [ids])] ordenado."""
     productos = Producto.query.join(Proveedor).filter(
         Producto.activo.is_(True),
+        db.or_(Producto.no_requiere_codigo_interno.is_(False),
+               Producto.no_requiere_codigo_interno.is_(None)),
         db.or_(Producto.codigo_interno_inventario.is_(None),
                Producto.codigo_interno_inventario == ""),
     )
     variantes = ProductoVariante.query.join(Producto).join(Proveedor).filter(
         Producto.activo.is_(True),
         db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+        db.or_(ProductoVariante.no_requiere_codigo_interno.is_(False),
+               ProductoVariante.no_requiere_codigo_interno.is_(None)),
         db.or_(ProductoVariante.codigo_interno_inventario.is_(None),
                ProductoVariante.codigo_interno_inventario == ""),
     )
@@ -15102,18 +15249,51 @@ def stock_homologacion_descargar_faltantes():
         productos = productos.filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
         variantes = variantes.filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
 
-    filas = []
-    for producto in productos.order_by(Proveedor.nombre, Producto.codigo).all():
-        # Una familia con variantes se homologa por variante, no por el
-        # codigo padre: el padre no se compra ni se vende como tal.
-        if ProductoVariante.query.filter_by(producto_id=producto.id).count():
+    # Un producto padre que tiene variantes no se homologa por si mismo: lo
+    # que se compra y se vende son sus variantes.
+    con_variantes = {
+        pid for (pid,) in db.session.query(ProductoVariante.producto_id).distinct().all()
+    }
+    grupos = {}
+    for producto in productos.all():
+        if producto.id in con_variantes:
             continue
-        filas.append((producto.proveedor.nombre if producto.proveedor else "", producto.codigo,
-                      producto.descripcion, "Producto", f"P{producto.id}"))
-    for variante in variantes.order_by(Proveedor.nombre, ProductoVariante.codigo).all():
-        filas.append((variante.producto.proveedor.nombre if variante.producto and variante.producto.proveedor else "",
-                      variante.codigo, variante.descripcion, "Variante", f"V{variante.id}"))
-    filas.sort(key=lambda f: (_normalizar_nombre(f[0]), _normalizar_nombre(f[1])))
+        proveedor = producto.proveedor.nombre if producto.proveedor else ""
+        clave = (_normalizar_nombre(proveedor), (producto.codigo or "").strip().upper(),
+                 (producto.descripcion or "").strip().upper())
+        grupo = grupos.setdefault(clave, [proveedor, (producto.codigo or "").strip(),
+                                          (producto.descripcion or "").strip(), "Producto", []])
+        grupo[4].append(f"P{producto.id}")
+    for variante in variantes.all():
+        producto = variante.producto
+        proveedor = producto.proveedor.nombre if producto and producto.proveedor else ""
+        clave = (_normalizar_nombre(proveedor), (variante.codigo or "").strip().upper(),
+                 (variante.descripcion or "").strip().upper())
+        grupo = grupos.setdefault(clave, [proveedor, (variante.codigo or "").strip(),
+                                          (variante.descripcion or "").strip(), "Variante", []])
+        grupo[4].append(f"V{variante.id}")
+    salida = list(grupos.values())
+    salida.sort(key=lambda g: (_normalizar_nombre(g[0]), _normalizar_nombre(g[1]), _normalizar_nombre(g[2])))
+    return salida
+
+
+@app.route("/stock/homologacion/faltantes/descargar")
+@requiere_permiso("inventarios")
+def stock_homologacion_descargar_faltantes():
+    """Ronda CK (2026-10-29, punto 5 del pedido del usuario): planilla con
+    los productos del catalogo que todavia no tienen su codigo interno de
+    Inventarios (Ergopyme), para completarla afuera y volver a subirla.
+
+    Sin ese codigo no hay forma de cruzar la venta contra el producto del
+    proveedor, asi que en el S&OP esos productos aparecen sin promedio.
+
+    Ronda CL: UNA fila por codigo (proveedor + codigo + descripcion). La
+    columna "Items" dice a cuantos registros del catalogo se le va a aplicar
+    lo que se escriba, y la columna ID -- que no hay que tocar -- los lleva
+    a todos. Si un producto no lleva codigo de Inventarios (nunca se
+    importo), se escribe NO APLICA y deja de aparecer en la lista."""
+    proveedor_sel = request.args.get("proveedor", "").strip()
+    grupos = _grupos_sin_codigo_interno(proveedor_sel or None)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -15124,17 +15304,51 @@ def stock_homologacion_descargar_faltantes():
         celda.fill = PatternFill("solid", fgColor="2F5597")
         celda.alignment = Alignment(horizontal="center", vertical="center")
     amarillo = PatternFill("solid", fgColor="FFF2CC")
-    for i, (proveedor, codigo, descripcion, tipo, clave) in enumerate(filas, start=2):
+    naranja = PatternFill("solid", fgColor="FCE4D6")
+    for i, (proveedor, codigo, descripcion, tipo, ids) in enumerate(grupos, start=2):
         ws.cell(row=i, column=1, value=proveedor)
-        ws.cell(row=i, column=2, value=codigo)
+        celda_codigo = ws.cell(row=i, column=2, value=codigo)
+        if not codigo or codigo == "-":
+            # Sin codigo de proveedor real no hay forma de distinguirlo: se
+            # marca para que el usuario lo vea de inmediato.
+            celda_codigo.fill = naranja
         ws.cell(row=i, column=3, value=descripcion)
         ws.cell(row=i, column=4, value=tipo)
-        ws.cell(row=i, column=5).fill = amarillo       # columna a completar
-        ws.cell(row=i, column=6, value=clave)
+        ws.cell(row=i, column=5, value=len(ids))
+        ws.cell(row=i, column=6).fill = amarillo       # columna a completar
+        ws.cell(row=i, column=7, value=",".join(ids))
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:F{max(len(filas) + 1, 2)}"
-    for col, ancho in zip(range(1, 7), (26, 26, 60, 12, 26, 10)):
+    ws.auto_filter.ref = f"A1:G{max(len(grupos) + 1, 2)}"
+    for col, ancho in zip(range(1, 8), (22, 26, 58, 11, 8, 26, 30)):
         ws.column_dimensions[get_column_letter(col)].width = ancho
+
+    # Hoja de instrucciones, para que la planilla se explique sola.
+    guia = wb.create_sheet("Instrucciones")
+    texto = [
+        ("Cómo completar esta planilla", True),
+        ("", False),
+        ("1. Escribe el código interno de Inventarios (Ergopyme) en la columna amarilla", False),
+        ("   CODIGO INTERNO ERGOPYME, y vuelve a subir el archivo en Consulta de Stock >", False),
+        ("   Homologación > Sin código Ergopyme.", False),
+        ("", False),
+        ("2. Si ese producto NO lleva código de Inventarios (nunca se importó, no se vende", False),
+        ("   por ese sistema), escribe NO APLICA. Deja de aparecer en esta lista.", False),
+        ("", False),
+        ("3. Deja en blanco lo que todavía no sepas: vuelve a salir en la próxima descarga.", False),
+        ("", False),
+        ("4. NO borres ni muevas la columna ID: es la que permite volver a encontrar cada", False),
+        ("   producto. Una fila puede cubrir varios registros del catálogo (columna Items);", False),
+        ("   lo que escribas se aplica a todos ellos de una vez.", False),
+        ("", False),
+        ("5. Las celdas de código en naranja son productos que en el catálogo no tienen", False),
+        ("   código de proveedor (viene vacío o '-'), por eso se identifican sólo por su", False),
+        ("   descripción.", False),
+    ]
+    for i, (linea, negrita) in enumerate(texto, start=1):
+        celda = guia.cell(row=i, column=1, value=linea)
+        if negrita:
+            celda.font = Font(bold=True, size=13)
+    guia.column_dimensions["A"].width = 95
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -15152,14 +15366,18 @@ def stock_homologacion_descargar_faltantes():
 @app.route("/stock/homologacion/faltantes/cargar", methods=["POST"])
 @requiere_permiso("inventarios")
 def stock_homologacion_cargar_faltantes():
-    """Ronda CK (2026-10-29, punto 5): vuelve a subir la planilla con la
-    columna "CODIGO INTERNO ERGOPYME" completada.
+    """Ronda CK (punto 5), ampliado en la ronda CL: vuelve a subir la
+    planilla con la columna "CODIGO INTERNO ERGOPYME" completada.
 
     Por cada fila con codigo: 1) se le escribe al producto/variante (es lo
     que lo deja entrar en la planilla de Costeo), y 2) se crea o actualiza
     su fila en CodigoErgopyme con origen 'manual', que es la tabla contra la
     que se cruzan las ventas. Las filas 'manual' no se pisan cuando se
-    reelee el archivo maestro en el arranque."""
+    reelee el archivo maestro en el arranque.
+
+    Una fila puede traer VARIOS ids (columna ID separada por comas): lo que
+    se escribio se aplica a todos. Y si dice NO APLICA, ese producto se
+    marca como que no lleva codigo y deja de figurar entre los pendientes."""
     archivo = request.files.get("archivo")
     if not archivo or not archivo.filename:
         flash("Selecciona la planilla de homologación completada.", "warning")
@@ -15173,73 +15391,88 @@ def stock_homologacion_cargar_faltantes():
     except Exception as exc:
         flash(f"No se pudo leer el archivo: {exc}", "danger")
         return redirect(url_for("stock_homologacion", ver="sin_codigo_interno"))
-    ws = wb.worksheets[0]
 
-    encabezados = [str(c.value).strip().upper() if c.value is not None else ""
-                   for c in next(ws.iter_rows(min_row=1, max_row=1))]
-    def _columna(nombre):
+    # La hoja buena es la que trae los encabezados, no necesariamente la
+    # primera: el usuario puede haber agregado hojas (tablas dinamicas).
+    ws = None
+    for hoja in wb.worksheets:
         try:
-            return encabezados.index(nombre.upper())
-        except ValueError:
-            return None
-    col_codigo = _columna("CODIGO INTERNO ERGOPYME")
-    col_id = _columna("ID")
-    if col_codigo is None or col_id is None:
-        flash("La planilla no trae las columnas 'CODIGO INTERNO ERGOPYME' e 'ID'. "
+            encabezados = [str(c.value).strip().upper() if c.value is not None else ""
+                           for c in next(hoja.iter_rows(min_row=1, max_row=1))]
+        except StopIteration:
+            continue
+        if "ID" in encabezados and "CODIGO INTERNO ERGOPYME" in encabezados:
+            ws = hoja
+            break
+    if ws is None:
+        flash("La planilla no trae las columnas 'CODIGO INTERNO ERGOPYME' e 'ID' en ninguna hoja. "
               "Descárgala de nuevo desde esta misma pantalla y complétala sin borrar columnas.", "danger")
         return redirect(url_for("stock_homologacion", ver="sin_codigo_interno"))
+    col_codigo = encabezados.index("CODIGO INTERNO ERGOPYME")
+    col_id = encabezados.index("ID")
 
-    asignados, repetidos, sin_encontrar, iguales = 0, [], [], 0
+    asignados, repetidos, sin_encontrar, iguales, no_aplica = 0, [], [], 0, 0
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row or len(row) <= max(col_codigo, col_id):
             continue
-        codigo = _normalizar_codigo_ergopyme(row[col_codigo]) if row[col_codigo] is not None else ""
-        clave = str(row[col_id]).strip() if row[col_id] is not None else ""
-        if not codigo or not clave:
+        crudo = str(row[col_codigo]).strip() if row[col_codigo] is not None else ""
+        claves = [c.strip() for c in str(row[col_id] or "").split(",") if c.strip()]
+        if not crudo or not claves:
             continue
-        objetivo = None
-        if clave[:1].upper() == "P":
-            objetivo = Producto.query.get(parse_int(clave[1:], 0))
-        elif clave[:1].upper() == "V":
-            objetivo = ProductoVariante.query.get(parse_int(clave[1:], 0))
-        if objetivo is None:
-            sin_encontrar.append(clave)
+        marca_no_aplica = crudo.upper() in _MARCAS_NO_APLICA
+        codigo = "" if marca_no_aplica else _normalizar_codigo_ergopyme(crudo)
+        if not codigo and not marca_no_aplica:
             continue
-        if (objetivo.codigo_interno_inventario or "").strip() == codigo:
-            iguales += 1
-            continue
+        for clave in claves:
+            objetivo = None
+            if clave[:1].upper() == "P":
+                objetivo = Producto.query.get(parse_int(clave[1:], 0))
+            elif clave[:1].upper() == "V":
+                objetivo = ProductoVariante.query.get(parse_int(clave[1:], 0))
+            if objetivo is None:
+                sin_encontrar.append(clave)
+                continue
+            if marca_no_aplica:
+                objetivo.no_requiere_codigo_interno = True
+                no_aplica += 1
+                continue
+            if (objetivo.codigo_interno_inventario or "").strip() == codigo:
+                iguales += 1
+                continue
 
-        # Aviso si ese codigo interno ya esta en otro producto.
-        otro_p = Producto.query.filter(
-            Producto.codigo_interno_inventario == codigo,
-            Producto.id != (objetivo.id if isinstance(objetivo, Producto) else -1)).first()
-        otro_v = ProductoVariante.query.filter(
-            ProductoVariante.codigo_interno_inventario == codigo,
-            ProductoVariante.id != (objetivo.id if isinstance(objetivo, ProductoVariante) else -1)).first()
-        if otro_p or otro_v:
-            repetidos.append(f"{codigo} ({(otro_p or otro_v).codigo})")
+            # Aviso si ese codigo interno ya esta en otro producto.
+            otro_p = Producto.query.filter(
+                Producto.codigo_interno_inventario == codigo,
+                Producto.id != (objetivo.id if isinstance(objetivo, Producto) else -1)).first()
+            otro_v = ProductoVariante.query.filter(
+                ProductoVariante.codigo_interno_inventario == codigo,
+                ProductoVariante.id != (objetivo.id if isinstance(objetivo, ProductoVariante) else -1)).first()
+            if (otro_p or otro_v) and len(claves) == 1:
+                repetidos.append(f"{codigo} ({(otro_p or otro_v).codigo})")
 
-        objetivo.codigo_interno_inventario = codigo
-        producto = objetivo if isinstance(objetivo, Producto) else objetivo.producto
-        nombre_proveedor = producto.proveedor.nombre if producto and producto.proveedor else ""
-        # Y la contraparte: la tabla con la que se cruzan las ventas.
-        homologacion = CodigoErgopyme.query.filter_by(codigo_interno=codigo).first()
-        if not homologacion:
-            homologacion = CodigoErgopyme(codigo_interno=codigo)
-            db.session.add(homologacion)
-        homologacion.proveedor_nombre = nombre_proveedor
-        homologacion.codigo_proveedor = (objetivo.codigo or "")[:120]
-        homologacion.descripcion = (objetivo.descripcion or "")[:500]
-        homologacion.origen = "manual"
-        asignados += 1
+            objetivo.codigo_interno_inventario = codigo
+            producto = objetivo if isinstance(objetivo, Producto) else objetivo.producto
+            nombre_proveedor = producto.proveedor.nombre if producto and producto.proveedor else ""
+            # Y la contraparte: la tabla con la que se cruzan las ventas.
+            homologacion = CodigoErgopyme.query.filter_by(codigo_interno=codigo).first()
+            if not homologacion:
+                homologacion = CodigoErgopyme(codigo_interno=codigo)
+                db.session.add(homologacion)
+            homologacion.proveedor_nombre = nombre_proveedor
+            homologacion.codigo_proveedor = (objetivo.codigo or "")[:120]
+            homologacion.descripcion = (objetivo.descripcion or "")[:500]
+            homologacion.origen = "manual"
+            asignados += 1
     db.session.commit()
 
     mensaje = f"{asignados} código(s) interno(s) asignado(s)."
+    if no_aplica:
+        mensaje += f" {no_aplica} marcado(s) como 'no aplica' (ya no aparecen en la lista)."
     if iguales:
         mensaje += f" {iguales} ya estaba(n) igual."
     if sin_encontrar:
         mensaje += f" {len(sin_encontrar)} fila(s) con ID desconocido se omitieron."
-    flash(mensaje, "success" if asignados else "warning")
+    flash(mensaje, "success" if (asignados or no_aplica) else "warning")
     if repetidos:
         flash("OJO: estos códigos internos ya estaban en otro producto, revisa que no sea un error: "
               + ", ".join(sorted(set(repetidos))[:10]) + ".", "warning")

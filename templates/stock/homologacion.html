@@ -27,6 +27,12 @@
      class="btn btn-sm {{ 'btn-brand' if ver == 'sin_codigo_interno' else 'btn-outline-secondary' }}">
     Sin código Ergopyme <span class="badge bg-light text-dark">{{ total_sin_codigo_interno }}</span>
   </a>
+  {# Ronda CL (2026-10-29): códigos que están más de una vez en el catálogo
+     del mismo proveedor -- lo que el usuario detectó en la planilla. #}
+  <a href="{{ url_for('stock_homologacion', ver='repetidos') }}"
+     class="btn btn-sm {{ 'btn-brand' if ver == 'repetidos' else 'btn-outline-secondary' }}">
+    Códigos repetidos
+  </a>
 </div>
 <div class="text-muted small mb-3">
   {% if ver == 'pendiente' %}
@@ -36,6 +42,10 @@
   {% elif ver == 'sin_marca' %}
   Mostrando solo los códigos ya clasificados como <strong>"Sin Marca"</strong> (genéricos, sin
   proveedor asignado).
+  {% elif ver == 'repetidos' %}
+  Mostrando los códigos que aparecen <strong>más de una vez</strong> en el catálogo del mismo
+  proveedor. Cuando además cambia la descripción son dos productos distintos cargados con el mismo
+  código: hay que revisarlos uno por uno.
   {% elif ver == 'sin_codigo_interno' %}
   Mostrando los productos/variantes de <strong>nuestro catálogo</strong> que todavía NO tienen su
   propio código interno Ergopyme asignado -- dirección inversa a las otras pestañas: acá el código
@@ -46,6 +56,66 @@
   {% endif %}
 </div>
 
+{% if ver == 'repetidos' %}
+  {% if not repetidos %}
+  <div class="alert alert-success">
+    No hay códigos repetidos: cada código de proveedor está una sola vez en el catálogo.
+  </div>
+  {% else %}
+  <div class="alert alert-info">
+    <i class="bi bi-info-circle me-1"></i>
+    Las copias idénticas de una variante (mismo padre, mismo código y misma descripción) se limpian
+    solas al arrancar. Acá quedan los casos que hay que mirar: el mismo código con
+    <strong>descripciones distintas</strong>, o con precios distintos. Desactivar saca el producto de
+    las búsquedas sin borrar nada: las órdenes y costeos que ya lo usaron siguen intactos.
+  </div>
+  <div class="card p-3">
+    <div class="table-responsive" style="max-height: 620px; overflow-y: auto;">
+      <table class="table table-sm align-middle mb-0">
+        <thead class="sticky-top bg-white">
+          <tr>
+            <th>Proveedor</th><th>Código</th><th>Descripción</th>
+            <th class="text-end">Precio caja</th><th class="text-end">Precio unitario</th>
+            <th>Código interno</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for grupo in repetidos %}
+          <tr class="table-light">
+            <td colspan="7" class="fw-semibold">
+              {{ grupo.proveedor }} · {{ grupo.codigo }}
+              <span class="badge bg-secondary">{{ grupo.productos|length }} copias</span>
+              {% if grupo.misma_descripcion %}
+              <span class="badge bg-warning text-dark">misma descripción</span>
+              {% else %}
+              <span class="badge bg-danger">descripciones distintas</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% for p in grupo.productos %}
+          <tr>
+            <td class="text-muted small">{{ p.proveedor.nombre }}</td>
+            <td class="small">{{ p.codigo }}</td>
+            <td class="small" style="max-width: 380px;">{{ p.descripcion }}</td>
+            <td class="text-end small">{{ "%.2f"|format(p.precio_caja or 0) }}</td>
+            <td class="text-end small">{{ "%.2f"|format(p.precio_unitario or 0) }}</td>
+            <td class="small">{{ p.codigo_interno_inventario or '—' }}</td>
+            <td class="text-end">
+              <form method="post" action="{{ url_for('stock_homologacion_desactivar_producto', producto_id=p.id) }}"
+                    onsubmit="return confirm('Desactivar este producto del catálogo? Puedes volver a activarlo desde el catálogo del proveedor.');">
+                <button class="btn btn-sm btn-outline-danger">Desactivar</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+{% endif %}
+
 {% if ver == 'sin_codigo_interno' %}
 {# Ronda CK (2026-10-29, punto 5 del pedido del usuario): resolver los
    faltantes por planilla, que es lo practico cuando son cientos. Sin el
@@ -55,9 +125,13 @@
   <h5 class="section-title mb-2"><i class="bi bi-file-earmark-excel me-1"></i> Resolver por planilla</h5>
   <p class="text-muted small mb-3">
     Descarga la planilla con los faltantes, completa la columna amarilla
-    <strong>CODIGO INTERNO ERGOPYME</strong> y vuelve a subirla. No borres ni muevas la columna
-    <strong>ID</strong>: es la que permite volver a encontrar cada fila. Lo que completes acá se
-    guarda como homologación manual y no se pisa cuando se vuelve a leer el archivo maestro.
+    <strong>CODIGO INTERNO ERGOPYME</strong> y vuelve a subirla. Trae <strong>una fila por
+    código</strong>: si ese código está varias veces en el catálogo, la columna "Items" lo dice y
+    lo que escribas se aplica a todos de una vez. Si un producto <strong>no lleva</strong> código de
+    Inventarios (nunca se importó), escribe <strong>NO APLICA</strong> y deja de aparecer en esta
+    lista. No borres ni muevas la columna <strong>ID</strong>: es la que permite volver a encontrar
+    cada producto. Lo que completes acá se guarda como homologación manual y no se pisa cuando se
+    vuelve a leer el archivo maestro.
   </p>
   <div class="row g-3 align-items-end">
     <div class="col-md-5">
