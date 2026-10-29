@@ -102,11 +102,15 @@
             </ul>
           </li>
           {% endif %}
-          {# Ronda CH (2026-10-27), Fase 2: Forecast (S&OP). Permiso propio,
-             separado de Reportes -- lo usan los ejecutivos comerciales. #}
-          {% if current_user.tiene_permiso('forecast') %}
+          {# Ronda CH (2026-10-27), Fase 2. Ronda CK (2026-10-29): se llama
+             S&OP (como el archivo que reemplaza) y mientras este en pruebas
+             solo lo ven los administradores. #}
+          {% if puede_ver_sop %}
           <li class="nav-item">
-            <a class="nav-link {% if request.endpoint and 'forecast' in request.endpoint %}active{% endif %}" href="{{ url_for('forecast_index') }}">Forecast</a>
+            <a class="nav-link {% if request.endpoint and 'forecast' in request.endpoint %}active{% endif %}" href="{{ url_for('forecast_index') }}">
+              S&amp;OP
+              {% if sop_en_pruebas %}<span class="badge bg-warning text-dark ms-1">pruebas</span>{% endif %}
+            </a>
           </li>
           {% endif %}
           {% endif %}

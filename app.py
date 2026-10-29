@@ -48,7 +48,7 @@ from models import (
     FacturaEmbarqueImportacion,
     VentaLinea, ClienteVendedor, codigo_cuenta_para_rotacion, PREFIJOS_SIN_ROTACION,
     ForecastCiclo, ForecastEnvio, ForecastLinea, ForecastCambio, Notificacion,
-    SEMANAS_FORECAST,
+    ParametroSistema, SEMANAS_FORECAST,
 )
 from seed_data import seed_from_excel
 import costing
@@ -79,8 +79,8 @@ def _normalizar_nombre(texto):
     return " ".join(limpio.upper().split())
 
 
-VERSION_SUITE = "CJ"
-VERSION_SUITE_FECHA = "2026-10-28"
+VERSION_SUITE = "CK"
+VERSION_SUITE_FECHA = "2026-10-29"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -660,6 +660,19 @@ def ensure_schema_migrations():
         # Usuario.vendedor en models.py.
         "usuarios": [
             ("vendedor", "VARCHAR(120)"),
+        ],
+        # Ronda CK (2026-10-29): el forecast se identifica por PRODUCTO del
+        # catalogo, no por codigo interno de Ergopyme -- ver ForecastLinea.
+        "forecast_lineas": [
+            ("clave_producto", "VARCHAR(60)"),
+            ("producto_id", "INTEGER"),
+            ("variante_id", "INTEGER"),
+            ("codigo_proveedor", "VARCHAR(120)"),
+        ],
+        # Ronda CK (2026-10-29): de donde salio cada homologacion, para no
+        # pisar lo que el usuario completo a mano -- ver CodigoErgopyme.
+        "codigos_ergopyme": [
+            ("origen", "VARCHAR(10) DEFAULT 'archivo'"),
         ],
         # Ronda AK (2026-09-19): ajustes a Pago Proveedores -- facturar
         # consignacion, notas de credito y crédito por Proveedor.
@@ -3196,6 +3209,49 @@ def reparar_variantes_physiol_ronda_ae():
         )
 
 
+def reparar_forecast_claves_ronda_ck():
+    """Ronda CK (2026-10-29): las lineas de forecast creadas antes de esta
+    ronda se identificaban por el codigo interno de Ergopyme. Ahora se
+    identifican por el PRODUCTO del catalogo (ver ForecastLinea.
+    clave_producto), asi que a las que ya existen hay que darles su clave y,
+    cuando se pueda, enlazarlas con su producto/variante y su codigo de
+    proveedor -- que es el que se muestra en pantalla."""
+    try:
+        pendientes = ForecastLinea.query.filter(
+            db.or_(ForecastLinea.clave_producto.is_(None), ForecastLinea.clave_producto == "")
+        ).all()
+    except Exception:
+        return 0
+    if not pendientes:
+        return 0
+    enlazadas = 0
+    for linea in pendientes:
+        interno = (linea.codigo_interno or "").strip()
+        variante = ProductoVariante.query.filter(
+            ProductoVariante.codigo_interno_inventario == interno).first() if interno else None
+        producto = None
+        if variante is None and interno:
+            producto = Producto.query.filter(
+                Producto.codigo_interno_inventario == interno).first()
+        if variante is not None:
+            linea.clave_producto = f"V:{variante.id}"
+            linea.variante_id = variante.id
+            linea.producto_id = variante.producto_id
+            linea.codigo_proveedor = (variante.codigo or "")[:120]
+            enlazadas += 1
+        elif producto is not None:
+            linea.clave_producto = f"P:{producto.id}"
+            linea.producto_id = producto.id
+            linea.codigo_proveedor = (producto.codigo or "")[:120]
+            enlazadas += 1
+        else:
+            linea.clave_producto = f"E:{interno.upper()}"
+    db.session.commit()
+    print(f"[reparar_ronda_ck] Forecast: {len(pendientes)} linea(s) migradas a clave de producto "
+          f"({enlazadas} enlazadas con el catalogo).")
+    return len(pendientes)
+
+
 def reparar_usuarios_vendedores_ronda_ci():
     """Ronda CI (2026-10-28, a pedido del usuario): engancha las cuentas de
     acceso con su nombre de vendedor para el Forecast ("Asocia esos
@@ -3337,6 +3393,7 @@ def seed_codigos_ergopyme():
     existentes = {c.codigo_interno: c for c in CodigoErgopyme.query.all()}
     creados = 0
     actualizados = 0
+    respetados = 0
     vistos = set()
     for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
         if not row or row[0] is None:
@@ -3350,6 +3407,13 @@ def seed_codigos_ergopyme():
         descripcion = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
         existente = existentes.get(codigo)
         if existente:
+            # Ronda CK (2026-10-29): lo que el usuario completo a mano desde
+            # Homologación NO se pisa al releer el archivo maestro -- si no,
+            # el trabajo de resolver los faltantes se perderia en el
+            # siguiente reinicio.
+            if (existente.origen or "archivo") == "manual":
+                respetados += 1
+                continue
             if (existente.proveedor_nombre != proveedor
                     or existente.codigo_proveedor != codigo_proveedor
                     or existente.descripcion != descripcion):
@@ -3361,6 +3425,7 @@ def seed_codigos_ergopyme():
             nuevo = CodigoErgopyme(
                 codigo_interno=codigo, proveedor_nombre=proveedor,
                 codigo_proveedor=codigo_proveedor, descripcion=descripcion,
+                origen="archivo",
             )
             db.session.add(nuevo)
             existentes[codigo] = nuevo
@@ -3368,7 +3433,8 @@ def seed_codigos_ergopyme():
     db.session.commit()
     print(
         f"[seed] Códigos Ergopyme: {creados} nuevo(s), {actualizados} "
-        "actualizado(s) para homologación (Stock, Reportes)."
+        f"actualizado(s), {respetados} respetado(s) por estar completados a mano "
+        "(Stock, Reportes)."
     )
 
 
@@ -4045,6 +4111,7 @@ with app.app_context():
     _paso_arranque_seguro("reparar_lotes_historico_ronda_by", reparar_lotes_historico_ronda_by)
     _paso_arranque_seguro("seed_facturas_proveedor_pendientes", seed_facturas_proveedor_pendientes)
     _paso_arranque_seguro("reparar_usuarios_vendedores_ronda_ci", reparar_usuarios_vendedores_ronda_ci)
+    _paso_arranque_seguro("reparar_forecast_claves_ronda_ck", reparar_forecast_claves_ronda_ck)
 
 
 # ---------------------------------------------------------------------------
@@ -13277,25 +13344,129 @@ def _panorama_forecast_vendedor(vendedor):
     return panorama
 
 
-def _datos_producto_para_forecast(codigo, panorama):
-    """Resuelve descripcion/proveedor de un codigo que el vendedor agrega a
-    mano. Si nunca lo vendio (no esta en su panorama) igual se puede
-    agregar -- el usuario pidio que un equipo se pueda elegir aunque no
-    traiga promedio -- y los datos salen del catalogo homologado."""
-    if codigo in panorama:
-        return panorama[codigo]
-    homologado = _construir_homologador_ergopyme()(codigo)
-    ergo = CodigoErgopyme.query.filter(
-        db.func.upper(CodigoErgopyme.codigo_interno) == codigo.upper()
-    ).first()
-    return {
-        "codigo": codigo,
-        "descripcion": (homologado[3] if homologado else None) or (ergo.descripcion if ergo else ""),
-        "proveedor": (homologado[0] if homologado else None) or (ergo.proveedor_nombre if ergo else ""),
-        "promedio_6um": 0.0, "sugerencia": [0] * SEMANAS_FORECAST, "sugerencia_total": 0,
-        "clase_abc": "C",
-        "monto_12m": 0, "unidades_12m": 0,
-    }
+def _clave_producto_forecast(producto=None, variante=None, codigo_interno=None):
+    """Ronda CK (2026-10-29): identificador estable de una linea de
+    forecast. Es el producto del catalogo (variante si la tiene, si no el
+    producto padre); solo cuando no hay nada del catalogo se cae al codigo
+    interno de Ergopyme, que es el caso de un codigo vendido que todavia no
+    esta homologado."""
+    if variante is not None:
+        return f"V:{variante.id}"
+    if producto is not None:
+        return f"P:{producto.id}"
+    return f"E:{(codigo_interno or '').strip().upper()}"
+
+
+def _catalogo_para_forecast(proveedor_nombre=None):
+    """El CATALOGO de productos sobre el que se puede proyectar, por
+    proveedor -- no solo lo que ya se vendio.
+
+    A pedido del usuario (ronda CK, punto 3): "la busqueda codigo de
+    producto debe traer el catalogo de productos del proveedor". Antes la
+    lista salia unicamente de las ventas de los ultimos 12 meses, asi que
+    un producto nuevo (o uno que ese vendedor no habia vendido) no se podia
+    elegir.
+
+    Devuelve {clave_producto: datos}. El codigo que se muestra es el DEL
+    PROVEEDOR; el codigo interno de Ergopyme viaja adentro solo para cruzar
+    contra las ventas (punto 4 del mismo pedido).
+
+    Una familia con variantes aporta sus VARIANTES (que son los codigos que
+    de verdad se compran y se venden), no el codigo padre."""
+    query = Producto.query.filter(Producto.activo.is_(True))
+    if proveedor_nombre:
+        query = query.join(Proveedor).filter(
+            db.func.upper(Proveedor.nombre) == proveedor_nombre.strip().upper())
+    productos = query.all()
+    # Las variantes se traen de una sola vez (la relacion es lazy="dynamic":
+    # recorrerla producto por producto serian ~1.500 consultas).
+    ids = [p.id for p in productos]
+    variantes_por_producto = defaultdict(list)
+    if ids:
+        for variante in ProductoVariante.query.filter(
+            ProductoVariante.producto_id.in_(ids),
+            db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+        ).all():
+            variantes_por_producto[variante.producto_id].append(variante)
+    catalogo = {}
+    for producto in productos:
+        variantes = variantes_por_producto.get(producto.id, [])
+        if variantes:
+            for variante in variantes:
+                catalogo[_clave_producto_forecast(variante=variante)] = {
+                    "clave": _clave_producto_forecast(variante=variante),
+                    "codigo": (variante.codigo or "").strip(),
+                    "descripcion": (variante.descripcion or producto.descripcion or "").strip(),
+                    "proveedor": producto.proveedor.nombre if producto.proveedor else "",
+                    "producto_id": producto.id, "variante_id": variante.id,
+                    "codigo_interno": (variante.codigo_interno_inventario or "").strip(),
+                }
+        else:
+            catalogo[_clave_producto_forecast(producto=producto)] = {
+                "clave": _clave_producto_forecast(producto=producto),
+                "codigo": (producto.codigo or "").strip(),
+                "descripcion": (producto.descripcion or "").strip(),
+                "proveedor": producto.proveedor.nombre if producto.proveedor else "",
+                "producto_id": producto.id, "variante_id": None,
+                "codigo_interno": (producto.codigo_interno_inventario or "").strip(),
+            }
+    return catalogo
+
+
+def _productos_para_forecast(vendedor, proveedor_nombre=None):
+    """Junta el catalogo del proveedor con la historia de venta del
+    vendedor: cada producto del catalogo queda con su promedio 6UM, su
+    clase A/B/C y la sugerencia del sistema cuando hay venta, y en cero
+    cuando no la hay (igual se puede proyectar).
+
+    Tambien entran los codigos que el vendedor SI vendio pero que no estan
+    homologados contra el catalogo -- si se dejaran afuera, su venta
+    desapareceria de la vista."""
+    panorama = _panorama_forecast_vendedor(vendedor)
+    # Codigo interno de Ergopyme -> datos de venta, para cruzar.
+    ventas_por_interno = {(c or "").strip().upper(): d for c, d in panorama.items()}
+
+    filas, internos_usados = {}, set()
+    for clave, datos in _catalogo_para_forecast(proveedor_nombre).items():
+        interno = (datos.get("codigo_interno") or "").strip().upper()
+        venta = ventas_por_interno.get(interno) if interno else None
+        if venta:
+            internos_usados.add(interno)
+        promedio = (venta or {}).get("promedio_6um", 0) or 0
+        reparto = _distribuir_sugerencia(promedio)
+        filas[clave] = {
+            **datos,
+            "promedio_6um": promedio,
+            "clase_abc": (venta or {}).get("clase_abc", "C"),
+            "monto_12m": (venta or {}).get("monto_12m", 0) or 0,
+            "unidades_12m": (venta or {}).get("unidades_12m", 0) or 0,
+            "sugerencia": reparto, "sugerencia_total": sum(reparto),
+            "homologado": bool(interno),
+        }
+
+    # Lo vendido que no calza con el catalogo: solo cuando se mira "todos
+    # los proveedores" (con un proveedor filtrado no corresponde, porque no
+    # se sabe de quien es).
+    if not proveedor_nombre:
+        for interno, venta in ventas_por_interno.items():
+            if interno in internos_usados:
+                continue
+            clave = _clave_producto_forecast(codigo_interno=interno)
+            reparto = _distribuir_sugerencia(venta.get("promedio_6um", 0) or 0)
+            filas[clave] = {
+                "clave": clave,
+                "codigo": venta.get("codigo") or interno,
+                "descripcion": venta.get("descripcion") or "",
+                "proveedor": venta.get("proveedor") or "(sin homologar)",
+                "producto_id": None, "variante_id": None, "codigo_interno": interno,
+                "promedio_6um": venta.get("promedio_6um", 0) or 0,
+                "clase_abc": venta.get("clase_abc", "C"),
+                "monto_12m": venta.get("monto_12m", 0) or 0,
+                "unidades_12m": venta.get("unidades_12m", 0) or 0,
+                "sugerencia": reparto, "sugerencia_total": sum(reparto),
+                "homologado": False,
+            }
+    return filas
 
 
 def _url_forecast(envio_id=None):
@@ -13303,6 +13474,84 @@ def _url_forecast(envio_id=None):
     url_for) porque el mantenimiento automatico corre en el arranque, fuera
     de una request, donde url_for no puede construir la URL."""
     return f"/forecast/envios/{envio_id}" if envio_id else "/forecast"
+
+
+def _parametro(clave, por_defecto=None):
+    """Lee un interruptor de configuracion (ronda CK, 2026-10-29). Protegido
+    para que, si la tabla todavia no existe (primer arranque tras el
+    despliegue), la aplicacion no se caiga."""
+    try:
+        fila = ParametroSistema.query.filter_by(clave=clave).first()
+    except Exception:
+        return por_defecto
+    return fila.valor if fila and fila.valor is not None else por_defecto
+
+
+def _guardar_parametro(clave, valor):
+    fila = ParametroSistema.query.filter_by(clave=clave).first()
+    if not fila:
+        fila = ParametroSistema(clave=clave)
+        db.session.add(fila)
+    fila.valor = valor
+    fila.actualizado_por_id = _usuario_actual_id()
+    db.session.commit()
+    return fila
+
+
+def _sop_en_pruebas():
+    """Ronda CK (2026-10-29, punto 8 del pedido del usuario: "restringe el
+    acceso a todos excepto administrador hasta que lo tengamos probado y
+    autorizado"). Mientras esta en pruebas, el modulo S&OP solo lo ven los
+    administradores -- el menu ni siquiera aparece para el resto.
+
+    Es un interruptor guardado en la base (no una constante del codigo)
+    justamente para que el usuario lo pueda abrir al equipo desde la propia
+    pantalla cuando termine de probarlo, sin esperar un despliegue."""
+    return _parametro("sop_en_pruebas", "1") != "0"
+
+
+def _puede_entrar_al_sop():
+    if current_user.rol and current_user.rol.es_administrador:
+        return True
+    if _sop_en_pruebas():
+        return False
+    return current_user.tiene_permiso("forecast")
+
+
+def requiere_sop(vista):
+    """Igual que requiere_permiso('forecast'), mas el candado de pruebas."""
+    @wraps(vista)
+    @login_required
+    def _envoltorio(*args, **kwargs):
+        if not _puede_entrar_al_sop():
+            flash("El módulo S&OP está en pruebas: por ahora solo pueden entrar los administradores.",
+                  "warning")
+            return redirect(url_for("dashboard"))
+        return vista(*args, **kwargs)
+    return _envoltorio
+
+
+@app.context_processor
+def _inyectar_sop():
+    """Para que la barra de navegacion sepa si mostrar el menu S&OP."""
+    if not current_user.is_authenticated:
+        return {}
+    try:
+        return {"puede_ver_sop": _puede_entrar_al_sop(), "sop_en_pruebas": _sop_en_pruebas()}
+    except Exception:
+        return {"puede_ver_sop": False, "sop_en_pruebas": True}
+
+
+@app.route("/forecast/pruebas", methods=["POST"])
+@requiere_admin
+def forecast_cambiar_pruebas():
+    abrir = request.form.get("abrir") == "1"
+    _guardar_parametro("sop_en_pruebas", "0" if abrir else "1")
+    if abrir:
+        flash("S&OP abierto al equipo: ahora entra quien tenga el permiso de Forecast.", "success")
+    else:
+        flash("S&OP vuelve a modo pruebas: solo entran los administradores.", "warning")
+    return redirect(url_for("forecast_index"))
 
 
 def _notificar(usuarios, titulo, mensaje, url=None, icono="bell", clave_unica=None, modulo="forecast"):
@@ -13444,9 +13693,12 @@ def _abrir_ciclo_forecast(nombre, mes_objetivo, fecha_tope, vendedores, usuario_
             if envio_previo:
                 panorama = _panorama_forecast_vendedor(vendedor)
                 for linea in envio_previo.lineas.all():
-                    datos = panorama.get(linea.codigo_interno, {})
+                    datos = panorama.get((linea.codigo_interno or "").strip(), {})
                     nueva = ForecastLinea(
-                        envio_id=envio.id, codigo_interno=linea.codigo_interno,
+                        envio_id=envio.id, clave_producto=linea.clave_producto,
+                        producto_id=linea.producto_id, variante_id=linea.variante_id,
+                        codigo_proveedor=linea.codigo_proveedor,
+                        codigo_interno=linea.codigo_interno,
                         descripcion=linea.descripcion, proveedor=linea.proveedor,
                         # La clase y el promedio se RECALCULAN con los datos
                         # de hoy: lo que se arrastra son las cantidades.
@@ -13458,7 +13710,7 @@ def _abrir_ciclo_forecast(nombre, mes_objetivo, fecha_tope, vendedores, usuario_
                     db.session.add(nueva)
                     db.session.flush()
                     _registrar_cambio_forecast(
-                        envio, linea.codigo_interno, None, 0, nueva.total,
+                        envio, nueva.codigo_visible, None, 0, nueva.total,
                         "copia_ciclo_anterior", usuario_id=usuario_id)
                     copiadas_total += 1
 
@@ -13582,7 +13834,7 @@ def notificaciones_leer():
 
 
 @app.route("/forecast")
-@requiere_permiso("forecast")
+@requiere_sop
 def forecast_index():
     """Portada del modulo: el administrador/gerencia ve el tablero de todos
     los ciclos y quien entrego; un ejecutivo ve directamente su hoja."""
@@ -13766,7 +14018,7 @@ def _puede_editar_envio(envio):
 
 
 @app.route("/forecast/envios/<int:envio_id>")
-@requiere_permiso("forecast")
+@requiere_sop
 def forecast_envio(envio_id):
     """La hoja de captura: productos en filas, las 13 semanas en columnas.
     Replica la hoja FCST del SOP, con el promedio 6UM y la clase A/B/C al
@@ -13776,21 +14028,56 @@ def forecast_envio(envio_id):
     if not _puede_ver_envio(envio):
         flash("Ese forecast es de otro ejecutivo.", "danger")
         return redirect(url_for("forecast_index"))
-    panorama = _panorama_forecast_vendedor(envio.vendedor)
-    lineas = envio.lineas.order_by(ForecastLinea.clase_abc, ForecastLinea.codigo_interno).all()
-    codigos_cargados = {l.codigo_interno for l in lineas}
-    # Motor deterministico de sugerencias: lo que mas vende y todavia no
-    # esta en la hoja, ordenado por monto de los ultimos 12 meses.
+    # Ronda CK (2026-10-29, puntos 1 y 3 del pedido del usuario): el panel
+    # para agregar productos se filtra POR PROVEEDOR y trae el CATALOGO
+    # completo de ese proveedor, no solo lo que ya se vendio.
+    proveedor_sel = request.args.get("proveedor", "").strip()
+    busqueda = request.args.get("q", "").strip()
+    lineas = envio.lineas.order_by(ForecastLinea.proveedor, ForecastLinea.codigo_proveedor).all()
+    claves_cargadas = {l.clave_producto for l in lineas}
+
+    # El catalogo se arma UNA vez (la version completa) y de ahi salen tanto
+    # las sugerencias como la lista filtrada: asi la clave de cada fila es
+    # siempre la misma, venga de donde venga.
+    catalogo = _productos_para_forecast(envio.vendedor, proveedor_sel or None)
+    texto = _normalizar_nombre(busqueda)
+    disponibles = []
+    if proveedor_sel or busqueda:
+        for clave, datos in catalogo.items():
+            if clave in claves_cargadas:
+                continue
+            if texto and texto not in _normalizar_nombre(
+                f"{datos['codigo']} {datos['descripcion']} {datos.get('codigo_interno') or ''}"
+            ):
+                continue
+            disponibles.append(datos)
+        # Punto 2: por defecto, lo que MAS SE VENDE primero.
+        disponibles.sort(key=lambda d: (-(d["monto_12m"] or 0), _normalizar_nombre(d["codigo"])))
+    recortado = len(disponibles) > MAX_SUGERENCIAS_FORECAST
+    disponibles = disponibles[:MAX_SUGERENCIAS_FORECAST]
+
+    # Las sugerencias de siempre (lo que mas vende y no esta en la hoja)
+    # siguen saliendo sin tener que elegir proveedor.
+    catalogo_completo = catalogo if not proveedor_sel else _productos_para_forecast(envio.vendedor)
     sugerencias = sorted(
-        (d for c, d in panorama.items() if c not in codigos_cargados and d["promedio_6um"] > 0),
-        key=lambda d: -d["monto_12m"],
+        (d for clave, d in catalogo_completo.items()
+         if clave not in claves_cargadas and (d["promedio_6um"] or 0) > 0),
+        key=lambda d: -(d["monto_12m"] or 0),
     )[:MAX_SUGERENCIAS_FORECAST]
+
+    # La sugerencia de cada fila sale de su propio promedio 6UM (el que se
+    # congelo al agregarla), no de buscarla de nuevo por codigo interno.
+    sugerencia_por_linea = {l.id: _distribuir_sugerencia(l.promedio_6um or 0) for l in lineas}
     historial = ForecastCambio.query.filter_by(envio_id=envio.id).order_by(
         ForecastCambio.momento.desc()).limit(80).all()
     return render_template(
         "forecast/envio.html", envio=envio, ciclo=envio.ciclo,
+        sugerencia_por_linea=sugerencia_por_linea,
         semanas=_semanas_forecast(envio.ciclo), lineas=lineas,
-        panorama=panorama, sugerencias=sugerencias, historial=historial,
+        sugerencias=sugerencias, historial=historial,
+        disponibles=disponibles, recortado=recortado, max_productos=MAX_SUGERENCIAS_FORECAST,
+        proveedor_sel=proveedor_sel, busqueda=busqueda,
+        proveedores=Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all(),
         es_admin=bool(current_user.rol and current_user.rol.es_administrador),
         puede_editar=_puede_editar_envio(envio), es_mio=_es_mi_envio(envio),
         total_semanas=SEMANAS_FORECAST,
@@ -13798,7 +14085,7 @@ def forecast_envio(envio_id):
 
 
 @app.route("/forecast/envios/<int:envio_id>/guardar", methods=["POST"])
-@requiere_permiso("forecast")
+@requiere_sop
 def forecast_envio_guardar(envio_id):
     envio = ForecastEnvio.query.get_or_404(envio_id)
     if not _puede_ver_envio(envio):
@@ -13819,7 +14106,7 @@ def forecast_envio_guardar(envio_id):
             anterior = getattr(linea, f"s{n}") or 0
             if abs(nuevo - anterior) > 0.0001:
                 setattr(linea, f"s{n}", nuevo)
-                _registrar_cambio_forecast(envio, linea.codigo_interno, n, anterior, nuevo, "edicion")
+                _registrar_cambio_forecast(envio, linea.codigo_visible, n, anterior, nuevo, "edicion")
                 cambios += 1
     enviar = request.form.get("accion") == "enviar"
     if enviar:
@@ -13840,23 +14127,60 @@ def forecast_envio_guardar(envio_id):
 
 
 @app.route("/forecast/envios/<int:envio_id>/agregar", methods=["POST"])
-@requiere_permiso("forecast")
+@requiere_sop
 def forecast_envio_agregar(envio_id):
     envio = ForecastEnvio.query.get_or_404(envio_id)
     if not _puede_editar_envio(envio):
         flash("No se puede agregar productos a este forecast.", "warning")
         return redirect(url_for("forecast_envio", envio_id=envio.id))
-    codigos = [c.strip() for c in request.form.getlist("codigo") if c.strip()]
+    # Ronda CK (2026-10-29): las casillas mandan la CLAVE del producto del
+    # catalogo; el cuadro de texto sigue aceptando un codigo escrito a mano
+    # (de proveedor o interno).
+    claves = [c.strip() for c in request.form.getlist("clave") if c.strip()]
+    escritos = [c.strip() for c in request.form.getlist("codigo") if c.strip()]
     aplicar_sugerencia = request.form.get("aplicar_sugerencia") == "on"
-    panorama = _panorama_forecast_vendedor(envio.vendedor)
+    proveedor_sel = request.form.get("proveedor", "").strip()
+
+    catalogo = _productos_para_forecast(envio.vendedor, proveedor_sel or None)
+    if escritos:
+        # Para los escritos a mano hay que mirar TODO el catalogo, no solo
+        # el del proveedor filtrado.
+        catalogo_completo = _productos_para_forecast(envio.vendedor)
+        por_codigo = {}
+        for datos in catalogo_completo.values():
+            por_codigo.setdefault(_normalizar_nombre(datos["codigo"]), datos)
+            if datos.get("codigo_interno"):
+                por_codigo.setdefault(_normalizar_nombre(datos["codigo_interno"]), datos)
+        catalogo = {**catalogo_completo, **catalogo}
+    else:
+        por_codigo = {}
+
+    pedidos = []
+    no_encontrados = []
+    for clave in claves:
+        if clave in catalogo:
+            pedidos.append(catalogo[clave])
+        else:
+            no_encontrados.append(clave)
+    for codigo in escritos:
+        datos = por_codigo.get(_normalizar_nombre(codigo))
+        if datos:
+            pedidos.append(datos)
+        else:
+            no_encontrados.append(codigo)
+
     agregados, repetidos = 0, 0
-    for codigo in codigos:
-        if envio.lineas.filter(db.func.upper(ForecastLinea.codigo_interno) == codigo.upper()).first():
+    ya_en_hoja = {l.clave_producto for l in envio.lineas.all()}
+    for datos in pedidos:
+        if datos["clave"] in ya_en_hoja:
             repetidos += 1
             continue
-        datos = _datos_producto_para_forecast(codigo, panorama)
+        ya_en_hoja.add(datos["clave"])
         linea = ForecastLinea(
-            envio_id=envio.id, codigo_interno=codigo,
+            envio_id=envio.id, clave_producto=datos["clave"],
+            producto_id=datos.get("producto_id"), variante_id=datos.get("variante_id"),
+            codigo_proveedor=(datos.get("codigo") or "")[:120],
+            codigo_interno=(datos.get("codigo_interno") or "")[:40] or None,
             descripcion=(datos.get("descripcion") or "")[:300],
             proveedor=(datos.get("proveedor") or "")[:120],
             clase_abc=datos.get("clase_abc"), promedio_6um=datos.get("promedio_6um") or 0,
@@ -13866,28 +14190,31 @@ def forecast_envio_agregar(envio_id):
                 setattr(linea, f"s{n}", unidades)
         db.session.add(linea)
         db.session.flush()
-        _registrar_cambio_forecast(envio, codigo, None, 0, linea.total, "alta")
+        _registrar_cambio_forecast(envio, linea.codigo_visible, None, 0, linea.total, "alta")
         agregados += 1
     db.session.commit()
     mensaje = f"{agregados} producto(s) agregado(s)."
     if repetidos:
         mensaje += f" {repetidos} ya estaba(n) en la hoja."
+    if no_encontrados:
+        mensaje += (" No se encontraron en el catálogo: " + ", ".join(sorted(set(no_encontrados))[:8]) + ".")
     flash(mensaje, "success" if agregados else "warning")
-    return redirect(url_for("forecast_envio", envio_id=envio.id))
+    return redirect(url_for("forecast_envio", envio_id=envio.id,
+                            proveedor=proveedor_sel or None))
 
 
 @app.route("/forecast/lineas/<int:linea_id>/eliminar", methods=["POST"])
-@requiere_permiso("forecast")
+@requiere_sop
 def forecast_linea_eliminar(linea_id):
     linea = ForecastLinea.query.get_or_404(linea_id)
     envio = linea.envio
     if not _puede_editar_envio(envio):
         flash("No se puede quitar productos de este forecast.", "warning")
         return redirect(url_for("forecast_envio", envio_id=envio.id))
-    _registrar_cambio_forecast(envio, linea.codigo_interno, None, linea.total, 0, "baja")
+    _registrar_cambio_forecast(envio, linea.codigo_visible, None, linea.total, 0, "baja")
     db.session.delete(linea)
     db.session.commit()
-    flash(f"Producto {linea.codigo_interno} quitado del forecast.", "success")
+    flash(f"Producto {linea.codigo_visible} quitado del forecast.", "success")
     return redirect(url_for("forecast_envio", envio_id=envio.id))
 
 
@@ -14736,6 +15063,187 @@ def stock_homologacion_asignar_codigo_interno():
     else:
         flash(f"Código interno '{codigo_interno}' asignado a {etiqueta}.", "success")
     return redirect(url_for("stock_homologacion", ver=ver))
+
+
+_ENCABEZADOS_HOMOLOGACION_FALTANTES = [
+    "Proveedor", "Codigo Proveedor", "Descripcion", "Tipo",
+    "CODIGO INTERNO ERGOPYME", "ID",
+]
+
+
+@app.route("/stock/homologacion/faltantes/descargar")
+@requiere_permiso("inventarios")
+def stock_homologacion_descargar_faltantes():
+    """Ronda CK (2026-10-29, punto 5 del pedido del usuario): planilla con
+    TODOS los productos del catalogo que todavia no tienen su codigo interno
+    de Inventarios (Ergopyme), para completarla afuera y volver a subirla.
+
+    Sin ese codigo no hay forma de cruzar la venta contra el producto del
+    proveedor, asi que en el S&OP esos productos aparecen sin promedio -- es
+    justamente lo que el usuario quiere dejar resuelto antes de empezar a
+    proyectar.
+
+    La columna ID es la que permite volver a encontrar exactamente la misma
+    fila al subir el archivo: no hay que tocarla."""
+    proveedor_sel = request.args.get("proveedor", "").strip()
+
+    productos = Producto.query.join(Proveedor).filter(
+        Producto.activo.is_(True),
+        db.or_(Producto.codigo_interno_inventario.is_(None),
+               Producto.codigo_interno_inventario == ""),
+    )
+    variantes = ProductoVariante.query.join(Producto).join(Proveedor).filter(
+        Producto.activo.is_(True),
+        db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+        db.or_(ProductoVariante.codigo_interno_inventario.is_(None),
+               ProductoVariante.codigo_interno_inventario == ""),
+    )
+    if proveedor_sel:
+        productos = productos.filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
+        variantes = variantes.filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
+
+    filas = []
+    for producto in productos.order_by(Proveedor.nombre, Producto.codigo).all():
+        # Una familia con variantes se homologa por variante, no por el
+        # codigo padre: el padre no se compra ni se vende como tal.
+        if ProductoVariante.query.filter_by(producto_id=producto.id).count():
+            continue
+        filas.append((producto.proveedor.nombre if producto.proveedor else "", producto.codigo,
+                      producto.descripcion, "Producto", f"P{producto.id}"))
+    for variante in variantes.order_by(Proveedor.nombre, ProductoVariante.codigo).all():
+        filas.append((variante.producto.proveedor.nombre if variante.producto and variante.producto.proveedor else "",
+                      variante.codigo, variante.descripcion, "Variante", f"V{variante.id}"))
+    filas.sort(key=lambda f: (_normalizar_nombre(f[0]), _normalizar_nombre(f[1])))
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Homologacion"
+    for col, titulo in enumerate(_ENCABEZADOS_HOMOLOGACION_FALTANTES, start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.fill = PatternFill("solid", fgColor="2F5597")
+        celda.alignment = Alignment(horizontal="center", vertical="center")
+    amarillo = PatternFill("solid", fgColor="FFF2CC")
+    for i, (proveedor, codigo, descripcion, tipo, clave) in enumerate(filas, start=2):
+        ws.cell(row=i, column=1, value=proveedor)
+        ws.cell(row=i, column=2, value=codigo)
+        ws.cell(row=i, column=3, value=descripcion)
+        ws.cell(row=i, column=4, value=tipo)
+        ws.cell(row=i, column=5).fill = amarillo       # columna a completar
+        ws.cell(row=i, column=6, value=clave)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:F{max(len(filas) + 1, 2)}"
+    for col, ancho in zip(range(1, 7), (26, 26, 60, 12, 26, 10)):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    nombre = "Homologacion_codigos_faltantes"
+    if proveedor_sel:
+        nombre += "_" + proveedor_sel
+    nombre = f"{nombre}_{date.today().isoformat()}.xlsx".replace("/", "-").replace(" ", "_")
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/stock/homologacion/faltantes/cargar", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_homologacion_cargar_faltantes():
+    """Ronda CK (2026-10-29, punto 5): vuelve a subir la planilla con la
+    columna "CODIGO INTERNO ERGOPYME" completada.
+
+    Por cada fila con codigo: 1) se le escribe al producto/variante (es lo
+    que lo deja entrar en la planilla de Costeo), y 2) se crea o actualiza
+    su fila en CodigoErgopyme con origen 'manual', que es la tabla contra la
+    que se cruzan las ventas. Las filas 'manual' no se pisan cuando se
+    reelee el archivo maestro en el arranque."""
+    archivo = request.files.get("archivo")
+    if not archivo or not archivo.filename:
+        flash("Selecciona la planilla de homologación completada.", "warning")
+        return redirect(url_for("stock_homologacion", ver="sin_codigo_interno"))
+    if not archivo.filename.lower().endswith((".xlsx", ".xlsm")):
+        flash("El archivo debe ser .xlsx.", "warning")
+        return redirect(url_for("stock_homologacion", ver="sin_codigo_interno"))
+
+    try:
+        wb = openpyxl.load_workbook(archivo, data_only=True)
+    except Exception as exc:
+        flash(f"No se pudo leer el archivo: {exc}", "danger")
+        return redirect(url_for("stock_homologacion", ver="sin_codigo_interno"))
+    ws = wb.worksheets[0]
+
+    encabezados = [str(c.value).strip().upper() if c.value is not None else ""
+                   for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    def _columna(nombre):
+        try:
+            return encabezados.index(nombre.upper())
+        except ValueError:
+            return None
+    col_codigo = _columna("CODIGO INTERNO ERGOPYME")
+    col_id = _columna("ID")
+    if col_codigo is None or col_id is None:
+        flash("La planilla no trae las columnas 'CODIGO INTERNO ERGOPYME' e 'ID'. "
+              "Descárgala de nuevo desde esta misma pantalla y complétala sin borrar columnas.", "danger")
+        return redirect(url_for("stock_homologacion", ver="sin_codigo_interno"))
+
+    asignados, repetidos, sin_encontrar, iguales = 0, [], [], 0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) <= max(col_codigo, col_id):
+            continue
+        codigo = _normalizar_codigo_ergopyme(row[col_codigo]) if row[col_codigo] is not None else ""
+        clave = str(row[col_id]).strip() if row[col_id] is not None else ""
+        if not codigo or not clave:
+            continue
+        objetivo = None
+        if clave[:1].upper() == "P":
+            objetivo = Producto.query.get(parse_int(clave[1:], 0))
+        elif clave[:1].upper() == "V":
+            objetivo = ProductoVariante.query.get(parse_int(clave[1:], 0))
+        if objetivo is None:
+            sin_encontrar.append(clave)
+            continue
+        if (objetivo.codigo_interno_inventario or "").strip() == codigo:
+            iguales += 1
+            continue
+
+        # Aviso si ese codigo interno ya esta en otro producto.
+        otro_p = Producto.query.filter(
+            Producto.codigo_interno_inventario == codigo,
+            Producto.id != (objetivo.id if isinstance(objetivo, Producto) else -1)).first()
+        otro_v = ProductoVariante.query.filter(
+            ProductoVariante.codigo_interno_inventario == codigo,
+            ProductoVariante.id != (objetivo.id if isinstance(objetivo, ProductoVariante) else -1)).first()
+        if otro_p or otro_v:
+            repetidos.append(f"{codigo} ({(otro_p or otro_v).codigo})")
+
+        objetivo.codigo_interno_inventario = codigo
+        producto = objetivo if isinstance(objetivo, Producto) else objetivo.producto
+        nombre_proveedor = producto.proveedor.nombre if producto and producto.proveedor else ""
+        # Y la contraparte: la tabla con la que se cruzan las ventas.
+        homologacion = CodigoErgopyme.query.filter_by(codigo_interno=codigo).first()
+        if not homologacion:
+            homologacion = CodigoErgopyme(codigo_interno=codigo)
+            db.session.add(homologacion)
+        homologacion.proveedor_nombre = nombre_proveedor
+        homologacion.codigo_proveedor = (objetivo.codigo or "")[:120]
+        homologacion.descripcion = (objetivo.descripcion or "")[:500]
+        homologacion.origen = "manual"
+        asignados += 1
+    db.session.commit()
+
+    mensaje = f"{asignados} código(s) interno(s) asignado(s)."
+    if iguales:
+        mensaje += f" {iguales} ya estaba(n) igual."
+    if sin_encontrar:
+        mensaje += f" {len(sin_encontrar)} fila(s) con ID desconocido se omitieron."
+    flash(mensaje, "success" if asignados else "warning")
+    if repetidos:
+        flash("OJO: estos códigos internos ya estaban en otro producto, revisa que no sea un error: "
+              + ", ".join(sorted(set(repetidos))[:10]) + ".", "warning")
+    return redirect(url_for("stock_homologacion", ver="sin_codigo_interno"))
 
 
 @app.route("/stock/homologacion/<int:homolog_id>/resolver", methods=["POST"])

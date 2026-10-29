@@ -711,6 +711,14 @@ class CodigoErgopyme(db.Model):
     proveedor_nombre = db.Column(db.String(120))
     codigo_proveedor = db.Column(db.String(120))
     descripcion = db.Column(db.String(500))
+    # Ronda CK (2026-10-29): "archivo" = vino del maestro
+    # codigos_ergopyme_homologacion.xlsx, que se relee en cada arranque;
+    # "manual" = lo completo el usuario desde Homologación (descargar la
+    # planilla de faltantes, llenarla y volver a subirla). Las filas
+    # manuales NO se pisan al releer el archivo maestro -- si no, el
+    # trabajo de completar los faltantes se perderia en el proximo
+    # reinicio.
+    origen = db.Column(db.String(10), default="archivo")
     actualizado_en = db.Column(db.DateTime, default=datetime.utcnow)
 
     def __repr__(self):
@@ -2574,6 +2582,24 @@ SEMANAS_FORECAST = 13
 ESTADOS_ENVIO_FORECAST = ("Preparación", "Enviado")
 
 
+class ParametroSistema(db.Model):
+    """Ronda CK (2026-10-29): interruptores de configuracion que el
+    administrador cambia desde la propia aplicacion, sin esperar un
+    despliegue. Nace para dejar el modulo S&OP "en pruebas" (visible solo
+    para administradores) hasta que el usuario lo autorice, pero es
+    generico a proposito."""
+    __tablename__ = "parametros_sistema"
+
+    id = db.Column(db.Integer, primary_key=True)
+    clave = db.Column(db.String(60), unique=True, nullable=False, index=True)
+    valor = db.Column(db.String(300))
+    actualizado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ParametroSistema {self.clave}={self.valor!r}>"
+
+
 class ForecastCiclo(db.Model):
     """Un ciclo MENSUAL de captura de forecast. El administrador lo abre,
     fija la fecha tope, y esa fecha tope es el punto de partida para contar
@@ -2658,11 +2684,21 @@ class ForecastLinea(db.Model):
     igual que la hoja de Excel que reemplaza. El horizonte es fijo
     (SEMANAS_FORECAST)."""
     __tablename__ = "forecast_lineas"
-    __table_args__ = (db.UniqueConstraint("envio_id", "codigo_interno", name="uq_forecast_linea_envio_codigo"),)
+    __table_args__ = (db.UniqueConstraint("envio_id", "clave_producto", name="uq_forecast_linea_envio_clave"),)
 
     id = db.Column(db.Integer, primary_key=True)
     envio_id = db.Column(db.Integer, db.ForeignKey("forecast_envios.id"), nullable=False, index=True)
-    codigo_interno = db.Column(db.String(40), nullable=False, index=True)
+    # Ronda CK (2026-10-29, a pedido del usuario: "el codigo interno de
+    # Ergopyme aca no es relevante, solo para tu cruce de ventas vs codigo
+    # proveedor"): lo que identifica la linea es el PRODUCTO DEL CATALOGO
+    # (producto o variante). El codigo interno queda como dato de cruce con
+    # las ventas, y puede venir vacio -- un producto del catalogo que nunca
+    # se vendio igual se puede proyectar.
+    clave_producto = db.Column(db.String(60), nullable=False, index=True)
+    producto_id = db.Column(db.Integer, db.ForeignKey("productos.id"), nullable=True)
+    variante_id = db.Column(db.Integer, db.ForeignKey("producto_variantes.id"), nullable=True)
+    codigo_proveedor = db.Column(db.String(120), index=True)
+    codigo_interno = db.Column(db.String(40), index=True)
     descripcion = db.Column(db.String(300))
     proveedor = db.Column(db.String(120), index=True)
     # Clase A/B/C calculada al abrir la pantalla (Pareto 80/90/100 sobre el
@@ -2696,8 +2732,14 @@ class ForecastLinea(db.Model):
     def total(self):
         return sum(self.semanas)
 
+    @property
+    def codigo_visible(self):
+        """Lo que se muestra en pantalla: el codigo DEL PROVEEDOR, que es el
+        que el vendedor y el comprador reconocen."""
+        return (self.codigo_proveedor or self.codigo_interno or "").strip()
+
     def __repr__(self):
-        return f"<ForecastLinea envio={self.envio_id} {self.codigo_interno} total={self.total}>"
+        return f"<ForecastLinea envio={self.envio_id} {self.clave_producto} total={self.total}>"
 
 
 class ForecastCambio(db.Model):
@@ -2711,7 +2753,9 @@ class ForecastCambio(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     envio_id = db.Column(db.Integer, db.ForeignKey("forecast_envios.id"), nullable=False, index=True)
-    codigo_interno = db.Column(db.String(40), index=True)
+    # Ronda CK (2026-10-29): se guarda el codigo visible (el del proveedor),
+    # que es con el que el usuario lee la bitacora.
+    codigo_interno = db.Column(db.String(120), index=True)
     semana = db.Column(db.Integer)          # 1..13, o NULL si es un cambio de la linea entera
     valor_anterior = db.Column(db.Float, default=0)
     valor_nuevo = db.Column(db.Float, default=0)

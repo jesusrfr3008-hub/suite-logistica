@@ -47,6 +47,42 @@
 </div>
 
 {% if ver == 'sin_codigo_interno' %}
+{# Ronda CK (2026-10-29, punto 5 del pedido del usuario): resolver los
+   faltantes por planilla, que es lo practico cuando son cientos. Sin el
+   código interno no se puede cruzar la venta contra el producto del
+   proveedor, y en el S&OP ese producto sale sin promedio. #}
+<div class="card p-3 mb-3 border-primary">
+  <h5 class="section-title mb-2"><i class="bi bi-file-earmark-excel me-1"></i> Resolver por planilla</h5>
+  <p class="text-muted small mb-3">
+    Descarga la planilla con los faltantes, completa la columna amarilla
+    <strong>CODIGO INTERNO ERGOPYME</strong> y vuelve a subirla. No borres ni muevas la columna
+    <strong>ID</strong>: es la que permite volver a encontrar cada fila. Lo que completes acá se
+    guarda como homologación manual y no se pisa cuando se vuelve a leer el archivo maestro.
+  </p>
+  <div class="row g-3 align-items-end">
+    <div class="col-md-5">
+      <form method="get" action="{{ url_for('stock_homologacion_descargar_faltantes') }}" class="d-flex gap-2">
+        <select name="proveedor" class="form-select">
+          <option value="">Todos los proveedores</option>
+          {% for p in proveedores %}<option value="{{ p.nombre }}">{{ p.nombre }}</option>{% endfor %}
+        </select>
+        <button class="btn btn-outline-primary text-nowrap">
+          <i class="bi bi-download me-1"></i> Descargar
+        </button>
+      </form>
+    </div>
+    <div class="col-md-7">
+      <form method="post" action="{{ url_for('stock_homologacion_cargar_faltantes') }}"
+            enctype="multipart/form-data" class="d-flex gap-2">
+        <input type="file" name="archivo" class="form-control" accept=".xlsx,.xlsm" required>
+        <button class="btn btn-primary text-nowrap">
+          <i class="bi bi-upload me-1"></i> Subir completada
+        </button>
+      </form>
+    </div>
+  </div>
+</div>
+
   {% if not sin_codigo_productos and not sin_codigo_variantes %}
   <div class="alert alert-success">Todos los productos y variantes activos ya tienen código interno Ergopyme asignado.</div>
   {% else %}

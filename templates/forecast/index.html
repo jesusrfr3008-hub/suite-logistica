@@ -1,19 +1,44 @@
 {% extends "base.html" %}
-{% block title %}Forecast · Suite Logística{% endblock %}
+{% block title %}S&amp;OP · Suite Logística{% endblock %}
 {% block content %}
 
 {# Ronda CH (2026-10-27), Fase 2 del plan de Ventas/Forecast: portada del
    módulo S&OP. El administrador ve el tablero completo de cada ciclo
    (quién entregó y quién no); un ejecutivo ve solo su propia hoja. #}
 
-<div class="d-flex justify-content-between align-items-center mb-3">
-  <h3 class="section-title mb-0">Forecast · Proyección de ventas (S&OP)</h3>
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+  <h3 class="section-title mb-0">
+    S&amp;OP · Proyección de ventas
+    {% if sop_en_pruebas %}<span class="badge bg-warning text-dark">en pruebas</span>{% endif %}
+  </h3>
   {% if es_admin %}
-  <button class="btn btn-primary" data-bs-toggle="collapse" data-bs-target="#panelCiclo">
-    <i class="bi bi-calendar-plus me-1"></i> Abrir ciclo
-  </button>
+  <div class="d-flex gap-2">
+    {# Ronda CK (2026-10-29, punto 8): el módulo queda restringido a los
+       administradores hasta que el usuario lo autorice. El interruptor está
+       acá para que no haga falta un despliegue para abrirlo. #}
+    <form method="post" action="{{ url_for('forecast_cambiar_pruebas') }}"
+          onsubmit="return confirm({% if sop_en_pruebas %}'Abrir S&OP al equipo? Entrarán todos los que tengan el permiso de Forecast.'{% else %}'Volver a modo pruebas? Solo entrarán los administradores.'{% endif %});">
+      <input type="hidden" name="abrir" value="{{ '1' if sop_en_pruebas else '0' }}">
+      <button class="btn btn-outline-{{ 'success' if sop_en_pruebas else 'secondary' }}">
+        <i class="bi bi-{{ 'unlock' if sop_en_pruebas else 'lock' }} me-1"></i>
+        {{ 'Abrir al equipo' if sop_en_pruebas else 'Volver a pruebas' }}
+      </button>
+    </form>
+    <button class="btn btn-primary" data-bs-toggle="collapse" data-bs-target="#panelCiclo">
+      <i class="bi bi-calendar-plus me-1"></i> Abrir ciclo
+    </button>
+  </div>
   {% endif %}
 </div>
+
+{% if sop_en_pruebas and es_admin %}
+<div class="alert alert-warning">
+  <i class="bi bi-cone-striped me-1"></i>
+  <strong>Módulo en pruebas.</strong> Por ahora solo entran los administradores: el menú S&amp;OP ni
+  siquiera le aparece al resto del equipo. Cuando termines de probarlo, ábrelo con el botón
+  "Abrir al equipo".
+</div>
+{% endif %}
 
 {% if es_admin %}
 <div class="collapse mb-4" id="panelCiclo">

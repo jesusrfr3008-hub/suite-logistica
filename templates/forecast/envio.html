@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Forecast {{ envio.vendedor }} · {{ ciclo.nombre }}{% endblock %}
+{% block title %}S&amp;OP {{ envio.vendedor }} · {{ ciclo.nombre }}{% endblock %}
 {% block content %}
 
 {# Ronda CH (2026-10-27): hoja de captura del forecast de un vendedor.
@@ -10,7 +10,7 @@
 <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-3">
   <div>
     <h3 class="section-title mb-1">
-      Forecast · {{ envio.vendedor }}
+      S&amp;OP · {{ envio.vendedor }}
       {% if envio.enviado and envio.cerrado_automaticamente %}
       <span class="badge bg-warning text-dark">Cerrado sin confirmar</span>
       {% elif envio.enviado %}
@@ -76,10 +76,13 @@
       </thead>
       <tbody>
         {% for linea in lineas %}
-        {% set datos = panorama.get(linea.codigo_interno) %}
+        {# Ronda CK (punto 4): en pantalla manda el CÓDIGO DEL PROVEEDOR;
+           el código interno de Inventarios solo sirve para el cruce con las
+           ventas, así que no se muestra. #}
+        {% set sugerida = sugerencia_por_linea.get(linea.id) %}
         <tr data-fila="{{ linea.id }}">
           <td>
-            <div class="fw-semibold">{{ linea.codigo_interno }}</div>
+            <div class="fw-semibold">{{ linea.codigo_visible }}</div>
             <div class="text-muted small">{{ linea.descripcion or '—' }}</div>
             {% if linea.proveedor %}<div class="text-muted" style="font-size: .72rem;">{{ linea.proveedor }}</div>{% endif %}
           </td>
@@ -99,16 +102,16 @@
           <td class="text-end fw-semibold total-fila">{{ "%.0f"|format(linea.total) }}</td>
           <td class="text-end">
             {% if puede_editar %}
-            {% if datos and datos.sugerencia_total %}
+            {% if sugerida and sugerida|sum %}
             <button type="button" class="btn btn-sm btn-outline-secondary btn-sugerir"
-                    data-sugerencia="{{ datos.sugerencia|join(',') }}"
-                    title="Aplicar la sugerencia del sistema: {{ datos.sugerencia_total }} unidades en 13 semanas, a partir de tu promedio de 6 meses">
+                    data-sugerencia="{{ sugerida|join(',') }}"
+                    title="Aplicar la sugerencia del sistema: {{ sugerida|sum }} unidades en 13 semanas, a partir de tu promedio de 6 meses">
               <i class="bi bi-magic"></i>
             </button>
             {% endif %}
             <button type="button" class="btn btn-sm btn-outline-danger btn-eliminar"
                     data-url="{{ url_for('forecast_linea_eliminar', linea_id=linea.id) }}"
-                    data-codigo="{{ linea.codigo_interno }}" title="Quitar del forecast">
+                    data-codigo="{{ linea.codigo_visible }}" title="Quitar del forecast">
               <i class="bi bi-trash"></i>
             </button>
             {% endif %}
@@ -153,67 +156,109 @@
 <div class="card p-3 mb-3">
   <h5 class="section-title">Agregar productos</h5>
   <p class="text-muted small">
-    El sistema propone primero lo que más vendes y todavía no está en tu hoja, ordenado por monto de
-    los últimos 12 meses. La sugerencia de unidades es tu promedio mensual de 6 meses repartido en las
-    13 semanas. Igual puedes escribir cualquier código del catálogo: un equipo (códigos 30, 60, 80 y 90)
-    se puede proyectar, solo que no trae promedio porque no entra en el análisis de rotación.
+    Elige el proveedor para ver <strong>todo su catálogo</strong>, o busca por código o descripción.
+    La columna 6UM es tu promedio mensual de los últimos 6 meses y la sugerencia es ese promedio
+    repartido en las 13 semanas. Un producto sin venta previa (o un equipo, códigos 30/60/80/90)
+    igual se puede proyectar: simplemente no trae promedio.
   </p>
+
+  {# Ronda CK (2026-10-29, punto 1): filtro por proveedor, para ir
+     seleccionando proveedor por proveedor. #}
+  <form method="get" action="{{ url_for('forecast_envio', envio_id=envio.id) }}" class="row g-2 align-items-end mb-3">
+    <div class="col-md-4">
+      <label class="form-label small fw-semibold">Proveedor</label>
+      <select name="proveedor" class="form-select" onchange="this.form.submit()">
+        <option value="">— Elige un proveedor para ver su catálogo —</option>
+        {% for p in proveedores %}
+        <option value="{{ p.nombre }}" {% if proveedor_sel == p.nombre %}selected{% endif %}>{{ p.nombre }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-5">
+      <label class="form-label small fw-semibold">Buscar por código o descripción</label>
+      <input type="text" name="q" class="form-control" value="{{ busqueda }}"
+             placeholder="Ej. TRIFOCAL, 8445, LIBERTY...">
+    </div>
+    <div class="col-md-3 d-flex gap-2">
+      <button class="btn btn-outline-primary flex-grow-1"><i class="bi bi-search me-1"></i> Buscar</button>
+      {% if proveedor_sel or busqueda %}
+      <a class="btn btn-outline-secondary" href="{{ url_for('forecast_envio', envio_id=envio.id) }}" title="Limpiar">
+        <i class="bi bi-x-lg"></i>
+      </a>
+      {% endif %}
+    </div>
+  </form>
+
   <form method="post" action="{{ url_for('forecast_envio_agregar', envio_id=envio.id) }}">
-    <div class="row g-2 align-items-end mb-3">
-      <div class="col-md-5">
-        <label class="form-label small fw-semibold">Código del producto</label>
-        <input type="text" name="codigo" class="form-control" list="codigosForecast"
-               placeholder="Escribe o pega un código interno">
-        <datalist id="codigosForecast">
-          {% for codigo, d in panorama.items() %}
-          <option value="{{ codigo }}">{{ d.descripcion }}</option>
-          {% endfor %}
-        </datalist>
+    <input type="hidden" name="proveedor" value="{{ proveedor_sel }}">
+    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+      <div class="form-check mb-0">
+        <input class="form-check-input" type="checkbox" name="aplicar_sugerencia" id="aplicarSug" checked>
+        <label class="form-check-label small" for="aplicarSug">
+          Precargar las 13 semanas con la sugerencia del sistema
+        </label>
       </div>
-      <div class="col-md-4">
-        <div class="form-check">
-          <input class="form-check-input" type="checkbox" name="aplicar_sugerencia" id="aplicarSug" checked>
-          <label class="form-check-label small" for="aplicarSug">
-            Precargar las 13 semanas con la sugerencia del sistema
-          </label>
-        </div>
-      </div>
-      <div class="col-md-3">
-        <button class="btn btn-primary w-100"><i class="bi bi-plus-lg me-1"></i> Agregar seleccionados</button>
-      </div>
+      <button class="btn btn-primary"><i class="bi bi-plus-lg me-1"></i> Agregar seleccionados</button>
     </div>
 
-    {% if sugerencias %}
-    <div class="table-responsive" style="max-height: 320px;">
-      <table class="table table-sm table-hover align-middle mb-0">
-        <thead class="table-light" style="position: sticky; top: 0;">
+    {% set filas = disponibles if (proveedor_sel or busqueda) else sugerencias %}
+    {% if not (proveedor_sel or busqueda) %}
+    <div class="text-muted small mb-2">
+      <i class="bi bi-lightbulb me-1"></i>
+      Mientras no elijas proveedor, abajo va lo que más vendes y todavía no está en tu hoja.
+    </div>
+    {% elif recortado %}
+    <div class="text-muted small mb-2">
+      <i class="bi bi-info-circle me-1"></i>
+      Se muestran los {{ max_productos }} primeros; afina la búsqueda para ver el resto.
+    </div>
+    {% endif %}
+
+    {% if filas %}
+    {# Ronda CK (punto 2): encabezados ordenables, por defecto por lo que
+       más se vende (monto de los últimos 12 meses). #}
+    <div class="table-responsive" style="max-height: 360px;">
+      <table class="table table-sm table-hover align-middle mb-0" id="tablaDisponibles">
+        <thead class="table-light" style="position: sticky; top: 0; z-index: 2;">
           <tr>
             <th style="width: 36px;"><input type="checkbox" class="form-check-input" id="marcarTodos"></th>
-            <th>Código</th>
-            <th>Descripción</th>
-            <th>Proveedor</th>
-            <th class="text-center">ABC</th>
-            <th class="text-end">6UM</th>
-            <th class="text-end">Sugerido 13 sem.</th>
+            <th data-orden="texto" role="button">Código proveedor <i class="bi bi-arrow-down-up text-muted small"></i></th>
+            <th data-orden="texto" role="button">Descripción <i class="bi bi-arrow-down-up text-muted small"></i></th>
+            <th data-orden="texto" role="button">Proveedor <i class="bi bi-arrow-down-up text-muted small"></i></th>
+            <th class="text-center" data-orden="texto" role="button">ABC <i class="bi bi-arrow-down-up text-muted small"></i></th>
+            <th class="text-end" data-orden="num" role="button">6UM <i class="bi bi-arrow-down-up text-muted small"></i></th>
+            <th class="text-end" data-orden="num" role="button">Venta 12m <i class="bi bi-arrow-down text-muted small"></i></th>
+            <th class="text-end" data-orden="num" role="button">Sugerido 13 sem. <i class="bi bi-arrow-down-up text-muted small"></i></th>
           </tr>
         </thead>
         <tbody>
-          {% for d in sugerencias %}
+          {% for d in filas %}
           <tr>
-            <td><input class="form-check-input chk-sugerencia" type="checkbox" name="codigo" value="{{ d.codigo }}"></td>
-            <td class="fw-semibold">{{ d.codigo }}</td>
-            <td class="small">{{ d.descripcion or '—' }}</td>
-            <td class="small text-muted">{{ d.proveedor or '—' }}</td>
-            <td class="text-center">
+            <td><input class="form-check-input chk-sugerencia" type="checkbox" name="clave" value="{{ d.clave }}"></td>
+            <td class="fw-semibold" data-valor="{{ d.codigo }}">
+              {{ d.codigo }}
+              {% if d.homologado is defined and not d.homologado %}
+              <i class="bi bi-exclamation-triangle text-warning small"
+                 title="Este producto no tiene código interno de Inventarios: no se le puede cruzar la venta. Complétalo en Consulta de Stock > Homologación."></i>
+              {% endif %}
+            </td>
+            <td class="small" data-valor="{{ d.descripcion }}">{{ d.descripcion or '—' }}</td>
+            <td class="small text-muted" data-valor="{{ d.proveedor }}">{{ d.proveedor or '—' }}</td>
+            <td class="text-center" data-valor="{{ d.clase_abc }}">
               <span class="badge bg-{{ 'danger' if d.clase_abc == 'A' else ('warning text-dark' if d.clase_abc == 'B' else 'secondary') }}">{{ d.clase_abc }}</span>
             </td>
-            <td class="text-end">{{ "%.1f"|format(d.promedio_6um) }}</td>
-            <td class="text-end">{{ d.sugerencia_total }}</td>
+            <td class="text-end" data-valor="{{ d.promedio_6um }}">{{ "%.1f"|format(d.promedio_6um) }}</td>
+            <td class="text-end text-muted" data-valor="{{ d.monto_12m }}">{{ "%.0f"|format(d.monto_12m or 0) }}</td>
+            <td class="text-end" data-valor="{{ d.sugerencia_total }}">{{ d.sugerencia_total }}</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
+    {% elif proveedor_sel or busqueda %}
+    <p class="text-muted mb-0">
+      No hay productos del catálogo que calcen con esa búsqueda y no estén ya en tu hoja.
+    </p>
     {% else %}
     <p class="text-muted mb-0">No quedan productos con venta en los últimos 12 meses fuera de tu hoja.</p>
     {% endif %}
@@ -310,6 +355,42 @@
       }
     }
   });
+
+  // Ronda CK (punto 2): ordenar la tabla de productos disponibles por
+  // cualquier columna. Arranca por "Venta 12m" descendente (lo que más se
+  // vende), que es el orden que viene del servidor.
+  const tablaDisponibles = document.getElementById("tablaDisponibles");
+  if (tablaDisponibles) {
+    tablaDisponibles.querySelectorAll("thead th[data-orden]").forEach(function (encabezado, columna) {
+      encabezado.addEventListener("click", function () {
+        const indice = Array.prototype.indexOf.call(encabezado.parentNode.children, encabezado);
+        const numerico = encabezado.dataset.orden === "num";
+        const ascendente = encabezado.dataset.dir !== "asc";
+        encabezado.parentNode.querySelectorAll("th[data-orden]").forEach(function (otro) {
+          delete otro.dataset.dir;
+          const icono = otro.querySelector("i");
+          if (icono) icono.className = "bi bi-arrow-down-up text-muted small";
+        });
+        encabezado.dataset.dir = ascendente ? "asc" : "desc";
+        const icono = encabezado.querySelector("i");
+        if (icono) icono.className = "bi bi-arrow-" + (ascendente ? "up" : "down") + " text-muted small";
+        const cuerpo = tablaDisponibles.querySelector("tbody");
+        const filas = Array.prototype.slice.call(cuerpo.querySelectorAll("tr"));
+        filas.sort(function (a, b) {
+          const celdaA = a.children[indice], celdaB = b.children[indice];
+          let va = (celdaA && (celdaA.dataset.valor !== undefined ? celdaA.dataset.valor : celdaA.textContent)) || "";
+          let vb = (celdaB && (celdaB.dataset.valor !== undefined ? celdaB.dataset.valor : celdaB.textContent)) || "";
+          if (numerico) {
+            va = parseFloat(va) || 0; vb = parseFloat(vb) || 0;
+            return ascendente ? va - vb : vb - va;
+          }
+          va = va.trim().toUpperCase(); vb = vb.trim().toUpperCase();
+          return ascendente ? va.localeCompare(vb) : vb.localeCompare(va);
+        });
+        filas.forEach(function (fila) { cuerpo.appendChild(fila); });
+      });
+    });
+  }
 
   const marcarTodos = document.getElementById("marcarTodos");
   if (marcarTodos) {
