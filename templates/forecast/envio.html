@@ -244,8 +244,10 @@
             <th data-orden="texto" role="button">Descripción <i class="bi bi-arrow-down-up text-muted small"></i></th>
             <th data-orden="texto" role="button">Proveedor <i class="bi bi-arrow-down-up text-muted small"></i></th>
             <th class="text-center" data-orden="texto" role="button">ABC <i class="bi bi-arrow-down-up text-muted small"></i></th>
-            <th class="text-end" data-orden="num" role="button">6UM <i class="bi bi-arrow-down-up text-muted small"></i></th>
-            <th class="text-end" data-orden="num" role="button">Venta 12m <i class="bi bi-arrow-down text-muted small"></i></th>
+            <th class="text-end" data-orden="num" role="button"
+                title="Promedio mensual de unidades de los últimos 6 meses, solo de tus cuentas">
+              6UM <i class="bi bi-arrow-down text-muted small"></i>
+            </th>
             <th class="text-end" data-orden="num" role="button">Sugerido 13 sem. <i class="bi bi-arrow-down-up text-muted small"></i></th>
           </tr>
         </thead>
@@ -272,7 +274,6 @@
               <span class="badge bg-{{ 'danger' if d.clase_abc == 'A' else ('warning text-dark' if d.clase_abc == 'B' else 'secondary') }}">{{ d.clase_abc }}</span>
             </td>
             <td class="text-end" data-valor="{{ d.promedio_6um }}">{{ "%.1f"|format(d.promedio_6um) }}</td>
-            <td class="text-end text-muted" data-valor="{{ d.monto_12m }}">{{ "%.0f"|format(d.monto_12m or 0) }}</td>
             <td class="text-end" data-valor="{{ d.sugerencia_total }}">{{ d.sugerencia_total }}</td>
           </tr>
           {% endfor %}
@@ -428,8 +429,8 @@
   });
 
   // Ronda CK (punto 2): ordenar la tabla de productos disponibles por
-  // cualquier columna. Arranca por "Venta 12m" descendente (lo que más se
-  // vende), que es el orden que viene del servidor.
+  // cualquier columna. Arranca por "6UM" descendente (lo que más vende ese
+  // ejecutivo), que es el orden que viene del servidor.
   const tablaDisponibles = document.getElementById("tablaDisponibles");
   if (tablaDisponibles) {
     tablaDisponibles.querySelectorAll("thead th[data-orden]").forEach(function (encabezado, columna) {

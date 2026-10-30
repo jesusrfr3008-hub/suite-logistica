@@ -108,7 +108,13 @@ def _firma_codigo(texto):
     return limpio
 
 
-VERSION_SUITE = "CO"
+ACCIONES_HISTORIAL_FORECAST = (
+    "envio", "correccion", "cambio_vs_ciclo_anterior", "alta", "baja", "nota",
+    "cierre_automatico", "cierre_manual",
+)
+ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
+
+VERSION_SUITE = "CP"
 VERSION_SUITE_FECHA = "2026-10-30"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -3296,6 +3302,30 @@ def reparar_variantes_physiol_ronda_ae():
         )
 
 
+def reparar_historial_forecast_ronda_cp():
+    """Ronda CP (2026-10-30, punto 5 del pedido del usuario: "veo que sigue
+    el historial de cada movimiento abajo").
+
+    La ronda CN dejo de grabar cada tecla, pero lo que YA estaba grabado en
+    las rondas anteriores seguia mostrandose, asi que en pantalla no se
+    notaba el cambio. Esto borra esas filas viejas -- son el registro de
+    cada pulsacion mientras el vendedor preparaba su hoja y la copia del
+    ciclo anterior, que no es una variacion sino el punto de partida."""
+    try:
+        viejas = ForecastCambio.query.filter(
+            ForecastCambio.accion.in_(ACCIONES_HISTORIAL_OBSOLETAS)).all()
+    except Exception:
+        return 0
+    if not viejas:
+        return 0
+    for fila in viejas:
+        db.session.delete(fila)
+    db.session.commit()
+    print(f"[reparar_ronda_cp] Historial del S&OP: {len(viejas)} registro(s) de las rondas "
+          "anteriores eliminados (eran el registro de cada tecla, no variaciones).")
+    return len(viejas)
+
+
 def reparar_duplicados_catalogo_ronda_cl():
     """Ronda CL (2026-10-29, a pedido del usuario: "hay codigos de productos
     que estan muy repetidos, solo debe haber 1 solo codigo por producto").
@@ -4315,6 +4345,7 @@ with app.app_context():
     _paso_arranque_seguro("reparar_usuarios_vendedores_ronda_ci", reparar_usuarios_vendedores_ronda_ci)
     _paso_arranque_seguro("reparar_duplicados_catalogo_ronda_cl", reparar_duplicados_catalogo_ronda_cl)
     _paso_arranque_seguro("reparar_forecast_claves_ronda_ck", reparar_forecast_claves_ronda_ck)
+    _paso_arranque_seguro("reparar_historial_forecast_ronda_cp", reparar_historial_forecast_ronda_cp)
 
 
 # ---------------------------------------------------------------------------
@@ -13391,6 +13422,10 @@ MESES_ES_CORTO = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul",
 # Cuantos productos propone el motor de sugerencias al entrar a elaborar.
 MAX_SUGERENCIAS_FORECAST = 25
 
+# Ronda CP (2026-10-30): lo unico que se muestra en el historial. Las
+# acciones de rondas anteriores ("edicion", "copia_ciclo_anterior") no
+# aportan: eran el registro de cada tecla y del punto de partida.
+
 
 def _semanas_forecast(ciclo):
     """Las 13 semanas del ciclo, lunes a viernes, contadas desde la fecha
@@ -13696,29 +13731,142 @@ def _productos_para_forecast(vendedor, proveedor_nombre=None):
             "homologado_solo_en_maestro": por_maestro,
         }
 
-    # Lo vendido que no calza con el catalogo: solo cuando se mira "todos
-    # los proveedores" (con un proveedor filtrado no corresponde, porque no
-    # se sabe de quien es).
-    if not proveedor_nombre:
-        for interno, venta in ventas_por_interno.items():
-            if interno in internos_usados:
-                continue
-            clave = _clave_producto_forecast(codigo_interno=interno)
-            reparto = _distribuir_sugerencia(venta.get("promedio_6um", 0) or 0)
-            filas[clave] = {
-                "clave": clave,
-                "codigo": venta.get("codigo") or interno,
-                "descripcion": venta.get("descripcion") or "",
-                "proveedor": venta.get("proveedor") or "(sin homologar)",
-                "producto_id": None, "variante_id": None, "codigo_interno": interno,
-                "promedio_6um": venta.get("promedio_6um", 0) or 0,
-                "clase_abc": venta.get("clase_abc", "C"),
-                "monto_12m": venta.get("monto_12m", 0) or 0,
-                "unidades_12m": venta.get("unidades_12m", 0) or 0,
-                "sugerencia": reparto, "sugerencia_total": sum(reparto),
-                "homologado": False, "homologado_solo_en_maestro": False,
-            }
+    # Ronda CP (2026-10-30, a pedido del usuario: "no es un codigo que este
+    # en el catalogo de ningun proveedor... no debe pasar"): un codigo
+    # interno vendido que NO corresponde a ningun producto del catalogo ya
+    # NO se ofrece para proyectar. No se puede comprar lo que no existe en
+    # el catalogo de un proveedor.
+    #
+    # La ronda CN los habia dejado visibles para que su venta no
+    # desapareciera, pero eso ensuciaba la pantalla con codigos como
+    # 4010210026 que el vendedor no puede elegir con sentido. Esa venta no
+    # se pierde: queda listada en Homologación > Ventas sin producto (ver
+    # _ventas_sin_producto), que es donde se corrige.
     return _unificar_productos_duplicados(filas)
+
+
+def _ventas_sin_producto(dias=365):
+    """Ronda CP (2026-10-30, punto 3 del pedido del usuario: "valida si hay
+    productos en ventas que no tienen codigos de proveedores de los
+    catalogos que tenemos").
+
+    Codigos internos CON VENTA que no se pueden enganchar a ningun producto
+    del catalogo, ni por el codigo escrito en el producto ni a traves del
+    mapeo maestro. Son los que antes aparecian sueltos en el S&OP.
+
+    Por cada uno: cuanto vendio, y si el maestro al menos sabe de que
+    proveedor es (en ese caso falta crear el producto en el catalogo; si no
+    lo sabe, falta homologar el codigo)."""
+    desde = date.today() - timedelta(days=dias)
+    # Codigos internos que SI tienen producto en el catalogo. Son dos
+    # grupos: los escritos encima de un producto, y los que el maestro
+    # resuelve a un proveedor + codigo que EXISTE en el catalogo. Esa
+    # segunda condicion es la clave: el maestro tiene miles de codigos cuyo
+    # codigo de proveedor no esta en ningun catalogo, y esos son
+    # justamente los que hay que listar.
+    firmas_catalogo = set()
+    con_producto = set()
+    for producto in Producto.query.filter(Producto.activo.is_(True)).all():
+        proveedor = producto.proveedor.nombre if producto.proveedor else ""
+        firmas_catalogo.add((_firma_producto(proveedor), _firma_codigo(producto.codigo)))
+        if (producto.codigo_interno_inventario or "").strip():
+            con_producto.add(producto.codigo_interno_inventario.strip().upper())
+    for variante in ProductoVariante.query.join(Producto).filter(
+        Producto.activo.is_(True),
+        db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+    ).all():
+        padre = variante.producto
+        proveedor = padre.proveedor.nombre if padre and padre.proveedor else ""
+        firmas_catalogo.add((_firma_producto(proveedor), _firma_codigo(variante.codigo)))
+        if (variante.codigo_interno_inventario or "").strip():
+            con_producto.add(variante.codigo_interno_inventario.strip().upper())
+    for firma, interno in _indice_ergopyme_por_codigo_proveedor().items():
+        if firma in firmas_catalogo:
+            con_producto.add(interno)
+
+    maestro = {}
+    for fila in CodigoErgopyme.query.all():
+        interno = (fila.codigo_interno or "").strip().upper()
+        if interno:
+            maestro[interno] = fila
+
+    totales = defaultdict(lambda: {"unidades": 0.0, "monto": 0.0, "descripcion": "",
+                                   "vendedores": set(), "documentos": 0})
+    filas = VentaLinea.query.filter(VentaLinea.fecha >= desde).with_entities(
+        VentaLinea.codigo_interno, VentaLinea.descripcion, VentaLinea.unidades,
+        VentaLinea.valor_neto, VentaLinea.vendedor_archivo,
+    ).all()
+    for codigo, descripcion, unidades, monto, vendedor in filas:
+        clave = (codigo or "").strip().upper()
+        if not clave or clave in con_producto:
+            continue
+        dato = totales[clave]
+        dato["unidades"] += unidades or 0
+        dato["monto"] += monto or 0
+        dato["documentos"] += 1
+        if descripcion and not dato["descripcion"]:
+            dato["descripcion"] = descripcion
+        if vendedor:
+            dato["vendedores"].add(vendedor.strip())
+
+    salida = []
+    for codigo, dato in totales.items():
+        fila_maestro = maestro.get(codigo)
+        salida.append({
+            "codigo_interno": codigo,
+            "descripcion": dato["descripcion"],
+            "unidades": round(dato["unidades"], 1),
+            "monto": round(dato["monto"], 0),
+            "documentos": dato["documentos"],
+            "vendedores": ", ".join(sorted(dato["vendedores"]))[:120],
+            "proveedor_maestro": (fila_maestro.proveedor_nombre or "") if fila_maestro else "",
+            "codigo_maestro": (fila_maestro.codigo_proveedor or "") if fila_maestro else "",
+            # Que le falta a este codigo para quedar bien:
+            "falta": ("Crear el producto en el catálogo del proveedor"
+                      if fila_maestro and (fila_maestro.proveedor_nombre or "").strip()
+                      else "Homologar el código: no se sabe de qué proveedor es"),
+        })
+    salida.sort(key=lambda f: -(f["monto"] or 0))
+    return salida
+
+
+@app.route("/stock/homologacion/ventas-sin-producto/descargar")
+@requiere_permiso("inventarios")
+def stock_homologacion_descargar_ventas_sin_producto():
+    """Ronda CP (2026-10-30, punto 3): la lista en Excel."""
+    filas = _ventas_sin_producto()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Ventas sin producto"
+    encabezados = ["Codigo interno", "Descripcion en la venta", "Unidades 12m", "Monto 12m",
+                   "Lineas", "Vendedores", "Proveedor (maestro)", "Codigo proveedor (maestro)",
+                   "Que falta"]
+    for col, titulo in enumerate(encabezados, start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.fill = PatternFill("solid", fgColor="BF8F00")
+        celda.alignment = Alignment(horizontal="center", vertical="center")
+    for i, f in enumerate(filas, start=2):
+        ws.cell(row=i, column=1, value=f["codigo_interno"])
+        ws.cell(row=i, column=2, value=f["descripcion"])
+        ws.cell(row=i, column=3, value=f["unidades"])
+        ws.cell(row=i, column=4, value=f["monto"])
+        ws.cell(row=i, column=5, value=f["documentos"])
+        ws.cell(row=i, column=6, value=f["vendedores"])
+        ws.cell(row=i, column=7, value=f["proveedor_maestro"])
+        ws.cell(row=i, column=8, value=f["codigo_maestro"])
+        ws.cell(row=i, column=9, value=f["falta"])
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:I{max(len(filas) + 1, 2)}"
+    for col, ancho in zip(range(1, 10), (20, 50, 13, 15, 9, 30, 22, 26, 46)):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return send_file(
+        buffer, as_attachment=True,
+        download_name=f"Ventas_sin_producto_{date.today().isoformat()}.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 def _unificar_productos_duplicados(filas):
@@ -14374,8 +14522,11 @@ def forecast_envio(envio_id):
             ):
                 continue
             disponibles.append(datos)
-        # Punto 2: por defecto, lo que MAS SE VENDE primero.
-        disponibles.sort(key=lambda d: (-(d["monto_12m"] or 0), _normalizar_nombre(d["codigo"])))
+        # Lo que mas se vende primero. Ronda CP (2026-10-30): el orden lo
+        # manda el PROMEDIO 6UM, que es el dato que el usuario quiso ver en
+        # pantalla; el monto de 12 meses se sigue usando solo para desempatar.
+        disponibles.sort(key=lambda d: (-(d["promedio_6um"] or 0), -(d["monto_12m"] or 0),
+                                        _normalizar_nombre(d["codigo"])))
     recortado = len(disponibles) > MAX_SUGERENCIAS_FORECAST
     disponibles = disponibles[:MAX_SUGERENCIAS_FORECAST]
 
@@ -14385,14 +14536,22 @@ def forecast_envio(envio_id):
     sugerencias = sorted(
         (d for clave, d in catalogo_completo.items()
          if clave not in claves_cargadas and (d["promedio_6um"] or 0) > 0),
-        key=lambda d: -(d["monto_12m"] or 0),
+        key=lambda d: (-(d["promedio_6um"] or 0), -(d["monto_12m"] or 0)),
     )[:MAX_SUGERENCIAS_FORECAST]
 
     # La sugerencia de cada fila sale de su propio promedio 6UM (el que se
     # congelo al agregarla), no de buscarla de nuevo por codigo interno.
     sugerencia_por_linea = {l.id: _distribuir_sugerencia(l.promedio_6um or 0) for l in lineas}
-    historial = ForecastCambio.query.filter_by(envio_id=envio.id).order_by(
-        ForecastCambio.momento.desc()).limit(80).all()
+    # Ronda CP (2026-10-30, punto 5): el historial muestra SOLO lo que el
+    # usuario pidio -- la fecha de envio, los aumentos y disminuciones sobre
+    # codigos ya proyectados, y las notas del por que. Las acciones de las
+    # rondas anteriores ("edicion" de cada tecla, "copia_ciclo_anterior")
+    # quedan fuera; las que ya estaban grabadas se borran al arrancar, ver
+    # reparar_historial_forecast_ronda_cp().
+    historial = ForecastCambio.query.filter(
+        ForecastCambio.envio_id == envio.id,
+        ForecastCambio.accion.in_(ACCIONES_HISTORIAL_FORECAST),
+    ).order_by(ForecastCambio.momento.desc()).limit(80).all()
     return render_template(
         "forecast/envio.html", envio=envio, ciclo=envio.ciclo,
         sugerencia_por_linea=sugerencia_por_linea,
@@ -15419,6 +15578,7 @@ def stock_homologacion():
                                       _normalizar_nombre(r["codigo"])))
     internos_repetidos = _codigos_internos_repetidos() if ver == "repetidos" else []
     inconsistencias = _inconsistencias_homologacion() if ver == "repetidos" else None
+    ventas_huerfanas = _ventas_sin_producto() if ver == "repetidos" else []
     total_repetidos = len(repetidos) if ver == "repetidos" else None
 
     return render_template(
@@ -15428,6 +15588,7 @@ def stock_homologacion():
         total_sin_codigo_interno=total_sin_codigo_interno,
         grupos_sin_codigo=grupos_sin_codigo, repetidos=repetidos, total_repetidos=total_repetidos,
         internos_repetidos=internos_repetidos, inconsistencias=inconsistencias,
+        ventas_huerfanas=ventas_huerfanas,
     )
 
 
@@ -15661,6 +15822,79 @@ def _inconsistencias_homologacion():
         "maestro_sin_producto": maestro_sin_producto,
         "con_venta_sin_producto": sum(1 for f in maestro_sin_producto if f["con_venta"]),
     }
+
+
+@app.route("/stock/homologacion/catalogo-completo/descargar")
+@requiere_permiso("inventarios")
+def stock_homologacion_descargar_catalogo_completo():
+    """Ronda CP (2026-10-30, punto 2 del pedido del usuario: "no veo donde
+    descargue todos los productos de todos los proveedores con y sin
+    codigos internos"): UNA sola planilla con el catalogo entero.
+
+    La columna "Tiene codigo" permite filtrar en Excel y ver de un vistazo
+    lo que falta; la columna del codigo interno es editable y se puede
+    volver a subir por la misma pantalla que la planilla de faltantes."""
+    homologados = {(f["tipo"], f["id"]): f for f in _catalogo_homologado()}
+    filas = []
+
+    def _agregar(tipo, objeto, padre):
+        proveedor = padre.proveedor.nombre if padre and padre.proveedor else ""
+        datos = homologados.get((tipo, objeto.id))
+        filas.append({
+            "proveedor": proveedor, "tipo": tipo, "id": objeto.id,
+            "codigo": (objeto.codigo or "").strip(),
+            "descripcion": (objeto.descripcion or "").strip(),
+            "codigo_interno": (datos or {}).get("codigo_interno", "")
+                              or (objeto.codigo_interno_inventario or "").strip(),
+            "origen": (datos or {}).get("origen", ""),
+            "no_aplica": bool(getattr(objeto, "no_requiere_codigo_interno", False)),
+        })
+
+    con_variantes = {pid for (pid,) in db.session.query(ProductoVariante.producto_id).distinct().all()}
+    for producto in Producto.query.filter(Producto.activo.is_(True)).all():
+        if producto.id not in con_variantes:
+            _agregar("Producto", producto, producto)
+    for variante in ProductoVariante.query.join(Producto).filter(
+        Producto.activo.is_(True),
+        db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+    ).all():
+        _agregar("Variante", variante, variante.producto)
+    filas.sort(key=lambda f: (_normalizar_nombre(f["proveedor"]), _firma_codigo(f["codigo"])))
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Catalogo"
+    encabezados = ["Proveedor", "Codigo Proveedor", "Descripcion", "Tipo", "Tiene codigo",
+                   "CODIGO INTERNO ERGOPYME", "Origen del cruce", "ID"]
+    for col, titulo in enumerate(encabezados, start=1):
+        celda = ws.cell(row=1, column=col, value=titulo)
+        celda.font = Font(bold=True, color="FFFFFF")
+        celda.fill = PatternFill("solid", fgColor="2F5597")
+        celda.alignment = Alignment(horizontal="center", vertical="center")
+    amarillo = PatternFill("solid", fgColor="FFF2CC")
+    for i, f in enumerate(filas, start=2):
+        ws.cell(row=i, column=1, value=f["proveedor"])
+        ws.cell(row=i, column=2, value=f["codigo"])
+        ws.cell(row=i, column=3, value=f["descripcion"])
+        ws.cell(row=i, column=4, value=f["tipo"])
+        ws.cell(row=i, column=5,
+                value="Sí" if f["codigo_interno"] else ("No aplica" if f["no_aplica"] else "No"))
+        celda = ws.cell(row=i, column=6, value=f["codigo_interno"] or None)
+        if not f["codigo_interno"]:
+            celda.fill = amarillo
+        ws.cell(row=i, column=7, value=f["origen"])
+        ws.cell(row=i, column=8, value=f"{f['tipo'][0]}{f['id']}")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:H{max(len(filas) + 1, 2)}"
+    for col, ancho in zip(range(1, 9), (22, 26, 58, 11, 13, 26, 42, 10)):
+        ws.column_dimensions[get_column_letter(col)].width = ancho
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return send_file(
+        buffer, as_attachment=True,
+        download_name=f"Catalogo_completo_homologacion_{date.today().isoformat()}.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/stock/homologacion/homologados/descargar")

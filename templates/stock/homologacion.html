@@ -57,6 +57,56 @@
 </div>
 
 {% if ver == 'repetidos' %}
+{# Ronda CP (2026-10-30, punto 3 del pedido del usuario): ventas cuyo
+   código interno no corresponde a ningún producto del catálogo. Son los que
+   antes se colaban sueltos en el S&OP. #}
+{% if ventas_huerfanas %}
+<div class="card p-3 mb-3 border-warning">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+    <h5 class="section-title mb-0">
+      <i class="bi bi-cart-x me-1"></i> Ventas sin producto en el catálogo
+      <span class="badge bg-warning text-dark">{{ ventas_huerfanas|length }}</span>
+    </h5>
+    <a class="btn btn-sm btn-outline-primary"
+       href="{{ url_for('stock_homologacion_descargar_ventas_sin_producto') }}">
+      <i class="bi bi-download me-1"></i> Descargar en Excel
+    </a>
+  </div>
+  <p class="text-muted small">
+    Códigos internos <strong>con venta en los últimos 12 meses</strong> que no se pueden enganchar a
+    ningún producto del catálogo, ni por el código escrito en el producto ni a través del mapeo
+    maestro. Ya <strong>no aparecen en el S&amp;OP</strong> — no se puede proyectar la compra de algo
+    que no existe en el catálogo de un proveedor — pero su venta está acá para poder corregirla.
+  </p>
+  <div class="table-responsive" style="max-height: 420px; overflow-y: auto;">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="sticky-top bg-white">
+        <tr>
+          <th>Código interno</th><th>Descripción en la venta</th>
+          <th class="text-end">Unidades 12m</th><th class="text-end">Monto 12m</th>
+          <th>Proveedor (maestro)</th><th>Qué falta</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in ventas_huerfanas[:200] %}
+        <tr>
+          <td class="small fw-semibold">{{ f.codigo_interno }}</td>
+          <td class="small" style="max-width: 320px;">{{ f.descripcion }}</td>
+          <td class="text-end small">{{ "%.0f"|format(f.unidades) }}</td>
+          <td class="text-end small">{{ "%.0f"|format(f.monto) }}</td>
+          <td class="small text-muted">
+            {{ f.proveedor_maestro or '—' }}
+            {% if f.codigo_maestro %}<div style="font-size: .7rem;">{{ f.codigo_maestro }}</div>{% endif %}
+          </td>
+          <td class="small">{{ f.falta }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
 {# Ronda CN (2026-10-30, punto 4): cruce entre el catálogo y el mapeo
    maestro de Inventarios, para cazar las inconsistencias que hacen que un
    mismo producto se vea dos veces en el S&OP. #}
@@ -317,12 +367,19 @@
           <i class="bi bi-download me-1"></i> Faltantes
         </button>
       </form>
-      {# Ronda CN (2026-10-30, punto 3): faltaba poder bajar los que YA
-         tienen su código interno asignado. #}
-      <a class="btn btn-outline-success text-nowrap mt-2 d-inline-block"
-         href="{{ url_for('stock_homologacion_descargar_homologados') }}">
-        <i class="bi bi-check2-square me-1"></i> Descargar los ya homologados
-      </a>
+      {# Ronda CN: los que YA tienen código. Ronda CP: y el catálogo
+         COMPLETO de todos los proveedores, con y sin código, en una sola
+         planilla -- es lo que pidió el usuario. #}
+      <div class="d-flex flex-wrap gap-2 mt-2">
+        <a class="btn btn-outline-success text-nowrap"
+           href="{{ url_for('stock_homologacion_descargar_homologados') }}">
+          <i class="bi bi-check2-square me-1"></i> Ya homologados
+        </a>
+        <a class="btn btn-primary text-nowrap"
+           href="{{ url_for('stock_homologacion_descargar_catalogo_completo') }}">
+          <i class="bi bi-collection me-1"></i> Catálogo completo (con y sin código)
+        </a>
+      </div>
     </div>
     <div class="col-md-7">
       <form method="post" action="{{ url_for('stock_homologacion_cargar_faltantes') }}"
