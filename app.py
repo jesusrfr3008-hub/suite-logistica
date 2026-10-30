@@ -108,7 +108,7 @@ def _firma_codigo(texto):
     return limpio
 
 
-VERSION_SUITE = "CN"
+VERSION_SUITE = "CO"
 VERSION_SUITE_FECHA = "2026-10-30"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -570,6 +570,52 @@ def filtro_numero_flex(valor):
     return _formatear_numero(redondeado, 2)
 
 
+def ensure_columnas_de_modelos():
+    """Ronda CO (2026-10-30): red de seguridad del esquema.
+
+    ensure_schema_migrations() de arriba es una lista escrita a mano, y
+    basta olvidar una linea para que una columna nueva no llegue nunca a la
+    base desplegada. Paso de verdad: la ronda CN agrego ForecastCambio.nota
+    y la entrada quedo fuera del diccionario, asi que el S&OP respondia 500
+    en produccion ("no such column: forecast_cambios.nota") mientras en las
+    pruebas -- que siempre crean la base desde cero -- todo pasaba.
+
+    Esto recorre TODOS los modelos y agrega cualquier columna que exista en
+    el modelo y falte en la tabla. Se agregan siempre como NULL (aunque el
+    modelo las declare obligatorias): una tabla con datos no puede recibir
+    una columna NOT NULL sin default, y el codigo ya tolera el valor vacio
+    hasta que la reparacion de turno lo complete.
+
+    No borra ni cambia columnas: solo agrega las que faltan."""
+    inspector = db.inspect(db.engine)
+    tablas = set(inspector.get_table_names())
+    agregadas = []
+    for tabla in db.metadata.sorted_tables:
+        if tabla.name not in tablas:
+            continue  # la crea db.create_all()
+        existentes = {c["name"] for c in inspector.get_columns(tabla.name)}
+        for columna in tabla.columns:
+            if columna.name in existentes:
+                continue
+            try:
+                tipo = columna.type.compile(db.engine.dialect)
+            except Exception:
+                tipo = "TEXT"
+            try:
+                db.session.execute(
+                    db.text(f'ALTER TABLE {tabla.name} ADD COLUMN {columna.name} {tipo}'))
+                db.session.commit()
+                agregadas.append(f"{tabla.name}.{columna.name}")
+            except Exception as exc:
+                db.session.rollback()
+                print(f"[esquema] No se pudo agregar {tabla.name}.{columna.name} ({tipo}): {exc}")
+    if agregadas:
+        print(f"[esquema] Columnas agregadas automaticamente ({len(agregadas)}): {agregadas}")
+    else:
+        print("[esquema] La base ya tiene todas las columnas de los modelos.")
+    return len(agregadas)
+
+
 def ensure_schema_migrations():
     """Agrega columnas nuevas a tablas existentes sin borrar datos.
     SQLite soporta ALTER TABLE ... ADD COLUMN de forma sencilla, asi que
@@ -703,6 +749,12 @@ def ensure_schema_migrations():
             ("producto_id", "INTEGER"),
             ("variante_id", "INTEGER"),
             ("codigo_proveedor", "VARCHAR(120)"),
+        ],
+        # Ronda CN (2026-10-30): nota y semana de cada variacion -- ver
+        # ForecastCambio en models.py.
+        "forecast_cambios": [
+            ("nota", "TEXT"),
+            ("semana_inicio", "DATE"),
         ],
         # Ronda CK (2026-10-29): de donde salio cada homologacion, para no
         # pisar lo que el usuario completo a mano -- ver CodigoErgopyme.
@@ -4239,6 +4291,10 @@ with app.app_context():
     os.makedirs(REPORTES_DIR, exist_ok=True)
     db.create_all()
     _paso_arranque_seguro("ensure_schema_migrations", ensure_schema_migrations)
+    # Despues de las migraciones escritas a mano, la red de seguridad: si
+    # alguna columna nueva de los modelos no quedo declarada arriba, se
+    # agrega igual (ver ensure_columnas_de_modelos).
+    _paso_arranque_seguro("ensure_columnas_de_modelos", ensure_columnas_de_modelos)
     _paso_arranque_seguro("seed_from_excel", lambda: seed_from_excel(app))
     _paso_arranque_seguro("seed_empresas_compradoras", seed_empresas_compradoras)
     _paso_arranque_seguro("seed_variantes_lentes_medicontur", seed_variantes_lentes_medicontur)
