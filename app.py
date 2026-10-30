@@ -152,7 +152,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CQ"
+VERSION_SUITE = "CR"
 VERSION_SUITE_FECHA = "2026-10-30"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -5911,21 +5911,70 @@ def proveedores_editar(proveedor_id):
     return render_template("proveedores/form.html", proveedor=prov)
 
 
+def _referencias_de_proveedor(prov):
+    """Todo lo que cuelga de un proveedor y por lo tanto impide borrarlo.
+
+    Ronda CR (2026-10-30): se recorren las tablas que apuntan a
+    'proveedores' en vez de mirar solo las ordenes de compra, que era lo
+    unico que se revisaba antes. Devuelve [(etiqueta, cantidad)] con lo que
+    de verdad tiene, para poder decirselo al usuario."""
+    referencias = [
+        ("producto(s) en el catálogo", Producto.query.filter_by(proveedor_id=prov.id)),
+        ("orden(es) de compra", OrdenCompra.query.filter_by(proveedor_id=prov.id)),
+        ("importación(es)", Importacion.query.filter_by(proveedor_id=prov.id)),
+        ("factura(s) de proveedor", FacturaProveedor.query.filter_by(proveedor_id=prov.id)),
+        ("ajuste(s) de compras", AjusteCompraProveedor.query.filter_by(proveedor_id=prov.id)),
+        ("registro(s) de consignación",
+         ConsignacionPendienteLote.query.filter_by(proveedor_id=prov.id)),
+        ("alias de código", AliasCodigoProveedor.query.filter_by(proveedor_id=prov.id)),
+    ]
+    salida = []
+    for etiqueta, consulta in referencias:
+        try:
+            cantidad = consulta.count()
+        except Exception:
+            cantidad = 0
+        if cantidad:
+            salida.append((etiqueta, cantidad))
+    return salida
+
+
 @app.route("/proveedores/<int:proveedor_id>/eliminar", methods=["POST"])
 @requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_eliminar(proveedor_id):
+    """Ronda CR (2026-10-30): antes esto solo miraba las ordenes de compra.
+    Si el proveedor tenia productos, importaciones, facturas o consignacion,
+    el borrado reventaba contra la base y la pantalla devolvia un 500 sin
+    explicar nada -- es lo que le paso al usuario con INSUMOS MEDICOS M Y M.
+
+    Ahora se revisa TODO lo que cuelga del proveedor (ver
+    _referencias_de_proveedor): si hay algo, se desactiva y se dice
+    exactamente que lo retiene; si no hay nada, se borra. Y aunque algo se
+    escape, el borrado va protegido: nunca mas un 500."""
     prov = Proveedor.query.get_or_404(proveedor_id)
-    if prov.ordenes.count() > 0:
+    nombre = prov.nombre
+    referencias = _referencias_de_proveedor(prov)
+    if referencias:
         prov.activo = False
         db.session.commit()
-        flash(
-            f"'{prov.nombre}' tiene ordenes de compra asociadas: se desactivo en vez de eliminarse.",
-            "warning",
-        )
-    else:
+        detalle = ", ".join(f"{cantidad} {etiqueta}" for etiqueta, cantidad in referencias)
+        flash(f"'{nombre}' no se puede eliminar porque tiene {detalle}. "
+              "Se desactivó: deja de aparecer en las listas y búsquedas, pero todo su historial "
+              "queda intacto. Puedes reactivarlo cuando quieras.", "warning")
+        return redirect(url_for("proveedores_list"))
+    try:
         db.session.delete(prov)
         db.session.commit()
-        flash(f"Proveedor eliminado.", "success")
+        flash(f"Proveedor '{nombre}' eliminado.", "success")
+    except Exception as exc:
+        db.session.rollback()
+        prov = Proveedor.query.get(proveedor_id)
+        if prov:
+            prov.activo = False
+            db.session.commit()
+        app.logger.warning("No se pudo eliminar el proveedor %s: %s", proveedor_id, exc)
+        flash(f"'{nombre}' tiene información asociada que impide borrarlo, así que se desactivó "
+              "en vez de eliminarse. Su historial queda intacto.", "warning")
     return redirect(url_for("proveedores_list"))
 
 
@@ -13942,6 +13991,94 @@ def _codigos_internos_con_producto():
     return sorted(salida.items(), key=lambda par: par[1])
 
 
+@app.route("/stock/homologacion/asignar-venta-a-producto", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_homologacion_asignar_venta_a_producto():
+    """Ronda CR (2026-10-30, a pedido del usuario: "¿dónde le asigno el
+    código de producto proveedor a esas ventas?").
+
+    Se elige el PRODUCTO DEL CATALOGO (proveedor + codigo de proveedor) al
+    que pertenece esa venta, y el sistema decide solo como engancharla:
+
+    - Si ese producto todavia no tiene codigo interno, se le escribe el de
+      la venta y queda homologado.
+    - Si ya tiene OTRO codigo interno, no se le pisa: se crea un alias del
+      codigo de la venta hacia el que ya tiene (es el caso de un codigo que
+      Ergopyme reemplazo, como BIOVISC 3,0%).
+
+    En los dos casos la venta pasa a sumar en el promedio de ese producto
+    sin tocar ninguna linea de venta."""
+    codigo_venta = (request.form.get("codigo_interno") or "").strip().upper()
+    proveedor_sel = (request.form.get("proveedor") or "").strip()
+    codigo_proveedor = (request.form.get("codigo_proveedor") or "").strip()
+    if not (codigo_venta and proveedor_sel and codigo_proveedor):
+        flash("Hacen falta el código de la venta, el proveedor y el código del producto.", "warning")
+        return redirect(url_for("stock_homologacion", ver="repetidos"))
+
+    firma_prov = _firma_producto(proveedor_sel)
+    firma_cod = _firma_codigo(codigo_proveedor)
+    candidatos = []
+    for producto in Producto.query.filter(Producto.activo.is_(True)).all():
+        nombre = producto.proveedor.nombre if producto.proveedor else ""
+        if _firma_producto(nombre) == firma_prov and _firma_codigo(producto.codigo) == firma_cod:
+            candidatos.append(("Producto", producto, producto))
+    for variante in ProductoVariante.query.join(Producto).filter(
+        Producto.activo.is_(True),
+        db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+    ).all():
+        padre = variante.producto
+        nombre = padre.proveedor.nombre if padre and padre.proveedor else ""
+        if _firma_producto(nombre) == firma_prov and _firma_codigo(variante.codigo) == firma_cod:
+            candidatos.append(("Variante", variante, padre))
+
+    if not candidatos:
+        flash(f"No encontré el código '{codigo_proveedor}' en el catálogo de {proveedor_sel}. "
+              "Si el producto todavía no existe, créalo primero en el catálogo del proveedor.",
+              "warning")
+        return redirect(url_for("stock_homologacion", ver="repetidos"))
+    if len(candidatos) > 1:
+        flash(f"El código '{codigo_proveedor}' está más de una vez en el catálogo de "
+              f"{proveedor_sel}. Resuelve primero esa duplicación en 'Códigos de proveedor "
+              "repetidos', más abajo en esta misma pantalla.", "warning")
+        return redirect(url_for("stock_homologacion", ver="repetidos"))
+
+    tipo, objeto, padre = candidatos[0]
+    existente = (objeto.codigo_interno_inventario or "").strip().upper()
+    etiqueta = f"{(objeto.codigo or '').strip()} — {(objeto.descripcion or '')[:60]}"
+
+    if existente and existente != codigo_venta:
+        # Ya tiene su codigo vigente: la venta vieja se le enlaza.
+        alias = AliasCodigoInterno.query.filter_by(codigo_antiguo=codigo_venta).first()
+        if not alias:
+            alias = AliasCodigoInterno(codigo_antiguo=codigo_venta)
+            db.session.add(alias)
+        alias.codigo_vigente = existente
+        alias.motivo = (f"Asignado a {etiqueta} desde Homologación: el producto ya tenía el "
+                        f"código {existente}.")[:300]
+        alias.creado_por_id = _usuario_actual_id()
+        db.session.commit()
+        flash(f"Listo: la venta del código {codigo_venta} se suma ahora a {etiqueta}, que en "
+              f"Inventarios tiene el código {existente}. No se modificó ninguna línea de venta.",
+              "success")
+        return redirect(url_for("stock_homologacion", ver="repetidos"))
+
+    # No tenia codigo: se le escribe el de la venta y queda homologado.
+    objeto.codigo_interno_inventario = codigo_venta
+    nombre_proveedor = padre.proveedor.nombre if padre and padre.proveedor else proveedor_sel
+    homologacion = CodigoErgopyme.query.filter_by(codigo_interno=codigo_venta).first()
+    if not homologacion:
+        homologacion = CodigoErgopyme(codigo_interno=codigo_venta)
+        db.session.add(homologacion)
+    homologacion.proveedor_nombre = nombre_proveedor
+    homologacion.codigo_proveedor = (objeto.codigo or "")[:120]
+    homologacion.descripcion = (objeto.descripcion or "")[:500]
+    homologacion.origen = "manual"
+    db.session.commit()
+    flash(f"Listo: {etiqueta} quedó homologado con el código {codigo_venta}, y su venta ya cuenta "
+          "en el promedio del vendedor.", "success")
+    return redirect(url_for("stock_homologacion", ver="repetidos"))
+
+
 @app.route("/stock/homologacion/alias-codigo-interno", methods=["POST"])
 @requiere_permiso("inventarios")
 def stock_homologacion_alias_codigo_interno():
@@ -15754,6 +15891,8 @@ def stock_homologacion():
         AliasCodigoInterno.codigo_antiguo).all() if ver == "repetidos" else [])
     # Para el desplegable: los codigos internos que SI llevan a un producto.
     destinos_alias = _codigos_internos_con_producto() if ver == "repetidos" else []
+    proveedores_activos = (Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
+                           if ver == "repetidos" else [])
     total_repetidos = len(repetidos) if ver == "repetidos" else None
 
     return render_template(
@@ -15764,7 +15903,7 @@ def stock_homologacion():
         grupos_sin_codigo=grupos_sin_codigo, repetidos=repetidos, total_repetidos=total_repetidos,
         internos_repetidos=internos_repetidos, inconsistencias=inconsistencias,
         ventas_huerfanas=ventas_huerfanas, alias_internos=alias_internos,
-        destinos_alias=destinos_alias,
+        destinos_alias=destinos_alias, proveedores_activos=proveedores_activos,
     )
 
 

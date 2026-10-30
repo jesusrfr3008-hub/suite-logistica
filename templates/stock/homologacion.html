@@ -12,6 +12,27 @@
     modal.querySelector("#aliasAntiguo").value = boton.dataset.codigo || "";
     modal.querySelector("#aliasDescripcion").textContent = boton.dataset.descripcion || "";
   });
+
+  // Ronda CR: el modal de asignar a un producto llega precargado con lo que
+  // el mapeo maestro ya sabe de ese código, para no escribirlo a mano.
+  const modalProducto = document.getElementById("modalAsignarProducto");
+  if (modalProducto) {
+    modalProducto.addEventListener("show.bs.modal", function (evento) {
+      const boton = evento.relatedTarget;
+      if (!boton) return;
+      const codigo = boton.dataset.codigo || "";
+      modalProducto.querySelector("#asignarCodigo").textContent = codigo;
+      modalProducto.querySelector("#asignarCodigoOculto").value = codigo;
+      modalProducto.querySelector("#asignarDescripcion").textContent = boton.dataset.descripcion || "";
+      modalProducto.querySelector("#asignarCodigoProv").value = boton.dataset.codigoprov || "";
+      const proveedor = (boton.dataset.proveedor || "").trim();
+      const select = modalProducto.querySelector("#asignarProveedor");
+      select.value = "";
+      Array.prototype.forEach.call(select.options, function (opcion) {
+        if (opcion.value.trim().toUpperCase() === proveedor.toUpperCase()) select.value = opcion.value;
+      });
+    });
+  }
 })();
 </script>
 {% endblock %}
@@ -117,11 +138,16 @@
           <td class="text-end">
             {# Ronda CQ (2026-10-30): enganchar la venta de un codigo que
                Ergopyme reemplazo al codigo vigente del mismo producto. #}
-            <button type="button" class="btn btn-sm btn-outline-primary"
-                    data-bs-toggle="modal" data-bs-target="#modalAlias"
+            {# Ronda CR (2026-10-30): se asigna eligiendo el PRODUCTO del
+               catálogo; el sistema decide si lo homologa o si crea el
+               enlace hacia el código que el producto ya tiene. #}
+            <button type="button" class="btn btn-sm btn-primary"
+                    data-bs-toggle="modal" data-bs-target="#modalAsignarProducto"
                     data-codigo="{{ f.codigo_interno }}"
-                    data-descripcion="{{ f.descripcion }}">
-              Asignar
+                    data-descripcion="{{ f.descripcion }}"
+                    data-proveedor="{{ f.proveedor_maestro }}"
+                    data-codigoprov="{{ f.codigo_maestro }}">
+              Asignar a un producto
             </button>
           </td>
         </tr>
@@ -131,12 +157,61 @@
   </div>
 </div>
 
+<div class="modal fade" id="modalAsignarProducto" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('stock_homologacion_asignar_venta_a_producto') }}">
+        <div class="modal-header">
+          <h5 class="modal-title">Asignar esta venta a un producto del catálogo</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">
+            Elige el producto del catálogo al que pertenece esta venta. El sistema resuelve solo:
+            si ese producto todavía no tiene código interno, se lo escribe y queda homologado; si ya
+            tiene <strong>otro</strong> código, no se lo pisa — enlaza el de la venta al que ya
+            tiene, que es el caso de un código que Ergopyme reemplazó.
+            <strong>No se modifica ninguna línea de venta.</strong>
+          </p>
+          <div class="alert alert-light border small mb-3">
+            Venta: <strong id="asignarCodigo"></strong> · <span id="asignarDescripcion"></span>
+          </div>
+          <input type="hidden" name="codigo_interno" id="asignarCodigoOculto">
+          <div class="row g-3">
+            <div class="col-md-5">
+              <label class="form-label small fw-semibold">Proveedor</label>
+              <select name="proveedor" class="form-select" id="asignarProveedor" required>
+                <option value="">Elige el proveedor...</option>
+                {% for p in proveedores_activos %}
+                <option value="{{ p.nombre }}">{{ p.nombre }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-7">
+              <label class="form-label small fw-semibold">Código del producto (el del proveedor)</label>
+              <input type="text" class="form-control" name="codigo_proveedor" id="asignarCodigoProv"
+                     required placeholder="Tal como está en el catálogo del proveedor">
+              <div class="form-text">
+                No importan los puntos ni los guiones: "ILMB-05-S" y "ILMB.05.S" se reconocen igual.
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancelar</button>
+          <button class="btn btn-primary">Asignar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
 <div class="modal fade" id="modalAlias" tabindex="-1">
   <div class="modal-dialog modal-lg">
     <div class="modal-content">
       <form method="post" action="{{ url_for('stock_homologacion_alias_codigo_interno') }}">
         <div class="modal-header">
-          <h5 class="modal-title">Asignar la venta de un código reemplazado</h5>
+          <h5 class="modal-title">Asignar esta venta a otro código interno</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
