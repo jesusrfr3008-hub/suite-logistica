@@ -48,7 +48,7 @@ from models import (
     FacturaEmbarqueImportacion,
     VentaLinea, ClienteVendedor, codigo_cuenta_para_rotacion, PREFIJOS_SIN_ROTACION,
     ForecastCiclo, ForecastEnvio, ForecastLinea, ForecastCambio, Notificacion,
-    ParametroSistema, SEMANAS_FORECAST,
+    ParametroSistema, AliasCodigoInterno, SEMANAS_FORECAST,
 )
 from seed_data import seed_from_excel
 import costing
@@ -92,6 +92,44 @@ def _firma_producto(texto):
     return _normalizar_nombre(texto).replace(" ", "")
 
 
+def _alias_codigos_internos():
+    """{codigo antiguo: codigo vigente} -- ronda CQ (2026-10-30).
+
+    Ergopyme reasigna codigos internos de vez en cuando y el historico de
+    ventas conserva el anterior. Este mapa traduce al leer, nunca al
+    escribir: las lineas de venta quedan tal cual vinieron del sistema de
+    Inventarios.
+
+    Se resuelven las cadenas (A->B->C queda A->C) y se corta cualquier
+    ciclo, para que un alias mal cargado no cuelgue la aplicacion."""
+    try:
+        filas = AliasCodigoInterno.query.all()
+    except Exception:
+        return {}
+    directo = {}
+    for fila in filas:
+        antiguo = (fila.codigo_antiguo or "").strip().upper()
+        vigente = (fila.codigo_vigente or "").strip().upper()
+        if antiguo and vigente and antiguo != vigente:
+            directo[antiguo] = vigente
+    resuelto = {}
+    for antiguo in directo:
+        visto, actual = {antiguo}, directo[antiguo]
+        while actual in directo and actual not in visto:
+            visto.add(actual)
+            actual = directo[actual]
+        resuelto[antiguo] = actual
+    return resuelto
+
+
+def _codigo_interno_vigente(codigo, alias=None):
+    limpio = (codigo or "").strip().upper()
+    if not limpio:
+        return ""
+    mapa = _alias_codigos_internos() if alias is None else alias
+    return mapa.get(limpio, limpio)
+
+
 def _firma_codigo(texto):
     """Ronda CN (2026-10-30): codigo comparable. Ademas de lo que hace
     _firma_producto (tildes, mayusculas, espacios) quita los SEPARADORES
@@ -114,7 +152,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CP"
+VERSION_SUITE = "CQ"
 VERSION_SUITE_FECHA = "2026-10-30"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -3302,6 +3340,44 @@ def reparar_variantes_physiol_ronda_ae():
         )
 
 
+# Ronda CQ (2026-10-30): el caso concreto que identifico el usuario. En
+# Ergopyme, 'VISCO BIOVIS 3.0' paso del codigo 4010210026 al 4010210022; el
+# historico de ventas conserva el viejo. Se siembra el enlace para que esa
+# venta no quede huerfana. Si el usuario lo quita desde la pantalla, no se
+# vuelve a crear (se busca por codigo antiguo, no se fuerza).
+ALIAS_INTERNOS_CONOCIDOS = [
+    ("4010210026", "4010210022",
+     "Ergopyme reasignó el código de VISCO BIOVIS 3.0 / BIOVISC 3,0%; "
+     "el histórico de ventas conserva el anterior."),
+]
+
+
+def reparar_alias_codigos_internos_ronda_cq():
+    """Siembra los enlaces conocidos entre un codigo interno reemplazado y
+    el vigente. Solo crea lo que no existe: nunca pisa lo que el usuario
+    haya cargado o corregido a mano."""
+    try:
+        existentes = {a.codigo_antiguo for a in AliasCodigoInterno.query.all()}
+        quitados = {
+            (p.clave or "").split(":", 1)[-1]
+            for p in ParametroSistema.query.filter(
+                ParametroSistema.clave.like("alias_interno_quitado:%")).all()
+        }
+    except Exception:
+        return 0
+    creados = []
+    for antiguo, vigente, motivo in ALIAS_INTERNOS_CONOCIDOS:
+        if antiguo in existentes or antiguo in quitados:
+            continue
+        db.session.add(AliasCodigoInterno(
+            codigo_antiguo=antiguo, codigo_vigente=vigente, motivo=motivo))
+        creados.append(f"{antiguo} -> {vigente}")
+    if creados:
+        db.session.commit()
+        print(f"[reparar_ronda_cq] Códigos internos reemplazados enlazados: {creados}")
+    return len(creados)
+
+
 def reparar_historial_forecast_ronda_cp():
     """Ronda CP (2026-10-30, punto 5 del pedido del usuario: "veo que sigue
     el historial de cada movimiento abajo").
@@ -4346,6 +4422,7 @@ with app.app_context():
     _paso_arranque_seguro("reparar_duplicados_catalogo_ronda_cl", reparar_duplicados_catalogo_ronda_cl)
     _paso_arranque_seguro("reparar_forecast_claves_ronda_ck", reparar_forecast_claves_ronda_ck)
     _paso_arranque_seguro("reparar_historial_forecast_ronda_cp", reparar_historial_forecast_ronda_cp)
+    _paso_arranque_seguro("reparar_alias_codigos_internos_ronda_cq", reparar_alias_codigos_internos_ronda_cq)
 
 
 # ---------------------------------------------------------------------------
@@ -13141,8 +13218,13 @@ def _unidades_vendidas_por_codigo(dias, vendedor=None):
             return {}
         query = query.filter(VentaLinea.rut_cliente.in_(ruts))
     totales = defaultdict(float)
+    # Ronda CQ (2026-10-30): mismo criterio que el Forecast -- la venta de
+    # un codigo reemplazado por Ergopyme cuenta para el codigo vigente.
+    alias = _alias_codigos_internos()
     for codigo, unidades in query.with_entities(VentaLinea.codigo_interno, VentaLinea.unidades).all():
-        totales[(codigo or "").strip()] += unidades or 0
+        clave = _codigo_interno_vigente(codigo, alias)
+        if clave:
+            totales[clave] += unidades or 0
     return dict(totales)
 
 
@@ -13504,8 +13586,11 @@ def _ventas_vendedor_por_codigo(vendedor, desde):
         VentaLinea.codigo_interno, VentaLinea.descripcion,
         VentaLinea.unidades, VentaLinea.valor_neto,
     ).all()
+    # Ronda CQ (2026-10-30): la venta de un codigo que Ergopyme reemplazo se
+    # suma al codigo vigente -- ver _alias_codigos_internos.
+    alias = _alias_codigos_internos()
     for codigo, descripcion, unidades, monto in filas:
-        clave = (codigo or "").strip()
+        clave = _codigo_interno_vigente(codigo, alias)
         if not clave:
             continue
         totales[clave]["unidades"] += unidades or 0
@@ -13796,8 +13881,10 @@ def _ventas_sin_producto(dias=365):
         VentaLinea.codigo_interno, VentaLinea.descripcion, VentaLinea.unidades,
         VentaLinea.valor_neto, VentaLinea.vendedor_archivo,
     ).all()
+    alias = _alias_codigos_internos()
     for codigo, descripcion, unidades, monto, vendedor in filas:
-        clave = (codigo or "").strip().upper()
+        original = (codigo or "").strip().upper()
+        clave = _codigo_interno_vigente(original, alias)
         if not clave or clave in con_producto:
             continue
         dato = totales[clave]
@@ -13828,6 +13915,90 @@ def _ventas_sin_producto(dias=365):
         })
     salida.sort(key=lambda f: -(f["monto"] or 0))
     return salida
+
+
+def _codigos_internos_con_producto():
+    """[(codigo interno, 'PROVEEDOR - CODIGO - descripcion')] de los codigos
+    que SI llevan a un producto del catalogo. Es el desplegable para elegir
+    a que codigo vigente engancha un codigo antiguo (ronda CQ)."""
+    salida = {}
+
+    def _agregar(objeto, padre):
+        codigo = (objeto.codigo_interno_inventario or "").strip().upper()
+        if not codigo or codigo in salida:
+            return
+        proveedor = padre.proveedor.nombre if padre and padre.proveedor else ""
+        salida[codigo] = f"{proveedor} · {(objeto.codigo or '').strip()} · {(objeto.descripcion or '')[:60]}"
+
+    for producto in Producto.query.filter(
+            Producto.activo.is_(True), Producto.codigo_interno_inventario.isnot(None)).all():
+        _agregar(producto, producto)
+    for variante in ProductoVariante.query.join(Producto).filter(
+        Producto.activo.is_(True),
+        ProductoVariante.codigo_interno_inventario.isnot(None),
+        db.or_(ProductoVariante.activo.is_(True), ProductoVariante.activo.is_(None)),
+    ).all():
+        _agregar(variante, variante.producto)
+    return sorted(salida.items(), key=lambda par: par[1])
+
+
+@app.route("/stock/homologacion/alias-codigo-interno", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_homologacion_alias_codigo_interno():
+    """Ronda CQ (2026-10-30): engancha la venta de un codigo interno que
+    Ergopyme reemplazo al codigo vigente del mismo producto.
+
+    No toca ninguna linea de venta: la traduccion se aplica al leer (ver
+    _alias_codigos_internos), asi que el dato original queda intacto y el
+    alias se puede quitar cuando se quiera."""
+    antiguo = (request.form.get("codigo_antiguo") or "").strip().upper()
+    vigente = (request.form.get("codigo_vigente") or "").strip().upper()
+    motivo = (request.form.get("motivo") or "").strip()
+    if not antiguo or not vigente:
+        flash("Hacen falta el código antiguo y el código vigente.", "warning")
+        return redirect(url_for("stock_homologacion", ver="repetidos"))
+    if antiguo == vigente:
+        flash("El código antiguo y el vigente son el mismo.", "warning")
+        return redirect(url_for("stock_homologacion", ver="repetidos"))
+
+    # El vigente tiene que llevar de verdad a un producto del catalogo; si
+    # no, el alias no resuelve nada y solo mueve el problema de lugar.
+    indice = _indice_ergopyme_por_codigo_proveedor()
+    destino_valido = (
+        Producto.query.filter(Producto.codigo_interno_inventario == vigente).first()
+        or ProductoVariante.query.filter(
+            ProductoVariante.codigo_interno_inventario == vigente).first()
+        or vigente in set(indice.values())
+    )
+    alias = AliasCodigoInterno.query.filter_by(codigo_antiguo=antiguo).first()
+    if not alias:
+        alias = AliasCodigoInterno(codigo_antiguo=antiguo)
+        db.session.add(alias)
+    alias.codigo_vigente = vigente
+    alias.motivo = motivo or None
+    alias.creado_por_id = _usuario_actual_id()
+    db.session.commit()
+    mensaje = (f"Listo: la venta del código {antiguo} se suma ahora a {vigente}. "
+               "No se modificó ninguna línea de venta.")
+    flash(mensaje, "success")
+    if not destino_valido:
+        flash(f"Ojo: {vigente} todavía no corresponde a ningún producto del catálogo, "
+              "así que esa venta sigue sin producto. Revisa el código vigente.", "warning")
+    return redirect(url_for("stock_homologacion", ver="repetidos"))
+
+
+@app.route("/stock/homologacion/alias-codigo-interno/<int:alias_id>/quitar", methods=["POST"])
+@requiere_permiso("inventarios")
+def stock_homologacion_quitar_alias(alias_id):
+    alias = AliasCodigoInterno.query.get_or_404(alias_id)
+    antiguo, vigente = alias.codigo_antiguo, alias.codigo_vigente
+    db.session.delete(alias)
+    db.session.commit()
+    # Para que la siembra del arranque no lo vuelva a crear.
+    _guardar_parametro(f"alias_interno_quitado:{antiguo}", "1")
+    flash(f"Se quitó el enlace {antiguo} → {vigente}. La venta de {antiguo} vuelve a quedar "
+          "sin producto.", "success")
+    return redirect(url_for("stock_homologacion", ver="repetidos"))
 
 
 @app.route("/stock/homologacion/ventas-sin-producto/descargar")
@@ -15579,6 +15750,10 @@ def stock_homologacion():
     internos_repetidos = _codigos_internos_repetidos() if ver == "repetidos" else []
     inconsistencias = _inconsistencias_homologacion() if ver == "repetidos" else None
     ventas_huerfanas = _ventas_sin_producto() if ver == "repetidos" else []
+    alias_internos = (AliasCodigoInterno.query.order_by(
+        AliasCodigoInterno.codigo_antiguo).all() if ver == "repetidos" else [])
+    # Para el desplegable: los codigos internos que SI llevan a un producto.
+    destinos_alias = _codigos_internos_con_producto() if ver == "repetidos" else []
     total_repetidos = len(repetidos) if ver == "repetidos" else None
 
     return render_template(
@@ -15588,7 +15763,8 @@ def stock_homologacion():
         total_sin_codigo_interno=total_sin_codigo_interno,
         grupos_sin_codigo=grupos_sin_codigo, repetidos=repetidos, total_repetidos=total_repetidos,
         internos_repetidos=internos_repetidos, inconsistencias=inconsistencias,
-        ventas_huerfanas=ventas_huerfanas,
+        ventas_huerfanas=ventas_huerfanas, alias_internos=alias_internos,
+        destinos_alias=destinos_alias,
     )
 
 

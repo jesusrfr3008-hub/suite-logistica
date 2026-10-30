@@ -2593,6 +2593,36 @@ SEMANAS_FORECAST = 13
 ESTADOS_ENVIO_FORECAST = ("Preparación", "Enviado")
 
 
+class AliasCodigoInterno(db.Model):
+    """Ronda CQ (2026-10-30, a pedido del usuario): un codigo interno de
+    Inventarios (Ergopyme) que YA NO SE USA y que corresponde al mismo
+    producto que otro codigo vigente.
+
+    El caso que lo motiva: el producto 'VISCO BIOVIS 3.0' tenia el codigo
+    4010210026 y en Ergopyme se le cambio a 4010210022. El historico de
+    ventas conserva el codigo viejo, asi que esa venta quedaba huerfana --
+    no se le podia colgar a ningun producto del catalogo y desaparecia del
+    promedio del vendedor.
+
+    Con el alias, toda la venta del codigo antiguo se suma a la del codigo
+    vigente ANTES de calcular promedios, rotacion y clasificacion A/B/C. No
+    se modifica ni una sola linea de venta: la traduccion ocurre al leer,
+    asi que el dato original queda intacto y el alias se puede deshacer."""
+    __tablename__ = "alias_codigos_internos"
+
+    id = db.Column(db.Integer, primary_key=True)
+    codigo_antiguo = db.Column(db.String(40), nullable=False, unique=True, index=True)
+    codigo_vigente = db.Column(db.String(40), nullable=False, index=True)
+    motivo = db.Column(db.String(300))
+    creado_por_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    creado_por = db.relationship("Usuario")
+
+    def __repr__(self):
+        return f"<AliasCodigoInterno {self.codigo_antiguo} -> {self.codigo_vigente}>"
+
+
 class ParametroSistema(db.Model):
     """Ronda CK (2026-10-29): interruptores de configuracion que el
     administrador cambia desde la propia aplicacion, sin esperar un

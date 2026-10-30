@@ -1,5 +1,20 @@
 {% extends "base.html" %}
 {% block title %}Homologación de Stock · Suite Logística{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const modal = document.getElementById("modalAlias");
+  if (!modal) return;
+  modal.addEventListener("show.bs.modal", function (evento) {
+    const boton = evento.relatedTarget;
+    if (!boton) return;
+    modal.querySelector("#aliasAntiguo").value = boton.dataset.codigo || "";
+    modal.querySelector("#aliasDescripcion").textContent = boton.dataset.descripcion || "";
+  });
+})();
+</script>
+{% endblock %}
 {% block content %}
 
 <h3 class="section-title mb-1">Homologación de Stock</h3>
@@ -84,7 +99,7 @@
         <tr>
           <th>Código interno</th><th>Descripción en la venta</th>
           <th class="text-end">Unidades 12m</th><th class="text-end">Monto 12m</th>
-          <th>Proveedor (maestro)</th><th>Qué falta</th>
+          <th>Proveedor (maestro)</th><th>Qué falta</th><th></th>
         </tr>
       </thead>
       <tbody>
@@ -99,6 +114,99 @@
             {% if f.codigo_maestro %}<div style="font-size: .7rem;">{{ f.codigo_maestro }}</div>{% endif %}
           </td>
           <td class="small">{{ f.falta }}</td>
+          <td class="text-end">
+            {# Ronda CQ (2026-10-30): enganchar la venta de un codigo que
+               Ergopyme reemplazo al codigo vigente del mismo producto. #}
+            <button type="button" class="btn btn-sm btn-outline-primary"
+                    data-bs-toggle="modal" data-bs-target="#modalAlias"
+                    data-codigo="{{ f.codigo_interno }}"
+                    data-descripcion="{{ f.descripcion }}">
+              Asignar
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal fade" id="modalAlias" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('stock_homologacion_alias_codigo_interno') }}">
+        <div class="modal-header">
+          <h5 class="modal-title">Asignar la venta de un código reemplazado</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">
+            Cuando Ergopyme le cambia el código interno a un producto, el histórico de ventas
+            conserva el anterior y esa venta queda sin producto. Acá se indica cuál es el código
+            <strong>vigente</strong> del mismo producto: desde ese momento la venta del código
+            antiguo se suma a la del vigente, en el S&amp;OP y en la rotación.
+            <strong>No se modifica ninguna línea de venta</strong> — la unión se hace al leer, así
+            que el dato original queda intacto y esto se puede deshacer.
+          </p>
+          <div class="row g-3">
+            <div class="col-md-5">
+              <label class="form-label small fw-semibold">Código antiguo (el de la venta)</label>
+              <input type="text" class="form-control" name="codigo_antiguo" id="aliasAntiguo" required>
+              <div class="form-text" id="aliasDescripcion"></div>
+            </div>
+            <div class="col-md-7">
+              <label class="form-label small fw-semibold">Código vigente (el del producto hoy)</label>
+              <input type="text" class="form-control" name="codigo_vigente" list="destinosAlias" required
+                     placeholder="Escribe el código o busca el producto">
+              <datalist id="destinosAlias">
+                {% for codigo, etiqueta in destinos_alias %}
+                <option value="{{ codigo }}">{{ etiqueta }}</option>
+                {% endfor %}
+              </datalist>
+            </div>
+            <div class="col-12">
+              <label class="form-label small fw-semibold">Motivo (opcional)</label>
+              <input type="text" class="form-control" name="motivo"
+                     placeholder="Ej. Ergopyme reasignó el código del producto">
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancelar</button>
+          <button class="btn btn-primary">Asignar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if alias_internos %}
+{# Ronda CQ: los enlaces ya cargados, para poder revisarlos o quitarlos. #}
+<div class="card p-3 mb-3">
+  <h5 class="section-title mb-2">
+    <i class="bi bi-link-45deg me-1"></i> Códigos reemplazados por Ergopyme
+    <span class="badge bg-secondary">{{ alias_internos|length }}</span>
+  </h5>
+  <p class="text-muted small">
+    La venta de estos códigos antiguos se suma a la del código vigente. Quitar el enlace deja la
+    venta otra vez sin producto; no borra nada de las ventas.
+  </p>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead><tr><th>Código antiguo</th><th>Código vigente</th><th>Motivo</th><th></th></tr></thead>
+      <tbody>
+        {% for a in alias_internos %}
+        <tr>
+          <td class="small fw-semibold">{{ a.codigo_antiguo }}</td>
+          <td class="small fw-semibold text-success">{{ a.codigo_vigente }}</td>
+          <td class="small text-muted" style="max-width: 460px;">{{ a.motivo or '—' }}</td>
+          <td class="text-end">
+            <form method="post" action="{{ url_for('stock_homologacion_quitar_alias', alias_id=a.id) }}"
+                  onsubmit="return confirm('Quitar el enlace {{ a.codigo_antiguo }} → {{ a.codigo_vigente }}?');">
+              <button class="btn btn-sm btn-outline-danger">Quitar</button>
+            </form>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
