@@ -23,15 +23,25 @@
 
       <div class="col-md-6">
         <label class="form-label">Empresa compradora</label>
-        <select class="form-select" name="empresa_id">
+        {# Ronda CS (2026-11-02, punto 3): al elegir la empresa se sugiere
+           solo el siguiente correlativo de Inventarios. #}
+        <select class="form-select" name="empresa_id" id="selEmpresaImportacion">
           <option value="">Sin asignar</option>
-          {% for e in empresas %}<option value="{{ e.id }}">{{ e.nombre }}</option>{% endfor %}
+          {% for e in empresas %}
+          <option value="{{ e.id }}"
+                  data-correlativo="{{ correlativos_sugeridos.get(e.id|string) or '' }}">{{ e.nombre }}</option>
+          {% endfor %}
         </select>
       </div>
       <div class="col-md-6">
         <label class="form-label">Correlativo Inventario (opcional)</label>
-        <input type="number" class="form-control" name="numero_correlativo_inventario" placeholder="ej: 579">
-        <div class="form-text">Correlativo en el sistema de Inventarios para esa empresa — se puede completar después desde "Editar datos".</div>
+        <input type="number" class="form-control" name="numero_correlativo_inventario"
+               id="inpCorrelativoInventario" placeholder="ej: 579">
+        <div class="form-text" id="ayudaCorrelativo">
+          Correlativo en el sistema de Inventarios para esa empresa — al elegir la empresa se
+          propone el siguiente y se puede cambiar. También se puede completar después desde
+          "Editar datos".
+        </div>
       </div>
 
       <div class="col-md-6">
@@ -107,4 +117,33 @@
   El sistema calcula el costeo automáticamente.
 </div>
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Ronda CS (2026-11-02, punto 3): al elegir la empresa compradora se
+// propone el siguiente correlativo de Inventarios (el último guardado de
+// esa empresa + 1). No pisa lo que el usuario ya haya escrito.
+(function () {
+  const empresa = document.getElementById("selEmpresaImportacion");
+  const campo = document.getElementById("inpCorrelativoInventario");
+  const ayuda = document.getElementById("ayudaCorrelativo");
+  if (!empresa || !campo) return;
+  let sugeridoPuesto = "";
+  empresa.addEventListener("change", function () {
+    const opcion = empresa.options[empresa.selectedIndex];
+    const sugerido = (opcion && opcion.dataset.correlativo) || "";
+    const actual = (campo.value || "").trim();
+    if (actual === "" || actual === sugeridoPuesto) {
+      campo.value = sugerido;
+      sugeridoPuesto = sugerido;
+    }
+    if (ayuda) {
+      ayuda.textContent = sugerido
+        ? "Sugerido: " + sugerido + " (el último de esa empresa más uno). Puedes cambiarlo."
+        : "Esa empresa todavía no tiene correlativos cargados: escribe el primero a mano.";
+    }
+  });
+})();
+</script>
 {% endblock %}

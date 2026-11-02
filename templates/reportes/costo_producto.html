@@ -88,6 +88,11 @@
           <th class="text-end">Unidades</th>
           <th class="text-end">Unitario FOB</th>
           <th class="text-end">Total FOB</th>
+          {# Ronda CS (2026-11-02, punto 5): el tipo de cambio con que se
+             costeó la operación, para poder reconstruir el costo. #}
+          <th class="text-end" title="Dólar aduanero de esa operación (CLP por 1 USD). Si la factura no vino en dólares, abajo va la paridad usada.">
+            Tipo de cambio
+          </th>
           <th class="text-end">Costo unitario CLP</th>
         </tr>
       </thead>
@@ -123,10 +128,21 @@
           <td class="text-end">{{ "%g"|format(g.ultimo.unidades) }}</td>
           <td class="text-end">{{ g.ultimo.moneda|simbolo_moneda }}{{ g.ultimo.valor_unitario|moneda }}</td>
           <td class="text-end">{{ g.ultimo.moneda|simbolo_moneda }}{{ g.ultimo.total_invoice|moneda }}</td>
+          <td class="text-end">
+            {% if g.ultimo.tipo_cambio %}
+            ${{ g.ultimo.tipo_cambio|moneda }}
+            {% if g.ultimo.paridad and g.ultimo.paridad != 1 %}
+            <div class="text-muted" style="font-size: .72rem;"
+                 title="Unidades de {{ g.ultimo.moneda }} por 1 USD">
+              {{ g.ultimo.moneda }}/USD {{ "%.4f"|format(g.ultimo.paridad) }}
+            </div>
+            {% endif %}
+            {% else %}<span class="text-muted">—</span>{% endif %}
+          </td>
           <td class="text-end fw-semibold">${{ g.ultimo.costo_unitario_clp|moneda }}</td>
         </tr>
         <tr class="collapse" id="hist{{ loop.index }}">
-          <td colspan="11" class="bg-light">
+          <td colspan="12" class="bg-light">
             <div class="small text-muted mb-2">
               {{ g.total_costeos }} costeo(s) de este producto, del más reciente al más antiguo.
             </div>
@@ -140,10 +156,11 @@
                 <tr>
                   <th>Fecha</th><th>Factura</th><th>Origen</th><th>Empresa</th><th>Lote</th>
                   <th class="text-end">Unidades</th><th class="text-end">Unitario FOB</th>
-                  <th class="text-end">Total FOB</th><th class="text-end">Costo unitario CLP</th>
+                  <th class="text-end">Total FOB</th><th class="text-end">Tipo de cambio</th>
+                  <th class="text-end">Costo unitario CLP</th>
                 </tr>
               </thead>
-              <tbody><tr class="fila-cargando"><td colspan="9" class="text-muted">Cargando costeos...</td></tr></tbody>
+              <tbody><tr class="fila-cargando"><td colspan="10" class="text-muted">Cargando costeos...</td></tr></tbody>
             </table>
             <button type="button" class="btn btn-sm btn-outline-secondary mt-2 btn-ver-mas d-none"
                     data-offset="{{ por_pagina }}">Ver {{ por_pagina }} más</button>
@@ -237,6 +254,17 @@
   });
 
   function filaHistorial(e) {
+    // Ronda CS (2026-11-02, punto 5): tipo de cambio de la operación, con
+    // la paridad de la moneda debajo cuando la factura no vino en dólares.
+    function celdaTipoCambio(ev) {
+      if (!ev.tipo_cambio) return '<span class="text-muted">—</span>';
+      let html = '$' + Number(ev.tipo_cambio).toLocaleString('es-CL');
+      if (ev.paridad && Number(ev.paridad) !== 1) {
+        html += '<div class="text-muted" style="font-size:.72rem;">' + ev.moneda + '/USD ' +
+                Number(ev.paridad).toFixed(4) + '</div>';
+      }
+      return html;
+    }
     const fila = document.createElement('tr');
     const factura = e.importacion_id
       ? `<a href="/importaciones/${e.importacion_id}">${e.factura || '(sin número)'}</a>`
@@ -249,6 +277,7 @@
       `<td class="text-end">${e.unidades.toLocaleString('es-CL')}</td>` +
       `<td class="text-end">${s}${e.valor_unitario.toLocaleString('es-CL')}</td>` +
       `<td class="text-end">${s}${e.total_invoice.toLocaleString('es-CL')}</td>` +
+      `<td class="text-end">${celdaTipoCambio(e)}</td>` +
       `<td class="text-end">$${e.costo_unitario_clp.toLocaleString('es-CL')}</td>`;
     return fila;
   }

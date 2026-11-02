@@ -152,8 +152,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CR"
-VERSION_SUITE_FECHA = "2026-10-30"
+VERSION_SUITE = "CS"
+VERSION_SUITE_FECHA = "2026-11-02"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -9281,6 +9281,14 @@ def _tipo_cambio_mes(anio, mes):
 def importaciones_nueva():
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     empresas = Empresa.query.filter_by(activo=True).order_by(Empresa.nombre).all()
+    # Ronda CS (2026-11-02, punto 3 del pedido del usuario): el correlativo
+    # de Inventarios se SUGIERE solo, partiendo del ultimo guardado de esa
+    # empresa compradora (si la anterior de Accuvision fue la 597, propone
+    # la 598). Se calcula para todas las empresas de una vez y lo rellena
+    # el navegador al elegir la empresa -- sigue siendo editable.
+    correlativos_sugeridos = {
+        str(e.id): siguiente_correlativo_inventario(e.id) for e in empresas
+    }
     if request.method == "POST":
         empresa_id = request.form.get("empresa_id") or None
         imp = Importacion(
@@ -9307,6 +9315,7 @@ def importaciones_nueva():
     return render_template(
         "importaciones/form.html", proveedores=proveedores, empresas=empresas,
         condiciones=CONDICIONES_COMPRA, tc_mes=tc_mes,
+        correlativos_sugeridos=correlativos_sugeridos,
     )
 
 
@@ -11194,6 +11203,113 @@ def _totales_en_moneda(filas, moneda_dominante, paridad_representativa, excluir_
     }
 
 
+def _escribir_hoja_inventario(wb, nombre_hoja, imp, proveedor, lineas, codigo_proveedor):
+    """Escribe una hoja de la planilla de Inventarios con las `lineas` que
+    se le pasen -- las de UN parcial, o las de todos juntos para la hoja
+    consolidada (ronda CS, 2026-11-02). Antes esto vivia dentro del bucle
+    de parciales de _construir_excel_inventario; se extrajo tal cual para
+    poder reutilizarlo en las dos hojas sin duplicar una linea de calculo."""
+    ws = wb.create_sheet(title=nombre_hoja)
+    _escribir_cabecera_inventario(ws, imp, proveedor)
+
+    fila_encabezado = _FILA_TABLA_INVENTARIO
+    for i, titulo in enumerate(ENCABEZADOS_INVENTARIO):
+        celda = ws.cell(row=fila_encabezado, column=i + 1 + _COL_INVENTARIO_OFFSET, value=titulo)
+        celda.font = Font(bold=True)
+    for ancho, col in zip(_ANCHOS_INVENTARIO, range(1, len(_ANCHOS_INVENTARIO) + 1)):
+        ws.column_dimensions[get_column_letter(col + _COL_INVENTARIO_OFFSET)].width = ancho
+
+    fila_actual = fila_encabezado
+    for info in lineas:
+        linea = info["linea"]
+        codigo_limpio = (linea.codigo or "").strip()
+        descripcion_limpia = (linea.descripcion or "").strip()
+        # Ronda BT (2026-10-16, punto 1): DESCRIPCION (C) va SIEMPRE con la
+        # descripcion pura, sin el codigo del proveedor concatenado.
+        valor_descripcion_col_c = descripcion_limpia
+        # El codigo interno de Inventarios se usa en dos columnas: en B
+        # cuando el checkbox "Codigo Proveedor" esta sin marcar, y SIEMPRE
+        # en E (ver abajo).
+        codigo_interno = _codigo_interno_homologado(linea)
+        valor_codigo_col_b = codigo_limpio if codigo_proveedor else codigo_interno
+        total_unidades = linea.cantidad_unidades or 0
+        lotes = list(linea.lotes) or [None]
+        for lote in lotes:
+            if lote is not None:
+                cantidad_lote = lote.cantidad_unidades or 0
+                codigo_lote = lote.codigo_lote or ""
+                fecha_venc = lote.fecha_vencimiento
+            else:
+                cantidad_lote = total_unidades
+                codigo_lote = linea.codigo_lote or ""
+                fecha_venc = linea.fecha_vencimiento
+            share = (cantidad_lote / total_unidades) if total_unidades else 0
+            costo_total_lote = info["costo_total_clp"] * share
+            fila_actual += 1
+            valores = [
+                valor_codigo_col_b,
+                valor_descripcion_col_c,
+                imp.fecha_factura,
+                # Ronda CS (2026-11-02, punto 2 del pedido del usuario):
+                # "CODIGO DE BARRA ESCANEADO" (E) lleva el codigo interno de
+                # Inventarios. Antes quedaba en blanco y el usuario lo
+                # completaba a mano en cada archivo antes de subirlo.
+                codigo_interno,
+                codigo_lote,
+                fecha_venc,
+                None,
+                None,
+                linea.valor_unitario_moneda,
+                cantidad_lote,
+                (linea.valor_unitario_moneda or 0) * cantidad_lote,
+                info["valor_usd"] * share,
+                info["flete_usd"] * share,
+                info["seguro_usd"] * share,
+                info["cif_usd"] * share,
+                # Ronda BT (2026-10-16, punto 2): las 5 columnas en pesos
+                # chilenos se redondean a entero -- Ergopyme no las admite
+                # con decimales.
+                round(info["cif_clp"] * share),
+                round(info["derechos_clp"] * share),
+                round((info["gastos_clp"] - info["derechos_clp"]) * share),
+                round(costo_total_lote),
+                round((costo_total_lote / cantidad_lote) if cantidad_lote else 0),
+            ]
+            for i, valor in enumerate(valores):
+                ws.cell(row=fila_actual, column=i + 1 + _COL_INVENTARIO_OFFSET, value=valor)
+            ws.cell(row=fila_actual, column=3 + _COL_INVENTARIO_OFFSET).number_format = "DD-MM-YYYY"
+            if fecha_venc is not None:
+                ws.cell(row=fila_actual, column=6 + _COL_INVENTARIO_OFFSET).number_format = "YYMMDD"
+            for col_pos in _COLS_VALORES_INVENTARIO:
+                formato = (
+                    _FORMATO_ENTERO if col_pos in _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO
+                    else _FORMATO_CONTABILIDAD
+                )
+                ws.cell(row=fila_actual, column=col_pos + _COL_INVENTARIO_OFFSET).number_format = formato
+
+    # Fila de subtotales (ronda Q, puntos 3-5; ronda BT punto 2: "*" en la
+    # columna CODIGO en vez del texto "SUBTOTAL").
+    ws.sheet_view.showGridLines = False
+    if fila_actual > fila_encabezado:
+        fila_subtotal = fila_actual + 1
+        ws.cell(row=fila_subtotal, column=1 + _COL_INVENTARIO_OFFSET, value="*").font = Font(bold=True)
+        for col_pos in _COLS_SUBTOTAL_INVENTARIO:
+            col_letra = get_column_letter(col_pos + _COL_INVENTARIO_OFFSET)
+            celda = ws.cell(row=fila_subtotal, column=col_pos + _COL_INVENTARIO_OFFSET)
+            celda.value = f"=SUM({col_letra}{fila_encabezado + 1}:{col_letra}{fila_actual})"
+            celda.font = Font(bold=True)
+            if col_pos != 10:  # 10 = "Unidades", sin formato de contabilidad
+                celda.number_format = (
+                    _FORMATO_ENTERO if col_pos in _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO
+                    else _FORMATO_CONTABILIDAD
+                )
+    ws.auto_filter.ref = (
+        f"B{fila_encabezado}:V{fila_actual}" if fila_actual > fila_encabezado
+        else f"B{fila_encabezado}:V{fila_encabezado}"
+    )
+    return ws
+
+
 def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
     """Arma el Excel de carga al sistema de Inventarios: mismos encabezados
     y misma cadena de conversión de moneda (factura -> USD -> CLP) que la
@@ -11235,137 +11351,44 @@ def _construir_excel_inventario(imp, resultado, codigo_proveedor=False):
     aceptó."""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-    nombres_usados = set()
     proveedor = imp.proveedor
-    for idx, pr in enumerate(resultado["parciales"], start=1):
-        parcial = pr["parcial"]
-        base = parcial.referencia or parcial.numero_parcial or f"Parcial {idx}"
-        base = re.sub(r'[\\/*?:\[\]]', "-", str(base)).strip()[:28] or f"Parcial {idx}"
-        nombre_hoja = base
-        sufijo = 2
-        while nombre_hoja in nombres_usados:
-            nombre_hoja = f"{base} ({sufijo})"
+    parciales = resultado["parciales"]
+
+    def _nombre_base(pr, idx):
+        base = pr["parcial"].referencia or pr["parcial"].numero_parcial or f"Parcial {idx}"
+        return re.sub(r'[\\/*?:\[\]]', "-", str(base)).strip()[:28] or f"Parcial {idx}"
+
+    nombres_usados = set()
+
+    def _nombre_unico(base):
+        nombre, sufijo = base, 2
+        while nombre in nombres_usados:
+            nombre = f"{base} ({sufijo})"[:31]
             sufijo += 1
-        nombres_usados.add(nombre_hoja)
+        nombres_usados.add(nombre)
+        return nombre
 
-        ws = wb.create_sheet(title=nombre_hoja)
-        _escribir_cabecera_inventario(ws, imp, proveedor)
+    # Ronda CS (2026-11-02, punto 1 del pedido del usuario): cuando la
+    # importacion tiene MAS DE UN PARCIAL, la PRIMERA hoja trae todos los
+    # productos de todos los parciales juntos -- que es la que se sube al
+    # sistema de Inventarios -- y las siguientes traen cada parcial por
+    # separado, para control. Con un solo parcial no cambia nada: una hoja,
+    # como siempre.
+    if len(parciales) > 1:
+        lineas_todas = [info for pr in parciales for info in pr["lineas"]]
+        _escribir_hoja_inventario(
+            wb, _nombre_unico(_nombre_base(parciales[0], 1)), imp, proveedor,
+            lineas_todas, codigo_proveedor)
+        for idx, pr in enumerate(parciales, start=1):
+            _escribir_hoja_inventario(
+                wb, _nombre_unico(f"P{idx} {_nombre_base(pr, idx)}"[:31]), imp, proveedor,
+                pr["lineas"], codigo_proveedor)
+    else:
+        for idx, pr in enumerate(parciales, start=1):
+            _escribir_hoja_inventario(
+                wb, _nombre_unico(_nombre_base(pr, idx)), imp, proveedor,
+                pr["lineas"], codigo_proveedor)
 
-        fila_encabezado = _FILA_TABLA_INVENTARIO
-        for i, titulo in enumerate(ENCABEZADOS_INVENTARIO):
-            celda = ws.cell(row=fila_encabezado, column=i + 1 + _COL_INVENTARIO_OFFSET, value=titulo)
-            celda.font = Font(bold=True)
-        for ancho, col in zip(_ANCHOS_INVENTARIO, range(1, len(_ANCHOS_INVENTARIO) + 1)):
-            ws.column_dimensions[get_column_letter(col + _COL_INVENTARIO_OFFSET)].width = ancho
-
-        fila_actual = fila_encabezado
-        for info in pr["lineas"]:
-            linea = info["linea"]
-            codigo_limpio = (linea.codigo or "").strip()
-            descripcion_limpia = (linea.descripcion or "").strip()
-            # Ronda BT (2026-10-16, punto 1 del pedido del usuario): DESCRIPCION
-            # (C) va SIEMPRE con la descripción pura, sin el código del
-            # proveedor concatenado -- antes, cuando el checkbox "Código
-            # Proveedor" quedaba sin marcar, esta columna mezclaba "código
-            # descripción", lo que el usuario no quiere en ningún caso. Solo
-            # la columna CODIGO (B) cambia según el checkbox.
-            valor_descripcion_col_c = descripcion_limpia
-            if codigo_proveedor:
-                # Checkbox marcado (ronda T): CODIGO (B) = código del proveedor
-                # (el propio de Suite Logística).
-                valor_codigo_col_b = codigo_limpio
-            else:
-                # Checkbox sin marcar (default, ronda V): CODIGO (B) = código
-                # interno ya homologado del sistema de Inventarios, cuando ya
-                # se conoce (queda en blanco si el producto/variante todavía
-                # no se homologó).
-                valor_codigo_col_b = _codigo_interno_homologado(linea)
-            total_unidades = linea.cantidad_unidades or 0
-            lotes = list(linea.lotes) or [None]
-            for lote in lotes:
-                if lote is not None:
-                    cantidad_lote = lote.cantidad_unidades or 0
-                    codigo_lote = lote.codigo_lote or ""
-                    fecha_venc = lote.fecha_vencimiento
-                else:
-                    cantidad_lote = total_unidades
-                    codigo_lote = linea.codigo_lote or ""
-                    fecha_venc = linea.fecha_vencimiento
-                share = (cantidad_lote / total_unidades) if total_unidades else 0
-                costo_total_lote = info["costo_total_clp"] * share
-                fila_actual += 1
-                valores = [
-                    valor_codigo_col_b,
-                    valor_descripcion_col_c,
-                    imp.fecha_factura,
-                    None,
-                    codigo_lote,
-                    fecha_venc,
-                    None,
-                    None,
-                    linea.valor_unitario_moneda,
-                    cantidad_lote,
-                    (linea.valor_unitario_moneda or 0) * cantidad_lote,
-                    info["valor_usd"] * share,
-                    info["flete_usd"] * share,
-                    info["seguro_usd"] * share,
-                    info["cif_usd"] * share,
-                    # Ronda BT (2026-10-16, punto 2): de acá en adelante son
-                    # las 5 columnas en pesos chilenos (CLP) -- se redondean a
-                    # entero (sin decimales) porque Ergopyme no las admite con
-                    # decimales; ver _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO
-                    # para el mismo ajuste en el FORMATO de estas columnas.
-                    round(info["cif_clp"] * share),
-                    round(info["derechos_clp"] * share),
-                    round((info["gastos_clp"] - info["derechos_clp"]) * share),
-                    round(costo_total_lote),
-                    round((costo_total_lote / cantidad_lote) if cantidad_lote else 0),
-                ]
-                for i, valor in enumerate(valores):
-                    ws.cell(row=fila_actual, column=i + 1 + _COL_INVENTARIO_OFFSET, value=valor)
-                ws.cell(row=fila_actual, column=3 + _COL_INVENTARIO_OFFSET).number_format = "DD-MM-YYYY"
-                if fecha_venc is not None:
-                    ws.cell(row=fila_actual, column=6 + _COL_INVENTARIO_OFFSET).number_format = "YYMMDD"
-                # Formato "Contabilidad" en las columnas de valores (ronda Q,
-                # punto 2) -- "Unidades" (columna K) queda fuera a propósito.
-                # Ronda BT (2026-10-16, punto 2): las columnas en CLP (ver
-                # _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO) usan formato
-                # entero en vez del de contabilidad -- Ergopyme no admite
-                # decimales ahí.
-                for col_pos in _COLS_VALORES_INVENTARIO:
-                    formato = (
-                        _FORMATO_ENTERO if col_pos in _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO
-                        else _FORMATO_CONTABILIDAD
-                    )
-                    ws.cell(row=fila_actual, column=col_pos + _COL_INVENTARIO_OFFSET).number_format = formato
-
-        # Fila de subtotales, filtro en el encabezado y sin cuadricula (ronda
-        # Q, puntos 3, 4 y 5) -- una vez procesadas todas las lineas/lotes de
-        # este parcial.
-        #
-        # Ronda BT (2026-10-16, punto 2 del pedido del usuario): esta fila ya
-        # NO lleva el texto "SUBTOTAL" en la columna DESCRIPCION -- Ergopyme
-        # espera un "*" en la columna CODIGO (B) para saber dónde terminan
-        # los productos del archivo (confirmado comparando con un archivo
-        # real que Ergopyme sí aceptó, "Carga physiol revision_programa.xlsx").
-        ws.sheet_view.showGridLines = False
-        if fila_actual > fila_encabezado:
-            fila_subtotal = fila_actual + 1
-            ws.cell(row=fila_subtotal, column=1 + _COL_INVENTARIO_OFFSET, value="*").font = Font(bold=True)
-            for col_pos in _COLS_SUBTOTAL_INVENTARIO:
-                col_letra = get_column_letter(col_pos + _COL_INVENTARIO_OFFSET)
-                celda = ws.cell(row=fila_subtotal, column=col_pos + _COL_INVENTARIO_OFFSET)
-                celda.value = f"=SUM({col_letra}{fila_encabezado + 1}:{col_letra}{fila_actual})"
-                celda.font = Font(bold=True)
-                if col_pos != 10:  # 10 = "Unidades", sin formato de contabilidad
-                    celda.number_format = (
-                        _FORMATO_ENTERO if col_pos in _COLS_VALORES_CLP_SIN_DECIMALES_INVENTARIO
-                        else _FORMATO_CONTABILIDAD
-                    )
-        ws.auto_filter.ref = (
-            f"B{fila_encabezado}:V{fila_actual}" if fila_actual > fila_encabezado
-            else f"B{fila_encabezado}:V{fila_encabezado}"
-        )
     if not wb.worksheets:
         ws = wb.create_sheet(title="Sin datos")
         _escribir_cabecera_inventario(ws, imp, proveedor)
@@ -17955,6 +17978,14 @@ def _agrupar_costo_producto(filas, q=""):
             "costo_unitario_clp": f.get("costo_unitario_clp") or 0,
             "costo_total_clp": f.get("costo_total_clp") or 0,
             "importacion_id": f.get("importacion_id"),
+            # Ronda CS (2026-11-02, punto 5 del pedido del usuario): el tipo
+            # de cambio con que se costeó esa operación. Son dos datos y hay
+            # que mostrar los dos para poder reconstruir el costo:
+            #   - "tipo_cambio": el dólar aduanero (CLP por 1 USD).
+            #   - "paridad": cuántas unidades de la moneda de la factura hay
+            #     en 1 USD (1 cuando la factura ya viene en dólares).
+            "tipo_cambio": f.get("tipo_cambio") or 0,
+            "paridad": f.get("paridad") or 1,
         })
 
     resultado = []
@@ -18051,6 +18082,9 @@ def api_costo_producto_historial():
             "total_invoice": round(e["total_invoice"], 2),
             "costo_unitario_clp": round(e["costo_unitario_clp"], 2),
             "importacion_id": e["importacion_id"],
+            # Ronda CS (2026-11-02, punto 5): tipo de cambio de la operación.
+            "tipo_cambio": round(e.get("tipo_cambio") or 0, 2),
+            "paridad": round(e.get("paridad") or 1, 6),
         } for e in tramo],
         hay_mas=(offset + COSTEOS_POR_PAGINA) < grupo["total_costeos"],
     )
