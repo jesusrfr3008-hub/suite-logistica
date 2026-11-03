@@ -156,7 +156,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CT"
+VERSION_SUITE = "CT.1"
 VERSION_SUITE_FECHA = "2026-11-03"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -18968,6 +18968,78 @@ def _formato_moneda_planilla(moneda):
     return _PP_FORMATOS.get(_moneda_canonica_planilla(moneda), '#,##0.00')
 
 
+def _tipos_cambio_sugeridos():
+    """Ultimo tipo de cambio que el programa conoce, para llenar las dos
+    celdas de la planilla de pago (ronda CT bis, 2026-11-03).
+
+    La primera version dejaba las celdas vacias esperando que el usuario
+    las escribiera. En la practica la planilla llegaba con la columna en
+    pesos en blanco, porque Excel solo recalcula al abrir si la
+    calculadora esta en automatico. Ahora llegan ya llenas con el tipo de
+    cambio del mes (el mismo de Configuracion > Tipo de cambio mensual) y
+    ademas la planilla trae el resultado ya calculado adentro, asi que se
+    ve bien apenas se abre. Siguen siendo editables: al cambiarlas se
+    recalcula todo.
+
+    Devuelve (clp_por_usd, clp_por_eur, etiqueta de donde salio)."""
+    tc = (TipoCambioMensual.query
+          .order_by(TipoCambioMensual.anio.desc(), TipoCambioMensual.mes.desc())
+          .first())
+    if not tc or not (tc.tc_aduanero or 0):
+        return 0.0, 0.0, ""
+    clp_usd = round(float(tc.tc_aduanero), 2)
+    paridad = float(tc.paridad_eur_usd or 0)
+    # paridad_eur_usd = EUR por 1 USD -> CLP por 1 EUR = CLP/USD dividido por ella
+    clp_eur = round(clp_usd / paridad, 2) if paridad > 0 else 0.0
+    return clp_usd, clp_eur, f"{tc.nombre_mes} {tc.anio}"
+
+
+def _empresa_de_factura(factura):
+    """La empresa compradora de la factura. Si la factura no la tiene
+    cargada pero viene de una importacion, se usa la de la importacion --
+    es la misma que muestra la pantalla de la importacion, y evita que la
+    planilla diga '(sin asignar)' cuando el dato si existe."""
+    if factura.empresa:
+        return factura.empresa.nombre
+    imp = getattr(factura, "importacion", None)
+    if imp is not None and getattr(imp, "empresa", None):
+        return imp.empresa.nombre
+    return "(sin asignar)"
+
+
+def _inyectar_valores_calculados(contenido, valores):
+    """Deja los RESULTADOS guardados dentro del .xlsx, al lado de cada
+    formula (ronda CT bis).
+
+    openpyxl escribe las formulas sin resultado (<v></v>). Excel las
+    calcula al abrir solo si la calculadora esta en automatico; si el
+    usuario la tiene en manual -- o si el archivo se abre en una vista
+    previa -- las columnas en pesos salen en blanco, que es justamente lo
+    que le paso al usuario. Guardando el resultado, la planilla se ve
+    completa apenas se abre y las formulas siguen vivas: al cambiar un
+    tipo de cambio se recalcula igual.
+
+    'valores' es {referencia de celda: numero}."""
+    import zipfile
+    origen = zipfile.ZipFile(io.BytesIO(contenido))
+    hoja = "xl/worksheets/sheet1.xml"
+    xml = origen.read(hoja).decode("utf-8")
+    for referencia, numero in valores.items():
+        if numero is None:
+            continue
+        patron = re.compile(
+            r'(<c r="%s"[^>]*>)(<f>.*?</f>)<v></v>' % re.escape(referencia))
+        xml, cambios = patron.subn(
+            lambda m: f"{m.group(1)}{m.group(2)}<v>{numero!r}</v>", xml, count=1)
+    salida = io.BytesIO()
+    with zipfile.ZipFile(salida, "w", zipfile.ZIP_DEFLATED) as destino:
+        for elemento in origen.infolist():
+            datos = xml.encode("utf-8") if elemento.filename == hoja else origen.read(elemento.filename)
+            destino.writestr(elemento, datos)
+    salida.seek(0)
+    return salida
+
+
 def _borde_planilla(fino="thin"):
     lado = Side(style=fino, color=_PP_BORDE)
     return Border(left=lado, right=lado, top=lado, bottom=lado)
@@ -19057,14 +19129,15 @@ def pagos_proveedores_descargar():
     ws["A4"] = "TIPO DE CAMBIO"
     ws["A4"].font = Font(bold=True, size=11, color=_PP_AZUL)
 
-    filas_tc = [("USD", "B5", "C5", "Dólar observado del día de pago"),
-                ("EUR", "B6", "C6", "Euro del día de pago")]
-    for moneda, celda_etiqueta, celda_valor, ayuda in filas_tc:
+    tc_usd_sugerido, tc_eur_sugerido, origen_tc = _tipos_cambio_sugeridos()
+    filas_tc = [("USD", "B5", "C5", tc_usd_sugerido),
+                ("EUR", "B6", "C6", tc_eur_sugerido)]
+    for moneda, celda_etiqueta, celda_valor, sugerido in filas_tc:
         ws[celda_etiqueta] = f"{moneda} → CLP"
         ws[celda_etiqueta].font = Font(bold=True)
         ws[celda_etiqueta].alignment = Alignment(horizontal="right")
         celda = ws[celda_valor]
-        celda.value = None
+        celda.value = sugerido or None
         celda.fill = PatternFill("solid", fgColor=_PP_AMARILLO)
         celda.border = _borde_planilla("medium")
         celda.number_format = '#,##0.00'
@@ -19074,11 +19147,15 @@ def pagos_proveedores_descargar():
     ws["B6"].value = "EUR → CLP"
 
     ws.merge_cells("D5:H5")
-    ws["D5"] = ("◄ Escriba acá el tipo de cambio del DÓLAR en pesos chilenos (ej.: 969,70). "
-                "Al escribirlo, las facturas en USD se valorizan solas.")
+    ws["D5"] = (("◄ Tipo de cambio del DÓLAR en pesos chilenos. Viene con el del mes "
+                 f"({origen_tc}); cámbielo por el del día de pago si corresponde.")
+                if tc_usd_sugerido else
+                "◄ Escriba acá el tipo de cambio del DÓLAR en pesos chilenos (ej.: 969,70).")
     ws.merge_cells("D6:H6")
-    ws["D6"] = ("◄ Escriba acá el tipo de cambio del EURO en pesos chilenos. Cada factura "
-                "se calcula con el tipo de cambio de SU propia moneda.")
+    ws["D6"] = (("◄ Tipo de cambio del EURO en pesos chilenos. Cada factura se calcula con "
+                 "el tipo de cambio de SU propia moneda.")
+                if tc_eur_sugerido else
+                "◄ Escriba acá el tipo de cambio del EURO en pesos chilenos.")
     for celda in ("D5", "D6"):
         ws[celda].font = Font(size=9.5, italic=True, color="7F3F00")
         ws[celda].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
@@ -19101,15 +19178,21 @@ def pagos_proveedores_descargar():
 
     ws.merge_cells("A8:M8")
     ws["A8"] = ("Las columnas en pesos se calculan solas a partir de los tipos de cambio de arriba: "
-                "mientras estén vacías, los pesos quedan en cero. Los subtotales por proveedor y el "
-                "total general también se recalculan solos.")
+                "cambie esos dos valores y se recalculan todas las facturas, los subtotales por "
+                "proveedor y el total general." +
+                (f"  ·  Tipo de cambio cargado: el de {origen_tc} (Configuración → Tipo de cambio "
+                 f"mensual)." if origen_tc else
+                 "  ·  Todavía no hay tipo de cambio mensual cargado en el programa, así que las "
+                 "celdas vienen vacías."))
     ws["A8"].font = Font(size=9, italic=True, color="44546A")
     ws["A8"].alignment = Alignment(horizontal="left", vertical="center")
 
-    # Nombres para poder escribir formulas legibles (=H14*TC_USD).
-    hoja = ws.title.replace("'", "''")
-    wb.defined_names.add(DefinedName("TC_USD", attr_text=f"'{hoja}'!$C$5"))
-    wb.defined_names.add(DefinedName("TC_EUR", attr_text=f"'{hoja}'!$C$6"))
+    # Las formulas apuntan DIRECTO a $C$5 y $C$6. La primera version usaba
+    # rangos con nombre (TC_USD / TC_EUR), mas legibles, pero una referencia
+    # absoluta es lo que cualquier Excel entiende sin depender de que los
+    # nombres sobrevivan al archivo -- y aca lo que importa es que el numero
+    # salga, no que la formula se lea bonita.
+    CELDA_TC_USD, CELDA_TC_EUR = "$C$5", "$C$6"
 
     # --- Encabezado de la tabla
     FILA_ENCABEZADO = 10
@@ -19129,8 +19212,20 @@ def pagos_proveedores_descargar():
 
     def _formula_clp(fila, col_valor):
         """Convierte a pesos segun la moneda de ESA fila (columna G)."""
-        return (f'=IF($G{fila}="USD",{col_valor}{fila}*TC_USD,'
-                f'IF($G{fila}="EUR",{col_valor}{fila}*TC_EUR,{col_valor}{fila}))')
+        return (f'=IF($G{fila}="USD",{col_valor}{fila}*{CELDA_TC_USD},'
+                f'IF($G{fila}="EUR",{col_valor}{fila}*{CELDA_TC_EUR},{col_valor}{fila}))')
+
+    def _a_pesos(moneda, monto):
+        """El mismo calculo que la formula, pero en Python: es lo que se
+        guarda como resultado dentro del archivo."""
+        if moneda == "USD":
+            return round((monto or 0) * tc_usd_sugerido, 2)
+        if moneda == "EUR":
+            return round((monto or 0) * tc_eur_sugerido, 2)
+        return round(monto or 0, 2)
+
+    # Resultado de cada celda con formula, para dejarlo guardado en el .xlsx
+    calculados = {}
 
     fila = FILA_ENCABEZADO
     filas_clp_totales = []        # filas de subtotal, para el total general
@@ -19155,7 +19250,7 @@ def pagos_proveedores_descargar():
                 valores = [
                     nombre_proveedor,
                     f.numero_factura or "",
-                    (f.empresa.nombre if f.empresa else "(sin asignar)"),
+                    _empresa_de_factura(f),
                     f.fecha_emision,
                     f.fecha_vencimiento,
                     (f.estado or "").capitalize(),
@@ -19175,6 +19270,8 @@ def pagos_proveedores_descargar():
                         celda.fill = PatternFill("solid", fgColor="FAFCFF")
                 ws.cell(row=fila, column=9).value = _formula_clp(fila, "H")
                 ws.cell(row=fila, column=13).value = _formula_clp(fila, "L")
+                calculados[f"I{fila}"] = _a_pesos(moneda, f.valor_factura)
+                calculados[f"M{fila}"] = _a_pesos(moneda, f.saldo_pendiente)
                 for col in (4, 5):
                     ws.cell(row=fila, column=col).number_format = "DD-MM-YYYY"
                     ws.cell(row=fila, column=col).alignment = Alignment(horizontal="center")
@@ -19200,12 +19297,18 @@ def pagos_proveedores_descargar():
                 celda.font = Font(bold=True, size=10)
                 celda.border = borde
             ws.cell(row=fila, column=1).alignment = Alignment(horizontal="right")
-            for col, formato in ((8, formato), (10, formato), (11, formato), (12, formato),
-                                 (9, _PP_FORMATOS["CLP"]), (13, _PP_FORMATOS["CLP"])):
+            for col, formato_col in ((8, formato), (10, formato), (11, formato), (12, formato),
+                                     (9, _PP_FORMATOS["CLP"]), (13, _PP_FORMATOS["CLP"])):
                 letra = get_column_letter(col)
                 celda = ws.cell(row=fila, column=col)
                 celda.value = f"=SUM({letra}{primera}:{letra}{fila - 1})"
-                celda.number_format = formato
+                celda.number_format = formato_col
+                if col in (9, 13):
+                    calculados[f"{letra}{fila}"] = round(sum(
+                        calculados.get(f"{letra}{n}", 0) for n in range(primera, fila)), 2)
+                else:
+                    calculados[f"{letra}{fila}"] = round(sum(
+                        (ws.cell(row=n, column=col).value or 0) for n in range(primera, fila)), 2)
             filas_subtotal_proveedor.append(fila)
 
         # Total del proveedor en pesos, solo si tiene mas de una moneda
@@ -19225,6 +19328,8 @@ def pagos_proveedores_descargar():
                 celda = ws.cell(row=fila, column=col)
                 celda.value = f"={suma}"
                 celda.number_format = _PP_FORMATOS["CLP"]
+                calculados[f"{letra}{fila}"] = round(sum(
+                    calculados.get(f"{letra}{f_sub}", 0) for f_sub in filas_subtotal_proveedor), 2)
             filas_clp_totales.append(fila)
         else:
             filas_clp_totales.extend(filas_subtotal_proveedor)
@@ -19246,6 +19351,8 @@ def pagos_proveedores_descargar():
         celda = ws.cell(row=fila, column=col)
         if filas_clp_totales:
             celda.value = "=" + "+".join(f"{letra}{f_sub}" for f_sub in filas_clp_totales)
+            calculados[f"{letra}{fila}"] = round(sum(
+                calculados.get(f"{letra}{f_sub}", 0) for f_sub in filas_clp_totales), 2)
         else:
             celda.value = 0
         celda.number_format = _PP_FORMATOS["CLP"]
@@ -19279,7 +19386,7 @@ def pagos_proveedores_descargar():
 
     buffer = io.BytesIO()
     wb.save(buffer)
-    buffer.seek(0)
+    buffer = _inyectar_valores_calculados(buffer.getvalue(), calculados)
     nombre = f"Facturas_por_pagar_{date.today().isoformat()}.xlsx"
     return send_file(
         buffer, as_attachment=True, download_name=nombre,
