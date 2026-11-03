@@ -4,7 +4,16 @@
 
 <div class="d-flex justify-content-between align-items-start mb-1">
   <h3 class="section-title mb-1">Pago Proveedores</h3>
-  <a href="{{ url_for('pagos_proveedores_facturar_consignacion') }}" class="btn btn-sm btn-brand">+ Emitir documento</a>
+  <div class="d-flex gap-2">
+    {# Ronda CT (2026-11-03): planilla de las facturas a pagar, con las celdas de
+       tipo de cambio arriba y los valores en pesos como fórmula. Arrastra los
+       mismos filtros que se están viendo en pantalla. #}
+    <a href="{{ url_for('pagos_proveedores_descargar', estado=estado_filtro, proveedor_id=proveedor_filtro, empresa_id=empresa_filtro) }}"
+       class="btn btn-sm btn-outline-success" title="Planilla Excel de las facturas a pagar, con tipo de cambio editable y subtotales por proveedor">
+      <i class="bi bi-file-earmark-excel"></i> Descargar planilla de pago
+    </a>
+    <a href="{{ url_for('pagos_proveedores_facturar_consignacion') }}" class="btn btn-sm btn-brand">+ Emitir documento</a>
+  </div>
 </div>
 <div class="text-muted small mb-3">
   Cuentas por pagar a proveedores extranjeros: facturas pendientes, su fecha de vencimiento y el plazo de

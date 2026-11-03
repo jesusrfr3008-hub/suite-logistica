@@ -17,6 +17,10 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.comments import Comment
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.worksheet.properties import PageSetupProperties
+from openpyxl.worksheet.page import PageMargins
 from flask import (
     Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory,
     send_file, abort
@@ -152,8 +156,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CS"
-VERSION_SUITE_FECHA = "2026-11-02"
+VERSION_SUITE = "CT"
+VERSION_SUITE_FECHA = "2026-11-03"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -18924,6 +18928,362 @@ def pagos_proveedores_list():
         ESTADOS_FACTURA_PROVEEDOR=ESTADOS_FACTURA_PROVEEDOR,
         totales_por_proveedor_id=totales_por_proveedor_id,
     )
+
+
+# --- Planilla de facturas a pagar (ronda CT, 2026-11-03) -----------------
+# Colores de la planilla: azul corporativo para las bandas de encabezado,
+# amarillo para las dos celdas que el usuario COMPLETA (los tipos de
+# cambio) y gris suave para los subtotales.
+_PP_AZUL = "1F3864"
+_PP_AZUL_MEDIO = "2F5597"
+_PP_GRIS = "EDF1F7"
+_PP_GRIS_FUERTE = "D6DEE9"
+_PP_AMARILLO = "FFE699"
+_PP_BORDE = "B7C3D4"
+
+_PP_FORMATOS = {
+    "USD": '"US$" #,##0.00',
+    "EUR": '"\u20ac" #,##0.00',
+    "CLP": '"$" #,##0',
+}
+
+
+# En la base hay facturas guardadas con "EURO" (asi lo escribe la pantalla de
+# Importaciones) y otras con "EUR". Para la planilla se unifica el codigo, que
+# es lo que la formula de cada fila mira para decidir con que tipo de cambio
+# valorizar: si no se unificara, una factura en "EURO" no se convertiria.
+_PP_EQUIVALENCIAS_MONEDA = {
+    "USD": "USD", "US$": "USD", "DOLAR": "USD", "DÓLAR": "USD", "DOLARES": "USD",
+    "EUR": "EUR", "EURO": "EUR", "EUROS": "EUR", "\u20ac": "EUR",
+    "CLP": "CLP", "PESOS": "CLP", "PESO": "CLP", "$": "CLP",
+}
+
+
+def _moneda_canonica_planilla(moneda):
+    bruta = (moneda or "USD").strip().upper()
+    return _PP_EQUIVALENCIAS_MONEDA.get(bruta, bruta)
+
+
+def _formato_moneda_planilla(moneda):
+    return _PP_FORMATOS.get(_moneda_canonica_planilla(moneda), '#,##0.00')
+
+
+def _borde_planilla(fino="thin"):
+    lado = Side(style=fino, color=_PP_BORDE)
+    return Border(left=lado, right=lado, top=lado, bottom=lado)
+
+
+@app.route("/pagos-proveedores/descargar")
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_descargar():
+    """Ronda CT (2026-11-03, a pedido del usuario): planilla Excel de las
+    facturas a pagar.
+
+    La gracia de esta planilla es que es VIVA: arriba hay dos celdas
+    (tipo de cambio USD y EUR) que el usuario completa, y la columna en
+    pesos de cada factura es una FORMULA que las referencia. Al escribir
+    los tipos de cambio, todos los valores en pesos -- y los subtotales
+    por proveedor y el total general -- se recalculan solos en Excel. No
+    se entrega un numero congelado por el servidor.
+
+    Respeta los mismos filtros que la pantalla (estado, proveedor y
+    empresa compradora), asi que lo que se baja es exactamente lo que se
+    esta viendo."""
+    estado_filtro = request.args.get("estado", "pendientes").strip().lower()
+    proveedor_filtro = request.args.get("proveedor_id", "").strip()
+    empresa_filtro = request.args.get("empresa_id", "").strip()
+
+    q = FacturaProveedor.query
+    if estado_filtro == "pendientes":
+        q = q.filter(FacturaProveedor.estado.in_(["pendiente", "abonada"]))
+    elif estado_filtro in ESTADOS_FACTURA_PROVEEDOR:
+        q = q.filter(FacturaProveedor.estado == estado_filtro)
+    if proveedor_filtro.isdigit():
+        q = q.filter(FacturaProveedor.proveedor_id == int(proveedor_filtro))
+    if empresa_filtro:
+        if empresa_filtro == "sin-asignar":
+            q = q.filter(FacturaProveedor.empresa_id.is_(None))
+        else:
+            q = q.filter(FacturaProveedor.empresa_id == empresa_filtro)
+    facturas = q.order_by(
+        db.case((FacturaProveedor.fecha_vencimiento.is_(None), 1), else_=0),
+        FacturaProveedor.fecha_vencimiento,
+    ).all()
+
+    # Agrupadas por proveedor y, dentro de cada uno, por moneda: sumar
+    # dolares con euros no significa nada, asi que cada moneda lleva su
+    # propio subtotal y lo unico que se totaliza en conjunto son los pesos.
+    por_proveedor = defaultdict(lambda: defaultdict(list))
+    for f in facturas:
+        nombre = f.proveedor.nombre if f.proveedor else "(sin proveedor)"
+        por_proveedor[nombre][_moneda_canonica_planilla(f.moneda)].append(f)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Facturas a pagar"
+    ws.sheet_view.showGridLines = False
+    borde = _borde_planilla()
+
+    anchos = [26, 22, 18, 13, 13, 13, 9, 17, 17, 15, 15, 17, 17]
+    for i, ancho in enumerate(anchos, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = ancho
+
+    # --- Titulo
+    ws.merge_cells("A1:M1")
+    titulo = ws["A1"]
+    titulo.value = "FACTURAS POR PAGAR A PROVEEDORES"
+    titulo.font = Font(bold=True, size=16, color="FFFFFF")
+    titulo.fill = PatternFill("solid", fgColor=_PP_AZUL)
+    titulo.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    empresa_nombre = "Todas las empresas"
+    if empresa_filtro == "sin-asignar":
+        empresa_nombre = "Sin empresa asignada"
+    elif empresa_filtro:
+        empresa = Empresa.query.get(empresa_filtro)
+        empresa_nombre = empresa.nombre if empresa else empresa_filtro
+    etiquetas_estado = {"pendientes": "Pendientes y abonadas"}
+    ws.merge_cells("A2:M2")
+    ws["A2"] = (f"{empresa_nombre}   ·   "
+                f"{etiquetas_estado.get(estado_filtro, estado_filtro.capitalize())}   ·   "
+                f"Emitido el {date.today().strftime('%d-%m-%Y')}")
+    ws["A2"].font = Font(size=10, color="FFFFFF", italic=True)
+    ws["A2"].fill = PatternFill("solid", fgColor=_PP_AZUL_MEDIO)
+    ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 18
+
+    # --- Las dos celdas de tipo de cambio, con su instruccion al lado
+    ws["A4"] = "TIPO DE CAMBIO"
+    ws["A4"].font = Font(bold=True, size=11, color=_PP_AZUL)
+
+    filas_tc = [("USD", "B5", "C5", "Dólar observado del día de pago"),
+                ("EUR", "B6", "C6", "Euro del día de pago")]
+    for moneda, celda_etiqueta, celda_valor, ayuda in filas_tc:
+        ws[celda_etiqueta] = f"{moneda} → CLP"
+        ws[celda_etiqueta].font = Font(bold=True)
+        ws[celda_etiqueta].alignment = Alignment(horizontal="right")
+        celda = ws[celda_valor]
+        celda.value = None
+        celda.fill = PatternFill("solid", fgColor=_PP_AMARILLO)
+        celda.border = _borde_planilla("medium")
+        celda.number_format = '#,##0.00'
+        celda.alignment = Alignment(horizontal="center")
+        celda.font = Font(bold=True, size=12)
+    ws["B5"].value = "USD → CLP"
+    ws["B6"].value = "EUR → CLP"
+
+    ws.merge_cells("D5:H5")
+    ws["D5"] = ("◄ Escriba acá el tipo de cambio del DÓLAR en pesos chilenos (ej.: 969,70). "
+                "Al escribirlo, las facturas en USD se valorizan solas.")
+    ws.merge_cells("D6:H6")
+    ws["D6"] = ("◄ Escriba acá el tipo de cambio del EURO en pesos chilenos. Cada factura "
+                "se calcula con el tipo de cambio de SU propia moneda.")
+    for celda in ("D5", "D6"):
+        ws[celda].font = Font(size=9.5, italic=True, color="7F3F00")
+        ws[celda].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[5].height = 30
+    ws.row_dimensions[6].height = 30
+
+    ws["C5"].comment = Comment(
+        "INSTRUCCIÓN\n\n"
+        "Escriba en esta celda el tipo de cambio del DÓLAR en pesos chilenos "
+        "(por ejemplo 969,70).\n\n"
+        "Al escribirlo, la columna «Valor en CLP» y «Saldo en CLP» de todas las "
+        "facturas en USD se calculan automáticamente, igual que los subtotales "
+        "por proveedor y el total general.", "Suite Logística", height=170, width=330)
+    ws["C6"].comment = Comment(
+        "INSTRUCCIÓN\n\n"
+        "Escriba en esta celda el tipo de cambio del EURO en pesos chilenos.\n\n"
+        "Las facturas en EUR se valorizan con este valor; las en USD usan la "
+        "celda de arriba. Cada factura se calcula con el tipo de cambio de SU "
+        "propia moneda.", "Suite Logística", height=150, width=330)
+
+    ws.merge_cells("A8:M8")
+    ws["A8"] = ("Las columnas en pesos se calculan solas a partir de los tipos de cambio de arriba: "
+                "mientras estén vacías, los pesos quedan en cero. Los subtotales por proveedor y el "
+                "total general también se recalculan solos.")
+    ws["A8"].font = Font(size=9, italic=True, color="44546A")
+    ws["A8"].alignment = Alignment(horizontal="left", vertical="center")
+
+    # Nombres para poder escribir formulas legibles (=H14*TC_USD).
+    hoja = ws.title.replace("'", "''")
+    wb.defined_names.add(DefinedName("TC_USD", attr_text=f"'{hoja}'!$C$5"))
+    wb.defined_names.add(DefinedName("TC_EUR", attr_text=f"'{hoja}'!$C$6"))
+
+    # --- Encabezado de la tabla
+    FILA_ENCABEZADO = 10
+    encabezados = [
+        "Proveedor", "N° Invoice", "Empresa", "Emisión", "Vencimiento", "Estado",
+        "Moneda", "Valor factura", "Valor en CLP", "Notas de crédito", "Pagado",
+        "Saldo por pagar", "Saldo en CLP",
+    ]
+    for i, texto in enumerate(encabezados, start=1):
+        celda = ws.cell(row=FILA_ENCABEZADO, column=i, value=texto)
+        celda.font = Font(bold=True, color="FFFFFF", size=10)
+        celda.fill = PatternFill("solid", fgColor=_PP_AZUL)
+        celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        celda.border = borde
+    ws.row_dimensions[FILA_ENCABEZADO].height = 30
+    ws.freeze_panes = ws.cell(row=FILA_ENCABEZADO + 1, column=1)
+
+    def _formula_clp(fila, col_valor):
+        """Convierte a pesos segun la moneda de ESA fila (columna G)."""
+        return (f'=IF($G{fila}="USD",{col_valor}{fila}*TC_USD,'
+                f'IF($G{fila}="EUR",{col_valor}{fila}*TC_EUR,{col_valor}{fila}))')
+
+    fila = FILA_ENCABEZADO
+    filas_clp_totales = []        # filas de subtotal, para el total general
+    for nombre_proveedor in sorted(por_proveedor, key=_normalizar_nombre):
+        monedas = por_proveedor[nombre_proveedor]
+        fila += 1
+        ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=13)
+        celda = ws.cell(row=fila, column=1, value=nombre_proveedor.upper())
+        celda.font = Font(bold=True, size=11, color="FFFFFF")
+        celda.fill = PatternFill("solid", fgColor=_PP_AZUL_MEDIO)
+        celda.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[fila].height = 19
+
+        filas_subtotal_proveedor = []
+        for moneda in sorted(monedas):
+            lista = monedas[moneda]
+            primera = fila + 1
+            formato = _formato_moneda_planilla(moneda)
+            formato_clp = _PP_FORMATOS["CLP"]
+            for i, f in enumerate(lista):
+                fila += 1
+                valores = [
+                    nombre_proveedor,
+                    f.numero_factura or "",
+                    (f.empresa.nombre if f.empresa else "(sin asignar)"),
+                    f.fecha_emision,
+                    f.fecha_vencimiento,
+                    (f.estado or "").capitalize(),
+                    moneda,
+                    f.valor_factura or 0,
+                    None,                      # J: formula
+                    f.total_notas_credito or 0,
+                    f.monto_pagado or 0,
+                    f.saldo_pendiente or 0,
+                    None,                      # M: formula
+                ]
+                for col, valor in enumerate(valores, start=1):
+                    celda = ws.cell(row=fila, column=col, value=valor)
+                    celda.border = borde
+                    celda.font = Font(size=10)
+                    if i % 2 == 1:
+                        celda.fill = PatternFill("solid", fgColor="FAFCFF")
+                ws.cell(row=fila, column=9).value = _formula_clp(fila, "H")
+                ws.cell(row=fila, column=13).value = _formula_clp(fila, "L")
+                for col in (4, 5):
+                    ws.cell(row=fila, column=col).number_format = "DD-MM-YYYY"
+                    ws.cell(row=fila, column=col).alignment = Alignment(horizontal="center")
+                ws.cell(row=fila, column=7).alignment = Alignment(horizontal="center")
+                for col in (8, 10, 11, 12):
+                    ws.cell(row=fila, column=col).number_format = formato
+                for col in (9, 13):
+                    ws.cell(row=fila, column=col).number_format = formato_clp
+                # Lo vencido se marca en rojo, que es la lectura inmediata
+                # que se le pide a una planilla de cuentas por pagar.
+                if (f.fecha_vencimiento and f.fecha_vencimiento < date.today()
+                        and (f.saldo_pendiente or 0) > 0.009):
+                    for col in range(1, 14):
+                        ws.cell(row=fila, column=col).font = Font(size=10, color="C00000")
+
+            # Subtotal de esta moneda dentro del proveedor
+            fila += 1
+            ws.cell(row=fila, column=1, value=f"Subtotal {nombre_proveedor} · {moneda}")
+            ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=7)
+            for col in range(1, 14):
+                celda = ws.cell(row=fila, column=col)
+                celda.fill = PatternFill("solid", fgColor=_PP_GRIS)
+                celda.font = Font(bold=True, size=10)
+                celda.border = borde
+            ws.cell(row=fila, column=1).alignment = Alignment(horizontal="right")
+            for col, formato in ((8, formato), (10, formato), (11, formato), (12, formato),
+                                 (9, _PP_FORMATOS["CLP"]), (13, _PP_FORMATOS["CLP"])):
+                letra = get_column_letter(col)
+                celda = ws.cell(row=fila, column=col)
+                celda.value = f"=SUM({letra}{primera}:{letra}{fila - 1})"
+                celda.number_format = formato
+            filas_subtotal_proveedor.append(fila)
+
+        # Total del proveedor en pesos, solo si tiene mas de una moneda
+        if len(monedas) > 1:
+            fila += 1
+            ws.cell(row=fila, column=1, value=f"TOTAL {nombre_proveedor} (en pesos)")
+            ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=8)
+            for col in range(1, 14):
+                celda = ws.cell(row=fila, column=col)
+                celda.fill = PatternFill("solid", fgColor=_PP_GRIS_FUERTE)
+                celda.font = Font(bold=True, size=10, color=_PP_AZUL)
+                celda.border = borde
+            ws.cell(row=fila, column=1).alignment = Alignment(horizontal="right")
+            for col in (9, 13):
+                letra = get_column_letter(col)
+                suma = "+".join(f"{letra}{f_sub}" for f_sub in filas_subtotal_proveedor)
+                celda = ws.cell(row=fila, column=col)
+                celda.value = f"={suma}"
+                celda.number_format = _PP_FORMATOS["CLP"]
+            filas_clp_totales.append(fila)
+        else:
+            filas_clp_totales.extend(filas_subtotal_proveedor)
+        fila += 1   # una fila en blanco entre proveedores
+
+    # --- Total general
+    fila += 1
+    ws.cell(row=fila, column=1, value="TOTAL GENERAL A PAGAR (en pesos chilenos)")
+    ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=8)
+    for col in range(1, 14):
+        celda = ws.cell(row=fila, column=col)
+        celda.fill = PatternFill("solid", fgColor=_PP_AZUL)
+        celda.font = Font(bold=True, size=11, color="FFFFFF")
+        celda.border = borde
+    ws.cell(row=fila, column=1).alignment = Alignment(horizontal="right", vertical="center")
+    ws.row_dimensions[fila].height = 22
+    for col in (9, 13):
+        letra = get_column_letter(col)
+        celda = ws.cell(row=fila, column=col)
+        if filas_clp_totales:
+            celda.value = "=" + "+".join(f"{letra}{f_sub}" for f_sub in filas_clp_totales)
+        else:
+            celda.value = 0
+        celda.number_format = _PP_FORMATOS["CLP"]
+
+    fila += 2
+    ws.cell(row=fila, column=1, value=(
+        "Rojo = factura vencida con saldo pendiente.  ·  "
+        "«Saldo por pagar» descuenta las notas de crédito y los pagos ya registrados."))
+    ws.cell(row=fila, column=1).font = Font(size=8.5, italic=True, color="7A7A7A")
+
+    if facturas:
+        ws.auto_filter.ref = f"A{FILA_ENCABEZADO}:M{FILA_ENCABEZADO}"
+
+    # Impresion: horizontal, ajustada al ancho de la hoja y repitiendo el
+    # encabezado de la tabla en cada pagina. Sin esto la planilla se parte en
+    # columnas sueltas y queda ilegible al imprimirla o pasarla a PDF.
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_options.horizontalCentered = True
+    ws.page_margins = PageMargins(left=0.3, right=0.3, top=0.5, bottom=0.5,
+                                  header=0.2, footer=0.2)
+    ws.print_title_rows = f"{FILA_ENCABEZADO}:{FILA_ENCABEZADO}"
+    ws.print_area = f"A1:M{fila}"
+    ws.oddFooter.left.text = "Suite Logística · Facturas por pagar"
+    ws.oddFooter.left.size = 8
+    ws.oddFooter.right.text = "Página &P de &N"
+    ws.oddFooter.right.size = 8
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    nombre = f"Facturas_por_pagar_{date.today().isoformat()}.xlsx"
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/pagos-proveedores/<int:factura_id>")
