@@ -186,6 +186,7 @@
           <th class="text-end">Lotes</th>
           <th class="text-end">Unidades</th>
           <th>Generado por</th>
+          <th class="text-end">Detalle</th>
         </tr>
       </thead>
       <tbody>
@@ -196,9 +197,19 @@
           <td class="text-end">{{ r.cantidad_lotes }}</td>
           <td class="text-end">{{ r.cantidad_unidades }}</td>
           <td class="small text-muted">{{ r.creado_por.nombre_completo if r.creado_por else '-' }}</td>
+          {# Ronda CU (2026-11-04, a pedido del usuario): ver qué se informó en cada
+             corte y poder bajarlo en Excel. #}
+          <td class="text-end text-nowrap">
+            <a href="{{ url_for('consignacion_reporte_detalle', reporte_id=r.id) }}"
+               class="btn btn-sm btn-outline-primary">Ver</a>
+            <a href="{{ url_for('consignacion_reporte_descargar', reporte_id=r.id) }}"
+               class="btn btn-sm btn-outline-success" title="Descargar en Excel lo reportado en esta fecha">
+              <i class="bi bi-file-earmark-excel"></i>
+            </a>
+          </td>
         </tr>
         {% else %}
-        <tr><td colspan="5" class="text-center text-muted py-3">Todavía no se generó ningún reporte.</td></tr>
+        <tr><td colspan="6" class="text-center text-muted py-3">Todavía no se generó ningún reporte.</td></tr>
         {% endfor %}
       </tbody>
     </table>

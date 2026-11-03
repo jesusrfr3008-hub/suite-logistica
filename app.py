@@ -44,7 +44,7 @@ from models import (
     HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
     StockConsignacionVigente, StockComprometidoBodega, ConsignacionPendienteLote,
     ConsignacionRecepcionImportacion,
-    ConsignacionReporteProveedor,
+    ConsignacionReporteProveedor, ConsignacionReporteLinea,
     CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
     FacturaProveedor, PagoFacturaProveedor, ComprobantePagoProveedor, ESTADOS_FACTURA_PROVEEDOR,
     FacturaProveedorLinea, NotaCreditoProveedor, NotaCreditoProveedorLinea, TIPOS_NC_PROVEEDOR,
@@ -156,8 +156,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CT.1"
-VERSION_SUITE_FECHA = "2026-11-03"
+VERSION_SUITE = "CU"
+VERSION_SUITE_FECHA = "2026-11-04"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -15352,6 +15352,148 @@ def stock_consignacion_list():
     )
 
 
+def _slug_archivo(texto):
+    """Nombre de archivo seguro: sin acentos, espacios ni signos raros."""
+    base = _normalizar_nombre(texto or "")
+    return re.sub(r"[^A-Za-z0-9]+", "_", base).strip("_").upper() or "SIN_NOMBRE"
+
+
+def _lineas_de_reporte_consignacion(reporte):
+    """Detalle de un reporte de consignacion (ronda CU, 2026-11-04).
+
+    Lo normal es leerlo de ConsignacionReporteLinea. Para los reportes
+    anteriores a esta ronda, que no tienen detalle guardado, se reconstruye
+    con los lotes cuyo ultimo_reporte_id apunta a el -- es lo unico
+    recuperable, y se marca como reconstruido para no presentarlo como el
+    dato original (ver el docstring del modelo)."""
+    guardadas = reporte.lineas.order_by(ConsignacionReporteLinea.descripcion).all()
+    if guardadas:
+        return guardadas, False
+    lotes = (ConsignacionPendienteLote.query
+             .filter_by(ultimo_reporte_id=reporte.id)
+             .order_by(ConsignacionPendienteLote.descripcion).all())
+    reconstruidas = [
+        ConsignacionReporteLinea(
+            reporte_id=reporte.id, lote_id=l.id, codigo_interno=l.codigo_interno,
+            codigo_proveedor=l.codigo_proveedor, descripcion=l.descripcion,
+            codigo_lote=l.codigo_lote, cantidad=(l.cantidad_informada or 0),
+            reconstruida=True)
+        for l in lotes
+    ]
+    return reconstruidas, True
+
+
+@app.route("/stock-consignacion/reportes/<int:reporte_id>")
+@requiere_permiso("reportes")
+def consignacion_reporte_detalle(reporte_id):
+    """Ronda CU (2026-11-04, a pedido del usuario -- "en la consignacion
+    reportada no puedo ver cuales fueron reportados"): el detalle de un
+    corte ya enviado al proveedor."""
+    reporte = ConsignacionReporteProveedor.query.get_or_404(reporte_id)
+    lineas, reconstruido = _lineas_de_reporte_consignacion(reporte)
+    return render_template(
+        "stock/consignacion_reporte.html", reporte=reporte, lineas=lineas,
+        reconstruido=reconstruido,
+        total_unidades=round(sum(l.cantidad or 0 for l in lineas), 2),
+    )
+
+
+@app.route("/stock-consignacion/reportes/<int:reporte_id>/descargar")
+@requiere_permiso("reportes")
+def consignacion_reporte_descargar(reporte_id):
+    """Ronda CU (2026-11-04): el mismo corte, en Excel, para mandarselo al
+    proveedor o archivarlo."""
+    reporte = ConsignacionReporteProveedor.query.get_or_404(reporte_id)
+    lineas, reconstruido = _lineas_de_reporte_consignacion(reporte)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Reporte consignación"
+    ws.sheet_view.showGridLines = False
+    borde = _borde_planilla()
+    for i, ancho in enumerate([18, 22, 46, 22, 14], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = ancho
+
+    ws.merge_cells("A1:E1")
+    ws["A1"] = "CONSUMO DE CONSIGNACIÓN REPORTADO AL PROVEEDOR"
+    ws["A1"].font = Font(bold=True, size=13, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", fgColor=_PP_AZUL)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 24
+
+    ws.merge_cells("A2:E2")
+    ws["A2"] = (f"{reporte.proveedor.nombre}   ·   Fecha reportada: "
+                f"{reporte.fecha_reporte.strftime('%d-%m-%Y')}   ·   "
+                f"{len(lineas)} lote(s)   ·   "
+                f"{round(sum(l.cantidad or 0 for l in lineas), 2)} unidad(es)")
+    ws["A2"].font = Font(size=9, color="FFFFFF", italic=True)
+    ws["A2"].fill = PatternFill("solid", fgColor=_PP_AZUL_MEDIO)
+    ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 15
+
+    FILA_ENCABEZADO = 3
+    for i, texto in enumerate(["Código interno", "Código proveedor", "Descripción",
+                               "Lote", "Unidades"], start=1):
+        celda = ws.cell(row=FILA_ENCABEZADO, column=i, value=texto)
+        celda.font = Font(bold=True, color="FFFFFF", size=10)
+        celda.fill = PatternFill("solid", fgColor=_PP_AZUL)
+        celda.alignment = Alignment(horizontal="center", vertical="center")
+        celda.border = borde
+    ws.freeze_panes = ws.cell(row=FILA_ENCABEZADO + 1, column=1)
+
+    fila = FILA_ENCABEZADO
+    for i, l in enumerate(lineas):
+        fila += 1
+        for col, valor in enumerate([l.codigo_interno or "", l.codigo_proveedor or "",
+                                     l.descripcion or "", l.codigo_lote or "",
+                                     l.cantidad or 0], start=1):
+            celda = ws.cell(row=fila, column=col, value=valor)
+            celda.border = borde
+            celda.font = Font(size=10)
+            if i % 2 == 1:
+                celda.fill = PatternFill("solid", fgColor="FAFCFF")
+        ws.cell(row=fila, column=5).number_format = '#,##0.##'
+        ws.cell(row=fila, column=5).alignment = Alignment(horizontal="right")
+
+    primera = FILA_ENCABEZADO + 1
+    fila += 1
+    ws.cell(row=fila, column=4, value="TOTAL UNIDADES")
+    for col in range(1, 6):
+        celda = ws.cell(row=fila, column=col)
+        celda.fill = PatternFill("solid", fgColor=_PP_GRIS)
+        celda.font = Font(bold=True, size=10)
+        celda.border = borde
+    ws.cell(row=fila, column=4).alignment = Alignment(horizontal="right")
+    ws.cell(row=fila, column=5).value = (f"=SUM(E{primera}:E{fila - 1})" if lineas else 0)
+    ws.cell(row=fila, column=5).number_format = '#,##0.##'
+    calculados = ({f"E{fila}": round(sum(l.cantidad or 0 for l in lineas), 2)} if lineas else {})
+
+    if reconstruido:
+        fila += 2
+        ws.cell(row=fila, column=1, value=(
+            "Este reporte es anterior a que el programa guardara el detalle de cada corte: las "
+            "filas se reconstruyeron con los lotes que quedaron apuntando a él, así que las "
+            "unidades son las informadas en total de cada lote, no necesariamente solo las de "
+            "esta fecha."))
+        ws.cell(row=fila, column=1).font = Font(size=8.5, italic=True, color="C00000")
+
+    if lineas:
+        ws.auto_filter.ref = f"A{FILA_ENCABEZADO}:E{fila}"
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_title_rows = f"{FILA_ENCABEZADO}:{FILA_ENCABEZADO}"
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer = _inyectar_valores_calculados(buffer.getvalue(), calculados)
+    nombre = (f"Consignacion_reportada_{_slug_archivo(reporte.proveedor.nombre)}_"
+              f"{reporte.fecha_reporte.isoformat()}.xlsx")
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 @app.route("/stock-consignacion/generar-reporte", methods=["POST"])
 @requiere_permiso("reportes")
 def consignacion_generar_reporte():
@@ -15406,6 +15548,16 @@ def consignacion_generar_reporte():
         lote.cantidad_informada = (lote.cantidad_informada or 0) + cantidad
         lote.ultimo_reporte_id = reporte.id
         unidades_totales += cantidad
+        # Ronda CU (2026-11-04, a pedido del usuario): se guarda el detalle
+        # del corte, con la cantidad informada EN ESTE reporte y una copia
+        # del codigo/descripcion del dia -- un reporte es un documento
+        # historico y tiene que poder volver a verse y descargarse igual.
+        db.session.add(ConsignacionReporteLinea(
+            reporte_id=reporte.id, lote_id=lote.id,
+            codigo_interno=lote.codigo_interno, codigo_proveedor=lote.codigo_proveedor,
+            descripcion=lote.descripcion, codigo_lote=lote.codigo_lote,
+            cantidad=cantidad, reconstruida=False,
+        ))
     reporte.cantidad_unidades = unidades_totales
     db.session.commit()
 
@@ -19100,14 +19252,19 @@ def pagos_proveedores_descargar():
     for i, ancho in enumerate(anchos, start=1):
         ws.column_dimensions[get_column_letter(i)].width = ancho
 
-    # --- Titulo
+    # --- Encabezado de la hoja -----------------------------------------
+    # Ronda CU (2026-11-04, punto 1 del usuario -- "las filas inmovilizadas
+    # ocupan mucha pantalla"): todo el encabezado entra en 3 filas (titulo,
+    # subtitulo y la linea de tipos de cambio) y la tabla arranca en la 4,
+    # asi que se congelan 4 filas en vez de 10. Se ven 6 facturas mas sin
+    # desplazar.
     ws.merge_cells("A1:M1")
     titulo = ws["A1"]
     titulo.value = "FACTURAS POR PAGAR A PROVEEDORES"
-    titulo.font = Font(bold=True, size=16, color="FFFFFF")
+    titulo.font = Font(bold=True, size=14, color="FFFFFF")
     titulo.fill = PatternFill("solid", fgColor=_PP_AZUL)
     titulo.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[1].height = 24
 
     empresa_nombre = "Todas las empresas"
     if empresa_filtro == "sin-asignar":
@@ -19120,82 +19277,55 @@ def pagos_proveedores_descargar():
     ws["A2"] = (f"{empresa_nombre}   ·   "
                 f"{etiquetas_estado.get(estado_filtro, estado_filtro.capitalize())}   ·   "
                 f"Emitido el {date.today().strftime('%d-%m-%Y')}")
-    ws["A2"].font = Font(size=10, color="FFFFFF", italic=True)
+    ws["A2"].font = Font(size=9, color="FFFFFF", italic=True)
     ws["A2"].fill = PatternFill("solid", fgColor=_PP_AZUL_MEDIO)
     ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[2].height = 18
+    ws.row_dimensions[2].height = 15
 
-    # --- Las dos celdas de tipo de cambio, con su instruccion al lado
-    ws["A4"] = "TIPO DE CAMBIO"
-    ws["A4"].font = Font(bold=True, size=11, color=_PP_AZUL)
-
+    # Fila 3: los dos tipos de cambio, uno al lado del otro, y la
+    # instruccion en el espacio que sobra.
     tc_usd_sugerido, tc_eur_sugerido, origen_tc = _tipos_cambio_sugeridos()
-    filas_tc = [("USD", "B5", "C5", tc_usd_sugerido),
-                ("EUR", "B6", "C6", tc_eur_sugerido)]
-    for moneda, celda_etiqueta, celda_valor, sugerido in filas_tc:
-        ws[celda_etiqueta] = f"{moneda} → CLP"
-        ws[celda_etiqueta].font = Font(bold=True)
-        ws[celda_etiqueta].alignment = Alignment(horizontal="right")
+    CELDA_TC_USD, CELDA_TC_EUR = "$C$3", "$E$3"
+    ws["A3"] = "TIPO DE CAMBIO"
+    ws["A3"].font = Font(bold=True, size=10, color=_PP_AZUL)
+    ws["A3"].alignment = Alignment(horizontal="left", vertical="center")
+    for etiqueta, celda_etiqueta, celda_valor, sugerido in (
+            ("USD → CLP", "B3", "C3", tc_usd_sugerido),
+            ("EUR → CLP", "D3", "E3", tc_eur_sugerido)):
+        ws[celda_etiqueta] = etiqueta
+        ws[celda_etiqueta].font = Font(bold=True, size=10)
+        ws[celda_etiqueta].alignment = Alignment(horizontal="right", vertical="center")
         celda = ws[celda_valor]
         celda.value = sugerido or None
         celda.fill = PatternFill("solid", fgColor=_PP_AMARILLO)
         celda.border = _borde_planilla("medium")
         celda.number_format = '#,##0.00'
-        celda.alignment = Alignment(horizontal="center")
-        celda.font = Font(bold=True, size=12)
-    ws["B5"].value = "USD → CLP"
-    ws["B6"].value = "EUR → CLP"
+        celda.alignment = Alignment(horizontal="center", vertical="center")
+        celda.font = Font(bold=True, size=11)
+    ws.merge_cells("F3:M3")
+    ws["F3"] = ("◄ Cambie estos dos valores por los del día de pago y se recalcula toda la planilla. "
+                + (f"Vienen con el tipo de cambio de {origen_tc} (Configuración → Tipo de cambio mensual)."
+                   if origen_tc else
+                   "Todavía no hay tipo de cambio mensual cargado en el programa."))
+    ws["F3"].font = Font(size=9, italic=True, color="7F3F00")
+    ws["F3"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[3].height = 26
 
-    ws.merge_cells("D5:H5")
-    ws["D5"] = (("◄ Tipo de cambio del DÓLAR en pesos chilenos. Viene con el del mes "
-                 f"({origen_tc}); cámbielo por el del día de pago si corresponde.")
-                if tc_usd_sugerido else
-                "◄ Escriba acá el tipo de cambio del DÓLAR en pesos chilenos (ej.: 969,70).")
-    ws.merge_cells("D6:H6")
-    ws["D6"] = (("◄ Tipo de cambio del EURO en pesos chilenos. Cada factura se calcula con "
-                 "el tipo de cambio de SU propia moneda.")
-                if tc_eur_sugerido else
-                "◄ Escriba acá el tipo de cambio del EURO en pesos chilenos.")
-    for celda in ("D5", "D6"):
-        ws[celda].font = Font(size=9.5, italic=True, color="7F3F00")
-        ws[celda].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    ws.row_dimensions[5].height = 30
-    ws.row_dimensions[6].height = 30
-
-    ws["C5"].comment = Comment(
+    ws["C3"].comment = Comment(
         "INSTRUCCIÓN\n\n"
-        "Escriba en esta celda el tipo de cambio del DÓLAR en pesos chilenos "
-        "(por ejemplo 969,70).\n\n"
-        "Al escribirlo, la columna «Valor en CLP» y «Saldo en CLP» de todas las "
-        "facturas en USD se calculan automáticamente, igual que los subtotales "
-        "por proveedor y el total general.", "Suite Logística", height=170, width=330)
-    ws["C6"].comment = Comment(
+        "Tipo de cambio del DÓLAR en pesos chilenos (por ejemplo 969,70).\n\n"
+        "Al cambiarlo, las columnas «Valor en CLP» y «Saldo en CLP» de todas las "
+        "facturas en USD se recalculan solas, igual que los subtotales por "
+        "proveedor y el total general.", "Suite Logística", height=160, width=330)
+    ws["E3"].comment = Comment(
         "INSTRUCCIÓN\n\n"
-        "Escriba en esta celda el tipo de cambio del EURO en pesos chilenos.\n\n"
+        "Tipo de cambio del EURO en pesos chilenos.\n\n"
         "Las facturas en EUR se valorizan con este valor; las en USD usan la "
-        "celda de arriba. Cada factura se calcula con el tipo de cambio de SU "
-        "propia moneda.", "Suite Logística", height=150, width=330)
-
-    ws.merge_cells("A8:M8")
-    ws["A8"] = ("Las columnas en pesos se calculan solas a partir de los tipos de cambio de arriba: "
-                "cambie esos dos valores y se recalculan todas las facturas, los subtotales por "
-                "proveedor y el total general." +
-                (f"  ·  Tipo de cambio cargado: el de {origen_tc} (Configuración → Tipo de cambio "
-                 f"mensual)." if origen_tc else
-                 "  ·  Todavía no hay tipo de cambio mensual cargado en el programa, así que las "
-                 "celdas vienen vacías."))
-    ws["A8"].font = Font(size=9, italic=True, color="44546A")
-    ws["A8"].alignment = Alignment(horizontal="left", vertical="center")
-
-    # Las formulas apuntan DIRECTO a $C$5 y $C$6. La primera version usaba
-    # rangos con nombre (TC_USD / TC_EUR), mas legibles, pero una referencia
-    # absoluta es lo que cualquier Excel entiende sin depender de que los
-    # nombres sobrevivan al archivo -- y aca lo que importa es que el numero
-    # salga, no que la formula se lea bonita.
-    CELDA_TC_USD, CELDA_TC_EUR = "$C$5", "$C$6"
+        "celda de la izquierda. Cada factura se calcula con el tipo de cambio "
+        "de SU propia moneda.", "Suite Logística", height=150, width=330)
 
     # --- Encabezado de la tabla
-    FILA_ENCABEZADO = 10
+    FILA_ENCABEZADO = 4
     encabezados = [
         "Proveedor", "N° Invoice", "Empresa", "Emisión", "Vencimiento", "Estado",
         "Moneda", "Valor factura", "Valor en CLP", "Notas de crédito", "Pagado",
@@ -19207,7 +19337,7 @@ def pagos_proveedores_descargar():
         celda.fill = PatternFill("solid", fgColor=_PP_AZUL)
         celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         celda.border = borde
-    ws.row_dimensions[FILA_ENCABEZADO].height = 30
+    ws.row_dimensions[FILA_ENCABEZADO].height = 28
     ws.freeze_panes = ws.cell(row=FILA_ENCABEZADO + 1, column=1)
 
     def _formula_clp(fila, col_valor):
@@ -19227,17 +19357,24 @@ def pagos_proveedores_descargar():
     # Resultado de cada celda con formula, para dejarlo guardado en el .xlsx
     calculados = {}
 
+    # Ronda CU (punto 2 del usuario -- "los filtros no toman toda la data
+    # sino solo los primeros datos"): el autofiltro de Excel se corta en la
+    # primera fila en blanco Y las celdas combinadas dentro del rango lo
+    # rompen. Por eso dentro de la tabla ya NO hay filas en blanco entre
+    # proveedores ni celdas combinadas: la banda del proveedor y la etiqueta
+    # del subtotal se escriben en una sola celda y se desbordan sobre las
+    # vecinas vacias, que se ve igual pero deja el bloque entero filtrable.
     fila = FILA_ENCABEZADO
     filas_clp_totales = []        # filas de subtotal, para el total general
     for nombre_proveedor in sorted(por_proveedor, key=_normalizar_nombre):
         monedas = por_proveedor[nombre_proveedor]
         fila += 1
-        ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=13)
         celda = ws.cell(row=fila, column=1, value=nombre_proveedor.upper())
-        celda.font = Font(bold=True, size=11, color="FFFFFF")
-        celda.fill = PatternFill("solid", fgColor=_PP_AZUL_MEDIO)
+        celda.font = Font(bold=True, size=10, color="FFFFFF")
         celda.alignment = Alignment(horizontal="left", vertical="center")
-        ws.row_dimensions[fila].height = 19
+        for col in range(1, 14):
+            ws.cell(row=fila, column=col).fill = PatternFill("solid", fgColor=_PP_AZUL_MEDIO)
+        ws.row_dimensions[fila].height = 17
 
         filas_subtotal_proveedor = []
         for moneda in sorted(monedas):
@@ -19256,7 +19393,7 @@ def pagos_proveedores_descargar():
                     (f.estado or "").capitalize(),
                     moneda,
                     f.valor_factura or 0,
-                    None,                      # J: formula
+                    None,                      # I: formula
                     f.total_notas_credito or 0,
                     f.monto_pagado or 0,
                     f.saldo_pendiente or 0,
@@ -19287,16 +19424,17 @@ def pagos_proveedores_descargar():
                     for col in range(1, 14):
                         ws.cell(row=fila, column=col).font = Font(size=10, color="C00000")
 
-            # Subtotal de esta moneda dentro del proveedor
+            # Subtotal de esta moneda dentro del proveedor. La etiqueta va en
+            # la columna G (Moneda), alineada a la derecha: se desborda hacia
+            # la izquierda sobre las columnas vacias, sin combinar celdas.
             fila += 1
-            ws.cell(row=fila, column=1, value=f"Subtotal {nombre_proveedor} · {moneda}")
-            ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=7)
+            ws.cell(row=fila, column=7, value=f"Subtotal {nombre_proveedor} · {moneda}")
             for col in range(1, 14):
                 celda = ws.cell(row=fila, column=col)
                 celda.fill = PatternFill("solid", fgColor=_PP_GRIS)
                 celda.font = Font(bold=True, size=10)
                 celda.border = borde
-            ws.cell(row=fila, column=1).alignment = Alignment(horizontal="right")
+            ws.cell(row=fila, column=7).alignment = Alignment(horizontal="right")
             for col, formato_col in ((8, formato), (10, formato), (11, formato), (12, formato),
                                      (9, _PP_FORMATOS["CLP"]), (13, _PP_FORMATOS["CLP"])):
                 letra = get_column_letter(col)
@@ -19314,14 +19452,13 @@ def pagos_proveedores_descargar():
         # Total del proveedor en pesos, solo si tiene mas de una moneda
         if len(monedas) > 1:
             fila += 1
-            ws.cell(row=fila, column=1, value=f"TOTAL {nombre_proveedor} (en pesos)")
-            ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=8)
+            ws.cell(row=fila, column=7, value=f"TOTAL {nombre_proveedor} (en pesos)")
             for col in range(1, 14):
                 celda = ws.cell(row=fila, column=col)
                 celda.fill = PatternFill("solid", fgColor=_PP_GRIS_FUERTE)
                 celda.font = Font(bold=True, size=10, color=_PP_AZUL)
                 celda.border = borde
-            ws.cell(row=fila, column=1).alignment = Alignment(horizontal="right")
+            ws.cell(row=fila, column=7).alignment = Alignment(horizontal="right")
             for col in (9, 13):
                 letra = get_column_letter(col)
                 suma = "+".join(f"{letra}{f_sub}" for f_sub in filas_subtotal_proveedor)
@@ -19333,10 +19470,12 @@ def pagos_proveedores_descargar():
             filas_clp_totales.append(fila)
         else:
             filas_clp_totales.extend(filas_subtotal_proveedor)
-        fila += 1   # una fila en blanco entre proveedores
 
-    # --- Total general
-    fila += 1
+    ultima_fila_tabla = fila
+
+    # --- Total general (fuera del rango del autofiltro, por eso si puede ir
+    #     con celdas combinadas)
+    fila += 2
     ws.cell(row=fila, column=1, value="TOTAL GENERAL A PAGAR (en pesos chilenos)")
     ws.merge_cells(start_row=fila, start_column=1, end_row=fila, end_column=8)
     for col in range(1, 14):
@@ -19345,7 +19484,7 @@ def pagos_proveedores_descargar():
         celda.font = Font(bold=True, size=11, color="FFFFFF")
         celda.border = borde
     ws.cell(row=fila, column=1).alignment = Alignment(horizontal="right", vertical="center")
-    ws.row_dimensions[fila].height = 22
+    ws.row_dimensions[fila].height = 20
     for col in (9, 13):
         letra = get_column_letter(col)
         celda = ws.cell(row=fila, column=col)
@@ -19360,11 +19499,15 @@ def pagos_proveedores_descargar():
     fila += 2
     ws.cell(row=fila, column=1, value=(
         "Rojo = factura vencida con saldo pendiente.  ·  "
-        "«Saldo por pagar» descuenta las notas de crédito y los pagos ya registrados."))
+        "«Saldo por pagar» descuenta las notas de crédito y los pagos ya registrados.  ·  "
+        "El filtro del encabezado abarca TODAS las filas de la tabla, incluidos los subtotales."))
     ws.cell(row=fila, column=1).font = Font(size=8.5, italic=True, color="7A7A7A")
 
+    # El autofiltro cubre TODO el bloque de datos, no solo la fila del
+    # encabezado -- que era el motivo por el que solo filtraba las primeras
+    # filas (Excel se detiene en la primera fila vacia).
     if facturas:
-        ws.auto_filter.ref = f"A{FILA_ENCABEZADO}:M{FILA_ENCABEZADO}"
+        ws.auto_filter.ref = f"A{FILA_ENCABEZADO}:M{ultima_fila_tabla}"
 
     # Impresion: horizontal, ajustada al ancho de la hoja y repitiendo el
     # encabezado de la tabla en cada pagina. Sin esto la planilla se parte en

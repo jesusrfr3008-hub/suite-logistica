@@ -640,6 +640,48 @@ class ConsignacionReporteProveedor(db.Model):
         return f"<ConsignacionReporteProveedor proveedor={self.proveedor_id} fecha={self.fecha_reporte}>"
 
 
+class ConsignacionReporteLinea(db.Model):
+    """Ronda CU (2026-11-04, a pedido del usuario -- "en la consignacion
+    reportada no puedo ver cuales fueron reportados, deberia permitirme ver
+    lo ya reportado e incluso descargar consignacion reportado segun su
+    fecha"): el DETALLE de cada reporte, una fila por lote informado.
+
+    Hasta ahora lo unico que quedaba era ConsignacionPendienteLote.
+    ultimo_reporte_id, que -- como dice el nombre -- solo apunta al ULTIMO
+    reporte en que entro ese lote: si un lote se informo en dos cortes
+    distintos (porque se consumio de a poco), el primero se perdia. Ademas
+    no guardaba CUANTAS unidades se informaron en ese corte, que es
+    justamente lo que el proveedor factura.
+
+    Se guarda ademas una copia del codigo y la descripcion tal como estaban
+    el dia del reporte: un reporte es un documento historico y tiene que
+    poder reimprimirse igual aunque despues se corrija el catalogo."""
+    __tablename__ = "consignacion_reporte_lineas"
+
+    id = db.Column(db.Integer, primary_key=True)
+    reporte_id = db.Column(db.Integer, db.ForeignKey("consignacion_reportes_proveedor.id"),
+                           nullable=False, index=True)
+    lote_id = db.Column(db.Integer, db.ForeignKey("consignacion_pendiente_lotes.id"), nullable=True)
+    codigo_interno = db.Column(db.String(40))
+    codigo_proveedor = db.Column(db.String(120))
+    descripcion = db.Column(db.String(300))
+    codigo_lote = db.Column(db.String(80))
+    cantidad = db.Column(db.Float, default=0)
+    # True cuando la fila se reconstruyo a partir de ultimo_reporte_id para
+    # un reporte anterior a esta ronda -- la cantidad de esos casos es la
+    # mejor aproximacion disponible, no el dato original. Se muestra en
+    # pantalla para no presentarlo como si fuera exacto.
+    reconstruida = db.Column(db.Boolean, default=False)
+
+    reporte = db.relationship("ConsignacionReporteProveedor",
+                              backref=db.backref("lineas", lazy="dynamic",
+                                                 cascade="all, delete-orphan"))
+    lote = db.relationship("ConsignacionPendienteLote")
+
+    def __repr__(self):
+        return f"<ConsignacionReporteLinea reporte={self.reporte_id} lote={self.codigo_lote}>"
+
+
 class PedidoComprometido(db.Model):
     """Ronda X (2026-09-13, punto 3C): unidades ya comprometidas con
     clientes (OC de clientes, no de nosotros a los proveedores), tal como
@@ -1140,6 +1182,41 @@ class OrdenCompra(db.Model):
         )
 
     @property
+    def ordenes_hermanas(self):
+        """Ronda CU (2026-11-04): las OTRAS ordenes con el MISMO numero de
+        PO y la misma empresa compradora.
+
+        Una PO se parte en varias filas de la tabla `ordenes_compra` cada
+        vez que sus lineas avanzan a ritmos distintos (ver
+        dividir_orden_si_corresponde en app.py): la parte confirmada se
+        queda en una y el remanente se muda a otra. Para el usuario eso
+        sigue siendo UNA sola orden de compra, asi que los indicadores que
+        hablan de "la orden" (BO, lineas sin confirmar) tienen que mirar
+        todas las hermanas, no solo las lineas que casualmente quedaron en
+        esta fila. Se cachea por instancia: el listado consulta estas
+        propiedades varias veces por orden."""
+        if getattr(self, "_hermanas_cache", None) is None:
+            if self.id is None:
+                self._hermanas_cache = []
+            else:
+                self._hermanas_cache = [
+                    o for o in OrdenCompra.query.filter_by(
+                        numero_po=self.numero_po, empresa_id=self.empresa_id
+                    ).filter(OrdenCompra.id != self.id)
+                    if o.estado != "Cancelada"
+                ]
+        return self._hermanas_cache
+
+    @property
+    def lineas_activas_de_la_po(self):
+        """Todas las lineas activas de la PO completa (esta orden y sus
+        hermanas), que es lo que el usuario entiende por "la orden"."""
+        lineas = [l for l in self.lineas if not l.anulada]
+        for hermana in self.ordenes_hermanas:
+            lineas.extend(l for l in hermana.lineas if not l.anulada)
+        return lineas
+
+    @property
     def lineas_sin_confirmar_en_orden_avanzada(self):
         """Ronda CC (2026-10-22, a pedido del usuario, revisando la
         PO-2026-0005: "se confirmó casi todos los productos y quedó uno
@@ -1163,7 +1240,16 @@ class OrdenCompra(db.Model):
         ]
         if not sin_confirmar:
             return 0
-        alguna_avanzo = any(l.etapa != ETAPAS_LINEA[0] for l in activas)
+        # Ronda CU (2026-11-04, a pedido del usuario -- "tengo varias OC que
+        # quedaron pendiente de confirmacion (BO) que se despacho
+        # parcialmente, pero no sale badge de BO"): "alguna avanzo" hay que
+        # mirarlo en la PO COMPLETA, no en esta fila sola. Al confirmar una
+        # parte, dividir_orden_si_corresponde se LLEVA las lineas avanzadas
+        # a una orden hermana -- desde el punto de vista de la orden que
+        # conserva el remanente ya no avanzo nada, y el indicador que se
+        # agrego en la ronda CC desaparecia justo cuando el usuario mas lo
+        # necesitaba. Verificado reproduciendo el caso (ver run_test_cu1).
+        alguna_avanzo = any(l.etapa != ETAPAS_LINEA[0] for l in self.lineas_activas_de_la_po)
         return len(sin_confirmar) if alguna_avanzo else 0
 
     @property
@@ -1177,6 +1263,40 @@ class OrdenCompra(db.Model):
         hoy ('Emisión de Orden') sin este indicador."""
         return any(
             l.disponibilidad_parcial_pendiente for l in self.lineas if not l.anulada
+        )
+
+    @property
+    def remanente_parcial_en_hermana(self):
+        """Ronda CU (2026-11-04): True si el BO de esta PO esta en una
+        orden HERMANA y no en esta fila.
+
+        Mismo motivo que arriba: tras confirmar una parte, el remanente se
+        muda a otra orden con el mismo numero de PO. Mirando solo la fila
+        que se despacho, el BO "desaparecia" -- el usuario veia la orden
+        despachada sin ninguna senal de que todavia quedaba un remanente
+        pendiente. Ahora las dos filas de la PO lo muestran, cada una con
+        su propio texto."""
+        if self.tiene_remanente_parcial:
+            return False
+        return any(
+            l.disponibilidad_parcial_pendiente
+            for hermana in self.ordenes_hermanas
+            for l in hermana.lineas if not l.anulada
+        )
+
+    @property
+    def sin_confirmar_en_hermana(self):
+        """Ronda CU (2026-11-04): cuantas lineas de la PO siguen sin
+        confirmar en una orden HERMANA. Misma idea que
+        remanente_parcial_en_hermana, para la orden que ya avanzo."""
+        if self.lineas_sin_confirmar_en_orden_avanzada:
+            return 0
+        return sum(
+            1
+            for hermana in self.ordenes_hermanas
+            for l in hermana.lineas
+            if not l.anulada and l.etapa == ETAPAS_LINEA[0]
+            and not l.disponibilidad_parcial_pendiente
         )
 
     def __repr__(self):

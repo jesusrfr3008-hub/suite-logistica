@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Reporte de consignación · Suite Logística{% endblock %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-start mb-1">
+  <div>
+    <h3 class="section-title mb-1">Consignación reportada al proveedor</h3>
+    <div class="text-muted small">
+      {{ reporte.proveedor.nombre }} · corte del <strong>{{ reporte.fecha_reporte.strftime('%d-%m-%Y') }}</strong>
+      · generado por {{ reporte.creado_por.nombre_completo if reporte.creado_por else '--' }}
+      {% if reporte.creado_en %}el {{ reporte.creado_en.strftime('%d-%m-%Y') }}{% endif %}
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('consignacion_reporte_descargar', reporte_id=reporte.id) }}"
+       class="btn btn-sm btn-outline-success">
+      <i class="bi bi-file-earmark-excel"></i> Descargar Excel
+    </a>
+    <a href="{{ url_for('stock_consignacion_list', proveedor=reporte.proveedor.nombre) }}"
+       class="btn btn-sm btn-outline-secondary">Volver</a>
+  </div>
+</div>
+
+{% if reconstruido %}
+<div class="alert alert-warning small py-2 mt-3">
+  Este reporte es anterior a que el programa guardara el detalle de cada corte. Las filas se
+  reconstruyeron con los lotes que quedaron apuntando a él, así que las unidades son las
+  <strong>informadas en total</strong> de cada lote, no necesariamente solo las de esta fecha.
+  Los reportes que generes de aquí en adelante sí guardan su detalle exacto.
+</div>
+{% endif %}
+
+<div class="row g-3 my-1">
+  <div class="col-auto">
+    <div class="card p-3">
+      <div class="text-muted small">Lotes informados</div>
+      <div class="fs-4 fw-semibold">{{ lineas|length }}</div>
+    </div>
+  </div>
+  <div class="col-auto">
+    <div class="card p-3">
+      <div class="text-muted small">Unidades informadas</div>
+      <div class="fs-4 fw-semibold">{{ total_unidades }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3">
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>Código interno</th>
+          <th>Código proveedor</th>
+          <th>Descripción</th>
+          <th>Lote</th>
+          <th class="text-end">Unidades</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for l in lineas %}
+        <tr>
+          <td class="fw-semibold">{{ l.codigo_interno or '--' }}</td>
+          <td>{{ l.codigo_proveedor or '--' }}</td>
+          <td>{{ l.descripcion or '--' }}</td>
+          <td>{{ l.codigo_lote or '--' }}</td>
+          <td class="text-end">{{ l.cantidad }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-center text-muted py-4">Este reporte no tiene líneas registradas.</td></tr>
+        {% endfor %}
+      </tbody>
+      {% if lineas %}
+      <tfoot>
+        <tr class="table-light fw-semibold">
+          <td colspan="4" class="text-end">Total</td>
+          <td class="text-end">{{ total_unidades }}</td>
+        </tr>
+      </tfoot>
+      {% endif %}
+    </table>
+  </div>
+</div>
+
+{% endblock %}

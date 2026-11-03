@@ -123,6 +123,11 @@
             {% if o.total_anuladas > 0 %}<span class="badge bg-secondary">{{ o.total_anuladas }} anulada(s)</span>{% endif %}
             {% if o.tiene_remanente_parcial %}
             <span class="badge bg-warning text-dark" data-bs-toggle="tooltip" title="Incluye línea(s) BO (back order) -- remanente pendiente de una confirmación parcial del proveedor, no un pedido nuevo">BO</span>
+            {% elif o.remanente_parcial_en_hermana %}
+            {# Ronda CU (2026-11-04): al confirmar una parte, el remanente se muda a
+               otra orden con el MISMO número de PO -- mirando solo esta fila el BO
+               "desaparecía". Se avisa igual, aclarando dónde está. #}
+            <span class="badge bg-warning text-dark border border-dark-subtle" data-bs-toggle="tooltip" title="Esta PO tiene un BO (back order) pendiente, en la otra orden del mismo número de PO que quedó en 'Emisión de Orden'">BO en la PO</span>
             {% endif %}
             {# Ronda CC (2026-10-22, a pedido del usuario): un producto que el
                proveedor no confirmó EN ABSOLUTO no es un BO (que es el
@@ -133,6 +138,16 @@
             <span class="badge bg-danger" data-bs-toggle="tooltip" title="{{ sin_confirmar }} producto(s) que el proveedor todavía no confirmó, mientras el resto de la orden ya avanzó. No es un BO: el BO es el remanente de una línea confirmada solo en parte.">
               {{ sin_confirmar }} sin confirmar
             </span>
+            {% else %}
+              {# Ronda CU (2026-11-04): mismo motivo que el BO de arriba --
+                 tras la división, las líneas sin confirmar viven en la orden
+                 hermana y esta fila se quedaba sin ningún aviso. #}
+              {% set sin_confirmar_hermana = o.sin_confirmar_en_hermana %}
+              {% if sin_confirmar_hermana %}
+              <span class="badge bg-danger-subtle text-danger border border-danger-subtle" data-bs-toggle="tooltip" title="{{ sin_confirmar_hermana }} producto(s) de esta misma PO que el proveedor todavía no confirmó, en la otra orden del mismo número que quedó en 'Emisión de Orden'.">
+                {{ sin_confirmar_hermana }} sin confirmar en la PO
+              </span>
+              {% endif %}
             {% endif %}
           </td>
           <td class="text-end">{{ o.total_unidades_pendientes|round(1) }}</td>
