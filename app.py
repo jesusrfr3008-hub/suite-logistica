@@ -156,7 +156,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CX"
+VERSION_SUITE = "CY"
 VERSION_SUITE_FECHA = "2026-11-06"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -13264,6 +13264,45 @@ def _corte_historia_ventas(hoy=None):
     return date(anio, mes, 1)
 
 
+_LARGOS_POR_MODELO = {}
+
+
+def _recortar_campos_de_texto(fila, modelo=None):
+    """Ronda CY (2026-11-06): recorta cada texto al largo que admite SU
+    columna en la base.
+
+    Lo que paso: el archivo que subio el usuario traia, en una celda de la
+    columna "Sector", un parrafo de 253 caracteres pegado por accidente.
+    VentaLinea.sector es VARCHAR(80). SQLite no hace caso del largo, asi que
+    en las pruebas entro sin chistar; Postgres SI lo valida, y la carga en
+    produccion murio con un 500 (StringDataRightTruncation) despues de haber
+    borrado todo -- la transaccion se deshizo sola, pero la pantalla quedo en
+    "Internal Server Error".
+
+    En vez de alargar esa columna puntual, se recorta TODO campo de texto al
+    largo de su propia columna, leido del modelo. Asi ningun dato raro de
+    ningun archivo futuro puede volver a tumbar la carga. Devuelve la lista
+    de campos que hubo que recortar, para avisarlo.
+
+    Sirve para cualquier modelo (se le pasa en `modelo`), por si hay que
+    aplicarlo a otra carga por archivo mas adelante."""
+    modelo = modelo or VentaLinea
+    largos = _LARGOS_POR_MODELO.get(modelo)
+    if largos is None:
+        largos = _LARGOS_POR_MODELO[modelo] = {
+            c.name: c.type.length
+            for c in modelo.__table__.columns
+            if getattr(c.type, "length", None)
+        }
+    recortados = []
+    for campo, largo in largos.items():
+        valor = fila.get(campo)
+        if isinstance(valor, str) and len(valor) > largo:
+            fila[campo] = valor[:largo]
+            recortados.append(campo)
+    return recortados
+
+
 def _numero_venta(valor):
     """Los números del reporte pueden venir como texto (con coma decimal)
     o como número real, según cómo se exporte."""
@@ -13291,7 +13330,7 @@ def _leer_filas_reporte_ventas(ws):
     (nombre_empresa_del_titulo, [dict por línea])."""
     filas = list(ws.iter_rows(values_only=True))
     if not filas:
-        return "", []
+        return "", [], [], []
     fila_encabezado = None
     columnas = {}
     for i, fila in enumerate(filas[:6]):
@@ -13301,7 +13340,7 @@ def _leer_filas_reporte_ventas(ws):
             columnas = {n: idx for idx, n in enumerate(nombres) if n}
             break
     if fila_encabezado is None:
-        return "", []
+        return "", [], [], []
 
     nombre_empresa = ""
     if fila_encabezado > 0:
@@ -13314,6 +13353,7 @@ def _leer_filas_reporte_ventas(ws):
 
     leidas = []
     descartadas = []
+    recortados = set()
     for fila in filas[fila_encabezado + 1:]:
         if not fila or all(v is None for v in fila):
             continue
@@ -13379,7 +13419,8 @@ def _leer_filas_reporte_ventas(ws):
             "categoria": str(col(fila, "categoria") or "").strip(),
             "subcategoria": str(col(fila, "subcategoria") or "").strip(),
         })
-    return nombre_empresa, leidas, descartadas
+        recortados.update(_recortar_campos_de_texto(leidas[-1]))
+    return nombre_empresa, leidas, descartadas, sorted(recortados)
 
 
 def _sembrar_clientes_vendedores(leidas):
@@ -14016,7 +14057,8 @@ def ventas_cargar():
         return redirect(url_for("ventas_list"))
     try:
         wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
-        nombre_empresa, leidas, descartadas = _leer_filas_reporte_ventas(wb.worksheets[0])
+        nombre_empresa, leidas, descartadas, recortados = _leer_filas_reporte_ventas(
+            wb.worksheets[0])
     except Exception:
         flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
         return redirect(url_for("ventas_list"))
@@ -14031,7 +14073,21 @@ def ventas_cargar():
 
     # Ronda CW (2026-11-05, punto 1): casilla "Reemplazar todo lo cargado".
     reemplazar_todo = request.form.get("reemplazar_todo") == "1"
-    resumen = _cargar_reporte_ventas(nombre_empresa, leidas, reemplazar_todo=reemplazar_todo)
+    # Ronda CY (2026-11-06): si la base rechaza algo del archivo, el usuario
+    # tiene que ver QUÉ pasó, no un "Internal Server Error". La transacción se
+    # deshace sola (nada queda a medias: ni se borró lo anterior ni entró lo
+    # nuevo), pero sin esto la pantalla no lo decía.
+    try:
+        resumen = _cargar_reporte_ventas(nombre_empresa, leidas, reemplazar_todo=reemplazar_todo)
+    except Exception as error:
+        db.session.rollback()
+        app.logger.exception("Error cargando el reporte de ventas")
+        flash(
+            "No se pudo cargar el archivo y NO se cambió nada: la base rechazó algún dato. "
+            f"Detalle técnico: {type(error).__name__}: {str(error)[:300]}",
+            "danger",
+        )
+        return redirect(url_for("ventas_list"))
     mensaje = (
         f"{resumen['insertadas']} línea(s) de venta cargadas del período "
         f"{resumen['desde'].strftime('%d-%m-%Y')} al {resumen['hasta'].strftime('%d-%m-%Y')}"
@@ -14047,6 +14103,13 @@ def ventas_cargar():
     if descartadas:
         mensaje += (f" Se descartaron {len(descartadas)} fila(s) que no son venta "
                     f"({', '.join(sorted(set(descartadas))[:3])}).")
+    if recortados:
+        # Ronda CY: el archivo traía algún texto más largo de lo que admite su
+        # columna (al usuario se le pegó un párrafo entero en una celda de
+        # "Sector"). Se recorta y se avisa, en vez de caerse con un 500.
+        mensaje += (f" Ojo: se recortó el texto de {', '.join(recortados)} en alguna(s) fila(s) "
+                    "por venir más largo de lo que admite ese campo -- revisa esas celdas en el "
+                    "archivo.")
     if resumen.get("vendedores_homologados"):
         mensaje += (
             f" {resumen['vendedores_homologados']} de ellos traían el nombre del vendedor escrito distinto "
