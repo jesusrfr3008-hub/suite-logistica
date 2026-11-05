@@ -1,0 +1,361 @@
+{% extends "base.html" %}
+{% block title %}{{ cliente.nombre }} · Ventas · Suite Logística{% endblock %}
+{% block content %}
+
+{# Ronda CV (2026-11-04, punto 3b del pedido del usuario): "ve bien cómo
+   funciona en compras a proveedores y repliques al máximo, los botones, las
+   barras de desplazamiento, etc.". Esta pantalla es el equivalente de
+   reportes/compras_proveedor_detalle.html para el lado de las ventas:
+   producto × mes, switch de unidades, buscador predictivo, encabezados
+   ordenables, filas desplegables con los documentos y tarjetas que se
+   recalculan en vivo con lo que quede visible. #}
+
+<style>
+  th.ordenable { cursor: pointer; user-select: none; white-space: nowrap; }
+  th.ordenable .bi { opacity: .4; }
+  th.ordenable.orden-activo .bi { opacity: 1; }
+  tr.fila-producto { cursor: pointer; }
+  tr.fila-producto:hover > td { filter: brightness(.97); }
+  tr.fila-documentos td { background-color: rgba(0,0,0,.02); }
+  .celda-mes { text-align: right; white-space: nowrap; }
+  #tabla-pivot th, #tabla-pivot td { font-size: .82rem; }
+  #tabla-pivot .valor-unidades { display: none; }
+  #tabla-pivot.modo-unidades .valor-monto { display: none; }
+  #tabla-pivot.modo-unidades .valor-unidades { display: inline; }
+  .col-descripcion { max-width: 260px; }
+  #tabla-pivot.modo-unidades .col-descripcion {
+    max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* Mismas barras de desplazamiento siempre visibles que en Compras Proveedor:
+     deja claro que hay más meses hacia los lados y más productos hacia abajo. */
+  .table-responsive-pivot { overflow-x: scroll; overflow-y: scroll; }
+  tr.fila-nota-credito td { background-color: #fdecea !important; }
+  tr.pareto-A > td { background-color: #e8f5e9; }
+  tr.pareto-B > td { background-color: #f6f7f9; }
+  tr.pareto-neg > td { background-color: #fdecea; }
+  .leyenda-pareto span { display: inline-block; width: .9rem; height: .9rem; border-radius: .2rem;
+                         vertical-align: -.1rem; margin-right: .25rem; border: 1px solid rgba(0,0,0,.1); }
+</style>
+
+{% macro documentos_tabla(prod) %}
+<div class="fw-semibold small mb-1">Documentos de {{ prod.codigo }} — {{ prod.descripcion }}</div>
+<table class="table table-sm mb-0">
+  <thead>
+    <tr>
+      <th>Fecha</th><th>Documento</th>
+      <th class="text-end">Unidades</th><th class="text-end">Venta neta</th>
+      <th class="text-end">Costo</th><th class="text-end">Margen</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for d in prod.documentos %}
+    <tr{% if d.es_nota_credito %} class="fila-nota-credito"{% endif %}>
+      <td>{{ d.fecha.strftime('%d-%m-%Y') if d.fecha else '-' }}</td>
+      <td>
+        {% if d.es_nota_credito %}
+        <span class="badge bg-danger-subtle text-danger-emphasis">{{ d.tipo_documento or 'Nota de Crédito' }}</span>
+        {% else %}
+        <span class="badge bg-secondary-subtle text-secondary-emphasis">{{ d.tipo_documento or 'Documento' }}</span>
+        {% endif %}
+        {{ d.numero_documento }}
+      </td>
+      <td class="text-end">{{ d.unidades | numero_flex }}</td>
+      <td class="text-end">${{ d.valor_neto | moneda }}</td>
+      <td class="text-end">${{ d.costo_total | moneda }}</td>
+      <td class="text-end {% if d.margen < 0 %}text-danger{% endif %}">${{ d.margen | moneda }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <div class="text-muted small mb-1">
+      <a href="{{ url_for('ventas_list', fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, vendedor=vendedor_sel) }}">
+        <i class="bi bi-arrow-left"></i> Reporte de Ventas
+      </a>
+    </div>
+    <h3 class="section-title mb-0">{{ cliente.nombre }} · Análisis por productos</h3>
+    <div class="text-muted small">
+      {% if cliente.rut %}RUT {{ cliente.rut }} · {% endif %}
+      Vendedor: {{ cliente.vendedor or '--' }}.
+      Ventas por producto y mes. Las notas de crédito vienen en negativo, así que restan solas.
+      Usa el buscador para acotar productos — las tarjetas de arriba se recalculan con lo que quede visible.
+    </div>
+  </div>
+</div>
+
+<form class="row g-2 mb-3 align-items-end">
+  <div class="col-auto">
+    <label class="form-label small mb-0">Desde</label>
+    <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}">
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Hasta</label>
+    <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}">
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Vendedor</label>
+    <select class="form-select" name="vendedor">
+      <option value="">Todos</option>
+      {% for v in vendedores %}
+      <option value="{{ v }}" {% if vendedor_sel|upper == v|upper %}selected{% endif %}>{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0 d-block">&nbsp;</label>
+    <button type="submit" class="btn btn-brand"><i class="bi bi-search"></i> Filtrar</button>
+  </div>
+  {% if fecha_desde or fecha_hasta or vendedor_sel %}
+  <div class="col-auto">
+    <label class="form-label small mb-0 d-block">&nbsp;</label>
+    <a href="{{ url_for('ventas_cliente_detalle', clave=cliente.clave, fecha_desde='', fecha_hasta='') }}"
+       class="btn btn-outline-secondary">Quitar filtros</a>
+  </div>
+  {% endif %}
+</form>
+
+<div class="row g-3 mb-3">
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Cantidad de productos</div>
+      <div class="stat-value fs-4" id="resumen-cantidad">{{ totales.productos }}</div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Venta neta</div>
+      <div class="stat-value fs-4">$ <span id="resumen-venta">{{ totales.venta | moneda }}</span></div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Costo neto</div>
+      <div class="stat-value fs-4">$ <span id="resumen-costo">{{ totales.costo | moneda }}</span></div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Margen neto</div>
+      <div class="stat-value fs-4">$ <span id="resumen-margen">{{ totales.margen | moneda }}</span></div>
+      <div class="text-muted small"><span id="resumen-margen-pct">{{ totales.pct_margen | round(1) }}</span>% sobre la venta</div>
+    </div>
+  </div>
+  <div class="col-md">
+    <div class="card card-stat h-100 p-3">
+      <div class="text-muted small">Documentos</div>
+      <div class="stat-value fs-4">{{ totales.documentos }}</div>
+      <div class="text-muted small">{{ totales.unidades | numero_flex }} unidad(es) netas</div>
+    </div>
+  </div>
+</div>
+
+<div class="card p-3">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <div class="fw-semibold">Análisis por productos (producto × mes)</div>
+    <div class="form-check form-switch mb-0">
+      <input class="form-check-input" type="checkbox" role="switch" id="toggle-unidades">
+      <label class="form-check-label small" for="toggle-unidades">Mostrar en unidades</label>
+    </div>
+    <div class="input-group" style="max-width: 340px;">
+      <span class="input-group-text"><i class="bi bi-search"></i></span>
+      <input type="text" class="form-control" id="buscador-producto" list="lista-codigos"
+             autocomplete="off" placeholder="Buscar código o descripción...">
+    </div>
+    <datalist id="lista-codigos">
+      {% for p in productos %}<option value="{{ p.codigo }}">{{ p.descripcion }}</option>{% endfor %}
+    </datalist>
+    <div class="small text-muted leyenda-pareto">
+      <span style="background:#e8f5e9"></span>80% de la utilidad &nbsp;
+      <span style="background:#f6f7f9"></span>20% &nbsp;
+      <span style="background:#fdecea"></span>negativo
+    </div>
+  </div>
+  <div class="text-muted small mb-2">
+    Haz clic en una fila para ver las facturas, boletas y notas de crédito con las que se vendió ese producto.
+  </div>
+  <div class="table-responsive table-responsive-pivot" style="max-height: 600px;">
+    <table class="table table-sm align-middle mb-0" id="tabla-pivot">
+      <thead class="table-dark">
+        <tr>
+          <th style="width: 24px;"></th>
+          <th class="ordenable" data-sort="codigo">Código <i class="bi bi-arrow-down-up"></i></th>
+          <th class="ordenable" data-sort="descripcion">Descripción <i class="bi bi-arrow-down-up"></i></th>
+          {% for m in meses_columnas %}
+          <th class="ordenable text-end" data-sort="mes:{{ m.clave }}">{{ m.etiqueta }} <i class="bi bi-arrow-down-up"></i></th>
+          {% endfor %}
+          <th class="ordenable text-end" data-sort="total">Total <span class="valor-monto">($)</span><span class="valor-unidades">(unid.)</span> <i class="bi bi-arrow-down-up"></i></th>
+          <th class="ordenable text-end" data-sort="margen">Margen <i class="bi bi-arrow-down-up"></i></th>
+          <th class="ordenable text-end" data-sort="pct">% util. <i class="bi bi-arrow-down-up"></i></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in productos %}
+        <tr class="fila-producto pareto-{{ p.pareto }}" data-busqueda="{{ p.busqueda }}"
+            data-venta="{{ p.venta }}" data-costo="{{ p.costo }}" data-margen="{{ p.margen }}"
+            data-sort-codigo="{{ p.codigo|lower }}" data-sort-descripcion="{{ p.descripcion|lower }}"
+            data-sort-total="{{ p.venta }}" data-sort-margen="{{ p.margen }}" data-sort-pct="{{ p.pct_del_total }}"
+            {% for m in meses_columnas %}data-sort-mes-{{ m.clave }}="{{ p.meses[m.clave].venta }}"{% if not loop.last %} {% endif %}{% endfor %}>
+          <td><i class="bi bi-chevron-right small text-muted"></i></td>
+          <td class="fw-semibold">{{ p.codigo }}</td>
+          <td class="col-descripcion" title="{{ p.descripcion }}">{{ p.descripcion }}</td>
+          {% for m in meses_columnas %}
+          {% set celda = p.meses[m.clave] %}
+          <td class="celda-mes">
+            {% if celda.venta %}<span class="valor-monto">{{ celda.venta | moneda }}</span>{% else %}<span class="valor-monto text-muted">-</span>{% endif %}
+            {% if celda.unidades %}<span class="valor-unidades">{{ celda.unidades | numero_flex }}</span>{% else %}<span class="valor-unidades text-muted">-</span>{% endif %}
+          </td>
+          {% endfor %}
+          <td class="text-end fw-semibold">
+            <span class="valor-monto">{{ p.venta | moneda }}</span>
+            <span class="valor-unidades">{{ p.unidades | numero_flex }}</span>
+          </td>
+          <td class="text-end fw-semibold {% if p.margen < 0 %}text-danger{% endif %}">{{ p.margen | moneda }}</td>
+          <td class="text-end">{{ "%.1f"|format(p.pct_del_total) }}%</td>
+        </tr>
+        <tr class="fila-documentos d-none">
+          <td></td>
+          <td colspan="{{ 2 + meses_columnas|length + 3 }}">
+            {{ documentos_tabla(p) }}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="99" class="text-center text-muted py-4">No hay ventas que coincidan con los filtros.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+  try { new bootstrap.Tooltip(el); } catch (e) {}
+});
+
+(function () {
+  var tabla = document.getElementById('tabla-pivot');
+  if (!tabla) return;
+  var tbody = tabla.querySelector('tbody');
+  var buscador = document.getElementById('buscador-producto');
+
+  // --- Expandir/contraer los documentos de un producto ---
+  tabla.querySelectorAll('tr.fila-producto').forEach(function (fila) {
+    fila.addEventListener('click', function () {
+      var sub = fila.nextElementSibling;
+      if (!sub || !sub.classList.contains('fila-documentos')) return;
+      var chevron = fila.querySelector('.bi-chevron-right, .bi-chevron-down');
+      sub.classList.toggle('d-none');
+      if (chevron) {
+        chevron.classList.toggle('bi-chevron-right');
+        chevron.classList.toggle('bi-chevron-down');
+      }
+    });
+  });
+
+  function paresFilas() {
+    var pares = [];
+    Array.prototype.forEach.call(tbody.children, function (f) {
+      if (!f.classList || !f.classList.contains('fila-producto')) return;
+      var sub = f.nextElementSibling;
+      pares.push({ principal: f, sub: (sub && sub.classList.contains('fila-documentos')) ? sub : null });
+    });
+    return pares;
+  }
+
+  // --- Buscador predictivo (código o descripción) ---
+  function aplicarFiltro() {
+    var texto = (buscador.value || '').trim().toLowerCase();
+    paresFilas().forEach(function (par) {
+      var coincide = !texto || par.principal.dataset.busqueda.indexOf(texto) !== -1;
+      par.principal.classList.toggle('d-none', !coincide);
+      if (!coincide && par.sub) par.sub.classList.add('d-none');
+    });
+    recalcularResumen();
+  }
+  if (buscador) buscador.addEventListener('input', aplicarFiltro);
+
+  // --- Tarjetas que se recalculan con lo que queda visible ---
+  function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+  function formatoMoneda(n) {
+    var redondeado = Math.round(n * 100) / 100;
+    var partes = redondeado.toFixed(2).split('.');
+    var negativo = partes[0].charAt(0) === '-';
+    if (negativo) partes[0] = partes[0].substring(1);
+    partes[0] = partes[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    return (negativo ? '-' : '') + partes[0] + ',' + partes[1];
+  }
+  function recalcularResumen() {
+    var cantidad = 0, venta = 0, costo = 0;
+    Array.prototype.forEach.call(tbody.children, function (fila) {
+      if (!fila.classList || !fila.classList.contains('fila-producto')) return;
+      if (fila.classList.contains('d-none')) return;
+      cantidad += 1;
+      venta += num(fila.dataset.venta);
+      costo += num(fila.dataset.costo);
+    });
+    var margen = venta - costo;
+    document.getElementById('resumen-cantidad').textContent = cantidad;
+    document.getElementById('resumen-venta').textContent = formatoMoneda(venta);
+    document.getElementById('resumen-costo').textContent = formatoMoneda(costo);
+    document.getElementById('resumen-margen').textContent = formatoMoneda(margen);
+    document.getElementById('resumen-margen-pct').textContent = (venta ? (margen / venta * 100) : 0).toFixed(1);
+  }
+
+  // --- Switch "Mostrar en unidades" (puro CSS, igual que en Compras) ---
+  var toggleUnidades = document.getElementById('toggle-unidades');
+  if (toggleUnidades) {
+    toggleUnidades.addEventListener('change', function () {
+      tabla.classList.toggle('modo-unidades', toggleUnidades.checked);
+    });
+  }
+
+  // --- Orden por columna ---
+  var ordenActual = { clave: null, asc: true };
+  tabla.querySelectorAll('th.ordenable').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var clave = th.dataset.sort;
+      var asc = (ordenActual.clave === clave) ? !ordenActual.asc : true;
+      ordenActual = { clave: clave, asc: asc };
+      tabla.querySelectorAll('th.ordenable').forEach(function (t) { t.classList.remove('orden-activo'); });
+      th.classList.add('orden-activo');
+
+      // Igual que en Compras Proveedor: las columnas de mes se leen con
+      // getAttribute() porque el nombre trae números después de un guion y
+      // la conversión a camelCase de dataset no es confiable ahí.
+      var esMes = clave.indexOf('mes:') === 0;
+      var atributoMes = esMes ? ('data-sort-mes-' + clave.split(':')[1]) : null;
+      function valorDe(fila) {
+        if (esMes) return fila.getAttribute(atributoMes);
+        if (clave === 'total') return fila.dataset.sortTotal;
+        if (clave === 'margen') return fila.dataset.sortMargen;
+        if (clave === 'pct') return fila.dataset.sortPct;
+        if (clave === 'codigo') return fila.dataset.sortCodigo;
+        if (clave === 'descripcion') return fila.dataset.sortDescripcion;
+        return '';
+      }
+      var pares = paresFilas();
+      pares.sort(function (a, b) {
+        var va = valorDe(a.principal), vb = valorDe(b.principal);
+        var esNumero = esMes || clave === 'total' || clave === 'margen' || clave === 'pct';
+        if (esNumero) { va = num(va); vb = num(vb); return asc ? (va - vb) : (vb - va); }
+        va = (va || '').toString(); vb = (vb || '').toString();
+        if (va < vb) return asc ? -1 : 1;
+        if (va > vb) return asc ? 1 : -1;
+        return 0;
+      });
+      pares.forEach(function (par) {
+        tbody.appendChild(par.principal);
+        if (par.sub) tbody.appendChild(par.sub);
+      });
+    });
+  });
+
+  recalcularResumen();
+})();
+</script>
+{% endblock %}

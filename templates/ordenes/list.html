@@ -26,6 +26,41 @@
   <a href="{{ url_for('ordenes_nueva') }}" class="btn btn-brand"><i class="bi bi-plus-lg"></i> Nueva orden de compra</a>
 </div>
 
+{# Ronda CV (2026-11-04, punto 2 del pedido del usuario -- "aparecen un badge BO
+   y otro sin confirmar, cuál es el criterio para que haya uno u otro?"): la
+   regla queda escrita acá, a la vista, para que no haya que adivinarla. El
+   criterio NO es si hay o no fecha estimada (las dos pueden tenerla, es la
+   fecha que nosotros planificamos); es QUÉ contestó el proveedor. #}
+<details class="mb-3">
+  <summary class="small text-muted" style="cursor:pointer">
+    ¿Qué significan los avisos <span class="badge bg-warning text-dark">BO</span> y
+    <span class="badge bg-danger">sin confirmar</span>?
+  </summary>
+  <div class="card p-3 mt-2 small">
+    <p class="mb-2">Los dos marcan producto que todavía no viene, y los dos dejan la línea en
+      <em>Emisión de Orden</em>. Lo que los separa es <strong>qué contestó el proveedor</strong>,
+      no si tenemos o no fecha estimada (esa fecha la ponemos nosotros al planificar, y puede
+      existir en ambos casos):</p>
+    <ul class="mb-2">
+      <li><span class="badge bg-warning text-dark">BO</span>
+        <strong>El proveedor confirmó solo una parte de la cantidad.</strong> Al confirmar se
+        indicó en "Cajas confirmadas" cuántas había disponibles: esa parte avanza a
+        <em>Orden Confirmada</em> con su fecha de despacho confirmada, y el resto queda como
+        <em>back order</em> esperando reposición del proveedor. Es un remanente de algo ya
+        aceptado, no un pedido nuevo.</li>
+      <li><span class="badge bg-danger">N sin confirmar</span>
+        <strong>El proveedor no contestó nada todavía por ese producto</strong>, mientras el
+        resto de la orden ya avanzó. No dijo ni cuánto ni cuándo.</li>
+    </ul>
+    <p class="mb-0 text-muted">Cuando el aviso dice <strong>"en la PO"</strong>
+      (<span class="badge bg-warning text-dark border border-dark-subtle">BO en la PO</span> /
+      <span class="badge bg-danger-subtle text-danger border border-danger-subtle">N sin confirmar en la PO</span>)
+      es porque esa parte quedó en la otra orden del mismo número de PO: el programa separa la
+      orden cuando sus líneas avanzan a ritmos distintos, pero sigue siendo la misma orden de
+      compra.</p>
+  </div>
+</details>
+
 <form class="row g-2 mb-3 align-items-end">
   <input type="hidden" name="sort" value="{{ sort_sel }}">
   <input type="hidden" name="dir" value="{{ dir_sel }}">

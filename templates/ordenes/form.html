@@ -256,7 +256,7 @@ async function cargarCatalogo(q) {
   if (productos.length === 0) {
     hintProveedor.textContent = 'Sin resultados en el catálogo de este proveedor.';
   } else {
-    hintProveedor.textContent = `${productos.length} producto(s) encontrados (máx. 50 mostrados).`;
+    hintProveedor.textContent = `${productos.length} producto(s) (máx. 50). Ordenados por lo que MÁS le compramos a este proveedor (histórico + órdenes de la plataforma).`;
   }
   // Ronda BV (2026-10-19, punto 3 del pedido del usuario): "cuando vaya a
   // emitir una OC de un proveedor y haya algun producto que su stock

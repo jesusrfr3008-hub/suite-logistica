@@ -1044,7 +1044,7 @@ document.getElementById('btnAccionAnular').addEventListener('click', () => {
     if (productos.length === 0) {
       hint.textContent = 'Sin resultados en el catálogo de este proveedor.';
     } else {
-      hint.textContent = `${productos.length} producto(s) encontrados (máx. 50 mostrados).`;
+      hint.textContent = `${productos.length} producto(s) (máx. 50). Ordenados por lo que MÁS le compramos a este proveedor (histórico + órdenes de la plataforma).`;
     }
     // Ronda BV (2026-10-19, punto 3 del pedido del usuario): el backend ya
     // ordena primero los productos marcados "Reponer" (stock proyectado

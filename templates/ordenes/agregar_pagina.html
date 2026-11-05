@@ -187,7 +187,7 @@ async function cargarCatalogo(q) {
     if (productos.length === 0) {
       hintProveedor.textContent = 'Sin resultados en el catálogo de este proveedor.';
     } else {
-      hintProveedor.textContent = `${productos.length} producto(s) encontrados (máx. 50 mostrados).`;
+      hintProveedor.textContent = `${productos.length} producto(s) (máx. 50). Ordenados por lo que MÁS le compramos a este proveedor (histórico + órdenes de la plataforma).`;
     }
     // Ronda BV (2026-10-19, punto 3): el backend ya ordena primero los
     // productos marcados "Reponer" (stock proyectado negativo).

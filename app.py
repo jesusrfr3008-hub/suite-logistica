@@ -156,8 +156,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CU"
-VERSION_SUITE_FECHA = "2026-11-04"
+VERSION_SUITE = "CV"
+VERSION_SUITE_FECHA = "2026-11-05"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -7349,6 +7349,76 @@ def ordenes_simple_cancelar(orden_id):
     return redirect(url_for("ordenes_simple_list"))
 
 
+def _ranking_compras_por_producto(proveedor_id):
+    """Ronda CV (2026-11-04, punto 1 del pedido del usuario -- "en la
+    emision de nueva orden de compra el programa trae 50 productos, pero
+    trae por orden numerico o alfabetico. Mejor esos 50 productos sean los
+    productos mas comprados"): cuanto se le ha comprado a este proveedor
+    de cada producto, juntando las DOS fuentes de compras que ya usa el
+    reporte Compras Proveedor:
+
+    - CompraHistorica (el archivo historico, homologado por codigo
+      Ergopyme), y
+    - las Ordenes de Compra hechas en la plataforma (lineas activas, sin
+      contar las anuladas).
+
+    Devuelve {CODIGO EN MAYUSCULAS: (veces comprado, unidades)}. Se ordena
+    primero por VECES: "lo que mas compramos" es lo que aparece una y otra
+    vez en las facturas, no el producto barato del que entran miles de
+    unidades en un solo embarque.
+
+    Se consulta agregado en la base (no fila por fila) porque esto corre en
+    cada tecleo del buscador del catalogo."""
+    proveedor = Proveedor.query.get(proveedor_id)
+    if proveedor is None:
+        return {}
+    ranking = defaultdict(lambda: [0, 0.0])
+
+    historico = (
+        db.session.query(
+            CompraHistorica.codigo_proveedor,
+            db.func.count(CompraHistorica.id),
+            db.func.sum(CompraHistorica.unidades),
+        )
+        .filter(db.func.upper(db.func.coalesce(CompraHistorica.proveedor_homologado,
+                                               CompraHistorica.proveedor_original))
+                == proveedor.nombre.upper())
+        .group_by(CompraHistorica.codigo_proveedor)
+        .all()
+    )
+    for codigo, veces, unidades in historico:
+        clave = _firma_codigo(codigo or "")
+        if not clave:
+            continue
+        ranking[clave][0] += veces or 0
+        ranking[clave][1] += unidades or 0
+
+    plataforma = (
+        db.session.query(
+            Producto.codigo,
+            OrdenCompraLinea.variante_codigo,
+            db.func.count(OrdenCompraLinea.id),
+            db.func.sum(OrdenCompraLinea.cantidad_cajas),
+        )
+        .join(Producto, Producto.id == OrdenCompraLinea.producto_id)
+        .join(OrdenCompra, OrdenCompra.id == OrdenCompraLinea.orden_id)
+        .filter(OrdenCompra.proveedor_id == proveedor_id,
+                OrdenCompraLinea.anulada == False)  # noqa: E712
+        .group_by(Producto.codigo, OrdenCompraLinea.variante_codigo)
+        .all()
+    )
+    for codigo, variante, veces, cajas in plataforma:
+        # La variante (ej. la dioptria de un lente) se suma al codigo PADRE,
+        # que es lo que muestra el catalogo al armar la orden.
+        clave = _firma_codigo(codigo or "")
+        if not clave:
+            continue
+        ranking[clave][0] += veces or 0
+        ranking[clave][1] += cajas or 0
+
+    return {k: tuple(v) for k, v in ranking.items()}
+
+
 @app.route("/api/proveedores/<int:proveedor_id>/productos")
 @requiere_permiso("crear_orden", "generar_costeo", "pagos_proveedores")
 def api_productos_por_proveedor(proveedor_id):
@@ -7371,7 +7441,20 @@ def api_productos_por_proveedor(proveedor_id):
         query = query.filter(
             db.or_(Producto.codigo.ilike(f"%{q}%"), Producto.descripcion.ilike(f"%{q}%"))
         )
-    productos = query.order_by(Producto.activo.desc(), Producto.codigo).limit(50).all()
+    # Ronda CV (2026-11-04, punto 1): el recorte a 50 se hace DESPUES de
+    # ordenar por lo mas comprado -- si se recortara antes (como hacia
+    # hasta ahora, con un limit(50) alfabetico) los 50 que llegaban eran
+    # los primeros del abecedario y el orden nuevo no cambiaba nada.
+    candidatos = query.order_by(Producto.activo.desc(), Producto.codigo).all()
+    ranking = _ranking_compras_por_producto(proveedor_id)
+
+    def _compras_de(p):
+        return ranking.get(_firma_codigo(p.codigo or ""), (0, 0.0))
+
+    candidatos.sort(key=lambda p: (0 if p.activo else 1,
+                                   -_compras_de(p)[0], -_compras_de(p)[1],
+                                   (p.codigo or "").upper()))
+    productos = candidatos[:50]
 
     # Ronda BV (2026-10-19, punto 3 del pedido del usuario): "cuando vaya a
     # emitir una OC de un proveedor y haya algun producto que su stock
@@ -7416,6 +7499,10 @@ def api_productos_por_proveedor(proveedor_id):
             "tiene_variantes": p.variantes.count() > 0,
             "activo": p.activo,
             "needs_reorder": _producto_necesita_reposicion(p),
+            # Ronda CV: para que el front-end pueda mostrar por que un
+            # producto viene primero ("lo compramos N veces").
+            "veces_comprado": _compras_de(p)[0],
+            "unidades_compradas": _compras_de(p)[1],
         }
         for p in productos
     ]
@@ -13250,14 +13337,39 @@ def _cargar_reporte_ventas(nombre_empresa, leidas):
     # archivo como sugerencia (sin confirmar), los ya existentes no se
     # tocan -- la asignación vigente la decide el usuario.
     existentes = {c.rut for c in ClienteVendedor.query.with_entities(ClienteVendedor.rut).all()}
+    # Ronda CV (2026-11-04, punto 3c del pedido del usuario -- "verifica si
+    # este proceso lo homologa en caso de un cliente nuevo que no lo
+    # hayamos asignado manualmente"): el nombre del vendedor que trae el
+    # archivo se homologa contra los vendedores que ya conoce el programa
+    # (los usuarios con vendedor asignado y los que ya están en el
+    # maestro), comparando sin tildes ni mayúsculas. Sin esto, "MARIANA
+    # PEREZ" en el archivo y "Mariana Pérez" en el programa quedaban como
+    # dos vendedores distintos y la cuenta nueva no se sumaba a las de
+    # ella -- ni en este reporte ni en el Forecast.
+    canonicos = {}
+    for (nombre,) in db.session.query(Usuario.vendedor).distinct().all():
+        if (nombre or "").strip():
+            canonicos.setdefault(_normalizar_nombre(nombre), nombre.strip())
+    for (nombre,) in db.session.query(ClienteVendedor.vendedor).distinct().all():
+        if (nombre or "").strip():
+            canonicos.setdefault(_normalizar_nombre(nombre), nombre.strip())
+
     nuevos = 0
+    homologados = 0
+    sin_homologar = set()
     for f in leidas:
         rut = f["rut_cliente"]
         if not rut or rut in existentes:
             continue
+        del_archivo = (f["vendedor_archivo"] or "").strip()
+        canonico = canonicos.get(_normalizar_nombre(del_archivo))
+        if canonico and canonico != del_archivo:
+            homologados += 1
+        elif del_archivo and not canonico:
+            sin_homologar.add(del_archivo)
         db.session.add(ClienteVendedor(
             rut=rut, nombre_cliente=f["nombre_cliente"],
-            vendedor=f["vendedor_archivo"], asignacion_confirmada=False,
+            vendedor=canonico or del_archivo, asignacion_confirmada=False,
         ))
         existentes.add(rut)
         nuevos += 1
@@ -13271,6 +13383,8 @@ def _cargar_reporte_ventas(nombre_empresa, leidas):
         "desde": desde, "hasta": hasta,
         "insertadas": len(leidas), "reemplazadas": borradas,
         "clientes_nuevos": nuevos, "purgadas": purgadas,
+        "vendedores_homologados": homologados,
+        "vendedores_sin_homologar": sorted(sin_homologar),
     }
 
 
@@ -13320,13 +13434,307 @@ def _rotacion_por_codigo(ventanas=(90, 180, 360)):
     return resultado
 
 
+def _vendedor_vigente_por_rut():
+    """{rut: vendedor vigente} del maestro ClienteVendedor (ronda CV,
+    2026-11-04, punto 3c del pedido del usuario).
+
+    El reporte de Ventas mostraba y filtraba por `vendedor_archivo`, el
+    vendedor que venia escrito en la factura. Eso no es lo que manda: la
+    asignacion VIGENTE es la del maestro, igual que en el Forecast (ver
+    _ruts_del_vendedor). Un cliente reasignado seguia apareciendo bajo el
+    vendedor viejo en este reporte y bajo el nuevo en el Forecast."""
+    return {
+        c.rut: (c.vendedor or "").strip()
+        for c in ClienteVendedor.query.with_entities(
+            ClienteVendedor.rut, ClienteVendedor.vendedor).all()
+        if c.rut
+    }
+
+
+def _clave_cliente(linea):
+    """Identificador estable de un cliente para agrupar y para la URL del
+    detalle: el RUT cuando lo hay, el nombre si no (ventas sin RUT)."""
+    rut = (linea.rut_cliente or "").strip()
+    if rut:
+        return rut
+    nombre = (linea.nombre_cliente or "").strip()
+    return f"NOMBRE:{nombre}" if nombre else "(sin cliente)"
+
+
+def _marcar_pareto(filas, campo="margen"):
+    """Ronda CV (2026-11-04, punto 3b): marca el 80-20 de la UTILIDAD.
+
+    El usuario lo pidio asi: "sombrear con colores diferentes los clientes
+    y productos que conforman el 80-20 de nuestras utilidades". Se ordena
+    por margen de mayor a menor y se va acumulando: los que juntos llegan
+    al 80% del margen total quedan en el grupo "A" (los que de verdad
+    sostienen la utilidad), el resto en "B". Los de margen NEGATIVO se
+    marcan aparte ("neg") -- no son 80-20 de nada, son los que nos cuestan
+    plata, y conviene verlos de un color propio.
+
+    Modifica las filas en el lugar, agregando 'pct_del_total' (participacion
+    en la utilidad, no en la venta) y 'pareto'."""
+    positivos = [f for f in filas if (f.get(campo) or 0) > 0]
+    total = sum(f[campo] for f in positivos)
+    orden = sorted(positivos, key=lambda f: -f[campo])
+    acumulado = 0.0
+    for f in orden:
+        f["pct_del_total"] = (f[campo] / total * 100) if total else 0.0
+        acumulado += f[campo]
+        f["pct_acumulado"] = (acumulado / total * 100) if total else 0.0
+        f["pareto"] = "A" if (acumulado - f[campo]) < total * 0.8 else "B"
+    for f in filas:
+        if (f.get(campo) or 0) <= 0:
+            f["pct_del_total"] = (f[campo] / total * 100) if total else 0.0
+            f["pct_acumulado"] = 0.0
+            f["pareto"] = "neg" if (f.get(campo) or 0) < 0 else "B"
+    return filas
+
+
+def _lineas_ventas_filtradas(desde, hasta, vendedor="", q="", clave_cliente=None):
+    """Las lineas de venta que calzan con los filtros de la pantalla de
+    Ventas. El filtro de vendedor usa el maestro VIGENTE (ver
+    _vendedor_vigente_por_rut), no el vendedor del archivo."""
+    query = VentaLinea.query
+    if desde:
+        query = query.filter(VentaLinea.fecha >= desde)
+    if hasta:
+        query = query.filter(VentaLinea.fecha <= hasta)
+    if vendedor:
+        ruts = _ruts_del_vendedor(vendedor)
+        if not ruts:
+            return []
+        query = query.filter(VentaLinea.rut_cliente.in_(ruts))
+    if q:
+        like = f"%{q}%"
+        query = query.filter(db.or_(
+            VentaLinea.codigo_interno.ilike(like), VentaLinea.descripcion.ilike(like),
+            VentaLinea.nombre_cliente.ilike(like), VentaLinea.rut_cliente.ilike(like),
+        ))
+    lineas = query.order_by(VentaLinea.fecha.desc(), VentaLinea.numero_documento.desc()).all()
+    if clave_cliente:
+        lineas = [l for l in lineas if _clave_cliente(l) == clave_cliente]
+    return lineas
+
+
+def _resumen_ventas_por_cliente(lineas):
+    """Ronda CV (2026-11-04, punto 3b del pedido del usuario): resumen por
+    cliente con venta neta, costo neto y margen, armado igual que el
+    "Resumen por proveedor" de Compras.
+
+    Las notas de credito vienen con unidades y montos NEGATIVOS en el
+    propio archivo de Ergopyme, asi que restan solas al sumar -- facturas,
+    boletas y notas de credito entran todas a la misma suma (es justo lo
+    que pidio el usuario: "sumando facturas y boletas y restando las notas
+    de credito")."""
+    vendedores = _vendedor_vigente_por_rut()
+    por_cliente = {}
+    for l in lineas:
+        clave = _clave_cliente(l)
+        fila = por_cliente.get(clave)
+        if fila is None:
+            fila = por_cliente[clave] = {
+                "clave": clave,
+                "rut": (l.rut_cliente or "").strip(),
+                "nombre": (l.nombre_cliente or "").strip() or "(sin cliente)",
+                "vendedor": vendedores.get((l.rut_cliente or "").strip())
+                            or (l.vendedor_archivo or "").strip(),
+                "codigos": set(),
+                "documentos": set(),
+                "unidades": 0.0, "venta": 0.0, "costo": 0.0,
+                "notas_credito": 0.0,
+            }
+        codigo = (l.codigo_interno or "").strip()
+        if codigo:
+            fila["codigos"].add(codigo)
+        if l.numero_documento:
+            fila["documentos"].add((l.tipo_documento, l.numero_documento))
+        fila["unidades"] += l.unidades or 0
+        fila["venta"] += l.valor_neto or 0
+        fila["costo"] += l.costo_total or 0
+        if (l.valor_neto or 0) < 0:
+            fila["notas_credito"] += l.valor_neto or 0
+
+    filas = []
+    for fila in por_cliente.values():
+        fila["productos"] = len(fila.pop("codigos"))
+        fila["documentos"] = len(fila["documentos"])
+        fila["margen"] = round(fila["venta"] - fila["costo"], 2)
+        fila["pct_margen"] = (fila["margen"] / fila["venta"] * 100) if fila["venta"] else 0.0
+        filas.append(fila)
+    _marcar_pareto(filas, "margen")
+    filas.sort(key=lambda f: -f["margen"])
+    return filas
+
+
+def _sugerencias_busqueda_ventas(lineas, maximo=400):
+    """Ronda CV (2026-11-04, punto 3a del pedido del usuario -- "el buscador
+    debe ser predictivo, para saber si se esta seleccionando bien el nombre
+    del cliente o del producto"): la lista que alimenta el <datalist> del
+    buscador. Trae clientes y productos del corte, cada uno con una
+    etiqueta que dice cual es cual -- que es justo lo que el usuario queria
+    poder distinguir al escribir."""
+    clientes, productos = {}, {}
+    for l in lineas:
+        nombre = (l.nombre_cliente or "").strip()
+        if nombre and nombre not in clientes:
+            clientes[nombre] = (l.rut_cliente or "").strip()
+        codigo = (l.codigo_interno or "").strip()
+        if codigo and codigo not in productos:
+            productos[codigo] = (l.descripcion or "").strip()
+    salida = [{"valor": n, "etiqueta": f"Cliente · {r}" if r else "Cliente"}
+              for n, r in sorted(clientes.items())]
+    salida += [{"valor": c, "etiqueta": f"Producto · {d}"[:90]}
+               for c, d in sorted(productos.items())]
+    return salida[:maximo]
+
+
+def _pivot_ventas_por_producto(lineas):
+    """Ronda CV (2026-11-04, punto 3b): tabla dinamica producto x mes de un
+    cliente, con el mismo formato que el "Analisis por productos (codigo
+    proveedor x mes)" de Compras Proveedor -- que es el reporte que al
+    usuario le gusta.
+
+    Cada celda guarda la venta neta y las unidades del mes (el front-end
+    alterna entre las dos con el switch "Mostrar en unidades"), y cada
+    producto guarda ademas sus DOCUMENTOS (facturas, boletas y notas de
+    credito) para desplegarlos al hacer clic en la fila."""
+    meses_set = {}
+    productos = {}
+    for l in lineas:
+        if not l.fecha:
+            continue
+        clave_mes = (l.fecha.year, l.fecha.month)
+        if clave_mes not in meses_set:
+            nombre_mes = TipoCambioMensual.MESES_NOMBRE[l.fecha.month - 1][:3]
+            meses_set[clave_mes] = f"{nombre_mes}-{str(l.fecha.year)[2:]}"
+
+        codigo = (l.codigo_interno or "").strip() or "(sin código)"
+        prod = productos.get(codigo)
+        if prod is None:
+            prod = productos[codigo] = {
+                "codigo": codigo, "descripcion": (l.descripcion or "").strip(),
+                "marca": (l.marca or "").strip(),
+                "unidades": 0.0, "venta": 0.0, "costo": 0.0,
+                "meses": defaultdict(lambda: {"venta": 0.0, "unidades": 0.0, "costo": 0.0}),
+                "documentos": [],
+            }
+        if not prod["descripcion"] and l.descripcion:
+            prod["descripcion"] = l.descripcion
+        prod["unidades"] += l.unidades or 0
+        prod["venta"] += l.valor_neto or 0
+        prod["costo"] += l.costo_total or 0
+        celda = prod["meses"][clave_mes]
+        celda["venta"] += l.valor_neto or 0
+        celda["unidades"] += l.unidades or 0
+        celda["costo"] += l.costo_total or 0
+        prod["documentos"].append({
+            "fecha": l.fecha,
+            "tipo_documento": l.tipo_documento or "",
+            "numero_documento": l.numero_documento or "-",
+            "unidades": l.unidades or 0,
+            "valor_neto": l.valor_neto or 0,
+            "costo_total": l.costo_total or 0,
+            "margen": round((l.valor_neto or 0) - (l.costo_total or 0), 2),
+            # Las notas de credito vienen en negativo en el propio archivo:
+            # se marcan para sombrearlas y que se vean de una.
+            "es_nota_credito": (l.valor_neto or 0) < 0,
+        })
+
+    meses_ordenados = sorted(meses_set.keys())
+    meses_columnas = [{"clave": f"{a}-{m:02d}", "etiqueta": meses_set[(a, m)]}
+                      for (a, m) in meses_ordenados]
+
+    filas = []
+    for prod in productos.values():
+        prod["documentos"].sort(key=lambda d: d["fecha"] or date.min, reverse=True)
+        filas.append({
+            "codigo": prod["codigo"],
+            "descripcion": prod["descripcion"],
+            "marca": prod["marca"],
+            "unidades": prod["unidades"],
+            "venta": round(prod["venta"], 2),
+            "costo": round(prod["costo"], 2),
+            "margen": round(prod["venta"] - prod["costo"], 2),
+            "pct_margen": (prod["venta"] - prod["costo"]) / prod["venta"] * 100 if prod["venta"] else 0.0,
+            "meses": {
+                f"{a}-{m:02d}": prod["meses"].get((a, m), {"venta": 0.0, "unidades": 0.0, "costo": 0.0})
+                for (a, m) in meses_ordenados
+            },
+            "documentos": prod["documentos"],
+            "busqueda": f"{prod['codigo']} {prod['descripcion']}".lower(),
+        })
+    _marcar_pareto(filas, "margen")
+    filas.sort(key=lambda f: -f["margen"])
+    return filas, meses_columnas
+
+
+@app.route("/ventas/cliente/<path:clave>")
+@requiere_permiso("reportes")
+def ventas_cliente_detalle(clave):
+    """Ronda CV (2026-11-04, punto 3b del pedido del usuario): al hacer
+    clic en un cliente del resumen se entra a su analisis por producto x
+    mes, replicando el reporte de Compras Proveedor -- buscador, switch de
+    unidades, encabezados ordenables, filas desplegables con los
+    documentos, tarjetas que se recalculan en vivo y boton para volver."""
+    desde_txt = request.args.get("fecha_desde", "")
+    hasta_txt = request.args.get("fecha_hasta", "")
+    vendedor_sel = request.args.get("vendedor", "").strip()
+    q = request.args.get("q", "").strip()
+    if not desde_txt and not hasta_txt and "fecha_desde" not in request.args:
+        desde_txt = (date.today() - timedelta(days=90)).isoformat()
+        hasta_txt = date.today().isoformat()
+    desde, hasta = parse_date(desde_txt), parse_date(hasta_txt)
+
+    lineas = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q, clave_cliente=clave)
+    if not lineas:
+        flash("No hay ventas de ese cliente con los filtros elegidos.", "warning")
+        return redirect(url_for("ventas_list", fecha_desde=desde_txt, fecha_hasta=hasta_txt,
+                                vendedor=vendedor_sel))
+
+    primera = lineas[0]
+    vendedores_maestro = _vendedor_vigente_por_rut()
+    cliente = {
+        "clave": clave,
+        "rut": (primera.rut_cliente or "").strip(),
+        "nombre": (primera.nombre_cliente or "").strip() or "(sin cliente)",
+        "vendedor": vendedores_maestro.get((primera.rut_cliente or "").strip())
+                    or (primera.vendedor_archivo or "").strip(),
+    }
+    productos, meses_columnas = _pivot_ventas_por_producto(lineas)
+    venta = round(sum(l.valor_neto or 0 for l in lineas), 2)
+    costo = round(sum(l.costo_total or 0 for l in lineas), 2)
+    vendedores = sorted({
+        (v[0] or "").strip()
+        for v in ClienteVendedor.query.with_entities(ClienteVendedor.vendedor).distinct().all()
+        if (v[0] or "").strip()
+    })
+    return render_template(
+        "ventas/cliente_detalle.html", cliente=cliente, productos=productos,
+        meses_columnas=meses_columnas,
+        totales={"productos": len(productos), "venta": venta, "costo": costo,
+                 "margen": round(venta - costo, 2),
+                 "pct_margen": ((venta - costo) / venta * 100) if venta else 0.0,
+                 "unidades": sum(l.unidades or 0 for l in lineas),
+                 "documentos": len({(l.tipo_documento, l.numero_documento) for l in lineas})},
+        fecha_desde=desde_txt, fecha_hasta=hasta_txt, vendedor_sel=vendedor_sel, q=q,
+        vendedores=vendedores,
+    )
+
+
 @app.route("/ventas")
 @requiere_permiso("reportes")
 def ventas_list():
     """Ronda CE (2026-10-26): Reporte de Ventas -- reemplaza la tarjeta
     "Reportes y Ventas / Próximamente" del dashboard. Es la base de la
     rotación que se muestra en Consulta de Stock y, en la Fase 2, de los
-    promedios del Forecast."""
+    promedios del Forecast.
+
+    Ronda CV (2026-11-04, punto 3 del pedido del usuario): se agrega el
+    "Resumen por cliente" (venta neta, costo neto y margen, con el 80-20
+    de la utilidad sombreado), el buscador pasa a ser predictivo y el
+    filtro de vendedor usa el maestro VIGENTE en vez del vendedor que
+    venía escrito en la factura."""
     desde_txt = request.args.get("fecha_desde", "")
     hasta_txt = request.args.get("fecha_hasta", "")
     vendedor_sel = request.args.get("vendedor", "").strip()
@@ -13335,48 +13743,58 @@ def ventas_list():
         desde_txt = (date.today() - timedelta(days=90)).isoformat()
         hasta_txt = date.today().isoformat()
 
-    query = VentaLinea.query
     desde, hasta = parse_date(desde_txt), parse_date(hasta_txt)
-    if desde:
-        query = query.filter(VentaLinea.fecha >= desde)
-    if hasta:
-        query = query.filter(VentaLinea.fecha <= hasta)
-    if vendedor_sel:
-        query = query.filter(db.func.upper(VentaLinea.vendedor_archivo) == vendedor_sel.upper())
-    if q:
-        like = f"%{q}%"
-        query = query.filter(db.or_(
-            VentaLinea.codigo_interno.ilike(like), VentaLinea.descripcion.ilike(like),
-            VentaLinea.nombre_cliente.ilike(like), VentaLinea.rut_cliente.ilike(like),
-        ))
-    lineas = query.order_by(VentaLinea.fecha.desc(), VentaLinea.numero_documento.desc()).all()
+    lineas = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q)
+
+    # Resumen por cliente (ronda CV) -- lo que el usuario quiere mirar
+    # primero: quién deja utilidad, no quién compra más.
+    resumen_clientes = _resumen_ventas_por_cliente(lineas)
 
     # Resumen por producto (lo que de verdad se mira para comprar), con el
-    # promedio mensual del propio corte.
-    por_producto = defaultdict(lambda: {"unidades": 0.0, "neto": 0.0, "descripcion": "", "marca": "", "rotacion": True})
+    # promedio mensual del propio corte. Desde la ronda CV también trae
+    # costo, margen y su propio 80-20 de la utilidad.
+    por_producto = defaultdict(lambda: {
+        "unidades": 0.0, "neto": 0.0, "costo": 0.0, "descripcion": "", "marca": "",
+        "rotacion": True,
+    })
     for l in lineas:
         clave = (l.codigo_interno or "").strip() or "(sin código)"
         fila = por_producto[clave]
         fila["unidades"] += l.unidades or 0
         fila["neto"] += l.valor_neto or 0
+        fila["costo"] += l.costo_total or 0
         fila["descripcion"] = fila["descripcion"] or l.descripcion
         fila["marca"] = fila["marca"] or l.marca
         fila["rotacion"] = bool(l.cuenta_para_rotacion)
-    resumen = sorted(
-        ({"codigo": k, **v} for k, v in por_producto.items()),
-        key=lambda r: -r["neto"],
-    )[:300]
+    resumen = [{"codigo": k, **v} for k, v in por_producto.items()]
+    for fila in resumen:
+        fila["margen"] = round(fila["neto"] - fila["costo"], 2)
+        fila["pct_margen"] = (fila["margen"] / fila["neto"] * 100) if fila["neto"] else 0.0
+    _marcar_pareto(resumen, "margen")
+    resumen.sort(key=lambda r: -r["neto"])
+    resumen = resumen[:300]
 
     ultima_carga = db.session.query(db.func.max(VentaLinea.cargado_en)).scalar()
+    # Ronda CV (punto 3c): los vendedores salen del maestro vigente -- los
+    # mismos que ve el Forecast -- no de lo que diga cada factura.
     vendedores = sorted({
         (v[0] or "").strip()
-        for v in VentaLinea.query.with_entities(VentaLinea.vendedor_archivo).distinct().all()
+        for v in ClienteVendedor.query.with_entities(ClienteVendedor.vendedor).distinct().all()
         if (v[0] or "").strip()
     })
+    venta_total = sum(l.valor_neto or 0 for l in lineas)
+    costo_total = sum(l.costo_total or 0 for l in lineas)
     return render_template(
         "ventas/list.html", lineas=lineas[:500], total_lineas=len(lineas), resumen=resumen,
-        unidades=sum(l.unidades or 0 for l in lineas), neto=sum(l.valor_neto or 0 for l in lineas),
+        # Ronda CV (punto 3c): el detalle muestra el vendedor VIGENTE; el que
+        # venía escrito en el documento queda como dato de respaldo, visible
+        # al pasar el mouse cuando los dos no coinciden.
+        vendedor_vigente=_vendedor_vigente_por_rut(),
+        resumen_clientes=resumen_clientes,
+        unidades=sum(l.unidades or 0 for l in lineas), neto=venta_total,
+        costo=costo_total, margen=round(venta_total - costo_total, 2),
         vendedores=vendedores, vendedor_sel=vendedor_sel, q=q,
+        sugerencias=_sugerencias_busqueda_ventas(lineas),
         fecha_desde=desde_txt, fecha_hasta=hasta_txt, ultima_carga=ultima_carga,
         puede_cargar=current_user.tiene_permiso("inventarios"),
         prefijos_sin_rotacion=", ".join(PREFIJOS_SIN_ROTACION),
@@ -13421,6 +13839,16 @@ def ventas_cargar():
     if resumen["reemplazadas"]:
         mensaje += f", reemplazando {resumen['reemplazadas']} que ya estaban en ese período"
     mensaje += "."
+    if resumen.get("vendedores_homologados"):
+        mensaje += (
+            f" {resumen['vendedores_homologados']} de ellos traían el nombre del vendedor escrito distinto "
+            "en el archivo y se homologaron contra el vendedor que ya existe en el programa."
+        )
+    if resumen.get("vendedores_sin_homologar"):
+        mensaje += (
+            " Ojo: estos vendedores del archivo no corresponden a ningún usuario del programa, "
+            f"revísalos en Cliente/Vendedor: {', '.join(resumen['vendedores_sin_homologar'][:6])}."
+        )
     if resumen["clientes_nuevos"]:
         mensaje += (
             f" {resumen['clientes_nuevos']} cliente(s) nuevo(s) quedaron en el maestro con el vendedor del "

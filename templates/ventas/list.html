@@ -14,6 +14,15 @@
   .tabla-scroll-ventas > table > thead > tr > th {
     position: sticky; top: 0; z-index: 3; background: #fff; box-shadow: inset 0 -1px 0 #dee2e6;
   }
+  /* Ronda CV (2026-11-04, punto 3b): el 80-20 de la UTILIDAD. Verde = los
+     que juntos hacen el 80% del margen (los que de verdad sostienen la
+     utilidad); gris = el 20% restante; rojo = margen negativo, que no es
+     80-20 de nada pero hay que verlo. */
+  tr.pareto-A > td { background-color: #e8f5e9 !important; }
+  tr.pareto-B > td { background-color: #f6f7f9 !important; }
+  tr.pareto-neg > td { background-color: #fdecea !important; }
+  .leyenda-pareto span { display: inline-block; width: .9rem; height: .9rem; border-radius: .2rem;
+                         vertical-align: -.1rem; margin-right: .25rem; border: 1px solid rgba(0,0,0,.1); }
 </style>
 
 <div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
@@ -48,7 +57,17 @@
       {% endfor %}
     </select>
   </div>
-  <div class="col-auto"><input type="search" class="form-control" name="q" value="{{ q }}" placeholder="Código, producto o cliente"></div>
+  {# Ronda CV (punto 3a): buscador predictivo -- al escribir se despliegan los
+     clientes y productos del corte, cada uno diciendo cuál es, para saber que se
+     está eligiendo el correcto. #}
+  <div class="col-auto">
+    <input type="search" class="form-control" name="q" value="{{ q }}" list="sugerencias-ventas"
+           autocomplete="off" style="min-width: 19rem;"
+           placeholder="Cliente o producto (empieza a escribir)">
+    <datalist id="sugerencias-ventas">
+      {% for s in sugerencias %}<option value="{{ s.valor }}">{{ s.etiqueta }}</option>{% endfor %}
+    </datalist>
+  </div>
   <div class="col-auto"><button class="btn btn-outline-secondary">Filtrar</button></div>
 </form>
 
@@ -68,20 +87,82 @@
   </div>
   <div class="col-sm-6 col-lg-3">
     <div class="card card-stat p-3 h-100">
-      <div class="text-muted small">Líneas en el corte</div>
-      <div class="h4 mb-0">{{ total_lineas }}</div>
+      <div class="text-muted small">Costo neto</div>
+      <div class="h4 mb-0">${{ costo|moneda }}</div>
     </div>
   </div>
   <div class="col-sm-6 col-lg-3">
     <div class="card card-stat p-3 h-100">
-      <div class="text-muted small">Productos distintos</div>
-      <div class="h4 mb-0">{{ resumen|length }}</div>
+      <div class="text-muted small">Margen neto</div>
+      <div class="h4 mb-0">${{ margen|moneda }}</div>
+      <div class="text-muted small">{{ "%.1f"|format(margen / neto * 100 if neto else 0) }}% sobre la venta</div>
     </div>
   </div>
 </div>
 
+{# ===== Ronda CV (2026-11-04, punto 3b del pedido del usuario): Resumen por
+   cliente, con el mismo formato del "Resumen por proveedor" de Compras.
+   El % del total es sobre la UTILIDAD, no sobre la venta: lo que se quiere
+   medir acá es qué clientes son los más rentables. ===== #}
 <div class="card p-3 mb-3">
-  <h6 class="mb-2">Por producto</h6>
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <h6 class="mb-0">Resumen por cliente</h6>
+    <div class="small text-muted leyenda-pareto">
+      <span style="background:#e8f5e9"></span>80% de la utilidad &nbsp;
+      <span style="background:#f6f7f9"></span>20% restante &nbsp;
+      <span style="background:#fdecea"></span>margen negativo
+    </div>
+  </div>
+  <p class="text-muted small mb-2">
+    Facturas y boletas sumadas, notas de crédito restadas (vienen en negativo en el archivo).
+    La columna <strong>% de la utilidad</strong> es la participación de cada cliente en el margen
+    total, no en la venta. Haz clic en un cliente para ver su análisis por producto y mes.
+  </p>
+  <div class="table-responsive tabla-scroll-ventas">
+    <table class="table table-hover table-sm align-middle mb-0 tabla-ventas">
+      <thead>
+        <tr>
+          <th>Cliente</th><th>Vendedor</th>
+          <th class="text-end">Cant. productos</th>
+          <th class="text-end">Venta neta</th>
+          <th class="text-end">Costo neto</th>
+          <th class="text-end">Margen neto</th>
+          <th class="text-end">% margen</th>
+          <th class="text-end">% de la utilidad</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in resumen_clientes %}
+        <tr class="pareto-{{ c.pareto }}">
+          <td>
+            <a href="{{ url_for('ventas_cliente_detalle', clave=c.clave, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, vendedor=vendedor_sel) }}"
+               title="{{ c.rut }}">{{ c.nombre }}</a>
+          </td>
+          <td class="small text-muted">{{ c.vendedor or '-' }}</td>
+          <td class="text-end">{{ c.productos }}</td>
+          <td class="text-end">${{ c.venta|moneda }}</td>
+          <td class="text-end">${{ c.costo|moneda }}</td>
+          <td class="text-end fw-semibold {% if c.margen < 0 %}text-danger{% endif %}">${{ c.margen|moneda }}</td>
+          <td class="text-end">{{ "%.1f"|format(c.pct_margen) }}%</td>
+          <td class="text-end">{{ "%.1f"|format(c.pct_del_total) }}%</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="text-center text-muted py-4">No hay ventas en este período.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <h6 class="mb-0">Por producto</h6>
+    <div class="small text-muted leyenda-pareto">
+      <span style="background:#e8f5e9"></span>80% de la utilidad &nbsp;
+      <span style="background:#f6f7f9"></span>20% restante &nbsp;
+      <span style="background:#fdecea"></span>margen negativo
+    </div>
+  </div>
   <p class="text-muted small mb-2">
     Los códigos que empiezan en {{ prefijos_sin_rotacion }} (equipos, servicios, repuestos) y las líneas sin código
     (contratos, arriendos, hitos de pago) se muestran acá pero no entran en los promedios de rotación.
@@ -91,24 +172,29 @@
       <thead>
         <tr>
           <th>Código</th><th>Descripción</th><th>Marca</th>
-          <th class="text-end">Unidades</th><th class="text-end">Venta neta</th><th>Rotación</th>
+          <th class="text-end">Unidades</th><th class="text-end">Venta neta</th>
+          <th class="text-end">Costo neto</th><th class="text-end">Margen neto</th>
+          <th class="text-end">% de la utilidad</th><th>Rotación</th>
         </tr>
       </thead>
       <tbody>
         {% for r in resumen %}
-        <tr>
+        <tr class="pareto-{{ r.pareto }}">
           <td>{{ r.codigo }}</td>
           <td class="col-desc" title="{{ r.descripcion }}">{{ r.descripcion }}</td>
           <td>{{ r.marca or '-' }}</td>
           <td class="text-end">{{ "%g"|format(r.unidades) }}</td>
           <td class="text-end">${{ r.neto|moneda }}</td>
+          <td class="text-end">${{ r.costo|moneda }}</td>
+          <td class="text-end fw-semibold {% if r.margen < 0 %}text-danger{% endif %}">${{ r.margen|moneda }}</td>
+          <td class="text-end">{{ "%.1f"|format(r.pct_del_total) }}%</td>
           <td>
             {% if r.rotacion %}<span class="badge bg-success-subtle text-success-emphasis">entra</span>
             {% else %}<span class="badge bg-secondary">no aplica</span>{% endif %}
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="6" class="text-center text-muted py-4">No hay ventas cargadas en este período.</td></tr>
+        <tr><td colspan="9" class="text-center text-muted py-4">No hay ventas cargadas en este período.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -132,7 +218,14 @@
           <td>{{ l.fecha.strftime('%d-%m-%Y') }}</td>
           <td>{{ l.tipo_documento }} {{ l.numero_documento }}</td>
           <td title="{{ l.rut_cliente }}">{{ l.nombre_cliente }}</td>
-          <td>{{ l.vendedor_archivo }}</td>
+          {# Ronda CV (punto 3c): manda el vendedor VIGENTE del maestro, igual que
+             en el Forecast. Si el documento traía otro nombre, se ve al pasar el
+             mouse -- el dato original no se pierde. #}
+          {% set vig = vendedor_vigente.get(l.rut_cliente) %}
+          <td {% if vig and vig != l.vendedor_archivo %}title="En el documento decía: {{ l.vendedor_archivo }}"{% endif %}>
+            {{ vig or l.vendedor_archivo }}
+            {% if vig and vig != l.vendedor_archivo %}<i class="bi bi-arrow-repeat text-muted small"></i>{% endif %}
+          </td>
           <td>{{ l.codigo_interno or '-' }}</td>
           <td class="col-desc" title="{{ l.descripcion }}">{{ l.descripcion }}</td>
           <td class="text-end">{{ "%g"|format(l.unidades or 0) }}</td>
