@@ -156,7 +156,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CW"
+VERSION_SUITE = "CX"
 VERSION_SUITE_FECHA = "2026-11-06"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -13197,8 +13197,13 @@ def api_stock_cargar_auto():
 # los promedios del Forecast.
 # ---------------------------------------------------------------------------
 
-# El usuario quiere 13 meses de historia de ventas; más atrás no se usa.
-MESES_HISTORIA_VENTAS = 13
+# Meses CALENDARIO de historia de ventas que guarda el programa (el mes en
+# curso más los anteriores). Eran 13 desde la ronda CE; el usuario lo subió a
+# 24 en la ronda CX (2026-11-06) para poder comparar año contra año en el
+# Resumen por cliente y en el análisis por categoría, que es lo que se
+# construyó en las rondas CV y CW. El archivo que sube trae 22 meses: con 13
+# se purgaban 3.836 de sus 8.926 líneas.
+MESES_HISTORIA_VENTAS = 24
 
 # Columnas del reporte de ventas de Ergopyme, tal como vienen en el
 # encabezado (el archivo histórico y el reporte diario traen exactamente
@@ -13241,13 +13246,17 @@ def _empresa_desde_titulo_ventas(titulo):
 
 
 def _corte_historia_ventas(hoy=None):
-    """Primer día del mes de hace 12 meses: así quedan guardados 13 meses
-    CALENDARIO completos (el actual más los 12 anteriores), que es lo que
-    pidió el usuario -- "mantener el historico de 13 meses, mas de ahi no
-    lo consideramos". Se calcula por mes y no por cantidad de días para
-    que el corte sea predecible y no se mueva dentro del mismo mes."""
+    """Primer día del mes a partir del cual se conservan las ventas: deja
+    MESES_HISTORIA_VENTAS meses CALENDARIO completos (el mes en curso más
+    los anteriores). Se calcula por mes y no por cantidad de días para que
+    el corte sea predecible y no se mueva dentro del mismo mes.
+
+    Ronda CX (2026-11-06): el desfase sale de la propia constante en vez de
+    estar escrito a mano. Antes la constante decía 13 y la cuenta restaba
+    12 meses: los dos números tenían que moverse juntos y era fácil cambiar
+    uno y olvidar el otro."""
     hoy = hoy or date.today()
-    mes = hoy.month - 12
+    mes = hoy.month - (MESES_HISTORIA_VENTAS - 1)
     anio = hoy.year
     while mes <= 0:
         mes += 12
@@ -13430,7 +13439,7 @@ def _cargar_reporte_ventas(nombre_empresa, leidas, reemplazar_todo=False):
     siempre volver a considerar el mes de proceso".
 
     Además siembra el maestro cliente/vendedor con los RUT nuevos y purga
-    lo que quede fuera de los 13 meses de historia."""
+    lo que quede fuera de los MESES_HISTORIA_VENTAS meses de historia."""
     empresa = _empresa_desde_titulo_ventas(nombre_empresa)
     desde = min(f["fecha"] for f in leidas)
     hasta = max(f["fecha"] for f in leidas)
@@ -13988,6 +13997,7 @@ def ventas_list():
         fecha_desde=desde_txt, fecha_hasta=hasta_txt, ultima_carga=ultima_carga,
         puede_cargar=current_user.tiene_permiso("inventarios"),
         prefijos_sin_rotacion=", ".join(PREFIJOS_SIN_ROTACION),
+        meses_historia=MESES_HISTORIA_VENTAS,
     )
 
 
@@ -14056,8 +14066,7 @@ def ventas_cargar():
         mensaje += (
             f" Se purgaron {resumen['purgadas']} línea(s) anteriores a "
             f"{_corte_historia_ventas().strftime('%m-%Y')}: el programa guarda "
-            f"{MESES_HISTORIA_VENTAS} meses de historia (regla acordada). Si necesitas más "
-            "historia para los reportes, hay que ampliar ese límite."
+            f"{MESES_HISTORIA_VENTAS} meses de historia."
         )
     if not resumen["empresa"] and nombre_empresa:
         mensaje += f" Ojo: '{nombre_empresa}' no calza con ninguna empresa del catálogo, las líneas quedaron sin empresa."
