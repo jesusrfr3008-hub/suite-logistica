@@ -156,8 +156,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CV"
-VERSION_SUITE_FECHA = "2026-11-05"
+VERSION_SUITE = "CW"
+VERSION_SUITE_FECHA = "2026-11-06"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -3356,6 +3356,41 @@ ALIAS_INTERNOS_CONOCIDOS = [
 ]
 
 
+def reparar_costos_ventas_ronda_cw():
+    """Ronda CW (2026-11-05, punto 4 del pedido del usuario -- "¿por que
+    estan saliendo en el reporte los costos en 0?").
+
+    El reporte de ventas de Ergopyme NO trae una columna de costo total,
+    solo el costo UNITARIO (columna S). El lector buscaba una columna
+    "COSTO TOTAL" que no existe, asi que todas las lineas quedaron con
+    costo_total = 0 y el margen salia igual a la venta. El lector ya lo
+    calcula (ver _leer_filas_reporte_ventas); esta pasada arregla lo que ya
+    esta cargado, sin tener que volver a subir el archivo.
+
+    costo_total = |costo unitario| x unidades. El valor absoluto es a
+    proposito: en una nota de credito vienen NEGATIVOS tanto las unidades
+    como el costo unitario, y multiplicarlos daria un costo positivo --
+    justo al reves de lo que corresponde. Dejando que el signo lo ponga la
+    cantidad, la NC resta su costo.
+
+    Es idempotente: solo toca las lineas donde el costo total guardado no
+    coincide con ese calculo."""
+    corregidas = 0
+    for linea in VentaLinea.query.filter(VentaLinea.costo_unitario != 0).all():
+        esperado = round(abs(linea.costo_unitario or 0) * (linea.unidades or 0), 2)
+        contribucion = round((linea.valor_neto or 0) - esperado, 2)
+        if (abs((linea.costo_total or 0) - esperado) > 0.01
+                or abs((linea.contribucion or 0) - contribucion) > 0.01):
+            linea.costo_total = esperado
+            linea.contribucion = contribucion
+            corregidas += 1
+    if corregidas:
+        db.session.commit()
+        print(f"[reparar_ronda_cw] Ventas: {corregidas} línea(s) con el costo total recalculado "
+              "(costo unitario x unidades) -- antes quedaban en 0 y el margen salía igual a la venta.")
+    return corregidas
+
+
 def reparar_alias_codigos_internos_ronda_cq():
     """Siembra los enlaces conocidos entre un codigo interno reemplazado y
     el vigente. Solo crea lo que no existe: nunca pisa lo que el usuario
@@ -4427,6 +4462,7 @@ with app.app_context():
     _paso_arranque_seguro("reparar_forecast_claves_ronda_ck", reparar_forecast_claves_ronda_ck)
     _paso_arranque_seguro("reparar_historial_forecast_ronda_cp", reparar_historial_forecast_ronda_cp)
     _paso_arranque_seguro("reparar_alias_codigos_internos_ronda_cq", reparar_alias_codigos_internos_ronda_cq)
+    _paso_arranque_seguro("reparar_costos_ventas_ronda_cw", reparar_costos_ventas_ronda_cw)
 
 
 # ---------------------------------------------------------------------------
@@ -13176,7 +13212,15 @@ _COLUMNAS_VENTAS = {
     "costo_unitario": "COSTO UNITARIO", "condicion_venta": "COND.VTA", "cod_marca": "COD.MARCA",
     "contribucion": "CONTRIBUCIÓN", "descripcion_linea": "DESCRIPCION LINEA",
     "marca": "DESCRIPCIÓN MARCA", "costo_total": "COSTO TOTAL",
+    # Ronda CW (2026-11-05, punto 2): columnas AA y AB del reporte nuevo.
+    "categoria": "DESCRIPCIÓN CATEGORÍA", "subcategoria": "DESCRIPCIÓN SUBCATEGORÍA",
 }
+
+# Ronda CW (2026-11-05, punto 1 del pedido del usuario -- "el reporte que
+# cargué previamente tenía Guías de Despacho y eso no es venta"): los tipos
+# de documento que NO son una venta y se descartan al cargar, pase lo que
+# pase. Se compara sin tildes ni mayúsculas (ver _normalizar_nombre).
+TIPOS_DOCUMENTO_NO_VENTA = ("GUIA DE DESPACHO", "GUIA DESPACHO", "GUIA")
 
 
 def _empresa_desde_titulo_ventas(titulo):
@@ -13260,6 +13304,7 @@ def _leer_filas_reporte_ventas(ws):
         return fila[idx] if idx is not None and idx < len(fila) else None
 
     leidas = []
+    descartadas = []
     for fila in filas[fila_encabezado + 1:]:
         if not fila or all(v is None for v in fila):
             continue
@@ -13273,9 +13318,36 @@ def _leer_filas_reporte_ventas(ws):
         codigo = str(col(fila, "codigo_interno") or "").strip()
         if codigo.endswith(".0"):
             codigo = codigo[:-2]
+
+        tipo_documento = str(col(fila, "tipo_documento") or "").strip()
+        # Ronda CW (punto 1): una Guía de Despacho no es una venta -- mueve
+        # mercadería, se factura después. El archivo anterior las traía y el
+        # programa las contaba como venta. Aunque el archivo nuevo ya no las
+        # trae, se descartan igual acá: así no vuelve a pasar.
+        if _normalizar_nombre(tipo_documento) in TIPOS_DOCUMENTO_NO_VENTA:
+            descartadas.append(tipo_documento)
+            continue
+
+        # Ronda CW (punto 4 del pedido del usuario -- "¿por qué están saliendo
+        # en el reporte los costos en 0?"): el archivo NO trae columna de costo
+        # total; solo el costo UNITARIO (columna S). El mapeo buscaba una
+        # columna "COSTO TOTAL" que no existe, así que entraba 0 en todas las
+        # líneas y el margen quedaba igual a la venta. El costo total se
+        # calcula: costo unitario x unidades vendidas.
+        #
+        # Las notas de crédito vienen con unidades Y costo unitario en
+        # NEGATIVO, así que multiplicarlos daría un costo POSITIVO -- lo
+        # contrario de lo que corresponde. Se usa el valor absoluto del costo
+        # unitario y se deja que el signo lo ponga la cantidad: una NC de -10
+        # unidades resta su costo, como debe ser.
+        unidades = _numero_venta(col(fila, "unidades"))
+        costo_unitario = _numero_venta(col(fila, "costo_unitario"))
+        valor_neto = _numero_venta(col(fila, "valor_neto"))
+        costo_total = round(abs(costo_unitario) * unidades, 2)
+
         leidas.append({
             "fecha": fecha,
-            "tipo_documento": str(col(fila, "tipo_documento") or "").strip(),
+            "tipo_documento": tipo_documento,
             "numero_documento": str(col(fila, "numero_documento") or "").strip(),
             "sector": str(col(fila, "sector") or "").strip(),
             "tipo_cliente": str(col(fila, "tipo_cliente") or "").strip(),
@@ -13288,64 +13360,37 @@ def _leer_filas_reporte_ventas(ws):
             "descripcion": str(col(fila, "descripcion") or "").strip(),
             "cod_marca": str(col(fila, "cod_marca") or "").strip(),
             "marca": str(col(fila, "marca") or "").strip(),
-            "unidades": _numero_venta(col(fila, "unidades")),
+            "unidades": unidades,
             "precio_unitario": _numero_venta(col(fila, "precio_unitario")),
-            "valor_neto": _numero_venta(col(fila, "valor_neto")),
-            "costo_unitario": _numero_venta(col(fila, "costo_unitario")),
-            "costo_total": _numero_venta(col(fila, "costo_total")),
-            "contribucion": _numero_venta(col(fila, "contribucion")),
+            "valor_neto": valor_neto,
+            "costo_unitario": costo_unitario,
+            "costo_total": costo_total,
+            "contribucion": round(valor_neto - costo_total, 2),
             "condicion_venta": str(col(fila, "condicion_venta") or "").strip(),
+            "categoria": str(col(fila, "categoria") or "").strip(),
+            "subcategoria": str(col(fila, "subcategoria") or "").strip(),
         })
-    return nombre_empresa, leidas
+    return nombre_empresa, leidas, descartadas
 
 
-def _cargar_reporte_ventas(nombre_empresa, leidas):
-    """Guarda las líneas leídas REEMPLAZANDO el período completo que trae
-    el archivo (de su fecha mínima a su máxima, para esa empresa), que es
-    la única forma de que una venta modificada con fecha atrás se corrija
-    sola -- el usuario lo pidió explícitamente: "es posible que haya una
-    venta que se modifique con fecha atras, por lo que se recomienda
-    siempre volver a considerar el mes de proceso".
+def _sembrar_clientes_vendedores(leidas):
+    """Los RUT nuevos entran al maestro con el vendedor del archivo como
+    sugerencia; los ya existentes no se tocan -- la asignacion vigente la
+    decide el usuario.
 
-    Además siembra el maestro cliente/vendedor con los RUT nuevos y purga
-    lo que quede fuera de los 13 meses de historia."""
-    empresa = _empresa_desde_titulo_ventas(nombre_empresa)
-    desde = min(f["fecha"] for f in leidas)
-    hasta = max(f["fecha"] for f in leidas)
+    Ronda CV (2026-11-04, punto 3c del pedido del usuario -- "verifica si
+    este proceso lo homologa en caso de un cliente nuevo que no lo hayamos
+    asignado manualmente"): el nombre del vendedor que trae el archivo se
+    homologa contra los vendedores que ya conoce el programa (los usuarios
+    con vendedor asignado y los que ya estan en el maestro), comparando sin
+    tildes ni mayusculas. Sin esto, "MARIANA PEREZ" en el archivo y "Mariana
+    Perez" en el programa quedaban como dos vendedores distintos y la cuenta
+    nueva no se sumaba a las de ella -- ni en el reporte de Ventas ni en el
+    Forecast.
 
-    # Qué se reemplaza dentro del período: si el archivo dice de qué
-    # empresa es, se borran SUS líneas y además las que quedaron sin
-    # empresa (vienen de una carga histórica sin título, y este archivo
-    # las reemplaza). Si el archivo NO trae empresa, se borra todo el
-    # período: no hay forma de distinguir, y sin esto el mismo mes
-    # quedaría cargado dos veces -- una sin empresa y otra con ella.
-    borradas = VentaLinea.query.filter(VentaLinea.fecha >= desde, VentaLinea.fecha <= hasta)
-    if empresa:
-        borradas = borradas.filter(db.or_(
-            VentaLinea.empresa_id == empresa.id, VentaLinea.empresa_id.is_(None)
-        ))
-    borradas = borradas.delete(synchronize_session=False)
-
-    for f in leidas:
-        db.session.add(VentaLinea(
-            empresa_id=empresa.id if empresa else None,
-            cuenta_para_rotacion=codigo_cuenta_para_rotacion(f["codigo_interno"]),
-            **f,
-        ))
-
-    # Maestro cliente/vendedor: los RUT nuevos entran con el vendedor del
-    # archivo como sugerencia (sin confirmar), los ya existentes no se
-    # tocan -- la asignación vigente la decide el usuario.
+    Devuelve (clientes nuevos, vendedores homologados, nombres que no
+    calzaron con nadie)."""
     existentes = {c.rut for c in ClienteVendedor.query.with_entities(ClienteVendedor.rut).all()}
-    # Ronda CV (2026-11-04, punto 3c del pedido del usuario -- "verifica si
-    # este proceso lo homologa en caso de un cliente nuevo que no lo
-    # hayamos asignado manualmente"): el nombre del vendedor que trae el
-    # archivo se homologa contra los vendedores que ya conoce el programa
-    # (los usuarios con vendedor asignado y los que ya están en el
-    # maestro), comparando sin tildes ni mayúsculas. Sin esto, "MARIANA
-    # PEREZ" en el archivo y "Mariana Pérez" en el programa quedaban como
-    # dos vendedores distintos y la cuenta nueva no se sumaba a las de
-    # ella -- ni en este reporte ni en el Forecast.
     canonicos = {}
     for (nombre,) in db.session.query(Usuario.vendedor).distinct().all():
         if (nombre or "").strip():
@@ -13373,6 +13418,79 @@ def _cargar_reporte_ventas(nombre_empresa, leidas):
         ))
         existentes.add(rut)
         nuevos += 1
+    return nuevos, homologados, sin_homologar
+
+
+def _cargar_reporte_ventas(nombre_empresa, leidas, reemplazar_todo=False):
+    """Guarda las líneas leídas REEMPLAZANDO el período completo que trae
+    el archivo (de su fecha mínima a su máxima, para esa empresa), que es
+    la única forma de que una venta modificada con fecha atrás se corrija
+    sola -- el usuario lo pidió explícitamente: "es posible que haya una
+    venta que se modifique con fecha atras, por lo que se recomienda
+    siempre volver a considerar el mes de proceso".
+
+    Además siembra el maestro cliente/vendedor con los RUT nuevos y purga
+    lo que quede fuera de los 13 meses de historia."""
+    empresa = _empresa_desde_titulo_ventas(nombre_empresa)
+    desde = min(f["fecha"] for f in leidas)
+    hasta = max(f["fecha"] for f in leidas)
+
+    # Ronda CW (2026-11-05, punto 1 del pedido del usuario -- "te pido me
+    # habilites a que la carga que haga pueda reemplazar los datos cargados,
+    # que no se duplique... porque sé que si lo cargo así solo tomará los
+    # valores nuevos pero mantendrá lo anterior"): con reemplazar_todo se
+    # borra TODA la historia de ventas antes de insertar, no solo el período
+    # del archivo. Es lo que hace falta cuando el archivo viejo traía filas
+    # que ya no corresponden (las Guías de Despacho) o cuando quedaron líneas
+    # fuera del rango del archivo nuevo: con el reemplazo por período esas
+    # filas sobrevivirían para siempre.
+    if reemplazar_todo:
+        borradas_todo = VentaLinea.query.delete(synchronize_session=False)
+        for f in leidas:
+            db.session.add(VentaLinea(
+                empresa_id=empresa.id if empresa else None,
+                cuenta_para_rotacion=codigo_cuenta_para_rotacion(f["codigo_interno"]),
+                **f,
+            ))
+        nuevos, homologados, sin_homologar = _sembrar_clientes_vendedores(leidas)
+        purgadas = VentaLinea.query.filter(VentaLinea.fecha < _corte_historia_ventas()).delete(
+            synchronize_session=False
+        )
+        db.session.commit()
+        return {
+            "empresa": empresa, "nombre_empresa": nombre_empresa,
+            "desde": desde, "hasta": hasta,
+            "insertadas": len(leidas), "reemplazadas": borradas_todo,
+            "reemplazo_total": True,
+            "clientes_nuevos": nuevos, "purgadas": purgadas,
+            "vendedores_homologados": homologados,
+            "vendedores_sin_homologar": sorted(sin_homologar),
+        }
+
+    # Qué se reemplaza dentro del período: si el archivo dice de qué
+    # empresa es, se borran SUS líneas y además las que quedaron sin
+    # empresa (vienen de una carga histórica sin título, y este archivo
+    # las reemplaza). Si el archivo NO trae empresa, se borra todo el
+    # período: no hay forma de distinguir, y sin esto el mismo mes
+    # quedaría cargado dos veces -- una sin empresa y otra con ella.
+    borradas = VentaLinea.query.filter(VentaLinea.fecha >= desde, VentaLinea.fecha <= hasta)
+    if empresa:
+        borradas = borradas.filter(db.or_(
+            VentaLinea.empresa_id == empresa.id, VentaLinea.empresa_id.is_(None)
+        ))
+    borradas = borradas.delete(synchronize_session=False)
+
+    for f in leidas:
+        db.session.add(VentaLinea(
+            empresa_id=empresa.id if empresa else None,
+            cuenta_para_rotacion=codigo_cuenta_para_rotacion(f["codigo_interno"]),
+            **f,
+        ))
+
+    # Maestro cliente/vendedor: los RUT nuevos entran con el vendedor del
+    # archivo como sugerencia (sin confirmar), los ya existentes no se
+    # tocan -- la asignación vigente la decide el usuario.
+    nuevos, homologados, sin_homologar = _sembrar_clientes_vendedores(leidas)
 
     purgadas = VentaLinea.query.filter(VentaLinea.fecha < _corte_historia_ventas()).delete(
         synchronize_session=False
@@ -13383,6 +13501,7 @@ def _cargar_reporte_ventas(nombre_empresa, leidas):
         "desde": desde, "hasta": hasta,
         "insertadas": len(leidas), "reemplazadas": borradas,
         "clientes_nuevos": nuevos, "purgadas": purgadas,
+        "reemplazo_total": False,
         "vendedores_homologados": homologados,
         "vendedores_sin_homologar": sorted(sin_homologar),
     }
@@ -13491,10 +13610,17 @@ def _marcar_pareto(filas, campo="margen"):
     return filas
 
 
-def _lineas_ventas_filtradas(desde, hasta, vendedor="", q="", clave_cliente=None):
+def _lineas_ventas_filtradas(desde, hasta, vendedor="", q="", clave_cliente=None,
+                             linea="", categoria="", subcategoria=""):
     """Las lineas de venta que calzan con los filtros de la pantalla de
     Ventas. El filtro de vendedor usa el maestro VIGENTE (ver
-    _vendedor_vigente_por_rut), no el vendedor del archivo."""
+    _vendedor_vigente_por_rut), no el vendedor del archivo.
+
+    Ronda CW (2026-11-05, punto 3): linea/categoria/subcategoria son el
+    multifiltro en cascada (columnas Y, AA y AB del reporte). Se comparan
+    sin tildes ni mayusculas porque el archivo trae el mismo concepto
+    escrito de varias formas ("Monofocal" y "monofocal", "Equipos" y
+    "equipos")."""
     query = VentaLinea.query
     if desde:
         query = query.filter(VentaLinea.fecha >= desde)
@@ -13514,7 +13640,51 @@ def _lineas_ventas_filtradas(desde, hasta, vendedor="", q="", clave_cliente=None
     lineas = query.order_by(VentaLinea.fecha.desc(), VentaLinea.numero_documento.desc()).all()
     if clave_cliente:
         lineas = [l for l in lineas if _clave_cliente(l) == clave_cliente]
+    for campo, elegido in (("descripcion_linea", linea), ("categoria", categoria),
+                           ("subcategoria", subcategoria)):
+        if elegido:
+            clave = _normalizar_nombre(elegido)
+            lineas = [l for l in lineas if _normalizar_nombre(getattr(l, campo)) == clave]
     return lineas
+
+
+def _arbol_linea_categoria(lineas):
+    """Ronda CW (2026-11-05, punto 3 del pedido del usuario): el arbol del
+    multifiltro en cascada Linea -> Categoria -> Subcategoria.
+
+    Devuelve (lineas ordenadas, {linea: [categorias]},
+    {"linea|categoria": [subcategorias]}). Los nombres se agrupan sin
+    tildes ni mayusculas -- el archivo trae "Monofocal" y "monofocal",
+    "Equipos" y "equipos", "REPUESTOS" y "Repuestos" -- y se muestra la
+    grafia MAS FRECUENTE de cada concepto, para no dejar la lista llena de
+    duplicados que en realidad son el mismo."""
+    conteo = defaultdict(Counter)       # clave normalizada -> grafias
+    hijos_cat = defaultdict(set)
+    hijos_sub = defaultdict(set)
+    for l in lineas:
+        cl = _normalizar_nombre(l.descripcion_linea) or "(sin linea)"
+        cc = _normalizar_nombre(l.categoria) or "(sin categoria)"
+        cs = _normalizar_nombre(l.subcategoria) or "(sin subcategoria)"
+        conteo[("L", cl)][(l.descripcion_linea or "(sin línea)").strip() or "(sin línea)"] += 1
+        conteo[("C", cc)][(l.categoria or "(sin categoría)").strip() or "(sin categoría)"] += 1
+        conteo[("S", cs)][(l.subcategoria or "(sin subcategoría)").strip() or "(sin subcategoría)"] += 1
+        hijos_cat[cl].add(cc)
+        hijos_sub[(cl, cc)].add(cs)
+
+    def etiqueta(tipo, clave):
+        opciones = conteo.get((tipo, clave))
+        return opciones.most_common(1)[0][0] if opciones else clave
+
+    lineas_lista = sorted(etiqueta("L", cl) for cl in hijos_cat)
+    categorias = {
+        etiqueta("L", cl): sorted(etiqueta("C", cc) for cc in cats)
+        for cl, cats in hijos_cat.items()
+    }
+    subcategorias = {
+        f"{etiqueta('L', cl)}|{etiqueta('C', cc)}": sorted(etiqueta("S", cs) for cs in subs)
+        for (cl, cc), subs in hijos_sub.items()
+    }
+    return lineas_lista, categorias, subcategorias
 
 
 def _resumen_ventas_por_cliente(lineas):
@@ -13681,16 +13851,22 @@ def ventas_cliente_detalle(clave):
     hasta_txt = request.args.get("fecha_hasta", "")
     vendedor_sel = request.args.get("vendedor", "").strip()
     q = request.args.get("q", "").strip()
+    linea_sel = request.args.get("linea", "").strip()
+    categoria_sel = request.args.get("categoria", "").strip()
+    subcategoria_sel = request.args.get("subcategoria", "").strip()
     if not desde_txt and not hasta_txt and "fecha_desde" not in request.args:
         desde_txt = (date.today() - timedelta(days=90)).isoformat()
         hasta_txt = date.today().isoformat()
     desde, hasta = parse_date(desde_txt), parse_date(hasta_txt)
 
-    lineas = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q, clave_cliente=clave)
+    lineas = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q, clave_cliente=clave,
+                                      linea=linea_sel, categoria=categoria_sel,
+                                      subcategoria=subcategoria_sel)
     if not lineas:
         flash("No hay ventas de ese cliente con los filtros elegidos.", "warning")
         return redirect(url_for("ventas_list", fecha_desde=desde_txt, fecha_hasta=hasta_txt,
-                                vendedor=vendedor_sel))
+                                vendedor=vendedor_sel, linea=linea_sel,
+                                categoria=categoria_sel, subcategoria=subcategoria_sel))
 
     primera = lineas[0]
     vendedores_maestro = _vendedor_vigente_por_rut()
@@ -13718,7 +13894,8 @@ def ventas_cliente_detalle(clave):
                  "unidades": sum(l.unidades or 0 for l in lineas),
                  "documentos": len({(l.tipo_documento, l.numero_documento) for l in lineas})},
         fecha_desde=desde_txt, fecha_hasta=hasta_txt, vendedor_sel=vendedor_sel, q=q,
-        vendedores=vendedores,
+        vendedores=vendedores, linea_sel=linea_sel, categoria_sel=categoria_sel,
+        subcategoria_sel=subcategoria_sel,
     )
 
 
@@ -13739,12 +13916,22 @@ def ventas_list():
     hasta_txt = request.args.get("fecha_hasta", "")
     vendedor_sel = request.args.get("vendedor", "").strip()
     q = request.args.get("q", "").strip()
+    linea_sel = request.args.get("linea", "").strip()
+    categoria_sel = request.args.get("categoria", "").strip()
+    subcategoria_sel = request.args.get("subcategoria", "").strip()
     if not desde_txt and not hasta_txt and "fecha_desde" not in request.args:
         desde_txt = (date.today() - timedelta(days=90)).isoformat()
         hasta_txt = date.today().isoformat()
 
     desde, hasta = parse_date(desde_txt), parse_date(hasta_txt)
-    lineas = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q)
+    # El árbol del multifiltro se arma con el corte de fechas/vendedor pero
+    # SIN los propios filtros de línea/categoría/subcategoría -- si no, al
+    # elegir una categoría desaparecerían las demás opciones del desplegable.
+    lineas_base = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q)
+    arbol_lineas, arbol_categorias, arbol_subcategorias = _arbol_linea_categoria(lineas_base)
+    lineas = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q,
+                                      linea=linea_sel, categoria=categoria_sel,
+                                      subcategoria=subcategoria_sel)
 
     # Resumen por cliente (ronda CV) -- lo que el usuario quiere mirar
     # primero: quién deja utilidad, no quién compra más.
@@ -13794,7 +13981,10 @@ def ventas_list():
         unidades=sum(l.unidades or 0 for l in lineas), neto=venta_total,
         costo=costo_total, margen=round(venta_total - costo_total, 2),
         vendedores=vendedores, vendedor_sel=vendedor_sel, q=q,
-        sugerencias=_sugerencias_busqueda_ventas(lineas),
+        linea_sel=linea_sel, categoria_sel=categoria_sel, subcategoria_sel=subcategoria_sel,
+        arbol_lineas=arbol_lineas, arbol_categorias=arbol_categorias,
+        arbol_subcategorias=arbol_subcategorias,
+        sugerencias=_sugerencias_busqueda_ventas(lineas_base),
         fecha_desde=desde_txt, fecha_hasta=hasta_txt, ultima_carga=ultima_carga,
         puede_cargar=current_user.tiene_permiso("inventarios"),
         prefijos_sin_rotacion=", ".join(PREFIJOS_SIN_ROTACION),
@@ -13816,7 +14006,7 @@ def ventas_cargar():
         return redirect(url_for("ventas_list"))
     try:
         wb = openpyxl.load_workbook(archivo, read_only=True, data_only=True)
-        nombre_empresa, leidas = _leer_filas_reporte_ventas(wb.worksheets[0])
+        nombre_empresa, leidas, descartadas = _leer_filas_reporte_ventas(wb.worksheets[0])
     except Exception:
         flash("No se pudo leer el archivo. Verifica que no esté dañado o abierto en otro programa.", "danger")
         return redirect(url_for("ventas_list"))
@@ -13829,16 +14019,24 @@ def ventas_cargar():
         )
         return redirect(url_for("ventas_list"))
 
-    resumen = _cargar_reporte_ventas(nombre_empresa, leidas)
+    # Ronda CW (2026-11-05, punto 1): casilla "Reemplazar todo lo cargado".
+    reemplazar_todo = request.form.get("reemplazar_todo") == "1"
+    resumen = _cargar_reporte_ventas(nombre_empresa, leidas, reemplazar_todo=reemplazar_todo)
     mensaje = (
         f"{resumen['insertadas']} línea(s) de venta cargadas del período "
         f"{resumen['desde'].strftime('%d-%m-%Y')} al {resumen['hasta'].strftime('%d-%m-%Y')}"
     )
     if resumen["empresa"]:
         mensaje += f" ({resumen['empresa'].nombre})"
-    if resumen["reemplazadas"]:
+    if resumen.get("reemplazo_total"):
+        mensaje += (f". Se borró TODO lo que había cargado antes ({resumen['reemplazadas']} línea(s)) "
+                    "y quedó solo lo de este archivo")
+    elif resumen["reemplazadas"]:
         mensaje += f", reemplazando {resumen['reemplazadas']} que ya estaban en ese período"
     mensaje += "."
+    if descartadas:
+        mensaje += (f" Se descartaron {len(descartadas)} fila(s) que no son venta "
+                    f"({', '.join(sorted(set(descartadas))[:3])}).")
     if resumen.get("vendedores_homologados"):
         mensaje += (
             f" {resumen['vendedores_homologados']} de ellos traían el nombre del vendedor escrito distinto "
@@ -13855,7 +14053,12 @@ def ventas_cargar():
             "archivo como sugerencia -- revísalos en Cliente/Vendedor."
         )
     if resumen["purgadas"]:
-        mensaje += f" Se purgaron {resumen['purgadas']} línea(s) fuera de los {MESES_HISTORIA_VENTAS} meses de historia."
+        mensaje += (
+            f" Se purgaron {resumen['purgadas']} línea(s) anteriores a "
+            f"{_corte_historia_ventas().strftime('%m-%Y')}: el programa guarda "
+            f"{MESES_HISTORIA_VENTAS} meses de historia (regla acordada). Si necesitas más "
+            "historia para los reportes, hay que ampliar ese límite."
+        )
     if not resumen["empresa"] and nombre_empresa:
         mensaje += f" Ojo: '{nombre_empresa}' no calza con ninguna empresa del catálogo, las líneas quedaron sin empresa."
     flash(mensaje, "success")

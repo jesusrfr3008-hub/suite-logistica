@@ -890,6 +890,13 @@ class VentaLinea(db.Model):
     descripcion = db.Column(db.String(300))
     cod_marca = db.Column(db.String(20))
     marca = db.Column(db.String(80))
+    # Ronda CW (2026-11-05, punto 2 del pedido del usuario): columnas AA y AB
+    # del reporte nuevo de Ergopyme ("Descripción Categoría" y "Descripción
+    # Subcategoría"). Junto con descripcion_linea (columna Y) arman el
+    # multifiltro en cascada Línea -> Categoría -> Subcategoría del reporte
+    # de Ventas.
+    categoria = db.Column(db.String(120), index=True)
+    subcategoria = db.Column(db.String(120), index=True)
     unidades = db.Column(db.Float, default=0)
     precio_unitario = db.Column(db.Float, default=0)
     valor_neto = db.Column(db.Float, default=0)

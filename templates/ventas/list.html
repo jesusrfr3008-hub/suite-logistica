@@ -68,7 +68,41 @@
       {% for s in sugerencias %}<option value="{{ s.valor }}">{{ s.etiqueta }}</option>{% endfor %}
     </datalist>
   </div>
+  {# Ronda CW (2026-11-05, punto 3 del pedido del usuario): multifiltro
+     indirecto -- al elegir una Línea se habilitan solo sus Categorías, y al
+     elegir una Categoría solo sus Subcategorías. El árbol viene armado del
+     servidor (ver _arbol_linea_categoria) y el JS de abajo lo recorre. #}
+  <div class="col-auto">
+    <select class="form-select" name="linea" id="filtroLinea">
+      <option value="">Todas las líneas</option>
+      {% for l in arbol_lineas %}
+      <option value="{{ l }}" {% if linea_sel == l %}selected{% endif %}>{{ l }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <select class="form-select" name="categoria" id="filtroCategoria" {% if not linea_sel %}disabled{% endif %}>
+      <option value="">Todas las categorías</option>
+      {% for c in arbol_categorias.get(linea_sel, []) %}
+      <option value="{{ c }}" {% if categoria_sel == c %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <select class="form-select" name="subcategoria" id="filtroSubcategoria" {% if not categoria_sel %}disabled{% endif %}>
+      <option value="">Todas las subcategorías</option>
+      {% for sc in arbol_subcategorias.get(linea_sel ~ '|' ~ categoria_sel, []) %}
+      <option value="{{ sc }}" {% if subcategoria_sel == sc %}selected{% endif %}>{{ sc }}</option>
+      {% endfor %}
+    </select>
+  </div>
   <div class="col-auto"><button class="btn btn-outline-secondary">Filtrar</button></div>
+  {% if linea_sel or categoria_sel or subcategoria_sel or vendedor_sel or q %}
+  <div class="col-auto">
+    <a href="{{ url_for('ventas_list', fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}"
+       class="btn btn-outline-secondary">Quitar filtros</a>
+  </div>
+  {% endif %}
 </form>
 
 <div class="row g-3 mb-3">
@@ -113,11 +147,6 @@
       <span style="background:#fdecea"></span>margen negativo
     </div>
   </div>
-  <p class="text-muted small mb-2">
-    Facturas y boletas sumadas, notas de crédito restadas (vienen en negativo en el archivo).
-    La columna <strong>% de la utilidad</strong> es la participación de cada cliente en el margen
-    total, no en la venta. Haz clic en un cliente para ver su análisis por producto y mes.
-  </p>
   <div class="table-responsive tabla-scroll-ventas">
     <table class="table table-hover table-sm align-middle mb-0 tabla-ventas">
       <thead>
@@ -253,9 +282,27 @@
             Sube el .xlsx del reporte de ventas de Ergopyme. Se reemplaza <strong>todo el período</strong> que traiga
             el archivo, no solo los días nuevos: así una venta modificada con fecha atrás se corrige sola. Se
             mantienen 13 meses de historia. Los clientes nuevos quedan en el maestro Cliente/Vendedor con el
-            vendedor del archivo como sugerencia, para que los revises.
+            vendedor del archivo como sugerencia, para que los revises. Las Guías de Despacho se
+            descartan siempre: mueven mercadería, no son una venta.
           </p>
           <input type="file" class="form-control" name="archivo" accept=".xlsx,.xls" required>
+          {# Ronda CW (2026-11-05, punto 1 del pedido del usuario): sin esto, la
+             carga solo reemplaza el período que trae el archivo -- lo que haya
+             quedado fuera de ese rango (o filas que ya no corresponden, como las
+             Guías de Despacho del archivo viejo) sobreviviría para siempre. #}
+          <div class="form-check mt-3 p-3 border rounded bg-warning-subtle">
+            <input class="form-check-input" type="checkbox" value="1" name="reemplazar_todo" id="chkReemplazarTodo">
+            <label class="form-check-label" for="chkReemplazarTodo">
+              <strong>Reemplazar TODO lo cargado antes</strong>
+              <div class="small text-muted">
+                Borra toda la historia de ventas que haya en el programa y deja únicamente lo que
+                trae este archivo. Úsalo cuando el archivo viene corregido (por ejemplo, el anterior
+                traía Guías de Despacho y este ya no) o cuando quieras partir de cero: así no quedan
+                datos viejos mezclados ni duplicados. Si lo dejas sin marcar, solo se reemplaza el
+                período que abarca el archivo y lo anterior se conserva.
+              </div>
+            </label>
+          </div>
         </div>
         <div class="modal-footer"><button type="submit" class="btn btn-brand">Cargar</button></div>
       </form>
@@ -264,4 +311,44 @@
 </div>
 {% endif %}
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Ronda CW (2026-11-05, punto 3): multifiltro indirecto Línea -> Categoría ->
+// Subcategoría. El árbol lo arma el servidor con los datos del corte actual
+// (ver _arbol_linea_categoria), así que las opciones que se ofrecen siempre
+// existen de verdad en lo que se está mirando.
+(function () {
+  var CATEGORIAS = {{ arbol_categorias | tojson }};
+  var SUBCATEGORIAS = {{ arbol_subcategorias | tojson }};
+  var selLinea = document.getElementById('filtroLinea');
+  var selCategoria = document.getElementById('filtroCategoria');
+  var selSub = document.getElementById('filtroSubcategoria');
+  if (!selLinea || !selCategoria || !selSub) return;
+
+  function llenar(select, opciones, textoVacio) {
+    select.innerHTML = '';
+    var vacio = document.createElement('option');
+    vacio.value = ''; vacio.textContent = textoVacio;
+    select.appendChild(vacio);
+    (opciones || []).forEach(function (o) {
+      var op = document.createElement('option');
+      op.value = o; op.textContent = o;
+      select.appendChild(op);
+    });
+    select.disabled = !(opciones || []).length;
+  }
+
+  selLinea.addEventListener('change', function () {
+    llenar(selCategoria, CATEGORIAS[selLinea.value], 'Todas las categorías');
+    llenar(selSub, [], 'Todas las subcategorías');
+    selSub.disabled = true;
+  });
+  selCategoria.addEventListener('change', function () {
+    llenar(selSub, SUBCATEGORIAS[selLinea.value + '|' + selCategoria.value],
+           'Todas las subcategorías');
+  });
+})();
+</script>
 {% endblock %}
