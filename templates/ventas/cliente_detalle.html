@@ -22,10 +22,16 @@
   #tabla-pivot .valor-unidades { display: none; }
   #tabla-pivot.modo-unidades .valor-monto { display: none; }
   #tabla-pivot.modo-unidades .valor-unidades { display: inline; }
-  .col-descripcion { max-width: 260px; }
-  #tabla-pivot.modo-unidades .col-descripcion {
-    max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* Ronda CZ (2026-11-06, punto 4 del pedido del usuario): "no necesitamos
+     que se vea todo el código interno Ergopyme, achícalo y al posicionarse se
+     vea el código, pero que tenga prioridad la descripción". El código queda
+     angosto y recortado con "..." (se ve entero en el tooltip y al abrir la
+     fila), y la descripción se lleva el ancho. */
+  .col-codigo {
+    max-width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .col-descripcion { min-width: 320px; max-width: 460px; white-space: normal; }
+  #tabla-pivot.modo-unidades .col-descripcion { min-width: 240px; max-width: 320px; }
   /* Mismas barras de desplazamiento siempre visibles que en Compras Proveedor:
      deja claro que hay más meses hacia los lados y más productos hacia abajo. */
   .table-responsive-pivot { overflow-x: scroll; overflow-y: scroll; }
@@ -104,11 +110,88 @@
       {% endfor %}
     </select>
   </div>
+  {# Ronda CZ (2026-11-06, punto 5 del pedido del usuario): los mismos tres
+     paneles de selección múltiple del Reporte de Ventas, para poder buscar
+     dentro del cliente por línea / categoría / subcategoría. Vacío = todos. #}
+  <div class="col-auto">
+    <label class="form-label small mb-0">Línea</label>
+    <div class="dropdown">
+      <button class="btn btn-outline-secondary dropdown-toggle text-start" type="button"
+              id="btnLinea" data-bs-toggle="dropdown" data-bs-auto-close="outside"
+              style="min-width: 12rem;">
+        {% if lineas_sel %}{{ lineas_sel|length }} línea(s){% else %}Todas las líneas{% endif %}
+      </button>
+      <div class="dropdown-menu p-2" style="min-width: 17rem; max-height: 20rem; overflow: auto;">
+        <input type="search" class="form-control form-control-sm mb-2 filtro-lista" placeholder="Buscar línea...">
+        <div class="d-flex gap-2 mb-2 small">
+          <a href="#" class="marcar-todos">Todos</a><span class="text-muted">·</span>
+          <a href="#" class="marcar-ninguno">Ninguno</a>
+        </div>
+        {% for l in arbol_lineas %}
+        <div class="form-check opcion-lista">
+          <input class="form-check-input chk-linea" type="checkbox" name="linea" value="{{ l }}"
+                 id="lin{{ loop.index }}" {% if l in lineas_sel %}checked{% endif %}>
+          <label class="form-check-label small" for="lin{{ loop.index }}">{{ l }}</label>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Categoría</label>
+    <div class="dropdown">
+      <button class="btn btn-outline-secondary dropdown-toggle text-start" type="button"
+              id="btnCategoria" data-bs-toggle="dropdown" data-bs-auto-close="outside"
+              style="min-width: 14rem;">
+        {% if categorias_sel %}{{ categorias_sel|length }} categoría(s){% else %}Todas las categorías{% endif %}
+      </button>
+      <div class="dropdown-menu p-2" style="min-width: 19rem; max-height: 20rem; overflow: auto;">
+        <input type="search" class="form-control form-control-sm mb-2 filtro-lista" placeholder="Buscar categoría...">
+        <div class="d-flex gap-2 mb-2 small">
+          <a href="#" class="marcar-todos">Todos</a><span class="text-muted">·</span>
+          <a href="#" class="marcar-ninguno">Ninguno</a>
+        </div>
+        <div class="small text-muted sin-opciones d-none">Ninguna categoría de las líneas marcadas.</div>
+        {% for c in opciones_categoria %}
+        <div class="form-check opcion-lista opcion-hija" data-padres="{{ c.padres|join('␟') }}">
+          <input class="form-check-input chk-categoria" type="checkbox" name="categoria" value="{{ c.valor }}"
+                 id="cat{{ loop.index }}" {% if c.valor in categorias_sel %}checked{% endif %}>
+          <label class="form-check-label small" for="cat{{ loop.index }}">{{ c.valor }}</label>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Subcategoría</label>
+    <div class="dropdown">
+      <button class="btn btn-outline-secondary dropdown-toggle text-start" type="button"
+              id="btnSubcategoria" data-bs-toggle="dropdown" data-bs-auto-close="outside"
+              style="min-width: 15rem;">
+        {% if subcategorias_sel %}{{ subcategorias_sel|length }} subcategoría(s){% else %}Todas las subcategorías{% endif %}
+      </button>
+      <div class="dropdown-menu p-2" style="min-width: 21rem; max-height: 20rem; overflow: auto;">
+        <input type="search" class="form-control form-control-sm mb-2 filtro-lista" placeholder="Buscar subcategoría...">
+        <div class="d-flex gap-2 mb-2 small">
+          <a href="#" class="marcar-todos">Todos</a><span class="text-muted">·</span>
+          <a href="#" class="marcar-ninguno">Ninguno</a>
+        </div>
+        <div class="small text-muted sin-opciones d-none">Ninguna subcategoría de las categorías marcadas.</div>
+        {% for sc in opciones_subcategoria %}
+        <div class="form-check opcion-lista opcion-nieta" data-padres="{{ sc.padres|join('␟') }}">
+          <input class="form-check-input chk-subcategoria" type="checkbox" name="subcategoria" value="{{ sc.valor }}"
+                 id="sub{{ loop.index }}" {% if sc.valor in subcategorias_sel %}checked{% endif %}>
+          <label class="form-check-label small" for="sub{{ loop.index }}">{{ sc.valor }}</label>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
   <div class="col-auto">
     <label class="form-label small mb-0 d-block">&nbsp;</label>
     <button type="submit" class="btn btn-brand"><i class="bi bi-search"></i> Filtrar</button>
   </div>
-  {% if fecha_desde or fecha_hasta or vendedor_sel %}
+  {% if fecha_desde or fecha_hasta or vendedor_sel or lineas_sel or categorias_sel or subcategorias_sel %}
   <div class="col-auto">
     <label class="form-label small mb-0 d-block">&nbsp;</label>
     <a href="{{ url_for('ventas_cliente_detalle', clave=cliente.clave, fecha_desde='', fecha_hasta='') }}"
@@ -181,7 +264,7 @@
       <thead class="table-dark">
         <tr>
           <th style="width: 24px;"></th>
-          <th class="ordenable" data-sort="codigo">Código <i class="bi bi-arrow-down-up"></i></th>
+          <th class="ordenable col-codigo" data-sort="codigo" title="Código interno de Ergopyme -- se ve completo al pasar el mouse">Cód. <i class="bi bi-arrow-down-up"></i></th>
           <th class="ordenable" data-sort="descripcion">Descripción <i class="bi bi-arrow-down-up"></i></th>
           {% for m in meses_columnas %}
           <th class="ordenable text-end" data-sort="mes:{{ m.clave }}">{{ m.etiqueta }} <i class="bi bi-arrow-down-up"></i></th>
@@ -199,8 +282,8 @@
             data-sort-total="{{ p.venta }}" data-sort-margen="{{ p.margen }}" data-sort-pct="{{ p.pct_del_total }}"
             {% for m in meses_columnas %}data-sort-mes-{{ m.clave }}="{{ p.meses[m.clave].venta }}"{% if not loop.last %} {% endif %}{% endfor %}>
           <td><i class="bi bi-chevron-right small text-muted"></i></td>
-          <td class="fw-semibold">{{ p.codigo }}</td>
-          <td class="col-descripcion" title="{{ p.descripcion }}">{{ p.descripcion }}</td>
+          <td class="fw-semibold col-codigo" title="{{ p.codigo }}">{{ p.codigo }}</td>
+          <td class="col-descripcion" title="{{ p.codigo }} — {{ p.descripcion }}">{{ p.descripcion }}</td>
           {% for m in meses_columnas %}
           {% set celda = p.meses[m.clave] %}
           <td class="celda-mes">
@@ -232,6 +315,85 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+// Ronda CZ (2026-11-06, punto 5): mismo multifiltro de selección múltiple que
+// el Reporte de Ventas -- ver la explicación en ventas/list.html.
+(function () {
+  var SEP = '\u241f';
+  function marcadas(sel) {
+    return Array.prototype.map.call(document.querySelectorAll(sel + ':checked'),
+                                    function (c) { return c.value; });
+  }
+  function etiqueta(boton, n, sing, plur, todos) {
+    if (boton) boton.textContent = n ? (n + ' ' + (n === 1 ? sing : plur)) : todos;
+  }
+  function filtrarPorPadres(contenedorSel, padresMarcados) {
+    var panel = document.querySelector(contenedorSel);
+    if (!panel) return;
+    var visibles = 0;
+    panel.querySelectorAll('.opcion-lista[data-padres]').forEach(function (op) {
+      var padres = (op.dataset.padres || '').split(SEP);
+      var visible = !padresMarcados.length || padres.some(function (p) {
+        return padresMarcados.indexOf(p) !== -1;
+      });
+      op.classList.toggle('oculta-por-padre', !visible);
+      op.classList.toggle('d-none', !visible);
+      if (!visible) {
+        var chk = op.querySelector('input[type=checkbox]');
+        if (chk) chk.checked = false;
+      } else { visibles += 1; }
+    });
+    var aviso = panel.querySelector('.sin-opciones');
+    if (aviso) aviso.classList.toggle('d-none', visibles > 0);
+  }
+  function refrescar() {
+    var lineas = marcadas('.chk-linea');
+    var categorias = marcadas('.chk-categoria');
+    filtrarPorPadres('#btnCategoria + .dropdown-menu', lineas);
+    var pares = [];
+    document.querySelectorAll('.chk-categoria').forEach(function (chk) {
+      var op = chk.closest('.opcion-lista');
+      if (op.classList.contains('oculta-por-padre')) return;
+      if (categorias.length && !chk.checked) return;
+      (op.dataset.padres || '').split(SEP).forEach(function (linea) {
+        if (!lineas.length || lineas.indexOf(linea) !== -1) pares.push(linea + '|' + chk.value);
+      });
+    });
+    filtrarPorPadres('#btnSubcategoria + .dropdown-menu', pares);
+    etiqueta(document.getElementById('btnLinea'), lineas.length,
+             'línea', 'líneas', 'Todas las líneas');
+    etiqueta(document.getElementById('btnCategoria'), marcadas('.chk-categoria').length,
+             'categoría', 'categorías', 'Todas las categorías');
+    etiqueta(document.getElementById('btnSubcategoria'), marcadas('.chk-subcategoria').length,
+             'subcategoría', 'subcategorías', 'Todas las subcategorías');
+  }
+  document.querySelectorAll('.chk-linea, .chk-categoria, .chk-subcategoria')
+    .forEach(function (chk) { chk.addEventListener('change', refrescar); });
+  document.querySelectorAll('.filtro-lista').forEach(function (input) {
+    input.addEventListener('input', function () {
+      var texto = input.value.trim().toLowerCase();
+      input.closest('.dropdown-menu').querySelectorAll('.opcion-lista').forEach(function (op) {
+        if (op.classList.contains('oculta-por-padre')) return;
+        var t = (op.textContent || '').toLowerCase();
+        op.classList.toggle('d-none', texto !== '' && t.indexOf(texto) === -1);
+      });
+    });
+    input.addEventListener('click', function (e) { e.stopPropagation(); });
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') e.preventDefault(); });
+  });
+  document.querySelectorAll('.marcar-todos, .marcar-ninguno').forEach(function (enlace) {
+    enlace.addEventListener('click', function (e) {
+      e.preventDefault(); e.stopPropagation();
+      var marcar = enlace.classList.contains('marcar-todos');
+      enlace.closest('.dropdown-menu')
+        .querySelectorAll('.opcion-lista:not(.d-none) input[type=checkbox]')
+        .forEach(function (chk) { chk.checked = marcar; });
+      refrescar();
+    });
+  });
+  refrescar();
+})();
+</script>
 <script>
 document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
   try { new bootstrap.Tooltip(el); } catch (e) {}

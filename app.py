@@ -156,7 +156,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CY"
+VERSION_SUITE = "CZ"
 VERSION_SUITE_FECHA = "2026-11-06"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -13661,7 +13661,7 @@ def _marcar_pareto(filas, campo="margen"):
 
 
 def _lineas_ventas_filtradas(desde, hasta, vendedor="", q="", clave_cliente=None,
-                             linea="", categoria="", subcategoria=""):
+                             lineas_sel=(), categorias_sel=(), subcategorias_sel=()):
     """Las lineas de venta que calzan con los filtros de la pantalla de
     Ventas. El filtro de vendedor usa el maestro VIGENTE (ver
     _vendedor_vigente_por_rut), no el vendedor del archivo.
@@ -13670,7 +13670,11 @@ def _lineas_ventas_filtradas(desde, hasta, vendedor="", q="", clave_cliente=None
     multifiltro en cascada (columnas Y, AA y AB del reporte). Se comparan
     sin tildes ni mayusculas porque el archivo trae el mismo concepto
     escrito de varias formas ("Monofocal" y "monofocal", "Equipos" y
-    "equipos")."""
+    "equipos").
+
+    Ronda CZ (2026-11-06, punto 2 del pedido del usuario): los tres pasaron
+    a ser SELECCION MULTIPLE -- se reciben listas. Vacio = todos, que es el
+    comportamiento por defecto."""
     query = VentaLinea.query
     if desde:
         query = query.filter(VentaLinea.fecha >= desde)
@@ -13690,12 +13694,32 @@ def _lineas_ventas_filtradas(desde, hasta, vendedor="", q="", clave_cliente=None
     lineas = query.order_by(VentaLinea.fecha.desc(), VentaLinea.numero_documento.desc()).all()
     if clave_cliente:
         lineas = [l for l in lineas if _clave_cliente(l) == clave_cliente]
-    for campo, elegido in (("descripcion_linea", linea), ("categoria", categoria),
-                           ("subcategoria", subcategoria)):
-        if elegido:
-            clave = _normalizar_nombre(elegido)
-            lineas = [l for l in lineas if _normalizar_nombre(getattr(l, campo)) == clave]
+    for campo, elegidos in (("descripcion_linea", lineas_sel), ("categoria", categorias_sel),
+                            ("subcategoria", subcategorias_sel)):
+        claves = {_normalizar_nombre(e) for e in (elegidos or ()) if (e or "").strip()}
+        if claves:
+            lineas = [l for l in lineas if _normalizar_nombre(getattr(l, campo)) in claves]
     return lineas
+
+
+def _opciones_con_padres(arbol):
+    """Ronda CZ (2026-11-06, punto 2 del pedido del usuario): aplana el
+    arbol del multifiltro en una lista de opciones UNICAS, cada una con los
+    padres a los que pertenece.
+
+    Con seleccion multiple ya no sirve rellenar el desplegable de
+    categorias con los hijos de UNA linea: hay que mostrarlas todas y
+    dejar visibles solo las que cuelgan de alguna de las lineas marcadas.
+    Eso lo hace el navegador mirando `padres`, sin recargar la pagina.
+
+    Entra {padre: [hijos]} y sale [{"valor": hijo, "padres": [padres]}],
+    ordenado alfabeticamente."""
+    padres_por_hijo = defaultdict(list)
+    for padre, hijos in arbol.items():
+        for hijo in hijos:
+            padres_por_hijo[hijo].append(padre)
+    return [{"valor": hijo, "padres": sorted(padres)}
+            for hijo, padres in sorted(padres_por_hijo.items())]
 
 
 def _arbol_linea_categoria(lineas):
@@ -13901,24 +13925,39 @@ def ventas_cliente_detalle(clave):
     hasta_txt = request.args.get("fecha_hasta", "")
     vendedor_sel = request.args.get("vendedor", "").strip()
     q = request.args.get("q", "").strip()
-    linea_sel = request.args.get("linea", "").strip()
-    categoria_sel = request.args.get("categoria", "").strip()
-    subcategoria_sel = request.args.get("subcategoria", "").strip()
+    # Ronda CZ (2026-11-06, punto 2): selección múltiple -- vacío = todos.
+    lineas_sel = [v.strip() for v in request.args.getlist("linea") if v.strip()]
+    categorias_sel = [v.strip() for v in request.args.getlist("categoria") if v.strip()]
+    subcategorias_sel = [v.strip() for v in request.args.getlist("subcategoria") if v.strip()]
     if not desde_txt and not hasta_txt and "fecha_desde" not in request.args:
         desde_txt = (date.today() - timedelta(days=90)).isoformat()
         hasta_txt = date.today().isoformat()
     desde, hasta = parse_date(desde_txt), parse_date(hasta_txt)
 
+    # Ronda CZ (2026-11-06, punto 5 del pedido del usuario -- "agreguemos en
+    # el analisis por producto los mismos filtros que creamos en el reporte de
+    # venta, por si se desea buscar dentro del cliente con esos parametros"):
+    # el arbol se arma con TODO lo del cliente en el rango, sin aplicar los
+    # propios filtros de linea/categoria/subcategoria -- si no, al marcar una
+    # categoria desaparecerian las demas opciones del panel.
+    lineas_base = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q, clave_cliente=clave)
+    arbol_lineas, arbol_categorias, arbol_subcategorias = _arbol_linea_categoria(lineas_base)
     lineas = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q, clave_cliente=clave,
-                                      linea=linea_sel, categoria=categoria_sel,
-                                      subcategoria=subcategoria_sel)
-    if not lineas:
-        flash("No hay ventas de ese cliente con los filtros elegidos.", "warning")
+                                      lineas_sel=lineas_sel, categorias_sel=categorias_sel,
+                                      subcategorias_sel=subcategorias_sel)
+    if not lineas_base:
+        flash("No hay ventas de ese cliente en ese rango de fechas.", "warning")
         return redirect(url_for("ventas_list", fecha_desde=desde_txt, fecha_hasta=hasta_txt,
-                                vendedor=vendedor_sel, linea=linea_sel,
-                                categoria=categoria_sel, subcategoria=subcategoria_sel))
+                                vendedor=vendedor_sel, linea=lineas_sel,
+                                categoria=categorias_sel, subcategoria=subcategorias_sel))
+    # Ronda CZ: si son los filtros de linea/categoria los que dejan la tabla
+    # vacia, NO se expulsa al usuario de la pantalla -- se avisa y se le dejan
+    # los paneles para que corrija la seleccion.
+    if not lineas:
+        flash("Ningún producto de este cliente calza con los filtros de línea/categoría "
+              "elegidos. Ajústalos o quítalos para volver a verlo completo.", "warning")
 
-    primera = lineas[0]
+    primera = (lineas or lineas_base)[0]
     vendedores_maestro = _vendedor_vigente_por_rut()
     cliente = {
         "clave": clave,
@@ -13944,8 +13983,11 @@ def ventas_cliente_detalle(clave):
                  "unidades": sum(l.unidades or 0 for l in lineas),
                  "documentos": len({(l.tipo_documento, l.numero_documento) for l in lineas})},
         fecha_desde=desde_txt, fecha_hasta=hasta_txt, vendedor_sel=vendedor_sel, q=q,
-        vendedores=vendedores, linea_sel=linea_sel, categoria_sel=categoria_sel,
-        subcategoria_sel=subcategoria_sel,
+        vendedores=vendedores, lineas_sel=lineas_sel, categorias_sel=categorias_sel,
+        subcategorias_sel=subcategorias_sel,
+        arbol_lineas=arbol_lineas,
+        opciones_categoria=_opciones_con_padres(arbol_categorias),
+        opciones_subcategoria=_opciones_con_padres(arbol_subcategorias),
     )
 
 
@@ -13966,9 +14008,10 @@ def ventas_list():
     hasta_txt = request.args.get("fecha_hasta", "")
     vendedor_sel = request.args.get("vendedor", "").strip()
     q = request.args.get("q", "").strip()
-    linea_sel = request.args.get("linea", "").strip()
-    categoria_sel = request.args.get("categoria", "").strip()
-    subcategoria_sel = request.args.get("subcategoria", "").strip()
+    # Ronda CZ (2026-11-06, punto 2): selección múltiple -- vacío = todos.
+    lineas_sel = [v.strip() for v in request.args.getlist("linea") if v.strip()]
+    categorias_sel = [v.strip() for v in request.args.getlist("categoria") if v.strip()]
+    subcategorias_sel = [v.strip() for v in request.args.getlist("subcategoria") if v.strip()]
     if not desde_txt and not hasta_txt and "fecha_desde" not in request.args:
         desde_txt = (date.today() - timedelta(days=90)).isoformat()
         hasta_txt = date.today().isoformat()
@@ -13980,8 +14023,8 @@ def ventas_list():
     lineas_base = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q)
     arbol_lineas, arbol_categorias, arbol_subcategorias = _arbol_linea_categoria(lineas_base)
     lineas = _lineas_ventas_filtradas(desde, hasta, vendedor_sel, q,
-                                      linea=linea_sel, categoria=categoria_sel,
-                                      subcategoria=subcategoria_sel)
+                                      lineas_sel=lineas_sel, categorias_sel=categorias_sel,
+                                      subcategorias_sel=subcategorias_sel)
 
     # Resumen por cliente (ronda CV) -- lo que el usuario quiere mirar
     # primero: quién deja utilidad, no quién compra más.
@@ -14031,9 +14074,12 @@ def ventas_list():
         unidades=sum(l.unidades or 0 for l in lineas), neto=venta_total,
         costo=costo_total, margen=round(venta_total - costo_total, 2),
         vendedores=vendedores, vendedor_sel=vendedor_sel, q=q,
-        linea_sel=linea_sel, categoria_sel=categoria_sel, subcategoria_sel=subcategoria_sel,
+        lineas_sel=lineas_sel, categorias_sel=categorias_sel,
+        subcategorias_sel=subcategorias_sel,
         arbol_lineas=arbol_lineas, arbol_categorias=arbol_categorias,
         arbol_subcategorias=arbol_subcategorias,
+        opciones_categoria=_opciones_con_padres(arbol_categorias),
+        opciones_subcategoria=_opciones_con_padres(arbol_subcategorias),
         sugerencias=_sugerencias_busqueda_ventas(lineas_base),
         fecha_desde=desde_txt, fecha_hasta=hasta_txt, ultima_carga=ultima_carga,
         puede_cargar=current_user.tiene_permiso("inventarios"),

@@ -46,63 +46,142 @@
   </div>
 </div>
 
-<form class="row g-2 mb-3">
-  <div class="col-auto"><input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}"></div>
-  <div class="col-auto"><input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}"></div>
-  <div class="col-auto">
-    <select class="form-select" name="vendedor">
-      <option value="">Todos los vendedores</option>
-      {% for v in vendedores %}
-      <option value="{{ v }}" {% if vendedor_sel|upper == v|upper %}selected{% endif %}>{{ v }}</option>
-      {% endfor %}
-    </select>
+{# Ronda CZ (2026-11-06, puntos 1 y 2 del pedido del usuario): la barra de
+   filtros estaba toda en una fila con el buscador en el medio y no se leía.
+   Ahora va en una tarjeta con dos filas -- arriba el período, el vendedor y
+   el buscador predictivo alineado a la DERECHA (sobre la tarjeta de Margen
+   neto); abajo el multifiltro Línea / Categoría / Subcategoría, los tres con
+   SELECCIÓN MÚLTIPLE (mismo panel con casillas que ya se usa en el Reporte
+   Operacional). Por defecto vienen todos; marcando varios se combinan. #}
+<form class="card p-3 mb-3" id="filtrosVentas">
+  <div class="row g-2 align-items-end">
+    <div class="col-auto">
+      <label class="form-label small text-muted mb-1">Desde</label>
+      <input type="date" class="form-control" name="fecha_desde" value="{{ fecha_desde }}">
+    </div>
+    <div class="col-auto">
+      <label class="form-label small text-muted mb-1">Hasta</label>
+      <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}">
+    </div>
+    <div class="col-auto">
+      <label class="form-label small text-muted mb-1">Vendedor</label>
+      <select class="form-select" name="vendedor">
+        <option value="">Todos los vendedores</option>
+        {% for v in vendedores %}
+        <option value="{{ v }}" {% if vendedor_sel|upper == v|upper %}selected{% endif %}>{{ v }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {# Buscador predictivo, a la derecha de todo. #}
+    <div class="col-12 col-xl ms-xl-auto" style="max-width: 26rem;">
+      <label class="form-label small text-muted mb-1">Buscar cliente o producto</label>
+      <div class="input-group">
+        <span class="input-group-text"><i class="bi bi-search"></i></span>
+        <input type="search" class="form-control" name="q" value="{{ q }}" list="sugerencias-ventas"
+               autocomplete="off" placeholder="Empieza a escribir...">
+      </div>
+      <datalist id="sugerencias-ventas">
+        {% for s in sugerencias %}<option value="{{ s.valor }}">{{ s.etiqueta }}</option>{% endfor %}
+      </datalist>
+    </div>
   </div>
-  {# Ronda CV (punto 3a): buscador predictivo -- al escribir se despliegan los
-     clientes y productos del corte, cada uno diciendo cuál es, para saber que se
-     está eligiendo el correcto. #}
-  <div class="col-auto">
-    <input type="search" class="form-control" name="q" value="{{ q }}" list="sugerencias-ventas"
-           autocomplete="off" style="min-width: 19rem;"
-           placeholder="Cliente o producto (empieza a escribir)">
-    <datalist id="sugerencias-ventas">
-      {% for s in sugerencias %}<option value="{{ s.valor }}">{{ s.etiqueta }}</option>{% endfor %}
-    </datalist>
+
+  <hr class="my-3">
+
+  <div class="row g-2 align-items-end">
+    <div class="col-auto">
+      <label class="form-label small text-muted mb-1">Línea</label>
+      <div class="dropdown">
+        <button class="btn btn-outline-secondary dropdown-toggle text-start" type="button"
+                id="btnLinea" data-bs-toggle="dropdown" data-bs-auto-close="outside"
+                style="min-width: 13rem;">
+          {% if lineas_sel %}{{ lineas_sel|length }} línea(s){% else %}Todas las líneas{% endif %}
+        </button>
+        <div class="dropdown-menu p-2" style="min-width: 18rem; max-height: 20rem; overflow: auto;">
+          <input type="search" class="form-control form-control-sm mb-2 filtro-lista" placeholder="Buscar línea...">
+          <div class="d-flex gap-2 mb-2 small">
+            <a href="#" class="marcar-todos">Todos</a><span class="text-muted">·</span>
+            <a href="#" class="marcar-ninguno">Ninguno</a>
+          </div>
+          {% for l in arbol_lineas %}
+          <div class="form-check opcion-lista">
+            <input class="form-check-input chk-linea" type="checkbox" name="linea" value="{{ l }}"
+                   id="lin{{ loop.index }}" {% if l in lineas_sel %}checked{% endif %}>
+            <label class="form-check-label small" for="lin{{ loop.index }}">{{ l }}</label>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="col-auto">
+      <label class="form-label small text-muted mb-1">Categoría</label>
+      <div class="dropdown">
+        <button class="btn btn-outline-secondary dropdown-toggle text-start" type="button"
+                id="btnCategoria" data-bs-toggle="dropdown" data-bs-auto-close="outside"
+                style="min-width: 15rem;">
+          {% if categorias_sel %}{{ categorias_sel|length }} categoría(s){% else %}Todas las categorías{% endif %}
+        </button>
+        <div class="dropdown-menu p-2" style="min-width: 20rem; max-height: 20rem; overflow: auto;">
+          <input type="search" class="form-control form-control-sm mb-2 filtro-lista" placeholder="Buscar categoría...">
+          <div class="d-flex gap-2 mb-2 small">
+            <a href="#" class="marcar-todos">Todos</a><span class="text-muted">·</span>
+            <a href="#" class="marcar-ninguno">Ninguno</a>
+          </div>
+          <div class="small text-muted sin-opciones d-none">Ninguna categoría de las líneas marcadas.</div>
+          {% for c in opciones_categoria %}
+          <div class="form-check opcion-lista opcion-hija" data-padres="{{ c.padres|join('␟') }}">
+            <input class="form-check-input chk-categoria" type="checkbox" name="categoria" value="{{ c.valor }}"
+                   id="cat{{ loop.index }}" {% if c.valor in categorias_sel %}checked{% endif %}>
+            <label class="form-check-label small" for="cat{{ loop.index }}">{{ c.valor }}</label>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="col-auto">
+      <label class="form-label small text-muted mb-1">Subcategoría</label>
+      <div class="dropdown">
+        <button class="btn btn-outline-secondary dropdown-toggle text-start" type="button"
+                id="btnSubcategoria" data-bs-toggle="dropdown" data-bs-auto-close="outside"
+                style="min-width: 16rem;">
+          {% if subcategorias_sel %}{{ subcategorias_sel|length }} subcategoría(s){% else %}Todas las subcategorías{% endif %}
+        </button>
+        <div class="dropdown-menu p-2" style="min-width: 22rem; max-height: 20rem; overflow: auto;">
+          <input type="search" class="form-control form-control-sm mb-2 filtro-lista" placeholder="Buscar subcategoría...">
+          <div class="d-flex gap-2 mb-2 small">
+            <a href="#" class="marcar-todos">Todos</a><span class="text-muted">·</span>
+            <a href="#" class="marcar-ninguno">Ninguno</a>
+          </div>
+          <div class="small text-muted sin-opciones d-none">Ninguna subcategoría de las categorías marcadas.</div>
+          {% for sc in opciones_subcategoria %}
+          <div class="form-check opcion-lista opcion-nieta" data-padres="{{ sc.padres|join('␟') }}">
+            <input class="form-check-input chk-subcategoria" type="checkbox" name="subcategoria" value="{{ sc.valor }}"
+                   id="sub{{ loop.index }}" {% if sc.valor in subcategorias_sel %}checked{% endif %}>
+            <label class="form-check-label small" for="sub{{ loop.index }}">{{ sc.valor }}</label>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="col-auto">
+      <button class="btn btn-brand" id="btnFiltrarVentas"><i class="bi bi-funnel"></i> Filtrar</button>
+    </div>
+    {% if lineas_sel or categorias_sel or subcategorias_sel or vendedor_sel or q %}
+    <div class="col-auto">
+      <a href="{{ url_for('ventas_list', fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}"
+         class="btn btn-outline-secondary">Quitar filtros</a>
+    </div>
+    {% endif %}
+    <div class="col-12">
+      <div class="form-text">
+        Los tres se pueden combinar y aceptan varios a la vez. Vacío = todos. Al marcar líneas, el
+        panel de categorías muestra solo las suyas; igual la subcategoría con la categoría.
+      </div>
+    </div>
   </div>
-  {# Ronda CW (2026-11-05, punto 3 del pedido del usuario): multifiltro
-     indirecto -- al elegir una Línea se habilitan solo sus Categorías, y al
-     elegir una Categoría solo sus Subcategorías. El árbol viene armado del
-     servidor (ver _arbol_linea_categoria) y el JS de abajo lo recorre. #}
-  <div class="col-auto">
-    <select class="form-select" name="linea" id="filtroLinea">
-      <option value="">Todas las líneas</option>
-      {% for l in arbol_lineas %}
-      <option value="{{ l }}" {% if linea_sel == l %}selected{% endif %}>{{ l }}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="col-auto">
-    <select class="form-select" name="categoria" id="filtroCategoria" {% if not linea_sel %}disabled{% endif %}>
-      <option value="">Todas las categorías</option>
-      {% for c in arbol_categorias.get(linea_sel, []) %}
-      <option value="{{ c }}" {% if categoria_sel == c %}selected{% endif %}>{{ c }}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="col-auto">
-    <select class="form-select" name="subcategoria" id="filtroSubcategoria" {% if not categoria_sel %}disabled{% endif %}>
-      <option value="">Todas las subcategorías</option>
-      {% for sc in arbol_subcategorias.get(linea_sel ~ '|' ~ categoria_sel, []) %}
-      <option value="{{ sc }}" {% if subcategoria_sel == sc %}selected{% endif %}>{{ sc }}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="col-auto"><button class="btn btn-outline-secondary">Filtrar</button></div>
-  {% if linea_sel or categoria_sel or subcategoria_sel or vendedor_sel or q %}
-  <div class="col-auto">
-    <a href="{{ url_for('ventas_list', fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}"
-       class="btn btn-outline-secondary">Quitar filtros</a>
-  </div>
-  {% endif %}
 </form>
 
 <div class="row g-3 mb-3">
@@ -152,7 +231,11 @@
       <thead>
         <tr>
           <th>Cliente</th><th>Vendedor</th>
-          <th class="text-end">Cant. productos</th>
+          {# Ronda CZ (2026-11-06, punto 3 del pedido del usuario): antes contaba
+             cuántos códigos distintos se le vendieron; lo que se necesita es la
+             suma de UNIDADES vendidas (netas, con las notas de crédito ya
+             restadas). El conteo de códigos queda como dato secundario. #}
+          <th class="text-end">Unidades vendidas</th>
           <th class="text-end">Venta neta</th>
           <th class="text-end">Costo neto</th>
           <th class="text-end">Margen neto</th>
@@ -164,11 +247,19 @@
         {% for c in resumen_clientes %}
         <tr class="pareto-{{ c.pareto }}">
           <td>
-            <a href="{{ url_for('ventas_cliente_detalle', clave=c.clave, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, vendedor=vendedor_sel) }}"
+            {# Ronda CZ (punto 5): los filtros de línea/categoría/subcategoría viajan
+               al detalle del cliente, para seguir mirando lo mismo adentro. #}
+            <a href="{{ url_for('ventas_cliente_detalle', clave=c.clave, fecha_desde=fecha_desde,
+                                fecha_hasta=fecha_hasta, vendedor=vendedor_sel,
+                                linea=lineas_sel, categoria=categorias_sel,
+                                subcategoria=subcategorias_sel) }}"
                title="{{ c.rut }}">{{ c.nombre }}</a>
           </td>
           <td class="small text-muted">{{ c.vendedor or '-' }}</td>
-          <td class="text-end">{{ c.productos }}</td>
+          <td class="text-end" title="{{ c.productos }} código(s) de producto distinto(s)">
+            {{ "%g"|format(c.unidades) }}
+            <span class="text-muted small">({{ c.productos }} cód.)</span>
+          </td>
           <td class="text-end">${{ c.venta|moneda }}</td>
           <td class="text-end">${{ c.costo|moneda }}</td>
           <td class="text-end fw-semibold {% if c.margen < 0 %}text-danger{% endif %}">${{ c.margen|moneda }}</td>
@@ -315,40 +406,106 @@
 
 {% block scripts %}
 <script>
-// Ronda CW (2026-11-05, punto 3): multifiltro indirecto Línea -> Categoría ->
-// Subcategoría. El árbol lo arma el servidor con los datos del corte actual
-// (ver _arbol_linea_categoria), así que las opciones que se ofrecen siempre
-// existen de verdad en lo que se está mirando.
+// Ronda CZ (2026-11-06, punto 2): multifiltro Línea / Categoría /
+// Subcategoría con SELECCIÓN MÚLTIPLE. Cada panel trae sus casillas, un
+// buscador y los atajos Todos/Ninguno. La cascada se resuelve en el
+// navegador: cada categoría sabe de qué líneas cuelga (data-padres) y cada
+// subcategoría de qué pares línea|categoría, así que marcar líneas deja
+// visibles solo las categorías que corresponden, sin recargar la página.
 (function () {
-  var CATEGORIAS = {{ arbol_categorias | tojson }};
-  var SUBCATEGORIAS = {{ arbol_subcategorias | tojson }};
-  var selLinea = document.getElementById('filtroLinea');
-  var selCategoria = document.getElementById('filtroCategoria');
-  var selSub = document.getElementById('filtroSubcategoria');
-  if (!selLinea || !selCategoria || !selSub) return;
+  var SEP = '\u241f';   // separador de los data-padres (no aparece en los datos)
 
-  function llenar(select, opciones, textoVacio) {
-    select.innerHTML = '';
-    var vacio = document.createElement('option');
-    vacio.value = ''; vacio.textContent = textoVacio;
-    select.appendChild(vacio);
-    (opciones || []).forEach(function (o) {
-      var op = document.createElement('option');
-      op.value = o; op.textContent = o;
-      select.appendChild(op);
-    });
-    select.disabled = !(opciones || []).length;
+  function marcadas(selector) {
+    return Array.prototype.map.call(
+      document.querySelectorAll(selector + ':checked'), function (c) { return c.value; });
   }
 
-  selLinea.addEventListener('change', function () {
-    llenar(selCategoria, CATEGORIAS[selLinea.value], 'Todas las categorías');
-    llenar(selSub, [], 'Todas las subcategorías');
-    selSub.disabled = true;
+  function etiqueta(boton, cantidad, singular, plural, todos) {
+    boton.textContent = cantidad ? (cantidad + ' ' + (cantidad === 1 ? singular : plural)) : todos;
+  }
+
+  // Muestra solo las opciones que cuelgan de algún padre marcado. Sin
+  // padres marcados se muestran todas -- "todos" es el estado por defecto.
+  function filtrarPorPadres(contenedorSel, padresMarcados) {
+    var panel = document.querySelector(contenedorSel);
+    if (!panel) return;
+    var visibles = 0;
+    panel.querySelectorAll('.opcion-lista[data-padres]').forEach(function (op) {
+      var padres = (op.dataset.padres || '').split(SEP);
+      var visible = !padresMarcados.length || padres.some(function (p) {
+        return padresMarcados.indexOf(p) !== -1;
+      });
+      op.classList.toggle('oculta-por-padre', !visible);
+      op.classList.toggle('d-none', !visible);
+      if (!visible) {
+        var chk = op.querySelector('input[type=checkbox]');
+        if (chk) chk.checked = false;   // no dejar marcado algo que ya no aplica
+      } else {
+        visibles += 1;
+      }
+    });
+    var aviso = panel.querySelector('.sin-opciones');
+    if (aviso) aviso.classList.toggle('d-none', visibles > 0);
+  }
+
+  function refrescar() {
+    var lineas = marcadas('.chk-linea');
+    var categorias = marcadas('.chk-categoria');
+    filtrarPorPadres('#btnCategoria + .dropdown-menu', lineas);
+    // Las subcategorías cuelgan del par "línea|categoría". Si no hay
+    // categorías marcadas se usan todas las de las líneas marcadas.
+    var pares = [];
+    document.querySelectorAll('.chk-categoria').forEach(function (chk) {
+      var op = chk.closest('.opcion-lista');
+      if (op.classList.contains('oculta-por-padre')) return;
+      if (categorias.length && !chk.checked) return;
+      (op.dataset.padres || '').split(SEP).forEach(function (linea) {
+        if (!lineas.length || lineas.indexOf(linea) !== -1) pares.push(linea + '|' + chk.value);
+      });
+    });
+    filtrarPorPadres('#btnSubcategoria + .dropdown-menu', pares);
+
+    etiqueta(document.getElementById('btnLinea'), marcadas('.chk-linea').length,
+             'línea', 'líneas', 'Todas las líneas');
+    etiqueta(document.getElementById('btnCategoria'), marcadas('.chk-categoria').length,
+             'categoría', 'categorías', 'Todas las categorías');
+    etiqueta(document.getElementById('btnSubcategoria'), marcadas('.chk-subcategoria').length,
+             'subcategoría', 'subcategorías', 'Todas las subcategorías');
+  }
+
+  document.querySelectorAll('.chk-linea, .chk-categoria, .chk-subcategoria')
+    .forEach(function (chk) { chk.addEventListener('change', refrescar); });
+
+  // Buscador dentro de cada panel (mismo patrón que el Reporte Operacional).
+  document.querySelectorAll('#filtrosVentas .filtro-lista').forEach(function (input) {
+    input.addEventListener('input', function () {
+      var texto = input.value.trim().toLowerCase();
+      input.closest('.dropdown-menu').querySelectorAll('.opcion-lista').forEach(function (op) {
+        if (op.classList.contains('oculta-por-padre')) return;
+        var t = (op.textContent || '').toLowerCase();
+        op.classList.toggle('d-none', texto !== '' && t.indexOf(texto) === -1);
+      });
+    });
+    input.addEventListener('click', function (e) { e.stopPropagation(); });
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') e.preventDefault(); });
   });
-  selCategoria.addEventListener('change', function () {
-    llenar(selSub, SUBCATEGORIAS[selLinea.value + '|' + selCategoria.value],
-           'Todas las subcategorías');
-  });
+
+  // Atajos Todos / Ninguno -- solo sobre lo que está visible en ese panel.
+  document.querySelectorAll('#filtrosVentas .marcar-todos, #filtrosVentas .marcar-ninguno')
+    .forEach(function (enlace) {
+      enlace.addEventListener('click', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        var marcar = enlace.classList.contains('marcar-todos');
+        enlace.closest('.dropdown-menu').querySelectorAll('.opcion-lista').forEach(function (op) {
+          if (op.classList.contains('d-none')) return;
+          var chk = op.querySelector('input[type=checkbox]');
+          if (chk) chk.checked = marcar;
+        });
+        refrescar();
+      });
+    });
+
+  refrescar();
 })();
 </script>
 {% endblock %}
