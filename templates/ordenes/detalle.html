@@ -1,4 +1,24 @@
 {% extends "base.html" %}
+
+{# Ronda DA (2026-11-07, a pedido del usuario): encabezados con flecha para
+   ordenar las líneas de la orden. El orden que se elija acá es el que sale
+   IMPRESO -- los botones "Imprimir / PDF" y "Descargar PDF" se llevan el
+   mismo sort/dir, que es para lo que se pidieron ("poder imprimirla según el
+   orden que se le establezca"). Por eso el orden lo resuelve el servidor y no
+   un JavaScript que solo movería la tabla en pantalla. #}
+{% macro th_linea(col, etiqueta, clase='') %}
+{% set es_actual = (sort_sel == col) %}
+{% set prox_dir = 'desc' if (es_actual and dir_sel == 'asc') else 'asc' %}
+<th class="{{ clase }}">
+  <a href="{{ url_for('ordenes_detalle', orden_id=orden.id, sort=col, dir=prox_dir) }}"
+     class="text-decoration-none {{ 'text-dark fw-semibold' if es_actual else 'text-muted' }}"
+     title="Ordenar por {{ etiqueta }} -- el PDF y la impresión salen en este mismo orden">
+    {{ etiqueta }}
+    {% if es_actual %}<i class="bi bi-arrow-{{ 'up' if dir_sel == 'asc' else 'down' }}"></i>
+    {% else %}<i class="bi bi-arrow-down-up small"></i>{% endif %}
+  </a>
+</th>
+{% endmacro %}
 {% block title %}{{ orden.numero_po }} · Suite Logística{% endblock %}
 {% block content %}
 
@@ -107,7 +127,7 @@
   </div>
   <div class="d-flex gap-2">
     {% if puede_crear or puede_aprobar %}
-    <a href="{{ url_for('ordenes_imprimir', orden_id=orden.id) }}" target="_blank" class="btn btn-outline-secondary"><i class="bi bi-printer"></i> Imprimir / PDF</a>
+    <a href="{{ url_for('ordenes_imprimir', orden_id=orden.id, sort=sort_sel, dir=dir_sel) }}" target="_blank" class="btn btn-outline-secondary"><i class="bi bi-printer"></i> Imprimir / PDF</a>
     {% endif %}
     {% if puede_crear %}
     <div class="btn-group">
@@ -116,13 +136,13 @@
       </button>
       <ul class="dropdown-menu dropdown-menu-end">
         <li>
-          <form method="post" action="{{ url_for('ordenes_enviar_outlook', orden_id=orden.id) }}">
+          <form method="post" action="{{ url_for('ordenes_enviar_outlook', orden_id=orden.id, sort=sort_sel, dir=dir_sel) }}">
             <button type="submit" class="dropdown-item">
               <i class="bi bi-microsoft me-1"></i> Enviar por Outlook (PDF adjunto)
             </button>
           </form>
         </li>
-        <li><a class="dropdown-item" href="{{ url_for('ordenes_pdf', orden_id=orden.id) }}"><i class="bi bi-file-earmark-pdf me-1"></i> Descargar PDF</a></li>
+        <li><a class="dropdown-item" href="{{ url_for('ordenes_pdf', orden_id=orden.id, sort=sort_sel, dir=dir_sel) }}"><i class="bi bi-file-earmark-pdf me-1"></i> Descargar PDF</a></li>
         <li><a class="dropdown-item" href="{{ url_for('ordenes_mailto', orden_id=orden.id) }}"><i class="bi bi-envelope me-1"></i> Enviar por correo (sin adjuntar PDF)</a></li>
       </ul>
     </div>
@@ -478,13 +498,13 @@
       <thead>
         <tr>
           <th style="width:30px;"></th>
-          <th>Código</th>
-          <th>Descripción</th>
-          <th class="text-end">Cant. cajas</th>
-          <th class="text-end">Precio/caja</th>
-          <th class="text-end">Subtotal</th>
-          <th>Fecha est. despacho</th>
-          <th>Etapa</th>
+          {{ th_linea('codigo', 'Código') }}
+          {{ th_linea('descripcion', 'Descripción') }}
+          {{ th_linea('cantidad', 'Cant. cajas', 'text-end') }}
+          {{ th_linea('precio', 'Precio/caja', 'text-end') }}
+          {{ th_linea('subtotal', 'Subtotal', 'text-end') }}
+          {{ th_linea('fecha', 'Fecha est. despacho') }}
+          {{ th_linea('etapa', 'Etapa') }}
           <th></th>
         </tr>
       </thead>

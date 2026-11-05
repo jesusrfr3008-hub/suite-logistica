@@ -156,7 +156,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "CZ"
+VERSION_SUITE = "DA"
 VERSION_SUITE_FECHA = "2026-11-06"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -7585,6 +7585,47 @@ def api_producto_variantes(producto_id):
     return jsonify(resultado)
 
 
+# Ronda DA (2026-11-07, a pedido del usuario): columnas ordenables en las
+# "Lineas de la orden". El orden que se elija en pantalla es el que sale
+# IMPRESO -- por eso no se resuelve con JavaScript en la tabla, sino con un
+# parametro que viaja tambien al PDF y a la vista de impresion ("esto para
+# poder imprimirla segun el orden que se le establezca").
+ORDENES_LINEAS_SORT = {
+    "codigo": lambda l: _normalizar_nombre(l.codigo_mostrar),
+    "descripcion": lambda l: _normalizar_nombre(l.descripcion_mostrar),
+    "cantidad": lambda l: l.cantidad_cajas or 0,
+    "precio": lambda l: l.precio_unitario_pactado or 0,
+    "subtotal": lambda l: l.subtotal or 0,
+    # Las lineas sin fecha van al final en orden ascendente (y al principio
+    # en descendente), que es lo util: lo que todavia no tiene fecha no
+    # deberia colarse entre las que si la tienen.
+    "fecha": lambda l: (l.fecha_estimada_despacho is None,
+                        l.fecha_estimada_despacho or date.min),
+    "etapa": lambda l: (ETAPAS_LINEA.index(l.etapa) if l.etapa in ETAPAS_LINEA else 99),
+}
+
+
+def _orden_lineas_de_request():
+    """(sort, dir) validados, tal como vienen en la URL. Vacio = el orden
+    natural de la orden (como se fueron agregando los productos)."""
+    sort = (request.args.get("sort") or "").strip()
+    direccion = (request.args.get("dir") or "asc").strip()
+    if sort not in ORDENES_LINEAS_SORT:
+        sort = ""
+    if direccion not in ("asc", "desc"):
+        direccion = "asc"
+    return sort, direccion
+
+
+def _ordenar_lineas_orden(lineas, sort, direccion="asc"):
+    """Ordena las lineas de una OC por la columna elegida. Sin columna, se
+    devuelven tal como estan (orden de carga). El orden es ESTABLE, asi que
+    dos lineas que empatan mantienen su orden original."""
+    if not sort or sort not in ORDENES_LINEAS_SORT:
+        return list(lineas)
+    return sorted(lineas, key=ORDENES_LINEAS_SORT[sort], reverse=(direccion == "desc"))
+
+
 @app.route("/ordenes/<int:orden_id>")
 @requiere_permiso("crear_orden", "aprobar_orden", "actualizar_despacho")
 def ordenes_detalle(orden_id):
@@ -7599,7 +7640,10 @@ def ordenes_detalle(orden_id):
     # anular, etc.) siguen exclusivas de crear_orden/aprobar_orden -- el
     # template ya las gatea por separado con puede_crear/puede_aprobar.
     orden = OrdenCompra.query.get_or_404(orden_id)
-    lineas = orden.lineas.all()
+    # Ronda DA (2026-11-07): orden de las lineas elegido por el usuario en los
+    # encabezados -- el mismo que se lleva el PDF/impresion.
+    sort_sel, dir_sel = _orden_lineas_de_request()
+    lineas = _ordenar_lineas_orden(orden.lineas.all(), sort_sel, dir_sel)
     documentos = orden.documentos.all()
     # Ronda BI (2026-10-08): historial de "Enviar al proveedor" -- ver
     # OrdenCorreoEnviado en models.py para la nota sobre qué confirma esto.
@@ -7642,6 +7686,7 @@ def ordenes_detalle(orden_id):
         otras_partes=otras_partes,
         empresas=empresas,
         correos_enviados=correos_enviados,
+        sort_sel=sort_sel, dir_sel=dir_sel,
     )
 
 
@@ -8581,7 +8626,8 @@ def ordenes_imprimir(orden_id):
     if not _puede_gestionar_orden_simple(orden):
         flash("Solo puedes imprimir/descargar las órdenes que tú mismo creaste.", "danger")
         return redirect(url_for("ordenes_simple_list"))
-    lineas = orden.lineas.all()
+    sort_sel, dir_sel = _orden_lineas_de_request()
+    lineas = _ordenar_lineas_orden(orden.lineas.all(), sort_sel, dir_sel)
     return render_template("ordenes/imprimir.html", orden=orden, lineas=lineas)
 
 
@@ -8657,7 +8703,7 @@ def construir_correo_oc(orden):
     return asunto, cuerpo
 
 
-def generar_pdf_orden(orden):
+def generar_pdf_orden(orden, sort="", direccion="asc"):
     """Genera el PDF de una Orden de Compra como ARCHIVO en disco (ronda L,
     punto 1, 2026-09-09: hace falta un archivo real para poder adjuntarlo a
     un correo de Outlook). Usa la libreria xhtml2pdf (HTML/CSS -> PDF, pura
@@ -8678,7 +8724,9 @@ def generar_pdf_orden(orden):
             "'py -m pip install -r requirements.txt' y reintentar)."
         ) from exc
 
-    lineas = orden.lineas.all()
+    # Ronda DA (2026-11-07): el PDF sale en el MISMO orden que se dejo en la
+    # pantalla -- es justamente para lo que el usuario pidio las flechas.
+    lineas = _ordenar_lineas_orden(orden.lineas.all(), sort, direccion)
     logo_abs_path = None
     if orden.empresa and orden.empresa.logo_nombre_archivo:
         candidato = os.path.join(EMPRESAS_LOGOS_DIR, orden.empresa.logo_nombre_archivo)
@@ -8722,7 +8770,7 @@ def ordenes_pdf(orden_id):
         flash("La orden no tiene productos todavía, no se puede generar el PDF.", "warning")
         return redirect(_destino_detalle_orden(orden))
     try:
-        ruta_pdf = generar_pdf_orden(orden)
+        ruta_pdf = generar_pdf_orden(orden, *_orden_lineas_de_request())
     except Exception as exc:
         flash(f"No se pudo generar el PDF de la orden: {exc}", "danger")
         return redirect(_destino_detalle_orden(orden))
@@ -8758,7 +8806,9 @@ def ordenes_enviar_outlook(orden_id):
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
 
     try:
-        ruta_pdf = generar_pdf_orden(orden)
+        # Ronda DA: el PDF que se le manda al proveedor sale en el mismo orden
+        # que el usuario dejo en la pantalla, igual que la descarga directa.
+        ruta_pdf = generar_pdf_orden(orden, *_orden_lineas_de_request())
     except Exception as exc:
         flash(f"No se pudo generar el PDF de la orden: {exc}", "danger")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
