@@ -156,8 +156,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DA"
-VERSION_SUITE_FECHA = "2026-11-06"
+VERSION_SUITE = "DB"
+VERSION_SUITE_FECHA = "2026-11-07"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -3356,6 +3356,108 @@ ALIAS_INTERNOS_CONOCIDOS = [
 ]
 
 
+def _canonicos_vendedores():
+    """Ronda DB (2026-11-07, a pedido del usuario -- "al cambiar los filtros
+    cuando busco filtrar por vendedor salen duplicados"): {nombre
+    normalizado: grafia UNICA que se muestra}.
+
+    El reporte de Ergopyme trae los vendedores en MAYUSCULAS ("DANILO
+    CAMPOS") y las cuentas de usuario del programa los tienen escritos como
+    personas ("Danilo Campos"). Como el maestro se fue sembrando de las dos
+    fuentes, el desplegable terminaba mostrando el mismo vendedor dos
+    veces. Los filtros igual funcionaban (comparan sin tildes ni
+    mayusculas, ver _ruts_del_vendedor), pero elegir entre dos lineas
+    identicas es desconcertante.
+
+    Que grafia manda, en orden:
+      1. La del USUARIO del programa, si ese vendedor tiene cuenta. Es la
+         lista que el usuario curo a mano (rondas CI/CJ) y la que ve el
+         Forecast, asi que es la autoridad.
+      2. Si no tiene cuenta, la que NO esta toda en mayusculas (se lee
+         mejor); a igualdad, la mas frecuente en el maestro.
+    """
+    canonicos = {}
+    for (nombre,) in db.session.query(Usuario.vendedor).distinct().all():
+        limpio = (nombre or "").strip()
+        if limpio:
+            canonicos.setdefault(_normalizar_nombre(limpio), limpio)
+
+    candidatos = defaultdict(Counter)
+    for tabla, columna in ((ClienteVendedor, ClienteVendedor.vendedor),
+                           (VentaLinea, VentaLinea.vendedor_archivo)):
+        for nombre, veces in (db.session.query(columna, db.func.count())
+                              .group_by(columna).all()):
+            limpio = (nombre or "").strip()
+            if limpio:
+                candidatos[_normalizar_nombre(limpio)][limpio] += veces or 1
+
+    for clave, grafias in candidatos.items():
+        if clave in canonicos:
+            continue
+        # Primero las que no son un grito en mayusculas; entre esas, la mas usada.
+        canonicos[clave] = max(
+            grafias.items(), key=lambda par: (par[0] != par[0].upper(), par[1]))[0]
+    return canonicos
+
+
+def _vendedor_canonico(nombre, canonicos=None):
+    """La grafia unica de un vendedor (ver _canonicos_vendedores). Si no se
+    conoce, se devuelve tal cual vino."""
+    limpio = (nombre or "").strip()
+    if not limpio:
+        return limpio
+    mapa = canonicos if canonicos is not None else _canonicos_vendedores()
+    return mapa.get(_normalizar_nombre(limpio), limpio)
+
+
+def _vendedores_para_filtro():
+    """La lista del desplegable "Vendedor": una sola entrada por persona.
+
+    Ronda DB: antes era un set de las grafias crudas del maestro, asi que
+    "DANILO CAMPOS" y "Danilo Campos" salian como dos opciones distintas."""
+    canonicos = _canonicos_vendedores()
+    vistos = {}
+    for (nombre,) in db.session.query(ClienteVendedor.vendedor).distinct().all():
+        limpio = (nombre or "").strip()
+        if not limpio:
+            continue
+        clave = _normalizar_nombre(limpio)
+        vistos.setdefault(clave, canonicos.get(clave, limpio))
+    return sorted(vistos.values(), key=_normalizar_nombre)
+
+
+def reparar_vendedores_duplicados_ronda_db():
+    """Ronda DB (2026-11-07): deja UNA sola grafia por vendedor en el
+    maestro cliente/vendedor y en las lineas de venta ya cargadas.
+
+    El usuario pidio dos cosas: corregir lo que ya esta duplicado, y que no
+    vuelva a pasar al subir el reporte. Esto es lo primero; lo segundo lo
+    resuelve _leer_filas_reporte_ventas, que homologa el vendedor de TODAS
+    las filas que lee (antes solo lo hacia para los clientes nuevos, asi
+    que un cliente ya existente seguia arrastrando la grafia vieja).
+
+    Es idempotente: solo toca las filas cuya grafia no es la canonica."""
+    canonicos = _canonicos_vendedores()
+    cambios = Counter()
+    for cliente in ClienteVendedor.query.all():
+        bueno = _vendedor_canonico(cliente.vendedor, canonicos)
+        if bueno and bueno != (cliente.vendedor or "").strip():
+            cambios[f"{(cliente.vendedor or '').strip()} -> {bueno}"] += 1
+            cliente.vendedor = bueno
+    lineas = 0
+    for linea in VentaLinea.query.filter(VentaLinea.vendedor_archivo.isnot(None)).all():
+        bueno = _vendedor_canonico(linea.vendedor_archivo, canonicos)
+        if bueno and bueno != (linea.vendedor_archivo or "").strip():
+            linea.vendedor_archivo = bueno
+            lineas += 1
+    if cambios or lineas:
+        db.session.commit()
+        print(f"[reparar_ronda_db] Vendedores homologados: {sum(cambios.values())} cuenta(s) del "
+              f"maestro y {lineas} linea(s) de venta. Unificados: "
+              f"{', '.join(sorted(cambios))}")
+    return sum(cambios.values()) + lineas
+
+
 def reparar_costos_ventas_ronda_cw():
     """Ronda CW (2026-11-05, punto 4 del pedido del usuario -- "¿por que
     estan saliendo en el reporte los costos en 0?").
@@ -4463,6 +4565,8 @@ with app.app_context():
     _paso_arranque_seguro("reparar_historial_forecast_ronda_cp", reparar_historial_forecast_ronda_cp)
     _paso_arranque_seguro("reparar_alias_codigos_internos_ronda_cq", reparar_alias_codigos_internos_ronda_cq)
     _paso_arranque_seguro("reparar_costos_ventas_ronda_cw", reparar_costos_ventas_ronda_cw)
+    _paso_arranque_seguro("reparar_vendedores_duplicados_ronda_db",
+                          reparar_vendedores_duplicados_ronda_db)
 
 
 # ---------------------------------------------------------------------------
@@ -13401,6 +13505,8 @@ def _leer_filas_reporte_ventas(ws):
         idx = columnas.get(_COLUMNAS_VENTAS[clave])
         return fila[idx] if idx is not None and idx < len(fila) else None
 
+    # Ronda DB: se resuelve UNA vez para todo el archivo (son ~9.000 filas).
+    canonicos = _canonicos_vendedores()
     leidas = []
     descartadas = []
     recortados = set()
@@ -13452,7 +13558,13 @@ def _leer_filas_reporte_ventas(ws):
             "tipo_cliente": str(col(fila, "tipo_cliente") or "").strip(),
             "rut_cliente": str(col(fila, "rut_cliente") or "").strip(),
             "nombre_cliente": str(col(fila, "nombre_cliente") or "").strip(),
-            "vendedor_archivo": str(col(fila, "vendedor_archivo") or "").strip(),
+            # Ronda DB (2026-11-07, a pedido del usuario -- "necesito que cada vez
+            # que se suba el reporte no vuelva a tener los nombres repetidos con
+            # formatos distintos"): el vendedor se homologa AL LEER, para TODAS
+            # las filas. La ronda CV solo lo hacia al dar de alta un cliente
+            # nuevo, asi que un cliente que ya existia seguia metiendo la grafia
+            # en mayusculas del archivo y el desplegable volvia a duplicarse.
+            "vendedor_archivo": _vendedor_canonico(col(fila, "vendedor_archivo"), canonicos),
             "cod_linea": str(col(fila, "cod_linea") or "").strip(),
             "descripcion_linea": str(col(fila, "descripcion_linea") or "").strip(),
             "codigo_interno": codigo,
@@ -14019,11 +14131,7 @@ def ventas_cliente_detalle(clave):
     productos, meses_columnas = _pivot_ventas_por_producto(lineas)
     venta = round(sum(l.valor_neto or 0 for l in lineas), 2)
     costo = round(sum(l.costo_total or 0 for l in lineas), 2)
-    vendedores = sorted({
-        (v[0] or "").strip()
-        for v in ClienteVendedor.query.with_entities(ClienteVendedor.vendedor).distinct().all()
-        if (v[0] or "").strip()
-    })
+    vendedores = _vendedores_para_filtro()
     return render_template(
         "ventas/cliente_detalle.html", cliente=cliente, productos=productos,
         meses_columnas=meses_columnas,
@@ -14107,11 +14215,7 @@ def ventas_list():
     ultima_carga = db.session.query(db.func.max(VentaLinea.cargado_en)).scalar()
     # Ronda CV (punto 3c): los vendedores salen del maestro vigente -- los
     # mismos que ve el Forecast -- no de lo que diga cada factura.
-    vendedores = sorted({
-        (v[0] or "").strip()
-        for v in ClienteVendedor.query.with_entities(ClienteVendedor.vendedor).distinct().all()
-        if (v[0] or "").strip()
-    })
+    vendedores = _vendedores_para_filtro()
     venta_total = sum(l.valor_neto or 0 for l in lineas)
     costo_total = sum(l.costo_total or 0 for l in lineas)
     return render_template(
