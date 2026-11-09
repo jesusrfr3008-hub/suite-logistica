@@ -33,8 +33,9 @@
 <h3 class="section-title mb-1">Consulta Costo Producto</h3>
 <p class="text-muted">
   Último costo ingresado de cada producto, combinando el histórico de compras con las importaciones costeadas en
-  este sistema. Puedes buscar por código, descripción <strong>o número de lote</strong>: si escribes un lote, se
-  trae el producto de ese lote.
+  este sistema. Puedes buscar por código, descripción <strong>o número de lote</strong>: si escribes un lote, la
+  fila trae la compra <strong>de ese lote</strong> (factura, fecha y costos), y al abrirla ves igual todo el
+  historial del producto, del costeo más reciente al más antiguo.
 </p>
 
 <form class="row g-2 mb-3">
@@ -83,7 +84,11 @@
           <th>Código</th>
           <th>Descripción</th>
           <th>Lote</th>
-          <th>Última factura</th>
+          {# Ronda DC (2026-11-09): buscando por lote, esta fila trae la compra
+             DE ESE lote, no la última del producto -- se dice en el título. #}
+          <th title="Buscando por lote, es la factura de ese lote; si no, la última compra del producto.">
+            Factura
+          </th>
           <th>Fecha</th>
           <th class="text-end">Unidades</th>
           <th class="text-end">Unitario FOB</th>
@@ -104,7 +109,8 @@
           <td>
             {{ g.codigo_producto }}
             {% if g.lotes_coincidentes %}
-            <span class="badge bg-info text-dark" title="Lote(s) que calzan con tu búsqueda: {{ g.lotes_coincidentes|join(', ') }}">
+            <span class="badge bg-info text-dark"
+                  title="Lote(s) que calzan con tu búsqueda: {{ g.lotes_coincidentes|join(', ') }}.{% if g.evento_lote %} Esta fila muestra la compra de ese lote; el historial de abajo trae todas.{% endif %}">
               lote {{ g.lotes_coincidentes[0] }}{% if g.lotes_coincidentes|length > 1 %} +{{ g.lotes_coincidentes|length - 1 }}{% endif %}
             </span>
             {% endif %}
@@ -113,7 +119,7 @@
           {# Ronda CA (2026-10-21, punto 1): una compra puede traer muchos
              lotes; se muestra el primero y el resto se abre en un modal. #}
           {% set lotes_ultimo = (g.ultimo.lote or '').split(', ') | select | list %}
-          <td title="Lote del último costeo">
+          <td title="{{ 'Lote que buscaste' if g.evento_lote else 'Lote del último costeo' }}">
             {% if lotes_ultimo %}{{ lotes_ultimo[0] }}{% else %}-{% endif %}
             {% if lotes_ultimo|length > 1 %}
             <button type="button" class="btn btn-sm btn-link btn-lotes p-0 ms-1"

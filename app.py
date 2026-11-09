@@ -156,8 +156,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DB"
-VERSION_SUITE_FECHA = "2026-11-07"
+VERSION_SUITE = "DC"
+VERSION_SUITE_FECHA = "2026-11-09"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -19021,7 +19021,14 @@ def _agrupar_costo_producto(filas, q=""):
                 grupo["coincide_texto"] = True
             if lote and q_lower in lote.lower():
                 grupo["coincide_texto"] = True
-                grupo["lotes_coincidentes"].add(lote)
+                # Ronda DC (2026-11-09): una compra puede traer VARIOS lotes
+                # en la misma celda ("1580, 1582"). Se guarda solo el/los que
+                # calzan, no la celda entera: asi el badge dice el lote que se
+                # busco y no la lista completa, y la fila puede emparejarse
+                # con su compra mas abajo.
+                partes = [parte.strip() for parte in lote.split(",") if parte.strip()]
+                coincidentes = [parte for parte in partes if q_lower in parte.lower()]
+                grupo["lotes_coincidentes"].update(coincidentes or partes or [lote])
         total_invoice = f.get("total_invoice") or 0
         grupo["eventos"].append({
             "fecha": f.get("fecha_factura"),
@@ -19052,9 +19059,31 @@ def _agrupar_costo_producto(filas, q=""):
         if not grupo["coincide_texto"]:
             continue
         grupo["eventos"].sort(key=lambda e: (e["fecha"] or date.min, e["factura"]), reverse=True)
-        grupo["ultimo"] = grupo["eventos"][0]
-        grupo["total_costeos"] = len(grupo["eventos"])
         grupo["lotes_coincidentes"] = sorted(grupo["lotes_coincidentes"])
+        # Ronda DC (2026-11-09, a pedido del usuario): si la busqueda fue por
+        # LOTE, la primera linea tiene que traer la factura, la fecha y los
+        # costos DE ESE LOTE, no los del ultimo costeo del producto. Antes
+        # mostraba siempre el mas reciente, asi que el badge azul decia un
+        # lote y la fila de al lado mostraba los numeros de otro -- parecia
+        # que ese lote hubiera costado lo que costo la ultima compra.
+        #
+        # El historial de abajo NO cambia: sigue completo y del mas reciente
+        # al mas antiguo, que es como el usuario lo queria.
+        grupo["evento_lote"] = None
+        if grupo["lotes_coincidentes"]:
+            coincidentes = {l.lower() for l in grupo["lotes_coincidentes"]}
+            # Una compra puede traer varios lotes en la misma linea ("1580,
+            # 1582"), por eso se parte antes de comparar. Entre varios que
+            # calcen, manda el mas reciente (los eventos ya vienen ordenados).
+            for evento in grupo["eventos"]:
+                lotes_evento = {parte.strip().lower()
+                                for parte in (evento["lote"] or "").split(",")
+                                if parte.strip()}
+                if lotes_evento & coincidentes:
+                    grupo["evento_lote"] = evento
+                    break
+        grupo["ultimo"] = grupo["evento_lote"] or grupo["eventos"][0]
+        grupo["total_costeos"] = len(grupo["eventos"])
         resultado.append(grupo)
     resultado.sort(key=lambda g: (g["ultimo"]["fecha"] or date.min), reverse=True)
     return resultado
