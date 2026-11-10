@@ -67,6 +67,17 @@
 
   {% if es_admin %}
   <div class="col-md-4">
+    <a href="{{ url_for('configuracion_reportes') }}" class="text-decoration-none">
+      <div class="card p-3 h-100">
+        <div class="fw-semibold"><i class="bi bi-sliders me-1"></i> Configuración de reportes</div>
+        <div class="text-muted small">Qué bodegas del sistema de Inventarios se consultan en Stock Bodegas.</div>
+      </div>
+    </a>
+  </div>
+  {% endif %}
+
+  {% if es_admin %}
+  <div class="col-md-4">
     <a href="{{ url_for('admin_reset') }}" class="text-decoration-none">
       <div class="card p-3 h-100 border-danger-subtle">
         <div class="fw-semibold text-danger"><i class="bi bi-exclamation-triangle me-1"></i> Reiniciar datos</div>

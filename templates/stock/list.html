@@ -19,6 +19,18 @@
     vertical-align: middle;
     font-size: 0.85rem;
   }
+  /* Ronda DD (2026-11-10, a pedido del usuario): producto en 0 en la
+     bodega central que SI tiene venta en los últimos 360 días. No lleva
+     badge ni columna extra (el usuario los rechazó expresamente); lo
+     único que lo distingue es la rotación resaltada, que es justo el dato
+     por el que hay que mirarlo. Fondo ámbar suave para que salte a la
+     vista sin competir con el rojo de "días de stock < 30". */
+  #tablaStock td.rotacion-sin-stock {
+    background-color: #fff3cd;
+    color: #8a5a00;
+    font-weight: 600;
+    border-radius: 3px;
+  }
   th.ordenable { cursor: pointer; user-select: none; }
   th.ordenable:hover { background-color: rgba(0,0,0,0.03); }
   .icono-orden { font-size: 0.7em; color: #adb5bd; margin-left: 2px; }
@@ -56,7 +68,14 @@
   <div>
     <h3 class="section-title mb-0">Consulta de Stock</h3>
     <div class="text-muted small">
-      Saldos de existencias del sistema de Inventarios (Accuvision y Accumedical juntas -- filtra por empresa o proveedor abajo).
+      Saldos de existencias de la <strong>bodega central</strong> -- lo que está disponible para vender
+      (Accuvision y Accumedical juntas -- filtra por empresa o proveedor abajo).
+      {# Ronda DD (2026-11-10): decirlo en pantalla importa -- hasta esta ronda
+         el reporte bajaba solo la central y "stock" no tenía ambigüedad; ahora
+         que el reporte trae todas las bodegas, hay que dejar claro que acá no
+         se suman demos, comodatos ni préstamos. #}
+      Un producto en 0 que tuvo venta en los últimos 360 días aparece igual, en 0 y con su rotación
+      resaltada, para que no se pierda de vista al reponer.
       {% if ultima_carga %}Última actualización de Stock: {{ ultima_carga | hora_cl }} (hora de Chile).{% else %}Todavía no se ha cargado ningún reporte de Stock.{% endif %}
       {% if ultima_carga_bodegas %}Última actualización de Stock Comprometido por Bodegas: {{ ultima_carga_bodegas | hora_cl }} (hora de Chile).{% elif ultima_carga_pedidos %}Última actualización de Notas de pedido: {{ ultima_carga_pedidos | hora_cl }} (hora de Chile).{% endif %}
     </div>
@@ -152,7 +171,13 @@
       </thead>
       <tbody>
         {% for g in grupos %}
-        <tr class="{% if not g.homologado %}text-muted{% endif %} {% if g.sin_stock_cargado %}table-warning{% endif %}">
+        {# Ronda DD (2026-11-10): el resaltado de la fila entera ya no sale de
+           "no tiene stock cargado" sino de `resaltar_fila`. Las filas nuevas
+           de esta ronda (en 0 en la central, con venta) NO se resaltan
+           enteras: el usuario pidió que lo único visible fuera la rotación
+           ("no agregues badge, solo resalta el valor de la rotación"), y una
+           fila amarilla completa además taparía ese resaltado. #}
+        <tr class="{% if not g.homologado %}text-muted{% endif %} {% if g.resaltar_fila %}table-warning{% endif %}">
           {# Ronda CF (2026-10-27): con "Todas las empresas" la fila viene
              consolidada y el desglose por empresa va en el tooltip. #}
           <td data-col="empresa" data-value="{{ (g.empresa.nombre if g.empresa else 'todas')|lower }}">
@@ -165,7 +190,11 @@
             {% else %}<span class="text-muted">-</span>{% endif %}
           </td>
           <td data-col="proveedor" data-value="{{ (g.proveedor_nombre or '')|lower }}">
-            {% if g.sin_stock_cargado and not g.proveedor_nombre %}
+            {# Ronda DD: esta etiqueta es solo para el caso de la ronda AA
+               (unidades comprometidas sin stock cargado) -- se condiciona a
+               que de verdad haya un pedido, porque ahora también llegan acá
+               filas que están en 0 por rotación y no por un pedido. #}
+            {% if g.sin_stock_cargado and g.pedido and not g.proveedor_nombre %}
             <span data-bs-toggle="tooltip" title="Este código tiene unidades pendientes en Notas de pedido, pero nunca apareció en el último reporte de Stock cargado, y tampoco está en el mapeo de códigos Ergopyme.">(pedido sin stock cargado)</span>
             {% else %}
             {{ g.proveedor_nombre or '(sin homologar)' }}
@@ -185,9 +214,23 @@
           <td class="text-end" data-col="pedido" data-value="{{ g.pedido }}">{{ g.pedido }}</td>
           <td class="text-end fw-semibold" data-col="stock_total" data-value="{{ g.stock_total_proyectado }}">{{ g.stock_total_proyectado }}</td>
           {% if hay_ventas %}
-          <td class="text-end" data-col="venta_90" data-value="{{ g.venta_90 or 0 }}">{{ g.venta_90 if g.venta_90 is not none else '-' }}</td>
-          <td class="text-end" data-col="venta_180" data-value="{{ g.venta_180 or 0 }}">{{ g.venta_180 if g.venta_180 is not none else '-' }}</td>
-          <td class="text-end" data-col="venta_360" data-value="{{ g.venta_360 or 0 }}">{{ g.venta_360 if g.venta_360 is not none else '-' }}</td>
+          {# Ronda DD (2026-11-10, a pedido del usuario): cuando el producto
+             está en 0 físico pero SÍ se vende, se resalta el valor de la
+             rotación -- es el dato que hay que mirar y la señal de que hay
+             que reponerlo. Pedido textual: "no agregues badge, solo
+             resalta el valor de la rotación para que sea visible". #}
+          {# Se resalta solo la celda que TIENE un valor: un "-" resaltado
+             no dice nada (un producto puede tener venta a 360 días y
+             ninguna a 90, que es justo el caso de un producto que se
+             agotó hace meses). #}
+          <td class="text-end {% if g.rotacion_resaltada and g.venta_90 %}rotacion-sin-stock{% endif %}"
+              data-col="venta_90" data-value="{{ g.venta_90 or 0 }}"
+              {% if g.rotacion_resaltada and g.venta_90 %}data-bs-toggle="tooltip" title="Sin stock en la bodega central, pero con venta en los últimos 90 días -- es de los primeros que conviene incluir en la próxima OC."{% endif %}>{{ g.venta_90 if g.venta_90 is not none else '-' }}</td>
+          <td class="text-end {% if g.rotacion_resaltada and g.venta_180 %}rotacion-sin-stock{% endif %}"
+              data-col="venta_180" data-value="{{ g.venta_180 or 0 }}">{{ g.venta_180 if g.venta_180 is not none else '-' }}</td>
+          <td class="text-end {% if g.rotacion_resaltada and g.venta_360 %}rotacion-sin-stock{% endif %}"
+              data-col="venta_360" data-value="{{ g.venta_360 or 0 }}"
+              {% if g.rotacion_resaltada and g.venta_360 %}data-bs-toggle="tooltip" title="Sin stock en la bodega central, pero con venta en los últimos 360 días."{% endif %}>{{ g.venta_360 if g.venta_360 is not none else '-' }}</td>
           <td class="text-end {% if g.dias_stock is not none and g.dias_stock < 30 %}text-danger fw-semibold{% endif %}"
               data-col="dias_stock" data-value="{{ g.dias_stock if g.dias_stock is not none else -1 }}">
             {% if g.dias_stock is not none %}{{ g.dias_stock }}{% else %}

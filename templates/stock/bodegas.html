@@ -1,0 +1,176 @@
+{% extends "base.html" %}
+{% block title %}Stock Bodegas · Suite Logística{% endblock %}
+{% block content %}
+
+<style>
+  /* Mismo tratamiento que Consulta de Stock: nada se envuelve y la tabla
+     tiene su propio scroll horizontal siempre visible (ronda AH/AI). */
+  #tablaBodegas th, #tablaBodegas td {
+    white-space: nowrap;
+    vertical-align: middle;
+    font-size: 0.85rem;
+  }
+  #tablaBodegas td[data-col="descripcion"] {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tabla-bodegas-scroll {
+    max-height: 70vh;
+    overflow: auto;
+  }
+  .tabla-bodegas-scroll thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #fff;
+    box-shadow: inset 0 -1px 0 #dee2e6;
+  }
+</style>
+
+<div class="d-flex justify-content-between align-items-start mb-1">
+  <div>
+    <h3 class="section-title mb-0">Stock Bodegas</h3>
+    <div class="text-muted small">
+      Existencias en las bodegas de control -- préstamo y apoyo clínico, demos, comodato, clientes, etc. --
+      con el costo del lote. La bodega central se consulta en
+      <a href="{{ url_for('stock_list') }}">Consulta de Stock</a>.
+      {% if ultima_carga_bodegas %}Última actualización del reporte de bodegas: {{ ultima_carga_bodegas | hora_cl }} (hora de Chile).{% endif %}
+    </div>
+  </div>
+  {% if current_user.rol and current_user.rol.es_administrador %}
+  <a href="{{ url_for('configuracion_reportes') }}" class="btn btn-sm btn-outline-secondary">
+    <i class="bi bi-gear"></i> Qué bodegas se consultan
+  </a>
+  {% endif %}
+</div>
+
+{% if not hay_bodegas_habilitadas %}
+<div class="alert alert-warning mt-3">
+  Todavía no hay ninguna bodega habilitada para consultar. Se habilitan en
+  <strong>Configuración &gt; Configuración de reportes</strong> -- las bodegas aparecen solas ahí a medida
+  que los reportes las traen, y nacen apagadas a propósito para que nadie vea una bodega que no se revisó.
+</div>
+{% else %}
+
+{% if resumen_bodegas %}
+<div class="d-flex flex-wrap gap-2 mb-3">
+  {% for r in resumen_bodegas %}
+  <a href="{{ url_for('stock_bodegas_list', bodega=r.codigo, empresa_id=empresa_sel, q=q) }}"
+     class="text-decoration-none">
+    <div class="card px-3 py-2 {% if bodega_sel == r.codigo %}border-brand{% endif %}">
+      <div class="small text-muted">{{ r.codigo }} · {{ r.nombre }}</div>
+      <div class="fw-semibold">{{ r.unidades }} unidad(es)</div>
+      <div class="small text-muted">{{ r.codigos }} código(s)</div>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-auto">
+    <select class="form-select" name="bodega">
+      <option value="">Todas las bodegas habilitadas</option>
+      {% for b in bodegas %}
+      <option value="{{ b.codigo }}" {% if bodega_sel == b.codigo %}selected{% endif %}>
+        {{ b.codigo }} · {{ b.nombre }}
+      </option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <select class="form-select" name="empresa_id">
+      <option value="">Todas las empresas</option>
+      {% for e in empresas %}
+      <option value="{{ e.id }}" {% if empresa_sel|string == e.id|string %}selected{% endif %}>{{ e.nombre }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <input type="text" class="form-control" name="q" value="{{ q }}" placeholder="Buscar código o descripción...">
+  </div>
+  <div class="col-auto">
+    <button class="btn btn-outline-secondary" type="submit">Buscar</button>
+  </div>
+</form>
+
+<div class="card p-3">
+  <div class="text-muted small mb-2">
+    {{ filas|length }} fila(s).
+    {# El costo del lote sale de la MISMA fuente que el reporte Costo Producto
+       (histórico de compras + importaciones costeadas en el programa), así
+       que las dos pantallas no pueden discrepar. Regla que fijó el usuario:
+       si un lote tiene varios costos, se muestra el último. #}
+    El costo es el del <strong>último costeo de ese lote</strong>, tomado del mismo histórico que el reporte
+    <a href="{{ url_for('reportes_costo_producto') }}">Costo Producto</a>.
+  </div>
+  <div class="table-responsive tabla-bodegas-scroll">
+    <table class="table table-sm table-hover align-middle mb-0" id="tablaBodegas">
+      <thead>
+        <tr>
+          <th>Bodega</th>
+          <th>Empresa</th>
+          <th>Proveedor</th>
+          <th>Código</th>
+          <th>Descripción</th>
+          <th>Lote</th>
+          <th>Vencimiento</th>
+          <th class="text-end">Unidades</th>
+          <th>Fecha compra</th>
+          <th>Invoice</th>
+          <th class="text-end" data-bs-toggle="tooltip" title="Valor unitario de la invoice del proveedor (FOB), en la moneda de la operación.">FOB unit.</th>
+          <th class="text-end" data-bs-toggle="tooltip" title="Costo unitario ya costeado, en pesos chilenos.">Costo unit. CLP</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in filas %}
+        <tr>
+          <td><span class="badge bg-light text-dark border">{{ f.bodega_codigo }}</span> {{ f.bodega_nombre }}</td>
+          <td>{{ f.empresa.nombre if f.empresa else '--' }}</td>
+          <td>{{ f.proveedor_nombre or '--' }}</td>
+          <td>{{ f.codigo_proveedor or f.codigo_interno }}</td>
+          <td data-col="descripcion" title="{{ f.descripcion }}">{{ f.descripcion or '--' }}</td>
+          <td>
+            {% if f.lote %}{{ f.lote }}
+            {% else %}
+            {# Sin lote = la fila viene del reporte "Stock de productos en
+               bodegas", que trae el saldo por bodega pero no el detalle de
+               lotes. En cuanto el reporte de stock por lotes baje todas las
+               bodegas, estas filas se reemplazan solas por las de arriba
+               (que sí traen lote y por lo tanto costo). #}
+            <span class="text-muted small" data-bs-toggle="tooltip"
+                  title="Esta fila viene del reporte de saldos por bodega, que no trae el detalle de lotes -- por eso no se le puede enganchar el costo. Aparecerá con lote cuando el reporte de stock por lotes baje todas las bodegas.">
+              sin detalle de lote
+            </span>
+            {% endif %}
+          </td>
+          <td>{{ f.fecha_vencimiento.strftime('%d-%m-%Y') if f.fecha_vencimiento else '--' }}</td>
+          <td class="text-end fw-semibold">{{ f.unidades }}</td>
+          {% if f.costo %}
+          <td>{{ f.costo.fecha.strftime('%d-%m-%Y') if f.costo.fecha else '--' }}</td>
+          <td>
+            {% if f.costo.importacion_id %}
+            <a href="{{ url_for('importacion_detalle', importacion_id=f.costo.importacion_id) }}">{{ f.costo.factura or '--' }}</a>
+            {% else %}{{ f.costo.factura or '--' }}{% endif %}
+          </td>
+          <td class="text-end">{{ f.costo.valor_unitario|moneda }} {{ f.costo.moneda }}</td>
+          <td class="text-end">{{ f.costo.costo_unitario_clp|moneda }}</td>
+          {% else %}
+          <td colspan="4" class="text-muted small">
+            {% if f.lote %}Ese lote no está en el histórico de compras ni en un costeo del programa.
+            {% else %}--{% endif %}
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+        {% if not filas %}
+        <tr><td colspan="12" class="text-center text-muted py-4">No hay existencias que calcen con este filtro.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

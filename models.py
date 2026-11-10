@@ -31,6 +31,13 @@ PERMISOS_DISPONIBLES = [
     # "inventarios" de arriba (ese es para quien administra/genera el costeo
     # de importaciones); este es de solo consulta de saldos de existencias.
     ("consultar_stock", "Consulta de Stock (saldos de existencias)"),
+    # Ronda DD (2026-11-10, a pedido del usuario): "Stock Bodegas" -- las
+    # bodegas de control (prestamo y apoyo clinico, demos, comodato, etc.)
+    # con el costo de cada lote. Vive dentro del mismo menu de Consulta de
+    # Stock pero con permiso propio: ahi se ve que equipo tiene cada cliente
+    # y cuanto costo, informacion que no corresponde a todo el equipo
+    # comercial. Nace apagado para todos los roles.
+    ("stock_bodegas", "Stock Bodegas (bodegas de control + costo del lote)"),
     # Ronda AJ (2026-09-18): modulo de Pago Proveedores (facturas
     # pendientes/pagadas, plazos de credito, registro de pagos y NC) --
     # separado de "inventarios"/"reportes" porque es informacion financiera
@@ -75,6 +82,12 @@ class Rol(db.Model):
     # Ronda V (2026-09-12): consulta de saldos de Stock -- ver PERMISOS_
     # DISPONIBLES arriba.
     permiso_consultar_stock = db.Column(db.Boolean, default=False)
+    # Ronda DD (2026-11-10): "Stock Bodegas" -- la consulta de las bodegas de
+    # control (prestamo, demos, etc.) con el costo de cada lote. Permiso
+    # aparte del de Consulta de Stock, a pedido del usuario: ahi se ve quien
+    # tiene que devolver un equipo y cuanto costo, que no es informacion para
+    # todo el equipo comercial. Nace apagado para todos los roles.
+    permiso_stock_bodegas = db.Column(db.Boolean, default=False)
     # Ronda AJ (2026-09-18): ver PERMISOS_DISPONIBLES arriba.
     permiso_pagos_proveedores = db.Column(db.Boolean, default=False)
     # Ronda CH (2026-10-27): ver PERMISOS_DISPONIBLES arriba.
@@ -375,6 +388,23 @@ class StockExistencia(db.Model):
     codigo_lote = db.Column(db.String(80))
     fecha_vencimiento = db.Column(db.Date, nullable=True)
     stock_fisico = db.Column(db.Integer, default=0)
+    # Ronda DD (2026-11-10): bodega de la que viene la fila (columna "Cod.Bod"
+    # del reporte). El lector SIEMPRE tuvo esa columna delante -- la usaba para
+    # ubicar el encabezado -- pero nunca leia su valor: cargaba todo como si
+    # fuera la bodega central. Mientras la automatizacion bajo solo la central
+    # eso no se noto; en cuanto el reporte traiga TODAS las bodegas (que es lo
+    # que el usuario va a configurar), sumarlas todas inflaria el stock de la
+    # central en +49.562 unidades sobre 318 codigos, medido contra su propio
+    # archivo. Consulta de Stock filtra por BODEGA_CENTRAL.
+    #
+    # Nullable a proposito: las filas cargadas antes de esta ronda quedan en
+    # NULL y se tratan como central, asi nada cambia de valor al desplegar.
+    # Sin index a proposito: la tabla se recarga COMPLETA en cada carga
+    # (~3.500 filas) y la red de seguridad del esquema solo sabe agregar
+    # columnas, no indices -- un index declarado aca nunca existiria en la
+    # base ya desplegada, y mejor que el modelo diga la verdad.
+    bodega_codigo = db.Column(db.String(10))
+    bodega_nombre = db.Column(db.String(120))
     cargado_en = db.Column(db.DateTime, default=datetime.utcnow)
 
     empresa = db.relationship("Empresa")
@@ -743,6 +773,74 @@ class StockComprometidoBodega(db.Model):
 
     def __repr__(self):
         return f"<StockComprometidoBodega {self.codigo_interno} x{self.cantidad}>"
+
+
+class StockBodegaSaldo(db.Model):
+    """Ronda DD (2026-11-10): saldo por CODIGO y BODEGA, sacado de las 17
+    columnas de bodega del reporte "Stock de productos en bodegas".
+
+    Ese reporte ya se venia subiendo desde la ronda AR, pero de sus 17
+    columnas de bodega se guardaba UNA SOLA (la de "Comprometido", ver
+    StockComprometidoBodega) y el resto se descartaba. Las bodegas que el
+    usuario quiere controlar -- 13 (prestamo y apoyo clinico) y 15 (demos) --
+    ya estaban llegando al programa y se estaban tirando.
+
+    Sirve para dos cosas distintas:
+
+    1. Saber que un codigo esta en CERO en la bodega central. El reporte de
+       stock con lotes solo trae lo que tiene saldo, asi que un producto que
+       se agoto desaparece y se pierde de vista; este reporte si lo trae con
+       0. Es lo que permite mostrarlo igual en Consulta de Stock cuando tuvo
+       ventas (ver _codigos_en_cero_con_rotacion).
+    2. Alimentar la consulta "Stock Bodegas" cuando el reporte de stock por
+       lotes todavia no traiga las otras bodegas.
+
+    Se recarga POR EMPRESA, igual que StockComprometidoBodega: se borran las
+    filas de la empresa del archivo y se insertan las nuevas."""
+    __tablename__ = "stock_bodega_saldos"
+
+    id = db.Column(db.Integer, primary_key=True)
+    empresa_id = db.Column(db.Integer, db.ForeignKey("empresas.id"), nullable=False, index=True)
+    codigo_interno = db.Column(db.String(40), nullable=False, index=True)
+    descripcion = db.Column(db.String(300))
+    bodega_codigo = db.Column(db.String(10), nullable=False, index=True)
+    bodega_nombre = db.Column(db.String(120))
+    cantidad = db.Column(db.Integer, default=0)
+    cargado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    empresa = db.relationship("Empresa")
+
+    def __repr__(self):
+        return f"<StockBodegaSaldo {self.codigo_interno} bod={self.bodega_codigo} x{self.cantidad}>"
+
+
+class BodegaReporte(db.Model):
+    """Ronda DD (2026-11-10, a pedido del usuario): que bodegas existen y
+    cuales se pueden consultar en "Stock Bodegas".
+
+    El usuario lo pidio configurable y dentro de Configuracion ("estas
+    pueden ser configurables, y esta configuracion debe estar en el menu de
+    configuracion, como configuracion de reportes"), en vez de dejar los
+    codigos de bodega escritos en el programa: Ergopyme puede agregar o
+    renombrar una bodega y no deberia hacer falta tocar codigo.
+
+    Las filas se crean solas con lo que traigan los reportes (ver
+    _registrar_bodegas_vistas), con el nombre tal como lo escribe Ergopyme.
+    `visible_en_consulta` arranca en False para toda bodega nueva: hay que
+    habilitarla a proposito, y la central nunca se ofrece aca (tiene su
+    propia pantalla, que es Consulta de Stock)."""
+    __tablename__ = "bodegas_reporte"
+
+    id = db.Column(db.Integer, primary_key=True)
+    codigo = db.Column(db.String(10), nullable=False, unique=True, index=True)
+    nombre = db.Column(db.String(120))
+    visible_en_consulta = db.Column(db.Boolean, default=False)
+    orden = db.Column(db.Integer, default=0)
+    notas = db.Column(db.String(300))
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<BodegaReporte {self.codigo} {self.nombre}>"
 
 
 class CodigoErgopyme(db.Model):

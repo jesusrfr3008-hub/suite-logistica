@@ -69,9 +69,29 @@
             <a class="nav-link {% if 'importaciones' in request.endpoint or 'parcial' in request.endpoint or 'gastos' in request.endpoint %}active{% endif %}" href="{{ url_for('importaciones_list') }}">Costeo Importaciones</a>
           </li>
           {% endif %}
-          {% if current_user.tiene_permiso('consultar_stock') or current_user.tiene_permiso('inventarios') %}
+          {# Ronda DD (2026-11-10, a pedido del usuario): "Stock Bodegas"
+             vive DENTRO del mismo menú de Consulta de Stock pero con
+             permiso propio ("dentro de este mismo menu de consulta de
+             stock"). Si el usuario no tiene el permiso especial, el menú
+             sigue siendo un link directo como siempre -- no se le muestra
+             un desplegable con una sola opción. #}
+          {% set puede_stock = current_user.tiene_permiso('consultar_stock') or current_user.tiene_permiso('inventarios') %}
+          {% set puede_stock_bodegas = current_user.tiene_permiso('stock_bodegas') %}
+          {% if puede_stock and puede_stock_bodegas %}
+          <li class="nav-item dropdown">
+            <a class="nav-link dropdown-toggle {% if request.endpoint in ('stock_list', 'stock_bodegas_list') %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Consulta de Stock</a>
+            <ul class="dropdown-menu">
+              <li><a class="dropdown-item" href="{{ url_for('stock_list') }}">Consulta de Stock</a></li>
+              <li><a class="dropdown-item" href="{{ url_for('stock_bodegas_list') }}">Stock Bodegas</a></li>
+            </ul>
+          </li>
+          {% elif puede_stock %}
           <li class="nav-item">
             <a class="nav-link {% if request.endpoint == 'stock_list' %}active{% endif %}" href="{{ url_for('stock_list') }}">Consulta de Stock</a>
+          </li>
+          {% elif puede_stock_bodegas %}
+          <li class="nav-item">
+            <a class="nav-link {% if request.endpoint == 'stock_bodegas_list' %}active{% endif %}" href="{{ url_for('stock_bodegas_list') }}">Stock Bodegas</a>
           </li>
           {% endif %}
           {% set puede_reportes = current_user.tiene_permiso('reportes') %}

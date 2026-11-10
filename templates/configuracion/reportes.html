@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Configuración de reportes · Suite Logística{% endblock %}
+{% block content %}
+
+<h3 class="section-title mb-1">Configuración de reportes</h3>
+<div class="text-muted small mb-3">
+  Qué bodegas del sistema de Inventarios se pueden consultar en
+  <a href="{{ url_for('stock_bodegas_list') }}">Stock Bodegas</a>.
+  Las bodegas no se dan de alta a mano: aparecen solas acá a medida que los reportes de Ergopyme las traen,
+  con el nombre tal como Ergopyme lo escribe. Nacen <strong>apagadas</strong> a propósito -- si mañana se
+  agrega una bodega nueva, nadie la ve hasta que se revise y se habilite acá.
+</div>
+
+<div class="alert alert-light border small">
+  <strong>Bodega {{ bodega_central }} (central)</strong> no se puede apagar ni se consulta acá: es el stock
+  disponible para vender y tiene su propia pantalla, <a href="{{ url_for('stock_list') }}">Consulta de Stock</a>,
+  que usa todo el equipo comercial.
+</div>
+
+<form method="post">
+  <div class="card p-3">
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead>
+          <tr class="text-muted small">
+            <th style="width: 110px;">Se consulta</th>
+            <th style="width: 80px;">Código</th>
+            <th>Nombre que se muestra</th>
+            <th class="text-end" data-bs-toggle="tooltip" title="Unidades del último reporte de saldos por bodega.">Unidades (saldos)</th>
+            <th class="text-end" data-bs-toggle="tooltip" title="Unidades del último reporte de stock con lotes. En 0 mientras la automatización baje solo la bodega central.">Unidades (con lote)</th>
+            <th>Nota</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for b in bodegas %}
+          {% set es_central = (b.codigo == bodega_central) %}
+          <tr {% if es_central %}class="table-light"{% endif %}>
+            <td>
+              <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" name="visibles" value="{{ b.codigo }}"
+                       id="vis_{{ b.codigo }}"
+                       {% if b.visible_en_consulta %}checked{% endif %}
+                       {% if es_central %}disabled title="La bodega central siempre está disponible -- se consulta en Consulta de Stock."{% endif %}>
+                {% if es_central %}
+                {# Un input deshabilitado no se envía: se manda igual como hidden
+                   para que el POST no la apague. De todos modos la ruta la fuerza
+                   a visible, esto es solo para que el formulario sea coherente. #}
+                <input type="hidden" name="visibles" value="{{ b.codigo }}">
+                {% endif %}
+              </div>
+            </td>
+            <td class="fw-semibold">{{ b.codigo }}</td>
+            <td>
+              <input type="text" class="form-control form-control-sm" name="nombre_{{ b.codigo }}"
+                     value="{{ b.nombre or '' }}" maxlength="120" placeholder="Bodega {{ b.codigo }}">
+            </td>
+            <td class="text-end">{{ unidades_por_bodega.get(b.codigo) or 0 }}</td>
+            <td class="text-end">{{ unidades_lotes_por_bodega.get(b.codigo) or 0 }}</td>
+            <td>
+              <input type="text" class="form-control form-control-sm" name="notas_{{ b.codigo }}"
+                     value="{{ b.notas or '' }}" maxlength="300" placeholder="Para qué se usa esta bodega (opcional)">
+            </td>
+          </tr>
+          {% endfor %}
+          {% if not bodegas %}
+          <tr><td colspan="6" class="text-center text-muted py-4">
+            Todavía no se ha cargado ningún reporte que traiga bodegas.
+          </td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="mt-3 d-flex gap-2">
+    <button class="btn btn-brand" type="submit">Guardar</button>
+    <a href="{{ url_for('configuracion_index') }}" class="btn btn-outline-secondary">Volver</a>
+  </div>
+</form>
+
+{% endblock %}

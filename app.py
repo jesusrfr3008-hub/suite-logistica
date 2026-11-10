@@ -43,6 +43,7 @@ from models import (
     Usuario, Rol, PERMISOS_DISPONIBLES,
     HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
     StockConsignacionVigente, StockComprometidoBodega, ConsignacionPendienteLote,
+    StockBodegaSaldo, BodegaReporte,
     ConsignacionRecepcionImportacion,
     ConsignacionReporteProveedor, ConsignacionReporteLinea,
     CodigoErgopyme, CompraHistorica, AliasCodigoProveedor,
@@ -156,8 +157,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DC"
-VERSION_SUITE_FECHA = "2026-11-09"
+VERSION_SUITE = "DD"
+VERSION_SUITE_FECHA = "2026-11-10"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -1273,6 +1274,111 @@ def _normalizar_codigo_interno(valor):
     return s
 
 
+BODEGA_CENTRAL = "1"
+
+# Ronda DD (2026-11-10): nombres de las bodegas tal como los escribe
+# Ergopyme en el encabezado del reporte "Stock de productos en bodegas"
+# (fila 5 del archivo, confirmado contra el stock_comprometido_bodegas del
+# 09/11/2026). Es solo un respaldo para poner un nombre legible cuando la
+# bodega entra por el reporte de lotes, que trae el numero pero no el
+# nombre; la lista que manda es la de BodegaReporte, que se arma con lo
+# que traigan los archivos y se edita desde Configuracion.
+BODEGAS_NOMBRES_CONOCIDOS = {
+    "1": "Central",
+    "2": "Clientes",
+    "3": "Hospital FACH",
+    "4": "Clínica San Pío X",
+    "5": "Muestras",
+    "6": "De Oftalmontt",
+    "7": "Ingeniería",
+    "8": "Arriendo equipos",
+    "9": "Lentes Fola",
+    "10": "Accumedical",
+    "11": "Comodato",
+    "12": "Ceola Valdivia",
+    "13": "Préstamo y apoyo clínico",
+    "14": "Vencidos y dañados",
+    "15": "Demos",
+    "16": "Equipos e instrumentales",
+    "17": "Hospital P. Montt",
+}
+
+
+def _normalizar_bodega(valor):
+    """Ronda DD (2026-11-10): deja el codigo de bodega en una sola forma.
+
+    Hace falta porque el MISMO numero de bodega llega escrito distinto
+    segun el archivo, verificado contra los dos reportes reales del
+    usuario: el .csv de la automatizacion trae "01" (texto, con el cero
+    adelante) y el Stock_Bodegas_consolidados.xlsx trae 1 (numero). Si no
+    se normaliza, "01", "1" y 1 serian tres bodegas distintas y el filtro
+    de la central dejaria afuera justo lo que tiene que mostrar.
+
+    Devuelve "" cuando no hay nada que normalizar -- quien llama decide si
+    eso significa central (filas viejas, formato antiguo) o si descarta la
+    fila."""
+    if valor is None:
+        return ""
+    s = str(valor).strip()
+    if not s:
+        return ""
+    if s.startswith("'"):
+        s = s[1:].strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    # "01" -> "1", pero "0" se queda en "0" y un codigo no numerico se
+    # devuelve tal cual (por si Ergopyme algun dia usa letras).
+    if s.isdigit():
+        return str(int(s))
+    return s
+
+
+def _firma_lote(texto):
+    """Ronda DD (2026-11-10): clave para COMPARAR dos codigos de lote que
+    son el mismo escrito distinto. No reemplaza al lote guardado (ese se
+    sigue mostrando tal como lo escribe Ergopyme), solo se usa para
+    emparejar.
+
+    Encontrado comparando los dos archivos reales del 09/11/2026, el mismo
+    stock bajado en los dos formatos: el .csv de la automatizacion trae el
+    lote como TEXTO con sus ceros adelante ("00126", "08726") y el .xlsx
+    lo trae como NUMERO, asi que openpyxl lo entrega 126 y se guarda
+    "126". Son el mismo lote.
+
+    Importa porque la deteccion de consignacion consumida compara el lote
+    de la foto anterior con el de la nueva: si el formato cambiara de un
+    dia al otro, TODOS los lotes pendientes pareceria que desaparecieron
+    del stock y se marcarian como consumidos de golpe -- se le facturaria
+    al proveedor mercaderia que sigue en bodega. Con esta firma, "00126" y
+    "126" son la misma cosa y el cambio de formato deja de ser un riesgo."""
+    if texto is None:
+        return ""
+    s = str(texto).strip().upper()
+    if not s:
+        return ""
+    sin_ceros = s.lstrip("0")
+    # "000" -> "0" (y no ""), y un lote no numerico se deja tal cual.
+    if sin_ceros.isdigit():
+        return sin_ceros
+    if not sin_ceros and s:
+        return "0"
+    return s
+
+
+def _nombre_bodega(codigo, nombre_dado=None):
+    """Nombre legible de una bodega: lo que diga el archivo, si no lo que
+    este guardado en BODEGAS_NOMBRES_CONOCIDOS, si no el numero pelado."""
+    codigo = _normalizar_bodega(codigo)
+    if nombre_dado and str(nombre_dado).strip():
+        nombre = str(nombre_dado).strip()[:120]
+        # Ergopyme escribe los nombres de bodega todos en minuscula
+        # (" central", "prestamo y apoyo clinico"). Se capitalizan solo en
+        # ese caso -- si el nombre ya trae mayusculas, se respeta tal cual
+        # (y si el usuario lo edita en Configuracion, manda lo que el ponga).
+        return nombre.title() if nombre == nombre.lower() else nombre
+    return BODEGAS_NOMBRES_CONOCIDOS.get(codigo, f"Bodega {codigo}" if codigo else "")
+
+
 def _empresa_por_nombre_reporte(nombre_reporte, cache):
     """Ronda V (2026-09-12): el reporte de Stock trae el nombre de la
     empresa como 'ACCUVISION SPA' / 'ACCUMEDICAL SPA' -- nuestras Empresa
@@ -1409,6 +1515,17 @@ def _filas_desde_reporte_consolidado(filas_crudas):
     idx_venc = columnas.get("vencimiento")
     idx_accuv = columnas["stock accuv"]
     idx_accum = columnas["stock accum"]
+    # Ronda DD (2026-11-10): la columna "Cód.Bod" se venia usando desde la
+    # ronda AI SOLO para ubicar la fila de encabezado (el `primera ==
+    # "cod.bod"` de arriba); su VALOR por fila nunca se leia y todo se
+    # cargaba como si fuera la bodega central. Mientras la automatizacion
+    # bajaba solo la central eso daba el mismo resultado, pero el usuario
+    # va a cambiarla para que baje TODAS: medido contra su propio
+    # Stock_Bodegas_consolidados.xlsx, sumarlas sin distinguir inflaba la
+    # central en +49.562 unidades sobre 318 codigos (ej. el 40103300042
+    # pasaba de 26.710 a 50.710), lo que rompia rotacion, dias de stock y
+    # la sugerencia de reposicion de las OC. Ahora se lee y se guarda.
+    idx_bodega = columnas.get("cod.bod")
     if idx_codigo is None:
         return None
 
@@ -1439,6 +1556,13 @@ def _filas_desde_reporte_consolidado(filas_crudas):
             except ValueError:
                 fecha_venc = None
 
+        # Ronda DD: bodega de la fila. Si la columna no viene o viene
+        # vacia se asume la central -- es lo que el archivo traia hasta
+        # hoy, asi que un archivo viejo sigue cargando igual que siempre.
+        bodega_codigo = _normalizar_bodega(row[idx_bodega]) if (idx_bodega is not None and len(row) > idx_bodega) else ""
+        if not bodega_codigo:
+            bodega_codigo = BODEGA_CENTRAL
+
         for empresa_texto, idx_stock in (("ACCUVISION SPA", idx_accuv), ("ACCUMEDICAL SPA", idx_accum)):
             valor_stock = row[idx_stock] if len(row) > idx_stock else 0
             if isinstance(valor_stock, str):
@@ -1456,6 +1580,7 @@ def _filas_desde_reporte_consolidado(filas_crudas):
                 "codigo_lote": codigo_lote,
                 "fecha_vencimiento": fecha_venc,
                 "stock_fisico": valor_stock,
+                "bodega_codigo": bodega_codigo,
             })
     return filas
 
@@ -1548,6 +1673,11 @@ def _clasificar_y_cargar_stock(filas):
             resumen["unidades_sin_empresa"] += fila["stock_fisico"] or 0
             continue
 
+        # Ronda DD (2026-11-10): se guarda la bodega de la que viene la
+        # fila. El formato viejo (_filas_desde_filas_crudas) no trae la
+        # columna, asi que esas filas quedan como central, que es lo que
+        # eran de hecho.
+        bodega_codigo = _normalizar_bodega(fila.get("bodega_codigo")) or BODEGA_CENTRAL
         db.session.add(StockExistencia(
             empresa_id=empresa.id,
             producto_id=homolog.producto_id,
@@ -1557,7 +1687,10 @@ def _clasificar_y_cargar_stock(filas):
             codigo_lote=fila["codigo_lote"],
             fecha_vencimiento=fila["fecha_vencimiento"],
             stock_fisico=fila["stock_fisico"],
+            bodega_codigo=bodega_codigo,
+            bodega_nombre=_nombre_bodega(bodega_codigo),
         ))
+        resumen.setdefault("unidades_por_bodega", defaultdict(int))[bodega_codigo] += fila["stock_fisico"] or 0
         resumen["cargados"] += 1
         resumen["unidades_cargadas"] += fila["stock_fisico"] or 0
         if homolog.estado == "vinculado":
@@ -1577,8 +1710,22 @@ def _cantidades_stock_por_lote(filas):
     totales = defaultdict(float)
     for fila in filas:
         codigo = (fila.get("codigo_interno") or "").strip()
-        lote = (fila.get("codigo_lote") or "").strip() or "(sin lote)"
+        # Ronda DD: se indexa por la FIRMA del lote, no por su texto -- ver
+        # _firma_lote (el mismo lote llega "00126" o "126" segun el formato
+        # del archivo, y una comparacion exacta daria "desaparecio").
+        lote = _firma_lote(fila.get("codigo_lote")) or "(sin lote)"
         if not codigo:
+            continue
+        # Ronda DD (2026-11-10): SOLO la bodega central. La deteccion de
+        # consignacion consumida compara "cuanto habia antes" contra
+        # "cuanto hay ahora" de cada lote: cuando el reporte empiece a
+        # traer todas las bodegas, un lote que salio de la central hacia
+        # "02 Clientes" (despachado) seguiria apareciendo con saldo y la
+        # consignacion NUNCA se detectaria como consumida. Mirando solo la
+        # central el lote desaparece, que es exactamente la señal que esta
+        # funcion busca -- o sea que esto no solo evita la regresion, es
+        # mas correcto que antes.
+        if (_normalizar_bodega(fila.get("bodega_codigo")) or BODEGA_CENTRAL) != BODEGA_CENTRAL:
             continue
         totales[(codigo, lote)] += fila.get("stock_fisico") or 0
     return totales
@@ -1637,7 +1784,8 @@ def _detectar_consumo_consignacion_por_lote(filas_nuevas):
     consumidos = 0
     revividos = 0
     for fila in candidatos:
-        clave = ((fila.codigo_interno or "").strip(), (fila.codigo_lote or "").strip() or "(sin lote)")
+        # Ronda DD: misma firma de lote en los dos lados de la comparacion.
+        clave = ((fila.codigo_interno or "").strip(), _firma_lote(fila.codigo_lote) or "(sin lote)")
         cantidad_nueva = nuevas_cantidades.get(clave, 0)
         cantidad_esperada = fila.cantidad_en_stock
         if cantidad_nueva < cantidad_esperada - 0.0001:
@@ -2160,7 +2308,10 @@ def _procesar_filas_stock_comprometido_bodegas(filas_excel):
     dentro de _leer_bloque_stock_comprometido_bodegas.
 
     Devuelve (resultados, error): `resultados` es una lista de
-    `(empresa, nuevas_filas)`, una entrada por cada bloque de empresa leído
+    `(empresa, nuevas_filas, filas_bodega)` -- Ronda DD (2026-11-10): se
+    agregó `filas_bodega`, el saldo de cada una de las 17 columnas de
+    bodega del mismo archivo, que antes se leía y se descartaba --, una
+    entrada por cada bloque de empresa leído
     con éxito (0, 1 o más). `error` es texto para mostrar/loguear (puede
     venir junto con `resultados` no vacío, si algún bloque en particular
     falló pero otro sí se pudo leer bien)."""
@@ -2190,11 +2341,13 @@ def _procesar_filas_stock_comprometido_bodegas(filas_excel):
     errores = []
     for j, (empresa, inicio) in enumerate(bloques):
         fin = bloques[j + 1][1] if j + 1 < len(bloques) else len(filas_excel)
-        nuevas_filas, error_bloque = _leer_bloque_stock_comprometido_bodegas(filas_excel[inicio:fin], empresa)
+        nuevas_filas, filas_bodega, error_bloque = _leer_bloque_stock_comprometido_bodegas(filas_excel[inicio:fin], empresa)
         if error_bloque:
             errores.append(f"{empresa.nombre}: {error_bloque}")
-        if nuevas_filas:
-            resultados.append((empresa, nuevas_filas))
+        if nuevas_filas or filas_bodega:
+            # Ronda DD: la tupla crecio a 3 -- (empresa, comprometidos,
+            # saldos por bodega).
+            resultados.append((empresa, nuevas_filas, filas_bodega))
 
     return resultados, ("; ".join(errores) if errores else None)
 
@@ -2224,9 +2377,41 @@ def _leer_bloque_stock_comprometido_bodegas(filas_bloque, empresa):
             break
 
     if fila_encabezado is None:
-        return [], "no se encontraron los encabezados 'Cód.Producto' y 'Comprometido' (¿cambió el formato del reporte en Ergopyme?)"
+        return [], [], "no se encontraron los encabezados 'Cód.Producto' y 'Comprometido' (¿cambió el formato del reporte en Ergopyme?)"
+
+    # Ronda DD (2026-11-10): las 17 columnas de BODEGA de este mismo
+    # reporte, que hasta hoy se leian y se tiraban. Este archivo se venia
+    # subiendo desde la ronda AR pero de sus 27 columnas se guardaba UNA
+    # (Comprometido): las bodegas 13 (prestamo y apoyo clinico) y 15
+    # (demos), que son las que el usuario necesita controlar, ya estaban
+    # llegando al programa y se descartaban.
+    #
+    # El numero de bodega NO esta en la fila de encabezado sino en la de
+    # ARRIBA, escrito como "..01..", "..13..", y abajo va el nombre
+    # (" central", "prestamo y apoyo clinico"). Verificado contra el
+    # archivo real del 09/11/2026: fila 3 los numeros, fila 4 los nombres.
+    # Se emparejan por indice de columna, asi que si Ergopyme agrega o
+    # mueve una bodega esto la toma sola, sin tocar codigo.
+    columnas_bodega = []  # [(indice, codigo, nombre), ...]
+    if fila_encabezado > 0:
+        fila_numeros = filas_bloque[fila_encabezado - 1] or []
+        fila_nombres = filas_bloque[fila_encabezado] or []
+        for j, celda in enumerate(fila_numeros):
+            if celda in (None, ""):
+                continue
+            marca = re.fullmatch(r"\.*\s*(\d{1,3})\s*\.*", str(celda).strip())
+            if not marca:
+                continue
+            codigo_bod = _normalizar_bodega(marca.group(1))
+            if not codigo_bod:
+                continue
+            nombre_bod = ""
+            if j < len(fila_nombres) and fila_nombres[j] not in (None, ""):
+                nombre_bod = str(fila_nombres[j]).strip()
+            columnas_bodega.append((j, codigo_bod, _nombre_bodega(codigo_bod, nombre_bod)))
 
     nuevas_filas = []
+    filas_bodega = []
     for row in filas_bloque[fila_encabezado + 1:]:
         if not row or col_codigo >= len(row):
             continue
@@ -2241,6 +2426,30 @@ def _leer_bloque_stock_comprometido_bodegas(filas_bloque, empresa):
             if col_descripcion is not None and col_descripcion < len(row) and row[col_descripcion] is not None
             else ""
         )
+
+        # Ronda DD: saldo por bodega. OJO -- aca NO se descarta el 0: que
+        # un codigo este en 0 en la bodega central es justamente el dato
+        # que falta hoy (el reporte de stock con lotes solo trae lo que
+        # tiene saldo, asi que un producto agotado desaparece y nadie se
+        # entera). Se guarda la fila de la central siempre, y las demas
+        # bodegas solo cuando tienen unidades, para no inflar la tabla con
+        # 830 codigos x 17 bodegas = 14.110 filas casi todas en cero.
+        for indice, codigo_bod, nombre_bod in columnas_bodega:
+            cantidad_bod = row[indice] if indice < len(row) else 0
+            if isinstance(cantidad_bod, str):
+                cantidad_bod = cantidad_bod.strip()
+            try:
+                cantidad_bod = int(float(cantidad_bod)) if cantidad_bod not in (None, "") else 0
+            except (TypeError, ValueError):
+                cantidad_bod = 0
+            if cantidad_bod == 0 and codigo_bod != BODEGA_CENTRAL:
+                continue
+            filas_bodega.append(StockBodegaSaldo(
+                empresa_id=empresa.id, codigo_interno=codigo_interno,
+                descripcion=descripcion[:300], bodega_codigo=codigo_bod,
+                bodega_nombre=nombre_bod, cantidad=cantidad_bod,
+            ))
+
         comprometido = row[col_comprometido] if col_comprometido < len(row) else 0
         try:
             comprometido = int(comprometido) if comprometido is not None else 0
@@ -2253,16 +2462,67 @@ def _leer_bloque_stock_comprometido_bodegas(filas_bloque, empresa):
             cantidad=comprometido,
         ))
 
-    if not nuevas_filas:
-        return [], "no tiene filas con unidades comprometidas (>0) reconocibles"
-    return nuevas_filas, None
+    # Ronda DD: antes bastaba con que no hubiera comprometidos para dar el
+    # bloque por fallido. Ahora un bloque que trae saldos por bodega pero
+    # ningun comprometido SI sirve (es informacion nueva), asi que solo se
+    # descarta cuando no se pudo leer ninguna de las dos cosas.
+    if not nuevas_filas and not filas_bodega:
+        return [], [], "no tiene filas con unidades comprometidas (>0) ni saldos por bodega reconocibles"
+    return nuevas_filas, filas_bodega, None
 
 
-def _guardar_stock_comprometido_bodegas(empresa, nuevas_filas):
+def _registrar_bodegas_vistas(pares):
+    """Ronda DD (2026-11-10): da de alta en BodegaReporte cualquier bodega
+    que aparezca en un reporte y todavia no este registrada, con el nombre
+    tal como lo escribe Ergopyme. No commitea (lo hace quien llama) ni
+    pisa el nombre de una bodega ya existente -- si el usuario la renombro
+    a mano en Configuracion, ese nombre manda.
+
+    Nace con visible_en_consulta=False a proposito: una bodega nueva no
+    aparece sola en "Stock Bodegas", hay que habilitarla desde
+    Configuracion > Configuracion de reportes. Es lo que el usuario pidio
+    ("estas pueden ser configurables") y evita que un cambio en Ergopyme
+    agregue pantallas que nadie reviso."""
+    if not pares:
+        return
+    existentes = {b.codigo for b in BodegaReporte.query.all()}
+    vistos = set()
+    for codigo, nombre in pares:
+        codigo = _normalizar_bodega(codigo)
+        if not codigo or codigo in existentes or codigo in vistos:
+            continue
+        vistos.add(codigo)
+        try:
+            orden = int(codigo)
+        except (TypeError, ValueError):
+            orden = 999
+        db.session.add(BodegaReporte(
+            codigo=codigo,
+            nombre=_nombre_bodega(codigo, nombre),
+            # La central se marca visible porque ya se consulta hoy (es
+            # Consulta de Stock); las demas quedan apagadas.
+            visible_en_consulta=(codigo == BODEGA_CENTRAL),
+            orden=orden,
+        ))
+
+
+def _guardar_stock_comprometido_bodegas(empresa, nuevas_filas, filas_bodega=None):
     """Reemplaza solo los registros de StockComprometidoBodega de `empresa`
-    con `nuevas_filas` y confirma. Devuelve el total de unidades cargadas."""
+    con `nuevas_filas` y confirma. Devuelve el total de unidades cargadas.
+
+    Ronda DD (2026-11-10): tambien reemplaza los StockBodegaSaldo de esa
+    empresa con `filas_bodega`. Mismo criterio de siempre -- se borra y se
+    reinserta SOLO lo de la empresa del bloque, nunca las dos, porque el
+    archivo puede traer un bloque solo y borrar el otro dejaria a la otra
+    empresa sin datos. `filas_bodega=None` (en vez de lista vacia) significa
+    "no vino informacion de bodegas, no toques lo que ya hay": asi un
+    archivo viejo, sin las columnas ..NN.., no borra los saldos buenos."""
     StockComprometidoBodega.query.filter_by(empresa_id=empresa.id).delete()
     db.session.add_all(nuevas_filas)
+    if filas_bodega is not None:
+        StockBodegaSaldo.query.filter_by(empresa_id=empresa.id).delete()
+        db.session.add_all(filas_bodega)
+        _registrar_bodegas_vistas([(f.bodega_codigo, f.bodega_nombre) for f in filas_bodega])
     db.session.commit()
     return sum(f.cantidad for f in nuevas_filas)
 
@@ -7616,13 +7876,16 @@ def api_productos_por_proveedor(proveedor_id):
                 claves.append((p.id, (v.codigo or "").strip().upper(), v.codigo_interno_inventario))
     necesita_reposicion = _necesita_reposicion_por_codigo(claves, empresa_id)
 
-    def _producto_necesita_reposicion(p):
-        if necesita_reposicion.get((p.id, None)):
-            return True
-        return any(
-            necesita_reposicion.get((p.id, (v.codigo or "").strip().upper()))
+    def _prioridad_reposicion(p):
+        """Ronda DD (2026-11-10): la prioridad MAS ALTA entre el producto
+        padre y sus variantes -- alcanza con que una variante tenga
+        comprometido sin cobertura para que el producto suba primero."""
+        candidatas = [necesita_reposicion.get((p.id, None), 0) or 0]
+        candidatas += [
+            necesita_reposicion.get((p.id, (v.codigo or "").strip().upper()), 0) or 0
             for v in variantes_por_producto.get(p.id, [])
-        )
+        ]
+        return max(candidatas)
 
     resultado = [
         {
@@ -7638,7 +7901,19 @@ def api_productos_por_proveedor(proveedor_id):
             # cual en vez de agregar la linea directo con el codigo padre.
             "tiene_variantes": p.variantes.count() > 0,
             "activo": p.activo,
-            "needs_reorder": _producto_necesita_reposicion(p),
+            # Ronda BV: señal visual de reposición (sigue siendo booleana
+            # para el front-end, que no cambia).
+            "needs_reorder": _prioridad_reposicion(p) > 0,
+            # Ronda DD (2026-11-10, a pedido del usuario): POR QUE hay que
+            # reponerlo, para que el orden de la lista se pueda explicar y
+            # no parezca arbitrario. 2 = ya hay unidades comprometidas que
+            # no se alcanzan a cubrir; 1 = se vende (rotación 90 días) y no
+            # queda stock ni tránsito.
+            "prioridad_reposicion": _prioridad_reposicion(p),
+            "motivo_reposicion": {
+                2: "Comprometido sin cobertura -- hay pedido de cliente que el stock y el tránsito no alcanzan a cubrir.",
+                1: "Sin stock ni tránsito, pero con venta en los últimos 90 días.",
+            }.get(_prioridad_reposicion(p), ""),
             # Ronda CV: para que el front-end pueda mostrar por que un
             # producto viene primero ("lo compramos N veces").
             "veces_comprado": _compras_de(p)[0],
@@ -7648,7 +7923,10 @@ def api_productos_por_proveedor(proveedor_id):
     ]
     # Ronda BV: "coloque de primero" -- sort estable, solo reordena los
     # marcados hacia arriba, sin alterar el orden relativo del resto.
-    resultado.sort(key=lambda d: 0 if d["needs_reorder"] else 1)
+    # Ronda DD (2026-11-10): ahora en dos niveles, como pidió el usuario --
+    # primero lo comprometido sin cobertura, después lo que se vende y está
+    # sin stock, y recién ahí el resto por lo más comprado.
+    resultado.sort(key=lambda d: -(d["prioridad_reposicion"] or 0))
     return jsonify(resultado)
 
 
@@ -7679,7 +7957,9 @@ def api_producto_variantes(producto_id):
             "id": v.id,
             "codigo": v.codigo,
             "descripcion": v.descripcion,
-            "needs_reorder": necesita_reposicion.get((producto_id, (v.codigo or "").strip().upper()), False),
+            "needs_reorder": bool(necesita_reposicion.get((producto_id, (v.codigo or "").strip().upper()), 0)),
+            # Ronda DD: misma prioridad que el catálogo, a nivel de variante.
+            "prioridad_reposicion": necesita_reposicion.get((producto_id, (v.codigo or "").strip().upper()), 0) or 0,
         }
         for v in variantes
     ]
@@ -12726,14 +13006,40 @@ def _necesita_reposicion_por_codigo(claves, empresa_id):
     de Compra" puede no tener una empresa elegida todavía al buscar el
     catálogo) -- en ese caso se suma el stock/tránsito/pedido de TODAS las
     empresas, sin separar (mejor una señal "por si acaso" que ninguna).
-    Devuelve {(producto_id, variante_codigo): bool} -- True si el
-    proyectado da negativo."""
+    Devuelve {(producto_id, variante_codigo): prioridad} con la PRIORIDAD
+    de reposición, no un booleano -- Ronda DD (2026-11-10), a pedido del
+    usuario, que pidió dos cosas distintas:
+
+      2 = comprometido sin cobertura: "los productos con nota de pedido,
+          es decir con saldo comprometido (-) debe ser de los primeros
+          productos sugeridos para incluir en la PO". Es el caso de la
+          ronda BV (actual + tránsito - comprometido < 0) y ahora va
+          primero de todos: ya hay un cliente esperando.
+      1 = sin stock pero con rotación: "si tiene una rotacion en los
+          ultimos 90 dias, está sin stock, debe ser una de los productos
+          que me proponga para incluir en la PO". No hay nadie esperando
+          todavía, pero se vende y no queda nada -- va después del caso de
+          arriba y antes de todo el resto.
+      0 = no hace falta reponer.
+
+    Un valor >0 sigue siendo "verdadero" para cualquier código viejo que
+    lo use como booleano, así que la señal visual de la ronda BV
+    (needs_reorder) no cambia de comportamiento."""
     if not claves:
         return {}
     empresa_id_int = int(empresa_id) if empresa_id else None
     producto_ids = {c[0] for c in claves}
 
-    stock_q = StockExistencia.query.filter(StockExistencia.producto_id.in_(producto_ids))
+    # Ronda DD: solo la bodega central. Lo que está en demos, comodato o
+    # préstamo no es stock disponible para cubrir un pedido, así que no
+    # puede ocultar una necesidad de reposición.
+    stock_q = StockExistencia.query.filter(
+        StockExistencia.producto_id.in_(producto_ids),
+        db.or_(
+            StockExistencia.bodega_codigo == BODEGA_CENTRAL,
+            StockExistencia.bodega_codigo.is_(None),
+        ),
+    )
     if empresa_id_int:
         stock_q = stock_q.filter(StockExistencia.empresa_id == empresa_id_int)
     stock_por_clave = {}
@@ -12748,6 +13054,9 @@ def _necesita_reposicion_por_codigo(claves, empresa_id):
 
     transito_por_empresa = _transito_huerfano_por_empresa()
     pedido_por_codigo, _ = _pedido_por_codigo()
+    # Ronda DD: rotación de los últimos 90 días, por código interno
+    # Ergopyme. Se pide una sola vez para todas las claves.
+    ventas_90 = _unidades_vendidas_por_codigo(90)
 
     resultado = {}
     for producto_id, variante_codigo, codigo_interno in claves:
@@ -12765,7 +13074,21 @@ def _necesita_reposicion_por_codigo(claves, empresa_id):
                 sum(v for (_e2, c2), v in pedido_por_codigo.items() if c2 == codigo_interno)
                 if codigo_interno else 0
             )
-        resultado[clave_pv] = (actual + transito - comprometido) < 0
+        if (actual + transito - comprometido) < 0:
+            # Hay unidades comprometidas que ni el stock ni el tránsito
+            # alcanzan a cubrir -- primero de la lista.
+            resultado[clave_pv] = 2
+        elif (
+            codigo_interno
+            and (actual + transito) <= 0
+            and (ventas_90.get((codigo_interno or "").strip()) or 0) > 0
+        ):
+            # Ronda DD: se vende (hubo venta neta en 90 días) y no queda
+            # nada ni en camino. Nadie lo está esperando todavía, pero si no
+            # entra en esta OC se va a perder la venta siguiente.
+            resultado[clave_pv] = 1
+        else:
+            resultado[clave_pv] = 0
     return resultado
 
 
@@ -12811,6 +13134,28 @@ def _producto_variante_por_codigo_interno():
     return resultado
 
 
+def _saldos_en_cero_en_central():
+    """Ronda DD (2026-11-10, a pedido del usuario): {(empresa_id, codigo):
+    descripcion} de los codigos que el reporte "Stock de productos en
+    bodegas" trae con CERO unidades en la bodega central.
+
+    Es la pieza que faltaba para cerrar el punto ciego que reporto el
+    usuario: el reporte de stock con lotes (el que llena Consulta de
+    Stock) solo trae lo que TIENE saldo, asi que un producto que se agoto
+    simplemente desaparece de la pantalla -- nadie se entera de que se
+    acabo, justo cuando mas importa saberlo. Este otro reporte si lo trae,
+    con un 0 explicito en la columna de la central.
+
+    Medido contra los dos archivos reales del 09/11/2026: 149 codigos
+    estan en el reporte de bodegas y no en el de lotes; de esos, 43 tienen
+    venta en los ultimos 360 dias."""
+    filas = StockBodegaSaldo.query.filter(
+        StockBodegaSaldo.bodega_codigo == BODEGA_CENTRAL,
+        StockBodegaSaldo.cantidad <= 0,
+    ).all()
+    return {(f.empresa_id, (f.codigo_interno or "").strip()): (f.descripcion or "") for f in filas}
+
+
 @app.route("/stock")
 @requiere_permiso("consultar_stock", "inventarios")
 def stock_list():
@@ -12818,7 +13163,23 @@ def stock_list():
     proveedor_id = request.args.get("proveedor_id", "")
     q = request.args.get("q", "").strip()
 
-    query = StockExistencia.query
+    # Ronda DD (2026-11-10): SOLO la bodega central. Hasta hoy el reporte
+    # que llena esta tabla bajaba unicamente la central, asi que no habia
+    # nada que filtrar; el usuario va a cambiar la automatizacion para que
+    # baje TODAS las bodegas, y sin este filtro el stock que ven los
+    # comerciales se sumaria con el de clientes, demos, comodato y
+    # prestamos -- medido contra su propio archivo de todas las bodegas,
+    # +49.562 unidades sobre 318 codigos (el 40103300042 pasaria de 26.710
+    # a 50.710). Esta pantalla es "que puedo vender", y eso es la central.
+    #
+    # El `is_(None)` deja pasar las filas cargadas antes de esta ronda, que
+    # no tienen bodega guardada y de hecho eran todas de la central: asi
+    # nada cambia de valor al desplegar, antes de la primera carga nueva.
+    # Las otras bodegas se consultan en Stock Bodegas (permiso aparte).
+    query = StockExistencia.query.filter(db.or_(
+        StockExistencia.bodega_codigo == BODEGA_CENTRAL,
+        StockExistencia.bodega_codigo.is_(None),
+    ))
     if empresa_id:
         query = query.filter_by(empresa_id=empresa_id)
     if q:
@@ -13015,6 +13376,10 @@ def stock_list():
                 "homologado": bool(resuelto),
                 "via_ergopyme": bool(resuelto),
                 "sin_stock_cargado": True,
+                # Ronda DD: esta fila sigue resaltada entera, como desde la
+                # ronda AA -- es un pedido que no tiene stock cargado, un
+                # caso que hay que mirar.
+                "resaltar_fila": True,
                 "_producto_id": producto_id_res,
                 "_variante_codigo": variante_codigo_res,
                 "stock_actual": 0,
@@ -13083,6 +13448,7 @@ def stock_list():
                 "homologado": True,
                 "via_ergopyme": False,
                 "sin_stock_cargado": True,
+                "resaltar_fila": True,
                 "_producto_id": producto_id_t,
                 "_variante_codigo": variante_codigo_t,
                 "stock_actual": 0,
@@ -13090,6 +13456,94 @@ def stock_list():
                 "transito_detalle": "<br>".join(str(escape(linea)) for linea in transito_info_t["detalle"]),
                 "pedido": 0,
                 "stock_total_proyectado": transito_info_t["cantidad"],
+            }
+
+    # Ronda DD (2026-11-10, a pedido del usuario): "que lo que esta en cero
+    # no pase en silencio". Un producto que se agoto desaparecia de esta
+    # pantalla, porque el reporte de stock con lotes solo trae lo que tiene
+    # saldo -- y desaparece justo cuando hay que reponerlo. Ahora, si el
+    # reporte de bodegas lo trae con 0 en la central Y tuvo venta en los
+    # ultimos 360 dias, se muestra igual: en 0, con su rotacion a la vista.
+    #
+    # Criterio EXACTO que pidio el usuario, y lo que deliberadamente NO es
+    # criterio:
+    #   - SI: cero en la bodega central (reporte de bodegas) + venta en 360
+    #     dias. Los otros dos casos (comprometido sin stock, transito sin
+    #     stock) ya los cubren los dos bloques de arriba desde las rondas
+    #     AA y BV.
+    #   - NO: tener unidades en otra bodega. Textual del usuario: "si hay
+    #     productos en otras bodegas no debe mostrarse aqui ni debe ser
+    #     criterio para que se muestre, solo los indicados". Un producto
+    #     que solo esta en demos o en prestamo NO aparece aca; se consulta
+    #     en Stock Bodegas.
+    #
+    # Tampoco se agrega badge ni columna "por que aparece" (el usuario los
+    # rechazo expresamente): la fila sale en 0 como cualquier otra y lo
+    # unico que la hace notar es la rotacion resaltada, mas abajo.
+    codigos_ya_mostrados = set()
+    for grupo in grupos.values():
+        emp_grupo = grupo["empresa"].id if grupo.get("empresa") else None
+        codigos_ya_mostrados.add((emp_grupo, (grupo.get("codigo_interno") or "").strip()))
+
+    if proveedor_id != "sin_marca":
+        ventas_360_por_codigo = _unidades_vendidas_por_codigo(360)
+        for (emp_id, codigo), descripcion_cero in _saldos_en_cero_en_central().items():
+            if not codigo or (emp_id, codigo) in codigos_ya_mostrados:
+                continue
+            if (ventas_360_por_codigo.get(codigo) or 0) <= 0:
+                continue
+            resuelto = _homologar_via_ergopyme(codigo)
+            if resuelto:
+                prov_nombre_res, prov_id_res, codigo_prov_res, descripcion_ergopyme = resuelto
+            else:
+                prov_nombre_res = prov_id_res = codigo_prov_res = descripcion_ergopyme = None
+            if proveedor_id and str(prov_id_res or "") != str(proveedor_id):
+                continue
+            if empresa_id and str(emp_id) != str(empresa_id):
+                continue
+            descripcion_cero = descripcion_cero or descripcion_ergopyme or ""
+            if (
+                q_lower
+                and q_lower not in (descripcion_cero or "").lower()
+                and q_lower not in (codigo or "").lower()
+                and q_lower not in (codigo_prov_res or "").lower()
+            ):
+                continue
+            producto_id_res, variante_codigo_res = producto_variante_por_codigo.get(codigo, (None, None))
+            transito_info_res = (
+                transito_por_linea.get((producto_id_res, variante_codigo_res)) if producto_id_res else None
+            )
+            transito_res = transito_info_res["cantidad"] if transito_info_res else 0
+            pedido_res = pedido_por_codigo.get((emp_id, codigo), 0)
+            grupos[("cero_con_rotacion", codigo, emp_id)] = {
+                "empresa": empresas_por_id.get(emp_id),
+                "proveedor_id": prov_id_res,
+                "proveedor_nombre": prov_nombre_res,
+                "codigo": codigo_prov_res,
+                "codigo_interno": codigo,
+                "descripcion": descripcion_cero,
+                "stock_total": 0,
+                "proximo_vencimiento": None,
+                "lotes": [],
+                "homologado": bool(resuelto),
+                "via_ergopyme": bool(resuelto),
+                "sin_stock_cargado": True,
+                # Ronda DD: la fila NO se resalta entera. El usuario fue
+                # explicito -- "no agregues badge, solo resalta el valor de
+                # la rotacion". Una fila amarilla completa es mas ruido que
+                # lo que pidio, y ademas taparia el resaltado de la
+                # rotacion, que es lo unico que tiene que saltar a la vista.
+                "resaltar_fila": False,
+                "_producto_id": producto_id_res,
+                "_variante_codigo": variante_codigo_res,
+                "stock_actual": 0,
+                "transito": transito_res,
+                "transito_detalle": (
+                    "<br>".join(str(escape(linea)) for linea in transito_info_res["detalle"])
+                    if transito_info_res else ""
+                ),
+                "pedido": pedido_res,
+                "stock_total_proyectado": 0 + transito_res - pedido_res,
             }
 
     # Ronda AD (2026-09-14): orden por defecto pedido por el usuario -- el
@@ -13126,6 +13580,10 @@ def stock_list():
                 base["pedido"] += grupo["pedido"]
                 base["lotes"].extend(grupo["lotes"])
                 base["sin_stock_cargado"] = base.get("sin_stock_cargado") and grupo.get("sin_stock_cargado")
+                # Ronda DD: si alguna de las filas que se consolidan SI hay
+                # que resaltarla (un pedido sin stock), la consolidada se
+                # resalta.
+                base["resaltar_fila"] = bool(base.get("resaltar_fila")) or bool(grupo.get("resaltar_fila"))
                 if grupo["proximo_vencimiento"] and (
                     base["proximo_vencimiento"] is None
                     or grupo["proximo_vencimiento"] < base["proximo_vencimiento"]
@@ -13159,6 +13617,16 @@ def stock_list():
         promedio_diario = datos.get("diario") or 0
         proyectado = grupo.get("stock_total_proyectado") or 0
         grupo["dias_stock"] = round(proyectado / promedio_diario) if promedio_diario > 0 and proyectado > 0 else None
+        # Ronda DD (2026-11-10, a pedido del usuario): "no agregues badge,
+        # solo resalta el valor de la rotacion para que sea visible". El
+        # producto esta en 0 fisico pero se vende -- la rotacion es el dato
+        # que hay que mirar, y es la señal de reposicion. Aplica a
+        # cualquier fila sin stock que tenga venta, no solo a las filas
+        # nuevas de este bloque (un producto que se agoto y todavia tiene
+        # comprometido tambien se resalta).
+        grupo["rotacion_resaltada"] = (
+            (grupo.get("stock_actual") or 0) <= 0 and (grupo.get("venta_360") or 0) > 0
+        )
 
     empresas = Empresa.query.order_by(Empresa.nombre).all()
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
@@ -16768,10 +17236,13 @@ def stock_comprometido_bodegas_cargar():
     os.makedirs(REPORTES_DIR, exist_ok=True)
     partes = []
     total_unidades_general = 0
-    for empresa, nuevas_filas in resultados:
-        total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas)
+    for empresa, nuevas_filas, filas_bodega in resultados:
+        total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas, filas_bodega)
         total_unidades_general += total_unidades
-        partes.append(f"{empresa.nombre}: {len(nuevas_filas)} código(s), {total_unidades} unidad(es)")
+        partes.append(
+            f"{empresa.nombre}: {len(nuevas_filas)} código(s), {total_unidades} unidad(es)"
+            + (f", {len(filas_bodega)} saldo(s) por bodega" if filas_bodega else "")
+        )
         nombre_archivo = f"stock_comprometido_bodegas_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
         archivo.stream.seek(0)
         archivo.save(os.path.join(REPORTES_DIR, nombre_archivo))
@@ -16821,11 +17292,14 @@ def api_stock_comprometido_bodegas_cargar_auto():
     detalle = []
     total_lineas = 0
     total_unidades_general = 0
-    for empresa, nuevas_filas in resultados:
-        total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas)
+    for empresa, nuevas_filas, filas_bodega in resultados:
+        total_unidades = _guardar_stock_comprometido_bodegas(empresa, nuevas_filas, filas_bodega)
         total_lineas += len(nuevas_filas)
         total_unidades_general += total_unidades
-        detalle.append({"empresa": empresa.nombre, "lineas": len(nuevas_filas), "unidades": total_unidades})
+        detalle.append({
+            "empresa": empresa.nombre, "lineas": len(nuevas_filas),
+            "unidades": total_unidades, "saldos_bodega": len(filas_bodega),
+        })
         if extension != ".csv":
             os.makedirs(REPORTES_DIR, exist_ok=True)
             nombre_archivo = f"stock_comprometido_bodegas_{re.sub(r'[^A-Za-z0-9]+', '_', empresa.nombre).strip('_').lower()}.xlsx"
@@ -19127,6 +19601,303 @@ def reportes_costo_producto():
         empresas_disponibles=_empresas_compradoras_disponibles(),
         proveedores_disponibles=_proveedores_con_compras(),
         empresa_sel=empresa, proveedor_sel=proveedor, q=q,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ronda DD (2026-11-10): Stock Bodegas -- las bodegas de control (prestamo,
+# demos, comodato, clientes...) con el costo del lote, y la configuracion de
+# que bodegas se consultan. Pedido textual del usuario:
+#
+#   "una consulta mas especializada con permisos especiales, es decir dentro
+#    del mismo menu de consulta de stock, pero con una opcion de 'stock
+#    bodegas' (...) Esta consulta no necesita los datos de rotacion, solo si
+#    es posible como dato informativo teniendo como lote, traer la fecha
+#    compra, Invoice, FOB, y costo de este lote (...) si el lote tiene varios
+#    costos en el historico o en el sistema trae el ultimo costo."
+# ---------------------------------------------------------------------------
+
+def _bodegas_configuradas(solo_visibles=False, excluir_central=True):
+    """Bodegas de BodegaReporte, ordenadas como se configuraron. Es la
+    lista que manda sobre que se puede consultar en Stock Bodegas -- el
+    usuario la edita en Configuracion > Configuracion de reportes.
+
+    La central se excluye por defecto porque ya tiene su propia pantalla
+    (Consulta de Stock) y mezclarla aca duplicaria la misma informacion con
+    dos criterios distintos."""
+    query = BodegaReporte.query
+    if solo_visibles:
+        query = query.filter(BodegaReporte.visible_en_consulta == True)  # noqa: E712
+    if excluir_central:
+        query = query.filter(BodegaReporte.codigo != BODEGA_CENTRAL)
+    return query.order_by(BodegaReporte.orden, BodegaReporte.codigo).all()
+
+
+def _ultimo_costo_por_lote():
+    """Ronda DD (2026-11-10): {lote en mayuscula: datos de la compra} con la
+    fecha, la factura, el valor unitario de la invoice (el "FOB" que pide el
+    usuario) y el costo unitario en pesos ya costeado.
+
+    Sale de la MISMA fuente que el reporte Costo Producto
+    (_filas_compras_unificadas: historico de compras + importaciones
+    costeadas aca), para que los numeros de las dos pantallas no puedan
+    discrepar.
+
+    Regla que fijo el usuario: "si el lote tiene varios costos en el
+    historico o en el sistema trae el ultimo costo" -- gana el de fecha de
+    factura mas reciente. Un lote puede venir con varios en la misma celda
+    ("1580, 1582"), asi que se indexa cada uno por separado."""
+    resultado = {}
+    for fila in _filas_compras_unificadas():
+        unidades = fila.get("unidades") or 0
+        if unidades <= 0:
+            continue
+        lote_crudo = (fila.get("codigo_lote") or "").strip()
+        if not lote_crudo:
+            continue
+        total_invoice = fila.get("total_invoice") or 0
+        datos = {
+            "fecha": fila.get("fecha_factura"),
+            "factura": fila.get("factura") or "",
+            "origen": fila.get("origen") or "",
+            "moneda": fila.get("moneda_operacion") or "USD",
+            "valor_unitario": fila.get("valor_unitario_moneda") or (total_invoice / unidades if unidades else 0),
+            "costo_unitario_clp": fila.get("costo_unitario_clp") or 0,
+            "importacion_id": fila.get("importacion_id"),
+            "codigo_producto": fila.get("codigo_producto") or "",
+            "proveedor": fila.get("proveedor") or "",
+        }
+        for parte in lote_crudo.split(","):
+            # Ronda DD: se indexa por la firma del lote (ver _firma_lote) --
+            # el historico de compras y el reporte de stock no siempre
+            # escriben los ceros de adelante igual.
+            clave = _firma_lote(parte)
+            if not clave:
+                continue
+            anterior = resultado.get(clave)
+            if anterior is None or (datos["fecha"] or date.min) >= (anterior["fecha"] or date.min):
+                resultado[clave] = datos
+    return resultado
+
+
+@app.route("/stock/bodegas")
+@requiere_permiso("stock_bodegas")
+def stock_bodegas_list():
+    """Consulta de las bodegas DISTINTAS de la central: que hay, en que
+    lote, y cuanto costo ese lote.
+
+    Dos fuentes, a proposito:
+      1. StockExistencia de esas bodegas -- trae el LOTE, que es lo que
+         permite enganchar el costo. Se llena cuando el reporte de stock por
+         lotes baja todas las bodegas (el usuario va a cambiar la
+         automatizacion para eso).
+      2. StockBodegaSaldo -- el saldo por bodega del reporte "Stock de
+         productos en bodegas", que YA se esta subiendo hoy. No trae lote,
+         asi que no trae costo, pero permite que la pantalla sirva desde el
+         primer dia, antes de tocar la automatizacion. Solo se usa para los
+         codigos de los que no haya detalle de lote, para no contar dos
+         veces las mismas unidades.
+    """
+    bodega_sel = request.args.get("bodega", "").strip()
+    empresa_id = request.args.get("empresa_id", "").strip()
+    q = request.args.get("q", "").strip()
+    q_lower = q.lower()
+
+    bodegas = _bodegas_configuradas(solo_visibles=True)
+    codigos_habilitados = [b.codigo for b in bodegas]
+    nombres_bodega = {b.codigo: (b.nombre or f"Bodega {b.codigo}") for b in bodegas}
+    if bodega_sel and bodega_sel not in codigos_habilitados:
+        # Pidieron una bodega que no esta habilitada (link viejo o URL
+        # editada a mano): se ignora el filtro en vez de mostrar datos de
+        # una bodega que la configuracion no permite consultar.
+        bodega_sel = ""
+    codigos_a_mostrar = [bodega_sel] if bodega_sel else codigos_habilitados
+
+    filas = []
+    empresas_por_id = {e.id: e for e in Empresa.query.all()}
+    _homologar_via_ergopyme = _construir_homologador_ergopyme()
+    costo_por_lote = _ultimo_costo_por_lote() if codigos_a_mostrar else {}
+
+    def _pasa_filtros(codigo_interno, descripcion, codigo_proveedor):
+        if not q_lower:
+            return True
+        return any(
+            q_lower in (texto or "").lower()
+            for texto in (codigo_interno, descripcion, codigo_proveedor)
+        )
+
+    codigos_con_lote = set()
+    if codigos_a_mostrar:
+        query = StockExistencia.query.filter(StockExistencia.bodega_codigo.in_(codigos_a_mostrar))
+        if empresa_id:
+            query = query.filter(StockExistencia.empresa_id == empresa_id)
+        for fila in query.all():
+            resuelto = _homologar_via_ergopyme(fila.codigo_interno)
+            proveedor_nombre = codigo_proveedor = None
+            if resuelto:
+                proveedor_nombre, _prov_id, codigo_proveedor, descripcion_ergopyme = resuelto
+            descripcion = fila.descripcion or (descripcion_ergopyme if resuelto else "") or ""
+            if not _pasa_filtros(fila.codigo_interno, descripcion, codigo_proveedor):
+                continue
+            lote = (fila.codigo_lote or "").strip()
+            costo = costo_por_lote.get(_firma_lote(lote)) if lote else None
+            codigos_con_lote.add((fila.empresa_id, fila.bodega_codigo, (fila.codigo_interno or "").strip()))
+            filas.append({
+                "empresa": empresas_por_id.get(fila.empresa_id),
+                "bodega_codigo": fila.bodega_codigo,
+                "bodega_nombre": fila.bodega_nombre or nombres_bodega.get(fila.bodega_codigo, ""),
+                "codigo_interno": fila.codigo_interno,
+                "codigo_proveedor": codigo_proveedor,
+                "proveedor_nombre": proveedor_nombre,
+                "descripcion": descripcion,
+                "lote": lote,
+                "fecha_vencimiento": fila.fecha_vencimiento,
+                "unidades": fila.stock_fisico or 0,
+                "costo": costo,
+                "sin_detalle_lote": False,
+            })
+
+        # Fuente 2: el reporte de bodegas, solo para lo que no tenga detalle
+        # de lote. Asi la pantalla ya sirve hoy y, cuando el reporte por
+        # lotes traiga todas las bodegas, estas filas desaparecen solas
+        # reemplazadas por las de arriba (que si traen costo).
+        query_saldo = StockBodegaSaldo.query.filter(
+            StockBodegaSaldo.bodega_codigo.in_(codigos_a_mostrar),
+            StockBodegaSaldo.cantidad > 0,
+        )
+        if empresa_id:
+            query_saldo = query_saldo.filter(StockBodegaSaldo.empresa_id == empresa_id)
+        for fila in query_saldo.all():
+            codigo_interno = (fila.codigo_interno or "").strip()
+            if (fila.empresa_id, fila.bodega_codigo, codigo_interno) in codigos_con_lote:
+                continue
+            resuelto = _homologar_via_ergopyme(codigo_interno)
+            proveedor_nombre = codigo_proveedor = None
+            descripcion_ergopyme = ""
+            if resuelto:
+                proveedor_nombre, _prov_id, codigo_proveedor, descripcion_ergopyme = resuelto
+            descripcion = fila.descripcion or descripcion_ergopyme or ""
+            if not _pasa_filtros(codigo_interno, descripcion, codigo_proveedor):
+                continue
+            filas.append({
+                "empresa": empresas_por_id.get(fila.empresa_id),
+                "bodega_codigo": fila.bodega_codigo,
+                "bodega_nombre": fila.bodega_nombre or nombres_bodega.get(fila.bodega_codigo, ""),
+                "codigo_interno": codigo_interno,
+                "codigo_proveedor": codigo_proveedor,
+                "proveedor_nombre": proveedor_nombre,
+                "descripcion": descripcion,
+                "lote": "",
+                "fecha_vencimiento": None,
+                "unidades": fila.cantidad or 0,
+                "costo": None,
+                "sin_detalle_lote": True,
+            })
+
+    filas.sort(key=lambda f: (
+        int(f["bodega_codigo"]) if (f["bodega_codigo"] or "").isdigit() else 999,
+        -(f["unidades"] or 0),
+        f["descripcion"] or "",
+    ))
+
+    totales_por_bodega = defaultdict(lambda: {"unidades": 0, "codigos": set()})
+    for f in filas:
+        acumulado = totales_por_bodega[f["bodega_codigo"]]
+        acumulado["unidades"] += f["unidades"] or 0
+        acumulado["codigos"].add(f["codigo_interno"])
+    resumen_bodegas = [
+        {
+            "codigo": codigo,
+            "nombre": nombres_bodega.get(codigo, f"Bodega {codigo}"),
+            "unidades": datos["unidades"],
+            "codigos": len(datos["codigos"]),
+        }
+        for codigo, datos in sorted(
+            totales_por_bodega.items(),
+            key=lambda kv: int(kv[0]) if (kv[0] or "").isdigit() else 999,
+        )
+    ]
+
+    ultima_carga = db.session.query(db.func.max(StockExistencia.cargado_en)).scalar()
+    ultima_carga_bodegas = db.session.query(db.func.max(StockBodegaSaldo.cargado_en)).scalar()
+    return render_template(
+        "stock/bodegas.html",
+        filas=filas, bodegas=bodegas, resumen_bodegas=resumen_bodegas,
+        empresas=Empresa.query.order_by(Empresa.nombre).all(),
+        bodega_sel=bodega_sel, empresa_sel=empresa_id, q=q,
+        ultima_carga=ultima_carga, ultima_carga_bodegas=ultima_carga_bodegas,
+        hay_bodegas_habilitadas=bool(codigos_habilitados),
+    )
+
+
+@app.route("/configuracion/reportes", methods=["GET", "POST"])
+@requiere_admin
+def configuracion_reportes():
+    """Configuracion de reportes -- hoy, que bodegas se consultan en Stock
+    Bodegas. El usuario pidio expresamente que esto fuera configurable y que
+    viviera aca ("esta configuracion debe estar en el menu de
+    configuracion, como configuracion de reportes") en vez de quedar escrito
+    en el programa: Ergopyme puede agregar o renombrar una bodega y no
+    deberia hacer falta tocar codigo ni esperar un despliegue.
+
+    Las bodegas no se crean a mano: aparecen solas cuando un reporte las
+    trae (ver _registrar_bodegas_vistas). Aca se decide cuales se pueden
+    consultar, en que orden, y con que nombre se muestran."""
+    if request.method == "POST":
+        visibles = set(request.form.getlist("visibles"))
+        cambios = 0
+        for bodega in BodegaReporte.query.all():
+            nuevo_visible = bodega.codigo in visibles
+            nuevo_nombre = (request.form.get(f"nombre_{bodega.codigo}", "") or "").strip()[:120]
+            nuevas_notas = (request.form.get(f"notas_{bodega.codigo}", "") or "").strip()[:300]
+            if bodega.codigo == BODEGA_CENTRAL:
+                # La central no se puede apagar: es Consulta de Stock, la
+                # pantalla que usa todo el equipo comercial.
+                nuevo_visible = True
+            if (
+                bodega.visible_en_consulta != nuevo_visible
+                or (nuevo_nombre and bodega.nombre != nuevo_nombre)
+                or bodega.notas != (nuevas_notas or None)
+            ):
+                cambios += 1
+            bodega.visible_en_consulta = nuevo_visible
+            if nuevo_nombre:
+                bodega.nombre = nuevo_nombre
+            bodega.notas = nuevas_notas or None
+        db.session.commit()
+        flash(
+            f"Configuración de reportes actualizada ({cambios} cambio(s))."
+            if cambios else "No había cambios que guardar.",
+            "success" if cambios else "info",
+        )
+        return redirect(url_for("configuracion_reportes"))
+
+    # Se completa la lista con las bodegas conocidas que todavia no
+    # aparecieron en ningun reporte. Pasa con una bodega que esta vacia en
+    # todos los archivos (la 12, por ejemplo, el dia que se midio): sus
+    # columnas vienen en cero, no generan ninguna fila y la bodega no se
+    # registraria nunca -- y entonces no se podria habilitar de antemano.
+    # Lo que trae un reporte siempre manda sobre esta lista: aca solo se
+    # agregan las que faltan, nunca se pisa un nombre ya guardado.
+    _registrar_bodegas_vistas(list(BODEGAS_NOMBRES_CONOCIDOS.items()))
+    db.session.commit()
+    bodegas = BodegaReporte.query.order_by(BodegaReporte.orden, BodegaReporte.codigo).all()
+
+    unidades_por_bodega = dict(
+        db.session.query(
+            StockBodegaSaldo.bodega_codigo, db.func.sum(StockBodegaSaldo.cantidad)
+        ).group_by(StockBodegaSaldo.bodega_codigo).all()
+    )
+    unidades_lotes_por_bodega = dict(
+        db.session.query(
+            StockExistencia.bodega_codigo, db.func.sum(StockExistencia.stock_fisico)
+        ).group_by(StockExistencia.bodega_codigo).all()
+    )
+    return render_template(
+        "configuracion/reportes.html", bodegas=bodegas,
+        bodega_central=BODEGA_CENTRAL,
+        unidades_por_bodega=unidades_por_bodega,
+        unidades_lotes_por_bodega=unidades_lotes_por_bodega,
     )
 
 
