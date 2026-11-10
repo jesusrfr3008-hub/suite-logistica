@@ -775,6 +775,56 @@ class StockComprometidoBodega(db.Model):
         return f"<StockComprometidoBodega {self.codigo_interno} x{self.cantidad}>"
 
 
+class OrdenCambio(db.Model):
+    """Ronda DE (2026-11-11, punto 4 del pedido del usuario): registro de
+    cada cambio hecho a una Orden de Compra DESPUES de aprobada.
+
+    Textual del pedido: "al emitir una OC puede un usuario modificarla y
+    pasar silencioso el cambio que se realizo". Hasta ahora la orden solo
+    guardaba quien la CREO (creado_por_usuario_id); una vez aprobada,
+    cualquiera con permiso podia agregar un producto, cambiar una cantidad
+    o un precio y no quedaba ningun rastro de quien ni cuando.
+
+    Solo se registra desde que la orden esta APROBADA: antes de eso la
+    orden todavia se esta armando y anotar cada tecleo seria ruido.
+
+    `despues_de_envio` marca los cambios hechos cuando la OC YA se le habia
+    mandado al proveedor (hay al menos un OrdenCorreoEnviado anterior a
+    este cambio). Son los graves: el proveedor tiene en su poder una
+    version distinta de la que quedo en el sistema, y por eso en pantalla
+    salen aparte y en rojo."""
+
+    __tablename__ = "ordenes_cambios"
+
+    id = db.Column(db.Integer, primary_key=True)
+    orden_id = db.Column(db.Integer, db.ForeignKey("ordenes_compra.id"), nullable=False, index=True)
+    # Linea afectada, cuando el cambio es de una linea puntual. Se guarda
+    # el id "pelado" (sin ForeignKey) a proposito: si mas adelante la linea
+    # se elimina, el registro del cambio tiene que sobrevivir -- es
+    # justamente el caso que hay que poder auditar.
+    linea_id = db.Column(db.Integer, nullable=True, index=True)
+    # Que paso, en una palabra: "linea_agregada", "linea_editada",
+    # "linea_eliminada", "linea_anulada", "linea_reactivada",
+    # "cabecera_editada", "fecha_masiva", "nota".
+    tipo = db.Column(db.String(40), nullable=False)
+    # Para que se entienda en pantalla sin tener que abrir nada mas.
+    descripcion = db.Column(db.String(400))
+    # Que campo cambio y de que a que (vacio cuando no aplica, por ejemplo
+    # al agregar o eliminar una linea entera).
+    campo = db.Column(db.String(60))
+    valor_antes = db.Column(db.String(200))
+    valor_despues = db.Column(db.String(200))
+    usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    despues_de_envio = db.Column(db.Boolean, default=False)
+
+    orden = db.relationship("OrdenCompra", backref=db.backref("cambios", lazy="dynamic"))
+    usuario = db.relationship("Usuario")
+
+    def __repr__(self):
+        return f"<OrdenCambio orden={self.orden_id} {self.tipo}>"
+
+
 class StockBodegaSaldo(db.Model):
     """Ronda DD (2026-11-10): saldo por CODIGO y BODEGA, sacado de las 17
     columnas de bodega del reporte "Stock de productos en bodegas".

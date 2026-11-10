@@ -2,13 +2,36 @@
 {% block title %}Pago múltiple · {{ proveedor.nombre }} · Pago Proveedores{% endblock %}
 {% block content %}
 
+<style>
+  /* Ronda DE: un monto mayor al saldo pendiente se marca en rojo mientras
+     se escribe -- es el síntoma del error que motivó esta ronda. */
+  input.monto-excedido {
+    border-color: #dc3545;
+    background-color: #fff5f5;
+  }
+  .fila-sin-monto { opacity: 0.55; }
+  #totalPago { font-variant-numeric: tabular-nums; }
+</style>
+
 <div class="d-flex justify-content-between align-items-start mb-3">
   <div>
     <h3 class="section-title mb-1">Pago múltiple -- {{ proveedor.nombre }}</h3>
     <div class="text-muted small">
-      Registra un solo pago/comprobante que cubra 2 o más facturas de este proveedor -- deja en 0 o en blanco
-      el monto de las que no se paguen en este envío. Cada factura puede tener su propio tipo de cambio si
-      corresponde (normalmente el mismo para todas, si se pagaron juntas el mismo día).
+      {% if vino_con_seleccion %}
+      Estas son las <strong>facturas que marcaste</strong> en el listado. Cada una viene con su saldo completo:
+      si vas a pagar menos, cambia el monto y la factura queda con el saldo pendiente que falte.
+      {% else %}
+      Un solo pago/comprobante que cubre varias facturas de este proveedor. Cada una viene con su saldo
+      completo: si vas a pagar menos, cambia el monto y queda con el saldo pendiente que falte.
+      {# Ronda DE (2026-11-11): antes esta pantalla traía SIEMPRE todas las
+         pendientes y había que acordarse de poner en 0 las que no se pagaban.
+         Ahora lo normal es llegar acá con las facturas ya marcadas desde el
+         listado. #}
+      Para elegir cuáles, márcalas con la casilla en
+      <a href="{{ url_for('pagos_proveedores_list', proveedor_id=proveedor.id) }}">el listado</a>.
+      {% endif %}
+      Cada factura puede tener su propio tipo de cambio si corresponde (normalmente el mismo para todas,
+      si se pagaron juntas el mismo día).
     </div>
   </div>
   <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-sm btn-outline-secondary">&larr; Volver al listado</a>
@@ -44,25 +67,41 @@
         <thead>
           <tr class="text-muted small">
             <th>Factura</th>
+            <th>Empresa</th>
             <th>Vencimiento</th>
             <th class="text-end">Saldo pendiente</th>
-            <th class="text-end" style="width: 160px;">Monto a pagar</th>
+            <th class="text-end" style="width: 170px;">Monto a pagar</th>
+            <th class="text-end" style="width: 150px;">Queda pendiente</th>
             <th class="text-end" style="width: 160px;">Tipo de cambio</th>
           </tr>
         </thead>
         <tbody>
           {% for f in facturas %}
-          <tr>
+          <tr data-fila-factura="{{ f.id }}">
             <td class="fw-semibold">{{ f.numero_factura }}</td>
+            <td>
+              {% if f.empresa %}{{ f.empresa.nombre }}
+              {% else %}<span class="badge bg-light text-muted border">Sin asignar</span>{% endif %}
+            </td>
             <td>{{ f.fecha_vencimiento.strftime('%d-%m-%Y') if f.fecha_vencimiento else '--' }}</td>
-            <td class="text-end">{{ f.saldo_pendiente|moneda }} {{ f.moneda }}</td>
-            <td class="text-end">
-              <input type="hidden" name="factura_id" value="{{ f.id }}">
-              <input type="text" class="form-control form-control-sm text-end" name="monto_factura_{{ f.id }}"
-                     value="{{ f.saldo_pendiente if f.id in ids_preseleccionados else '' }}" placeholder="0.00">
+            <td class="text-end saldo-factura" data-saldo="{{ f.saldo_pendiente }}">
+              {{ f.saldo_pendiente|moneda }} {{ f.moneda }}
             </td>
             <td class="text-end">
-              <input type="text" class="form-control form-control-sm text-end" name="tipo_cambio_factura_{{ f.id }}" placeholder="CLP por 1 {{ f.moneda }}">
+              <input type="hidden" name="factura_id" value="{{ f.id }}">
+              <input type="text" class="form-control form-control-sm text-end input-monto"
+                     name="monto_factura_{{ f.id }}" value="{{ f.saldo_pendiente }}"
+                     data-factura="{{ f.id }}" data-saldo="{{ f.saldo_pendiente }}"
+                     data-moneda="{{ f.moneda }}" placeholder="0.00">
+            </td>
+            {# Ronda DE (2026-11-11, punto 2): "si este es menor me deja el
+               documento con el saldo pendiente" -- se muestra cuánto va a
+               quedar, calculado mientras se escribe, para que no haya que
+               hacerlo de cabeza. #}
+            <td class="text-end small queda-pendiente" data-factura="{{ f.id }}"></td>
+            <td class="text-end">
+              <input type="text" class="form-control form-control-sm text-end input-tipo-cambio"
+                     name="tipo_cambio_factura_{{ f.id }}" placeholder="CLP por 1 {{ f.moneda }}">
             </td>
           </tr>
           {% endfor %}
@@ -71,8 +110,109 @@
     </div>
   </div>
 
-  <button type="submit" class="btn btn-brand">Registrar pago múltiple</button>
+  {# Ronda DE (2026-11-11, punto 3 del pedido del usuario): "Agrega un total
+     del valor que se está pagando antes de registrar el pago para tener a la
+     vista el valor y cotejarlo con el soporte antes de procesarlo para evitar
+     errores." Se separa por moneda, porque un mismo proveedor puede tener
+     facturas en USD y en EUR. #}
+  <div class="card p-3 mb-3 border-brand">
+    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <div>
+        <div class="fw-semibold">Total que se va a pagar</div>
+        <div class="text-muted small">
+          Cotéjalo con el comprobante antes de registrar. Las facturas que dejes en 0 o en blanco no se pagan.
+        </div>
+      </div>
+      <div class="text-end">
+        <div id="totalPago" class="fs-4 fw-semibold">--</div>
+        <div id="detalleTotal" class="text-muted small"></div>
+      </div>
+    </div>
+    <div id="avisoExcedido" class="alert alert-danger small mt-2 mb-0 d-none">
+      Hay al menos un monto <strong>mayor al saldo pendiente</strong> de su factura. Revísalo: si lo registras así,
+      la factura queda con saldo a favor.
+    </div>
+  </div>
+
+  <button type="submit" class="btn btn-brand" id="btnRegistrarPago">Registrar pago múltiple</button>
   <a href="{{ url_for('pagos_proveedores_list') }}" class="btn btn-outline-secondary">Cancelar</a>
 </form>
+
+<script>
+  // Ronda DE: total a la vista, saldo que queda en cada factura, y aviso
+  // cuando un monto supera el saldo pendiente. Todo en el navegador -- el
+  // servidor vuelve a validar igual al registrar.
+  (function () {
+    const inputs = Array.from(document.querySelectorAll('.input-monto'));
+
+    function numero(texto) {
+      const limpio = (texto || '').toString().trim().replace(',', '.');
+      const valor = parseFloat(limpio);
+      return isNaN(valor) ? 0 : valor;
+    }
+
+    function formatear(valor) {
+      return valor.toLocaleString('es-CL', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function refrescar() {
+      const porMoneda = {};
+      let hayExcedido = false;
+
+      inputs.forEach(function (input) {
+        const monto = numero(input.value);
+        const saldo = parseFloat(input.dataset.saldo) || 0;
+        const moneda = input.dataset.moneda || '';
+        const fila = document.querySelector('[data-fila-factura="' + input.dataset.factura + '"]');
+        const queda = document.querySelector('.queda-pendiente[data-factura="' + input.dataset.factura + '"]');
+
+        const excedido = monto > saldo + 0.01;
+        input.classList.toggle('monto-excedido', excedido);
+        if (excedido) hayExcedido = true;
+        if (fila) fila.classList.toggle('fila-sin-monto', monto <= 0);
+
+        if (queda) {
+          if (monto <= 0) {
+            queda.innerHTML = '<span class="text-muted">no se paga</span>';
+          } else if (excedido) {
+            queda.innerHTML = '<span class="text-danger fw-semibold">a favor ' +
+              formatear(monto - saldo) + ' ' + moneda + '</span>';
+          } else if (monto < saldo - 0.01) {
+            queda.innerHTML = '<span class="text-warning-emphasis fw-semibold">' +
+              formatear(saldo - monto) + ' ' + moneda + '</span>';
+          } else {
+            queda.innerHTML = '<span class="text-success">queda pagada</span>';
+          }
+        }
+
+        if (monto > 0) {
+          porMoneda[moneda] = (porMoneda[moneda] || 0) + monto;
+        }
+      });
+
+      const monedas = Object.keys(porMoneda);
+      const total = document.getElementById('totalPago');
+      const detalle = document.getElementById('detalleTotal');
+      if (!monedas.length) {
+        total.textContent = '--';
+        detalle.textContent = 'No hay ninguna factura con monto a pagar.';
+      } else {
+        total.textContent = monedas
+          .map(function (m) { return formatear(porMoneda[m]) + ' ' + m; })
+          .join('  ·  ');
+        const cuantas = inputs.filter(function (i) { return numero(i.value) > 0; }).length;
+        detalle.textContent = cuantas + ' factura(s) en este pago';
+      }
+      document.getElementById('avisoExcedido').classList.toggle('d-none', !hayExcedido);
+      document.getElementById('btnRegistrarPago').disabled = !monedas.length;
+    }
+
+    inputs.forEach(function (input) {
+      input.addEventListener('input', refrescar);
+      input.addEventListener('change', refrescar);
+    });
+    refrescar();
+  })();
+</script>
 
 {% endblock %}

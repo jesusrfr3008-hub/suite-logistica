@@ -273,7 +273,14 @@
 {% endif %}
 
 <div class="card p-3">
-  <div class="fw-semibold mb-2">Historial de pagos</div>
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <div class="fw-semibold">Historial de pagos</div>
+    {% if pagos %}
+    <div class="text-muted small">
+      ¿Registraste un pago por error? Se puede deshacer con el botón de cada fila.
+    </div>
+    {% endif %}
+  </div>
   {% if not pagos %}
   <div class="text-muted small">Todavía no se ha registrado ningún pago para esta factura.</div>
   {% else %}
@@ -289,6 +296,7 @@
           <th>Comprobante</th>
           <th>Notas</th>
           <th>Registrado por</th>
+          <th></th>
         </tr>
       </thead>
       <tbody>
@@ -310,6 +318,21 @@
           </td>
           <td class="text-muted small">{{ p.notas or '' }}</td>
           <td class="text-muted small">{{ p.registrado_por.nombre_completo if p.registrado_por else '--' }}</td>
+          {# Ronda DE (2026-11-11, a pedido del usuario): deshacer un pago mal
+             registrado. Caso real: en un pago múltiple a DORC quedó por error
+             el monto de una cuarta invoice y esa factura se marcó PAGADA sin
+             haberse pagado. El pago se borra, la factura recalcula su saldo y
+             vuelve sola a Pendiente o Abonada. #}
+          <td class="text-end">
+            <form method="post" action="{{ url_for('pagos_proveedores_pago_eliminar', factura_id=factura.id, pago_id=p.id) }}"
+                  onsubmit="return confirm('¿Deshacer este pago de {{ p.monto|moneda }} {{ factura.moneda }} del {{ p.fecha_pago.strftime('%d-%m-%Y') }}?\n\nSe borra del historial y la factura vuelve a quedar con su saldo pendiente.{% if p.comprobante and p.comprobante.pagos.count() > 1 %}\n\nOJO: este comprobante respalda el pago de {{ p.comprobante.pagos.count() }} facturas. Solo se deshace el de ESTA; los de las otras quedan igual.{% endif %}');"
+                  class="d-inline">
+              <button type="submit" class="btn btn-sm btn-outline-danger py-0"
+                      data-bs-toggle="tooltip" title="Deshacer este pago -- la factura vuelve a quedar pendiente por este monto.">
+                <i class="bi bi-arrow-counterclockwise"></i> Deshacer
+              </button>
+            </form>
+          </td>
         </tr>
         {% endfor %}
       </tbody>

@@ -32,7 +32,7 @@ from markupsafe import escape
 
 from models import (
     db, Empresa, Proveedor, Producto, ProductoVariante, OrdenCompra, OrdenCompraLinea, OrdenDocumento,
-    OrdenCorreoEnviado,
+    OrdenCorreoEnviado, OrdenCambio,
     ESTADOS_OC, ETAPAS_LINEA, TIPOS_DOCUMENTO_ORDEN,
     Importacion, Parcial, ParcialLinea, ParcialLineaLote, GastoImportacion, GastoDocumento,
     ImportacionDocumento,
@@ -157,8 +157,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DD.1"
-VERSION_SUITE_FECHA = "2026-11-10"
+VERSION_SUITE = "DE"
+VERSION_SUITE_FECHA = "2026-11-11"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -4897,6 +4897,191 @@ def siguiente_correlativo_inventario(empresa_id):
     return (maximo + 1) if maximo else None
 
 
+# ---------------------------------------------------------------------------
+# Ronda DE (2026-11-11, punto 4 del pedido del usuario): registro de cambios
+# de una Orden de Compra ya aprobada.
+#
+# Textual: "cuando una OC se emite, se agrega un producto o se edita debe
+# generar un registro del usuario, hora con un sombreado en los productos o
+# dato que se cambio o se actualizo, ya que al emitir una OC puede un usuario
+# modificarla y pasar silencioso el cambio que se realizo."
+#
+# Hasta ahora la orden solo guardaba quien la CREO. Una vez aprobada,
+# cualquiera con permiso podia cambiarle una cantidad o un precio sin dejar
+# rastro.
+# ---------------------------------------------------------------------------
+
+# Campos de una linea que se auditan, con el nombre que se le muestra al
+# usuario. Las etapas (Confirmada/Despachada/...) NO estan aca a proposito:
+# avanzar de etapa es el flujo normal de la orden, no una modificacion
+# silenciosa, y registrarlas llenaria el panel de ruido.
+CAMPOS_AUDITABLES_LINEA = [
+    ("cantidad_cajas", "Cantidad"),
+    ("precio_unitario_pactado", "Precio unitario"),
+    ("fecha_estimada_despacho", "Fecha estimada de despacho"),
+    ("cantidad_despachada_cajas", "Cantidad despachada"),
+    ("fecha_disponibilidad_confirmada", "Disponibilidad confirmada"),
+    ("fecha_estimada_despacho_confirmada", "Despacho confirmado"),
+    ("nota", "Nota"),
+]
+
+CAMPOS_AUDITABLES_ORDEN = [
+    ("numero_po", "N° de OC"),
+    ("empresa_id", "Empresa compradora"),
+    ("fecha_emision", "Fecha de emisión"),
+    ("moneda", "Moneda"),
+    ("notas", "Notas"),
+    ("es_consignacion", "Consignación"),
+]
+
+
+def _texto_valor_auditoria(valor):
+    """Deja cualquier valor en un texto corto y legible para guardarlo en
+    OrdenCambio. Las fechas en dd-mm-aaaa (como se ven en pantalla), los
+    booleanos en Si/No, y lo vacio como "(vacío)" para que se entienda la
+    diferencia entre "no tenia nada" y "no se toco"."""
+    if valor is None or valor == "":
+        return "(vacío)"
+    if isinstance(valor, bool):
+        return "Sí" if valor else "No"
+    if isinstance(valor, datetime):
+        return valor.strftime("%d-%m-%Y %H:%M")
+    if isinstance(valor, date):
+        return valor.strftime("%d-%m-%Y")
+    if isinstance(valor, float):
+        # Sin decimales cuando es redondo, para que "12 -> 15" no se lea
+        # "12.0 -> 15.0".
+        return f"{valor:,.2f}".rstrip("0").rstrip(".") if valor % 1 else f"{valor:,.0f}"
+    return str(valor)[:200]
+
+
+def _orden_ya_enviada_al_proveedor(orden):
+    """True si de esta orden ya se preparo al menos un correo al proveedor
+    (ver OrdenCorreoEnviado). Un cambio hecho despues de eso es el caso
+    grave: el proveedor tiene en su poder una version distinta de la que
+    quedo en el sistema."""
+    try:
+        return OrdenCorreoEnviado.query.filter_by(orden_id=orden.id).count() > 0
+    except Exception:
+        return False
+
+
+def orden_se_audita(orden):
+    """Solo se auditan las ordenes YA APROBADAS. Antes de eso la orden se
+    esta armando y anotar cada tecleo seria ruido -- el usuario pidio esto
+    "solo para las emitidas y despues tienen alguna modificacion"."""
+    return bool(orden) and (orden.estado_aprobacion or "") == "Aprobada"
+
+
+def registrar_cambio_orden(orden, tipo, descripcion, linea=None, campo=None,
+                           antes=None, despues=None, ya_enviada=None):
+    """Deja constancia de UN cambio. No hace commit -- lo hace quien llama,
+    junto con el cambio real, para que el registro y el cambio entren o no
+    entren juntos."""
+    if not orden_se_audita(orden):
+        return None
+    if ya_enviada is None:
+        ya_enviada = _orden_ya_enviada_al_proveedor(orden)
+    cambio = OrdenCambio(
+        orden_id=orden.id,
+        linea_id=linea.id if linea is not None else None,
+        tipo=tipo,
+        descripcion=(descripcion or "")[:400],
+        campo=(campo or None),
+        valor_antes=_texto_valor_auditoria(antes) if campo else None,
+        valor_despues=_texto_valor_auditoria(despues) if campo else None,
+        usuario_id=current_user.id if getattr(current_user, "is_authenticated", False) else None,
+        despues_de_envio=bool(ya_enviada),
+    )
+    db.session.add(cambio)
+    return cambio
+
+
+def _etiqueta_linea_orden(linea):
+    """Como se nombra una linea en el registro de cambios: codigo y
+    descripcion del producto, que es como el usuario la reconoce."""
+    if linea is None:
+        return ""
+    producto = getattr(linea, "producto", None)
+    codigo = getattr(linea, "codigo_variante", None) or (producto.codigo if producto else "")
+    descripcion = (producto.descripcion if producto else "") or ""
+    return f"{codigo} {descripcion}".strip()[:200] or "(producto sin identificar)"
+
+
+def snapshot_linea_orden(linea):
+    """Foto de los campos auditables ANTES de tocarlos -- se compara contra
+    el estado final en registrar_cambios_de_linea."""
+    return {campo: getattr(linea, campo, None) for campo, _ in CAMPOS_AUDITABLES_LINEA}
+
+
+def registrar_cambios_de_linea(orden, linea, antes):
+    """Compara la foto previa contra como quedo la linea y registra UN
+    cambio por cada campo que de verdad cambio. Devuelve cuantos."""
+    if not orden_se_audita(orden):
+        return 0
+    ya_enviada = _orden_ya_enviada_al_proveedor(orden)
+    etiqueta = _etiqueta_linea_orden(linea)
+    registrados = 0
+    for campo, nombre in CAMPOS_AUDITABLES_LINEA:
+        valor_antes = antes.get(campo)
+        valor_despues = getattr(linea, campo, None)
+        if valor_antes == valor_despues:
+            continue
+        registrar_cambio_orden(
+            orden, "linea_editada",
+            f"{etiqueta}: {nombre} {_texto_valor_auditoria(valor_antes)} → {_texto_valor_auditoria(valor_despues)}",
+            linea=linea, campo=nombre, antes=valor_antes, despues=valor_despues,
+            ya_enviada=ya_enviada,
+        )
+        registrados += 1
+    return registrados
+
+
+def snapshot_cabecera_orden(orden):
+    return {campo: getattr(orden, campo, None) for campo, _ in CAMPOS_AUDITABLES_ORDEN}
+
+
+def registrar_cambios_de_cabecera(orden, antes):
+    """Igual que registrar_cambios_de_linea pero para los datos de arriba de
+    la orden (N° de OC, empresa, moneda, notas...)."""
+    if not orden_se_audita(orden):
+        return 0
+    ya_enviada = _orden_ya_enviada_al_proveedor(orden)
+    nombres_empresa = {}
+    registrados = 0
+    for campo, nombre in CAMPOS_AUDITABLES_ORDEN:
+        valor_antes = antes.get(campo)
+        valor_despues = getattr(orden, campo, None)
+        if valor_antes == valor_despues:
+            continue
+        if campo == "empresa_id":
+            # Se guarda el NOMBRE de la empresa, no su id -- el registro
+            # tiene que poder leerse sin ir a buscar a otra tabla.
+            for valor in (valor_antes, valor_despues):
+                if valor and valor not in nombres_empresa:
+                    empresa = Empresa.query.get(valor)
+                    nombres_empresa[valor] = empresa.nombre if empresa else f"id {valor}"
+            valor_antes = nombres_empresa.get(valor_antes)
+            valor_despues = nombres_empresa.get(valor_despues)
+        registrar_cambio_orden(
+            orden, "cabecera_editada",
+            f"{nombre}: {_texto_valor_auditoria(valor_antes)} → {_texto_valor_auditoria(valor_despues)}",
+            campo=nombre, antes=valor_antes, despues=valor_despues, ya_enviada=ya_enviada,
+        )
+        registrados += 1
+    return registrados
+
+
+def lineas_con_cambios(orden):
+    """{linea_id: True/False} -- True si esa linea tiene algun cambio
+    registrado DESPUES del envio al proveedor. Sirve para sombrear la fila
+    en el detalle de la orden, que es lo que pidio el usuario."""
+    resultado = {}
+    for cambio in orden.cambios.filter(OrdenCambio.linea_id.isnot(None)).all():
+        resultado[cambio.linea_id] = resultado.get(cambio.linea_id, False) or bool(cambio.despues_de_envio)
+    return resultado
+
+
 def recalcular_estado_orden(orden):
     """Sincroniza orden.estado con las etapas de sus lineas activas
     (no anuladas). Si la orden esta Cancelada, se respeta y no se
@@ -8074,6 +8259,12 @@ def ordenes_detalle(orden_id):
         empresas=empresas,
         correos_enviados=correos_enviados,
         sort_sel=sort_sel, dir_sel=dir_sel,
+        # Ronda DE (2026-11-11, punto 4): historial de cambios de la orden
+        # (solo existe desde que la orden quedó aprobada) y el mapa de qué
+        # líneas se tocaron, para sombrearlas.
+        cambios_orden=orden.cambios.order_by(OrdenCambio.creado_en.desc()).all(),
+        lineas_tocadas=lineas_con_cambios(orden),
+        orden_ya_enviada=_orden_ya_enviada_al_proveedor(orden),
     )
 
 
@@ -8133,6 +8324,11 @@ def ordenes_editar(orden_id):
             )
             return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
+    # Ronda DE (2026-11-11, punto 4): foto de los datos de cabecera ANTES
+    # de tocarlos, para registrar quien cambio que (ver
+    # registrar_cambios_de_cabecera).
+    antes_cabecera = snapshot_cabecera_orden(orden)
+
     orden.numero_po = nuevo_numero
     orden.empresa_id = nuevo_empresa_id
     orden.fecha_emision = parse_date(request.form.get("fecha_emision")) or orden.fecha_emision
@@ -8142,8 +8338,12 @@ def ordenes_editar(orden_id):
     # después de emitida (por si se marcó mal al crearla) -- sigue siendo
     # por ORDEN COMPLETA.
     orden.es_consignacion = request.form.get("es_consignacion") == "on"
+    registrados = registrar_cambios_de_cabecera(orden, antes_cabecera)
     db.session.commit()
-    flash(f"Orden actualizada: {orden.numero_po}.", "success")
+    mensaje = f"Orden actualizada: {orden.numero_po}."
+    if registrados:
+        mensaje += f" Se registró el cambio en el historial de la orden ({registrados} dato(s))."
+    flash(mensaje, "success")
     return redirect(url_for("ordenes_detalle", orden_id=orden.id))
 
 
@@ -8305,6 +8505,14 @@ def ordenes_linea_nueva(orden_id):
         if linea.producto and not linea.producto.activo:
             linea.producto.activo = True
             reactivado = True
+        # Ronda DE (2026-11-11, punto 4): agregar un producto a una orden ya
+        # aprobada deja constancia de quien y cuando.
+        registrar_cambio_orden(
+            orden, "linea_agregada",
+            f"Se agregó a la orden: {_etiqueta_linea_orden(linea)} "
+            f"({cant} x {_texto_valor_auditoria(precio)})",
+            linea=linea,
+        )
         creadas.append(linea.codigo_mostrar)
 
     if not creadas:
@@ -8462,6 +8670,8 @@ def ordenes_linea_actualizar(orden_id, linea_id):
     if linea.bloqueada:
         flash("Esta línea ya fue despachada: no se puede editar. Gestiona sus documentos en la sección de Documentos de la orden.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
+    # Ronda DE (2026-11-11, punto 4): foto ANTES de tocar la linea.
+    antes_linea = snapshot_linea_orden(linea)
     linea.cantidad_cajas = parse_int(request.form.get("cantidad_cajas"), default=linea.cantidad_cajas)
     linea.precio_unitario_pactado = float(
         request.form.get("precio_unitario_pactado") or linea.precio_unitario_pactado
@@ -8483,8 +8693,12 @@ def ordenes_linea_actualizar(orden_id, linea_id):
     # dejar vacía para borrarla. Ver OrdenCompraLinea.nota/descripcion_oc.
     if "nota_linea" in request.form:
         linea.nota = (request.form.get("nota_linea") or "").strip() or None
+    registrados = registrar_cambios_de_linea(linea.orden, linea, antes_linea)
     db.session.commit()
-    flash("Linea de la orden actualizada.", "success")
+    mensaje = "Linea de la orden actualizada."
+    if registrados:
+        mensaje += f" Quedó registrado quién y cuándo ({registrados} dato(s) cambiado(s))."
+    flash(mensaje, "success")
     return redirect(url_for("ordenes_detalle", orden_id=orden_id))
 
 
@@ -8496,6 +8710,16 @@ def ordenes_linea_eliminar(orden_id, linea_id):
         flash("Esta línea ya fue despachada: no se puede eliminar.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
     orden = linea.orden
+    # Ronda DE (2026-11-11, punto 4): se registra ANTES de borrar -- despues
+    # ya no hay de donde sacar que producto era. OrdenCambio.linea_id es un
+    # id pelado, sin ForeignKey, justamente para que el registro sobreviva a
+    # la linea que describe.
+    registrar_cambio_orden(
+        orden, "linea_eliminada",
+        f"Se eliminó de la orden: {_etiqueta_linea_orden(linea)} "
+        f"({linea.cantidad_cajas or 0} x {_texto_valor_auditoria(linea.precio_unitario_pactado)})",
+        linea=linea,
+    )
     db.session.delete(linea)
     db.session.flush()
     recalcular_estado_orden(orden)
@@ -8524,7 +8748,19 @@ def ordenes_lineas_fecha_masiva(orden_id):
             if linea.bloqueada:
                 omitidas += 1
                 continue
+            # Ronda DE (2026-11-11, punto 4): tambien se registra cuando la
+            # fecha se cambia en masa -- es el mismo cambio silencioso, solo
+            # que sobre varias lineas de una vez.
+            antes_fecha = linea.fecha_estimada_despacho
             linea.fecha_estimada_despacho = nueva_fecha
+            if antes_fecha != nueva_fecha:
+                registrar_cambio_orden(
+                    orden, "fecha_masiva",
+                    f"{_etiqueta_linea_orden(linea)}: Fecha estimada de despacho "
+                    f"{_texto_valor_auditoria(antes_fecha)} → {_texto_valor_auditoria(nueva_fecha)}",
+                    linea=linea, campo="Fecha estimada de despacho",
+                    antes=antes_fecha, despues=nueva_fecha,
+                )
             actualizadas += 1
         db.session.commit()
         mensaje = f"Fecha estimada de despacho aplicada a {actualizadas} linea(s)."
@@ -8772,6 +9008,13 @@ def ordenes_linea_anular(orden_id, linea_id):
         flash("Esta línea ya fue despachada, no se puede anular.", "warning")
         return redirect(url_for("ordenes_detalle", orden_id=orden_id))
     linea.anulada = True
+    # Ronda DE (2026-11-11, punto 4): anular una linea saca el producto de la
+    # orden a efectos practicos -- se registra igual que una eliminacion.
+    registrar_cambio_orden(
+        orden, "linea_anulada",
+        f"Se anuló en la orden: {_etiqueta_linea_orden(linea)}",
+        linea=linea,
+    )
     recalcular_estado_orden(orden)
     db.session.commit()
     flash(f"'{linea.producto.codigo}' anulada.", "info")
@@ -8784,6 +9027,11 @@ def ordenes_linea_reactivar(orden_id, linea_id):
     linea = OrdenCompraLinea.query.get_or_404(linea_id)
     orden = linea.orden
     linea.anulada = False
+    registrar_cambio_orden(
+        orden, "linea_reactivada",
+        f"Se reactivó en la orden: {_etiqueta_linea_orden(linea)}",
+        linea=linea,
+    )
     recalcular_estado_orden(orden)
     db.session.commit()
     flash(f"'{linea.producto.codigo}' reactivada. Sigue en la etapa '{linea.etapa}'.", "info")
@@ -21586,6 +21834,75 @@ def pagos_proveedores_registrar_pago(factura_id):
     return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
 
 
+@app.route("/pagos-proveedores/<int:factura_id>/pago/<int:pago_id>/eliminar", methods=["POST"])
+@requiere_permiso("pagos_proveedores")
+def pagos_proveedores_pago_eliminar(factura_id, pago_id):
+    """Ronda DE (2026-11-11, a pedido del usuario): deshacer un pago mal
+    registrado.
+
+    Caso real que lo motivo: registrando un pago multiple a DORC por tres
+    invoice, se dejo por error el monto de una cuarta (CD100075403) en vez
+    de ponerlo en 0, y esa factura quedo marcada como PAGADA sin haberse
+    pagado. Hasta esta ronda no habia forma de revertirlo desde el
+    programa.
+
+    El usuario eligio BORRAR el pago por completo (no dejarlo anulado): el
+    movimiento desaparece del historial, la factura recalcula su saldo y
+    vuelve sola a Pendiente o Abonada segun lo que quede.
+
+    Dos cuidados que no son obvios:
+
+    1. PAGO MULTIPLE. Un mismo comprobante puede respaldar los pagos de
+       varias facturas. Aca se borra SOLO el pago de ESTA factura -- los de
+       las otras facturas del mismo comprobante quedan intactos, que es
+       justo lo que necesita el caso real (se pago bien 3 de 4).
+    2. EL COMPROBANTE. Si al borrar este pago el comprobante se queda sin
+       ningun pago colgando, se borra tambien: un PDF de respaldo que ya no
+       respalda nada solo estorba. Si todavia respalda otros pagos, no se
+       toca.
+    """
+    factura = FacturaProveedor.query.get_or_404(factura_id)
+    pago = PagoFacturaProveedor.query.get_or_404(pago_id)
+    if pago.factura_id != factura.id:
+        flash("Ese pago no pertenece a esta factura.", "danger")
+        return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+    monto_borrado = pago.monto or 0
+    comprobante = pago.comprobante
+    # Cuantas facturas MAS quedan respaldadas por el mismo comprobante --
+    # se cuenta antes de borrar para poder avisarlo en el mensaje.
+    otras_del_comprobante = []
+    if comprobante:
+        otras_del_comprobante = [
+            otro.factura_id for otro in comprobante.pagos.all() if otro.id != pago.id
+        ]
+
+    db.session.delete(pago)
+    db.session.flush()
+
+    if comprobante and not otras_del_comprobante:
+        db.session.delete(comprobante)
+
+    estado_antes = factura.estado
+    factura.estado = _factura_proveedor_estado_por_saldo(factura)
+    db.session.commit()
+
+    mensaje = (
+        f"Pago de {monto_borrado:,.2f} {factura.moneda} eliminado de la factura "
+        f"{factura.numero_factura}. "
+    )
+    if estado_antes != factura.estado:
+        mensaje += f"La factura pasó de \"{estado_antes}\" a \"{factura.estado}\" -- "
+    mensaje += f"saldo pendiente: {factura.saldo_pendiente:,.2f} {factura.moneda}."
+    if otras_del_comprobante:
+        mensaje += (
+            f" El comprobante sigue respaldando el pago de otra(s) {len(otras_del_comprobante)} "
+            "factura(s), que no se tocaron."
+        )
+    flash(mensaje, "success")
+    return redirect(url_for("pagos_proveedores_detalle", factura_id=factura.id))
+
+
 @app.route("/pagos-proveedores/<int:factura_id>/editar-valor", methods=["POST"])
 @requiere_permiso("pagos_proveedores")
 def pagos_proveedores_editar_valor_factura(factura_id):
@@ -21841,21 +22158,33 @@ def pagos_proveedores_pago_multiple():
         flash("Elige un proveedor para registrar un pago múltiple.", "danger")
         return redirect(url_for("pagos_proveedores_list"))
 
-    ids_preseleccionados = {int(i) for i in request.args.getlist("factura_id") if i.isdigit()}
-    facturas = (
+    seleccionadas = {int(i) for i in request.args.getlist("factura_id") if i.isdigit()}
+    query = (
         FacturaProveedor.query
         .filter(FacturaProveedor.proveedor_id == proveedor.id, FacturaProveedor.estado.in_(["pendiente", "abonada"]))
-        .order_by(FacturaProveedor.fecha_vencimiento)
-        .all()
     )
+    # Ronda DE (2026-11-11, punto 1 del pedido del usuario): si se viene con
+    # facturas marcadas desde el listado, la pantalla trae SOLO ESAS. Antes
+    # traia todas las pendientes del proveedor con el monto precargado y
+    # habia que acordarse de poner en 0 las que no se pagaban -- de ahi
+    # salio el error real que motivo esta ronda: quedo el monto de una
+    # cuarta invoice (CD100075403) y se marco PAGADA sin haberse pagado.
+    if seleccionadas:
+        query = query.filter(FacturaProveedor.id.in_(seleccionadas))
+    facturas = query.order_by(FacturaProveedor.fecha_vencimiento).all()
     if not facturas:
-        flash(f"{proveedor.nombre} no tiene facturas pendientes para pagar.", "warning")
+        flash(
+            f"{proveedor.nombre} no tiene facturas pendientes para pagar."
+            if not seleccionadas else
+            "Las facturas que marcaste ya no tienen saldo pendiente.",
+            "warning",
+        )
         return redirect(url_for("pagos_proveedores_list"))
 
     return render_template(
         "pagos_proveedores/pago_multiple.html",
         proveedor=proveedor, facturas=facturas,
-        ids_preseleccionados=ids_preseleccionados if ids_preseleccionados else {f.id for f in facturas},
+        vino_con_seleccion=bool(seleccionadas),
     )
 
 
@@ -21897,11 +22226,19 @@ def pagos_proveedores_pago_multiple_registrar():
 
     notas = request.form.get("notas", "").strip()
     facturas_pagadas, facturas_abonadas = [], []
+    # Ronda DE (2026-11-11): si a alguna factura se le paga MAS que su saldo,
+    # se avisa fuerte. No se bloquea (a veces se paga de mas a proposito, por
+    # ejemplo por un cargo bancario), pero tiene que quedar dicho: es
+    # exactamente el sintoma del error que motivo esta ronda, y hay una
+    # factura en produccion con saldo -1,00 EUR por algo asi.
+    excedidas = []
     for f in facturas:
         if f.id not in montos:
             continue
         monto, tipo_cambio_pago = montos[f.id]
         saldo_antes = f.saldo_pendiente
+        if monto > saldo_antes + 0.01:
+            excedidas.append(f"{f.numero_factura} (+{monto - saldo_antes:,.2f} {f.moneda})")
         es_abono = monto < (saldo_antes - 0.01)
         db.session.add(PagoFacturaProveedor(
             factura_id=f.id, fecha_pago=fecha_pago, monto=monto, tipo_cambio_pago=tipo_cambio_pago,
@@ -21918,7 +22255,15 @@ def pagos_proveedores_pago_multiple_registrar():
         partes.append(f"{len(facturas_pagadas)} factura(s) quedaron PAGADA(S) ({', '.join(facturas_pagadas)})")
     if facturas_abonadas:
         partes.append(f"{len(facturas_abonadas)} factura(s) quedaron con abono parcial ({', '.join(facturas_abonadas)})")
-    flash(f"Pago múltiple registrado a {proveedor.nombre} -- " + "; ".join(partes) + ".", "success")
+    mensaje = f"Pago múltiple registrado a {proveedor.nombre} -- " + "; ".join(partes) + "."
+    if excedidas:
+        mensaje += (
+            " OJO: se pagó MÁS que el saldo pendiente en " + ", ".join(excedidas) +
+            ". Si fue un error, puedes deshacer ese pago desde el detalle de la factura."
+        )
+        flash(mensaje, "warning")
+    else:
+        flash(mensaje, "success")
     return redirect(url_for("pagos_proveedores_list", proveedor_id=proveedor.id))
 
 

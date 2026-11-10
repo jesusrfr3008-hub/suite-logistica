@@ -64,8 +64,15 @@
 <div class="alert alert-success">No hay facturas que calcen con este filtro.</div>
 {% endif %}
 
+{# Ronda DE (2026-11-11, punto 1 del pedido del usuario): "se debe habilitar
+   un checkbox para seleccionar las facturas que quiero pagar, y no que te
+   lleve todas y allí ponerle 0 a las que no estoy pagando". Cada proveedor
+   es su propio formulario: se marcan las facturas y "Pagar seleccionadas"
+   lleva al pago múltiple SOLO con esas. Nace de un error real -- quedó el
+   monto de una cuarta invoice sin poner en 0 y se marcó pagada. #}
 {% for proveedor, facturas in agrupado.items() %}
-<div class="card p-3 mb-3">
+<form method="get" action="{{ url_for('pagos_proveedores_pago_multiple') }}" class="card p-3 mb-3">
+  <input type="hidden" name="proveedor_id" value="{{ proveedor.id }}">
   <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
     <div class="d-flex align-items-center gap-2">
       <span class="fw-semibold">{{ proveedor.nombre }}</span>
@@ -98,10 +105,11 @@
       {% endif %}
       {% endfor %}
     </div>
-    <div class="d-flex gap-2">
-      <a href="{{ url_for('pagos_proveedores_pago_multiple', proveedor_id=proveedor.id) }}" class="btn btn-sm btn-outline-brand">
-        Pago múltiple
-      </a>
+    <div class="d-flex gap-2 align-items-center">
+      <span class="text-muted small contador-seleccion" data-proveedor="{{ proveedor.id }}"></span>
+      <button type="submit" class="btn btn-sm btn-brand btn-pagar-seleccionadas" data-proveedor="{{ proveedor.id }}" disabled>
+        Pagar seleccionadas
+      </button>
       <a href="{{ url_for('proveedores_editar', proveedor_id=proveedor.id) }}" class="btn btn-sm btn-outline-secondary">
         Editar condiciones de crédito
       </a>
@@ -112,6 +120,11 @@
     <table class="table table-sm align-middle mb-0">
       <thead>
         <tr class="text-muted small">
+          <th style="width: 34px;">
+            {# Marca/desmarca todas las pagables de este proveedor. #}
+            <input type="checkbox" class="form-check-input check-todas" data-proveedor="{{ proveedor.id }}"
+                   data-bs-toggle="tooltip" title="Marcar o desmarcar todas las que se pueden pagar">
+          </th>
           <th>Factura</th>
           <th>Empresa</th>
           <th>Emisión</th>
@@ -125,7 +138,20 @@
       </thead>
       <tbody>
         {% for f in facturas %}
+        {% set pagable = f.estado in ('pendiente', 'abonada') and f.saldo_pendiente > 0.01 %}
         <tr>
+          <td>
+            {% if pagable %}
+            <input type="checkbox" class="form-check-input check-factura" name="factura_id" value="{{ f.id }}"
+                   data-proveedor="{{ proveedor.id }}">
+            {% else %}
+            {# Una factura ya pagada o anulada no se puede volver a pagar: no
+               se ofrece la casilla, en vez de dejar marcarla y que el pago
+               múltiple la rechace después. #}
+            <span class="text-muted" data-bs-toggle="tooltip"
+                  title="{% if f.estado == 'pagada' %}Ya está pagada.{% elif f.estado == 'anulada' %}Está anulada.{% else %}No tiene saldo pendiente.{% endif %}">--</span>
+            {% endif %}
+          </td>
           <td class="fw-semibold">{{ f.numero_factura }}</td>
           <td>
             {% if f.empresa %}{{ f.empresa.nombre }}
@@ -165,7 +191,43 @@
       </tbody>
     </table>
   </div>
-</div>
+</form>
 {% endfor %}
+
+<script>
+  // Ronda DE: habilita "Pagar seleccionadas" solo cuando hay algo marcado,
+  // y lleva la cuenta a la vista. El "marcar todas" de la cabecera actúa
+  // solo sobre las facturas de SU proveedor.
+  (function () {
+    function refrescar(proveedorId) {
+      const marcadas = document.querySelectorAll(
+        '.check-factura[data-proveedor="' + proveedorId + '"]:checked');
+      const boton = document.querySelector(
+        '.btn-pagar-seleccionadas[data-proveedor="' + proveedorId + '"]');
+      const contador = document.querySelector(
+        '.contador-seleccion[data-proveedor="' + proveedorId + '"]');
+      if (boton) boton.disabled = marcadas.length === 0;
+      if (contador) {
+        contador.textContent = marcadas.length
+          ? marcadas.length + ' factura(s) marcada(s)'
+          : '';
+      }
+    }
+    document.querySelectorAll('.check-factura').forEach(function (chk) {
+      chk.addEventListener('change', function () { refrescar(chk.dataset.proveedor); });
+    });
+    document.querySelectorAll('.check-todas').forEach(function (todas) {
+      todas.addEventListener('change', function () {
+        document.querySelectorAll(
+          '.check-factura[data-proveedor="' + todas.dataset.proveedor + '"]'
+        ).forEach(function (chk) { chk.checked = todas.checked; });
+        refrescar(todas.dataset.proveedor);
+      });
+    });
+    document.querySelectorAll('.btn-pagar-seleccionadas').forEach(function (b) {
+      refrescar(b.dataset.proveedor);
+    });
+  })();
+</script>
 
 {% endblock %}

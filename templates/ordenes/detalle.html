@@ -22,6 +22,18 @@
 {% block title %}{{ orden.numero_po }} · Suite Logística{% endblock %}
 {% block content %}
 
+<style>
+  /* Ronda DE (2026-11-11, punto 4): sombreado de las líneas que se tocaron
+     después de que la orden quedó aprobada. Ámbar para un cambio normal,
+     rojo cuando además se hizo DESPUÉS de habérsela enviado al proveedor --
+     ese es el que hay que mirar, porque el proveedor tiene otra versión. */
+  tr.fila-modificada > td { background-color: #fff8e1 !important; }
+  tr.fila-modificada-grave > td { background-color: #fdecea !important; }
+  tr.fila-modificada > td:first-child { box-shadow: inset 3px 0 0 #f0ad4e; }
+  tr.fila-modificada-grave > td:first-child { box-shadow: inset 3px 0 0 #dc3545; }
+</style>
+
+
 {% set puede_crear = current_user.tiene_permiso('crear_orden') %}
 {% set puede_aprobar = current_user.tiene_permiso('aprobar_orden') %}
 {# Ronda AN (2026-09-23, corrección, a pedido del usuario): "Confirmar" (el
@@ -510,9 +522,23 @@
       </thead>
       <tbody>
         {% for l in lineas %}
-        <tr class="{% if l.anulada %}table-secondary text-muted{% endif %}" data-producto-id="{{ l.producto_id }}" data-variante-codigo="{{ l.variante_codigo or '' }}" data-anulada="{{ 'true' if l.anulada else 'false' }}">
+        {# Ronda DE (2026-11-11, punto 4 del pedido del usuario): "un sombreado
+           en los productos o dato que se cambió o se actualizó". `lineas_tocadas`
+           trae las líneas con cambios registrados después de aprobada la orden;
+           el valor es True cuando ese cambio además ocurrió DESPUÉS de haberle
+           mandado la OC al proveedor, que es el caso grave. #}
+        {% set tocada = lineas_tocadas.get(l.id) %}
+        <tr class="{% if l.anulada %}table-secondary text-muted{% elif tocada is not none %}fila-modificada{% if tocada %} fila-modificada-grave{% endif %}{% endif %}"
+            data-producto-id="{{ l.producto_id }}" data-variante-codigo="{{ l.variante_codigo or '' }}" data-anulada="{{ 'true' if l.anulada else 'false' }}">
           <td><input type="checkbox" class="check-linea-det" value="{{ l.id }}"></td>
-          <td>{{ l.codigo_mostrar }}</td>
+          <td>
+            {{ l.codigo_mostrar }}
+            {% if tocada is not none %}
+            <i class="bi bi-pencil-fill small {% if tocada %}text-danger{% else %}text-warning-emphasis{% endif %}"
+               data-bs-toggle="tooltip"
+               title="Esta línea se modificó después de que la orden quedó aprobada{% if tocada %} Y DESPUÉS de habérsela enviado al proveedor{% endif %}. El detalle está en 'Cambios después de aprobada', más abajo."></i>
+            {% endif %}
+          </td>
           <td style="max-width:260px;">
             {{ l.descripcion_mostrar }}
             {% if l.nota %}<br><span class="text-muted small" title="Nota de esta línea, se refleja en la emisión/PDF de la OC">Nota: {{ l.nota }}</span>{% endif %}
@@ -611,6 +637,65 @@
     </table>
   </div>
 </div>
+
+{# Ronda DE (2026-11-11, punto 4 del pedido del usuario): "al emitir una OC
+   puede un usuario modificarla y pasar silencioso el cambio que se realizó".
+   Acá queda, con usuario y hora. Solo se registra desde que la orden está
+   APROBADA -- antes de eso todavía se está armando. #}
+{% if cambios_orden %}
+{% set cambios_graves = cambios_orden | selectattr('despues_de_envio') | list %}
+<div class="card p-3 mb-3 {% if cambios_graves %}border-danger{% endif %}">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <h5 class="section-title mb-0">
+      Cambios después de aprobada
+      <span class="badge {% if cambios_graves %}bg-danger{% else %}bg-warning text-dark{% endif %}">{{ cambios_orden|length }}</span>
+    </h5>
+    {% if cambios_graves %}
+    <span class="badge bg-danger">
+      {{ cambios_graves|length }} después de enviarla al proveedor
+    </span>
+    {% endif %}
+  </div>
+  <div class="text-muted small mb-2">
+    Todo lo que se tocó desde que esta orden quedó aprobada, con quién y cuándo.
+    {% if cambios_graves %}
+    Los marcados en rojo se hicieron <strong>después</strong> de haberle enviado la OC al proveedor:
+    él tiene en su poder una versión distinta de la que está acá.
+    {% elif orden_ya_enviada %}
+    Ninguno es posterior al envío al proveedor.
+    {% endif %}
+  </div>
+  <div class="table-responsive" style="max-height: 340px; overflow-y: auto;">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>Cuándo</th>
+          <th>Quién</th>
+          <th>Qué cambió</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in cambios_orden %}
+        <tr class="{% if c.despues_de_envio %}table-danger{% endif %}">
+          <td class="small text-nowrap">{{ c.creado_en | hora_cl }}</td>
+          <td class="small">{{ c.usuario.nombre_completo if c.usuario else '--' }}</td>
+          <td class="small">{{ c.descripcion }}</td>
+          <td class="text-end">
+            {% if c.despues_de_envio %}
+            <span class="badge bg-danger" data-bs-toggle="tooltip"
+                  title="Este cambio se hizo después de haberle mandado la OC al proveedor.">Posterior al envío</span>
+            {% else %}
+            <span class="badge bg-light text-muted border">Antes del envío</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
 
 <div class="card p-3">
   <h5 class="section-title mb-3">Documentos de la orden</h5>
