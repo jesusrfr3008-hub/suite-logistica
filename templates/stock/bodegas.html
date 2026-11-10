@@ -32,8 +32,10 @@
   <div>
     <h3 class="section-title mb-0">Stock Bodegas</h3>
     <div class="text-muted small">
-      Existencias en las bodegas de control -- préstamo y apoyo clínico, demos, comodato, clientes, etc. --
-      con el costo del lote. La bodega central se consulta en
+      Existencias por bodega, lote a lote, con el costo de cada lote. Pensada para las bodegas de control
+      -- préstamo y apoyo clínico, demos, comodato, clientes --, pero se puede habilitar cualquiera,
+      la central incluida, desde <strong>Configuración &gt; Configuración de reportes</strong>.
+      El saldo de la central para vender se sigue viendo en
       <a href="{{ url_for('stock_list') }}">Consulta de Stock</a>.
       {% if ultima_carga_bodegas %}Última actualización del reporte de bodegas: {{ ultima_carga_bodegas | hora_cl }} (hora de Chile).{% endif %}
     </div>
@@ -97,7 +99,16 @@
 
 <div class="card p-3">
   <div class="text-muted small mb-2">
-    {{ filas|length }} fila(s).
+    {% if recortado %}
+    {# Ronda DD.1: con la bodega central habilitada esto puede traer miles de
+       lotes -- se recorta y se dice, en vez de hacer la página inusable. #}
+    <span class="text-danger fw-semibold">Mostrando {{ filas|length }} de {{ total_filas }} fila(s)</span> --
+    {% if bodega_sel %}filtra o busca un código para ver el resto.
+    {% else %}el tope se reparte entre las bodegas habilitadas para que ninguna quede fuera;
+    filtra por una bodega para ver su detalle completo.{% endif %}
+    {% else %}
+    {{ total_filas if total_filas is defined else filas|length }} fila(s).
+    {% endif %}
     {# El costo del lote sale de la MISMA fuente que el reporte Costo Producto
        (histórico de compras + importaciones costeadas en el programa), así
        que las dos pantallas no pueden discrepar. Regla que fijó el usuario:
@@ -151,7 +162,7 @@
           <td>{{ f.costo.fecha.strftime('%d-%m-%Y') if f.costo.fecha else '--' }}</td>
           <td>
             {% if f.costo.importacion_id %}
-            <a href="{{ url_for('importacion_detalle', importacion_id=f.costo.importacion_id) }}">{{ f.costo.factura or '--' }}</a>
+            <a href="{{ url_for('importaciones_detalle', importacion_id=f.costo.importacion_id) }}">{{ f.costo.factura or '--' }}</a>
             {% else %}{{ f.costo.factura or '--' }}{% endif %}
           </td>
           <td class="text-end">{{ f.costo.valor_unitario|moneda }} {{ f.costo.moneda }}</td>

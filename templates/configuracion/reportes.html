@@ -11,10 +11,15 @@
   agrega una bodega nueva, nadie la ve hasta que se revise y se habilite acá.
 </div>
 
+{# Ronda DD.1 (2026-11-10): la central dejó de estar bloqueada. En la ronda
+   DD se forzaba prendida y sin poder tocarla; el usuario lo corrigió --
+   Consulta de Stock muestra el SALDO de la central, y ver su DETALLE por
+   lote con el costo es otra cosa, que puede querer o no. #}
 <div class="alert alert-light border small">
-  <strong>Bodega {{ bodega_central }} (central)</strong> no se puede apagar ni se consulta acá: es el stock
-  disponible para vender y tiene su propia pantalla, <a href="{{ url_for('stock_list') }}">Consulta de Stock</a>,
-  que usa todo el equipo comercial.
+  <strong>Bodega {{ bodega_central }} (central)</strong> se prende y se apaga como cualquier otra.
+  Apagarla acá <strong>no afecta</strong> a <a href="{{ url_for('stock_list') }}">Consulta de Stock</a>,
+  que siempre muestra el saldo de la central: lo único que decides acá es si además quieres poder ver
+  su detalle por lote, con el costo de cada uno, en <a href="{{ url_for('stock_bodegas_list') }}">Stock Bodegas</a>.
 </div>
 
 <form method="post">
@@ -39,17 +44,13 @@
               <div class="form-check form-switch mb-0">
                 <input class="form-check-input" type="checkbox" name="visibles" value="{{ b.codigo }}"
                        id="vis_{{ b.codigo }}"
-                       {% if b.visible_en_consulta %}checked{% endif %}
-                       {% if es_central %}disabled title="La bodega central siempre está disponible -- se consulta en Consulta de Stock."{% endif %}>
-                {% if es_central %}
-                {# Un input deshabilitado no se envía: se manda igual como hidden
-                   para que el POST no la apague. De todos modos la ruta la fuerza
-                   a visible, esto es solo para que el formulario sea coherente. #}
-                <input type="hidden" name="visibles" value="{{ b.codigo }}">
-                {% endif %}
+                       {% if b.visible_en_consulta %}checked{% endif %}>
               </div>
             </td>
-            <td class="fw-semibold">{{ b.codigo }}</td>
+            <td class="fw-semibold">
+              {{ b.codigo }}
+              {% if es_central %}<div class="text-muted fw-normal" style="font-size: 0.75rem;">central</div>{% endif %}
+            </td>
             <td>
               <input type="text" class="form-control form-control-sm" name="nombre_{{ b.codigo }}"
                      value="{{ b.nombre or '' }}" maxlength="120" placeholder="Bodega {{ b.codigo }}">

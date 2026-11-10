@@ -157,7 +157,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DD"
+VERSION_SUITE = "DD.1"
 VERSION_SUITE_FECHA = "2026-11-10"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -2499,9 +2499,12 @@ def _registrar_bodegas_vistas(pares):
         db.session.add(BodegaReporte(
             codigo=codigo,
             nombre=_nombre_bodega(codigo, nombre),
-            # La central se marca visible porque ya se consulta hoy (es
-            # Consulta de Stock); las demas quedan apagadas.
-            visible_en_consulta=(codigo == BODEGA_CENTRAL),
+            # Ronda DD.1: nacen apagadas TODAS, la central incluida. Antes
+            # la central nacia prendida y ademas no se podia apagar; el
+            # usuario pidio decidirlo el ("quizas no la quiera consultar
+            # por aca... pero si quiero ver el detalle puede que lo
+            # seleccione").
+            visible_en_consulta=False,
             orden=orden,
         ))
 
@@ -13156,6 +13159,74 @@ def _saldos_en_cero_en_central():
     return {(f.empresa_id, (f.codigo_interno or "").strip()): (f.descripcion or "") for f in filas}
 
 
+def _datos_catalogo_por_codigo_interno():
+    """Ronda DD.1 (2026-11-10): {codigo_interno: (codigo_catalogo,
+    descripcion, proveedor_nombre, proveedor_id)} para los codigos que SI
+    estan ligados a un Producto/Variante del catalogo.
+
+    Lo usan las filas "sinteticas" de Consulta de Stock (sin stock cargado)
+    como ULTIMO recurso, cuando el mapeo Ergopyme no resuelve el codigo.
+    Sin esto, un codigo homologado al catalogo pero ausente del mapeo
+    Ergopyme salia con la columna Codigo en "-" y la descripcion cruda del
+    reporte, cuando el programa tiene el dato bueno a mano.
+
+    Se mantiene la regla de la ronda AB (el mapeo Ergopyme manda cuando
+    resuelve): esto solo rellena lo que quedaria vacio."""
+    resultado = {}
+    for h in HomologacionStock.query.filter(
+        db.or_(HomologacionStock.producto_id.isnot(None), HomologacionStock.variante_id.isnot(None))
+    ).all():
+        if h.variante_id and h.variante:
+            producto = h.variante.producto
+            resultado[h.codigo_interno] = (
+                h.variante.codigo,
+                h.variante.descripcion or (producto.descripcion if producto else ""),
+                producto.proveedor.nombre if producto and producto.proveedor else None,
+                producto.proveedor_id if producto else None,
+            )
+        elif h.producto_id and h.producto:
+            resultado[h.codigo_interno] = (
+                h.producto.codigo,
+                h.producto.descripcion,
+                h.producto.proveedor.nombre if h.producto.proveedor else None,
+                h.producto.proveedor_id,
+            )
+    return resultado
+
+
+def _clave_grupo_por_codigo_interno():
+    """Ronda DD.1 (2026-11-10, bug reportado por el usuario): la MISMA clave
+    de agrupacion que usa una fila de stock real, pero resuelta desde el
+    codigo interno de Ergopyme.
+
+    Para que sirve: las filas "sinteticas" de Consulta de Stock (un codigo
+    con pedido pero sin stock cargado, uno en transito sin stock, uno en
+    cero en la central con rotacion) se agrupaban con una clave propia
+    ("pedido_sin_stock", codigo, empresa). Como la consolidacion por
+    producto corta la empresa del final de la clave y agrupa por el resto,
+    esa clave propia NUNCA se juntaba con la del stock real del mismo
+    producto ("variante", variante_id, empresa) -- y el producto salia en
+    DOS lineas.
+
+    El usuario lo reporto con TRIFOCAL BI-FLEX LIBERTY 20.0 y 23.0: una
+    linea con el stock de una empresa y otra en cero de la otra, y las dos
+    mostrando las mismas 4 unidades en transito, como si fueran 8. El
+    transito se calcula por (producto, variante) sin empresa, asi que
+    repetir la fila lo repite entero.
+
+    Devolviendo la clave real, la consolidacion de la ronda CF las junta
+    sola: una sola linea, el stock sumado y el transito una sola vez."""
+    resultado = {}
+    for h in HomologacionStock.query.filter(
+        db.or_(HomologacionStock.producto_id.isnot(None), HomologacionStock.variante_id.isnot(None))
+    ).all():
+        if h.variante_id:
+            resultado[h.codigo_interno] = ("variante", h.variante_id)
+        elif h.producto_id:
+            resultado[h.codigo_interno] = ("producto", h.producto_id)
+    return resultado
+
+
 @app.route("/stock")
 @requiere_permiso("consultar_stock", "inventarios")
 def stock_list():
@@ -13337,6 +13408,27 @@ def stock_list():
     # Ergopyme está vinculado a un Producto/Variante del catálogo, se resuelve
     # su tránsito real igual que cualquier fila con stock físico cargado.
     producto_variante_por_codigo = _producto_variante_por_codigo_interno()
+    # Ronda DD.1: ver _clave_grupo_por_codigo_interno -- las filas
+    # sinteticas de aca para abajo usan la MISMA clave que una fila de
+    # stock real, asi la consolidacion por producto las junta en vez de
+    # dejar el producto repetido en dos lineas.
+    clave_grupo_por_codigo = _clave_grupo_por_codigo_interno()
+    datos_catalogo_por_codigo = _datos_catalogo_por_codigo_interno()
+
+    def _completar_desde_catalogo(codigo, prov_nombre, prov_id, codigo_mostrar, descripcion):
+        """Ronda DD.1: rellena con el catalogo lo que el mapeo Ergopyme no
+        haya podido resolver. No pisa nada que ya venga resuelto."""
+        del_catalogo = datos_catalogo_por_codigo.get(codigo)
+        if not del_catalogo:
+            return prov_nombre, prov_id, codigo_mostrar, descripcion
+        codigo_cat, descripcion_cat, prov_nombre_cat, prov_id_cat = del_catalogo
+        return (
+            prov_nombre or prov_nombre_cat,
+            prov_id if prov_id is not None else prov_id_cat,
+            codigo_mostrar or codigo_cat,
+            descripcion or descripcion_cat or "",
+        )
+
     if proveedor_id != "sin_marca":
         for (emp_id, codigo), cantidad_pedido in pedido_por_codigo.items():
             if not cantidad_pedido or (emp_id, codigo) in codigos_cubiertos:
@@ -13351,6 +13443,10 @@ def stock_list():
             if empresa_id and str(emp_id) != str(empresa_id):
                 continue
             descripcion_pend = descripcion_pedido_por_codigo.get((emp_id, codigo), "") or descripcion_ergopyme or ""
+            # Ronda DD.1: mismo relleno desde el catalogo que abajo -- solo
+            # completa lo que el mapeo Ergopyme dejo vacio.
+            prov_nombre_res, prov_id_res, codigo_prov_res, descripcion_pend = _completar_desde_catalogo(
+                codigo, prov_nombre_res, prov_id_res, codigo_prov_res, descripcion_pend)
             if (
                 q_lower
                 and q_lower not in (descripcion_pend or "").lower()
@@ -13363,7 +13459,18 @@ def stock_list():
                 transito_por_linea.get((producto_id_res, variante_codigo_res)) if producto_id_res else None
             )
             transito_res = transito_info_res["cantidad"] if transito_info_res else 0
-            grupos[("pedido_sin_stock", codigo, emp_id)] = {
+            # Ronda DD.1: si el codigo NO esta homologado al catalogo, se
+            # usa ("codigo", codigo_interno) -- que es exactamente la clave
+            # con la que se agrupa una fila de stock real sin homologar
+            # (ver el armado de `grupos` mas arriba). Asi el mismo codigo
+            # interno queda en UNA sola linea, tenga stock en una empresa y
+            # cero en la otra, o venga de dos bloques sinteticos distintos
+            # (pedido sin stock + cero con rotacion son el mismo producto).
+            clave_base = clave_grupo_por_codigo.get(codigo) or ("codigo", codigo)
+            clave_fila = clave_base + (emp_id,)
+            if clave_fila in grupos:
+                continue
+            grupos[clave_fila] = {
                 "empresa": empresas_por_id.get(emp_id),
                 "proveedor_id": prov_id_res,
                 "proveedor_nombre": prov_nombre_res,
@@ -13435,7 +13542,15 @@ def stock_list():
                 for texto in (descripcion_t, codigo_mostrar_t, codigo_interno_t)
             ):
                 continue
-            grupos[("transito_huerfano", producto_id_t, variante_codigo_t, empresa_id_t)] = {
+            # Ronda DD.1: misma clave que una fila de stock real (ver
+            # _clave_grupo_por_codigo_interno).
+            clave_fila = (
+                ("variante", variante_t.id, empresa_id_t) if variante_t
+                else ("producto", producto_id_t, empresa_id_t)
+            )
+            if clave_fila in grupos:
+                continue
+            grupos[clave_fila] = {
                 "empresa": empresas_por_id.get(empresa_id_t),
                 "proveedor_id": proveedor_id_t,
                 "proveedor_nombre": producto_t.proveedor.nombre if producto_t.proveedor else None,
@@ -13502,6 +13617,11 @@ def stock_list():
             if empresa_id and str(emp_id) != str(empresa_id):
                 continue
             descripcion_cero = descripcion_cero or descripcion_ergopyme or ""
+            # Ronda DD.1: si el codigo esta homologado al catalogo, se
+            # muestra el codigo y la descripcion del catalogo en vez de
+            # dejar la columna Codigo en "-".
+            prov_nombre_res, prov_id_res, codigo_prov_res, descripcion_cero = _completar_desde_catalogo(
+                codigo, prov_nombre_res, prov_id_res, codigo_prov_res, descripcion_cero)
             if (
                 q_lower
                 and q_lower not in (descripcion_cero or "").lower()
@@ -13515,7 +13635,16 @@ def stock_list():
             )
             transito_res = transito_info_res["cantidad"] if transito_info_res else 0
             pedido_res = pedido_por_codigo.get((emp_id, codigo), 0)
-            grupos[("cero_con_rotacion", codigo, emp_id)] = {
+            # Ronda DD.1: misma clave que usaria una fila de stock real de
+            # ese codigo (ver el bloque de "pedido sin stock" de arriba).
+            # El `continue` de abajo es el que evita que un codigo que
+            # ademas tiene pedido pendiente salga dos veces: ese bloque
+            # corre primero y ya dejo la fila, con su pedido.
+            clave_base = clave_grupo_por_codigo.get(codigo) or ("codigo", codigo)
+            clave_fila = clave_base + (emp_id,)
+            if clave_fila in grupos:
+                continue
+            grupos[clave_fila] = {
                 "empresa": empresas_por_id.get(emp_id),
                 "proveedor_id": prov_id_res,
                 "proveedor_nombre": prov_nombre_res,
@@ -13580,10 +13709,12 @@ def stock_list():
                 base["pedido"] += grupo["pedido"]
                 base["lotes"].extend(grupo["lotes"])
                 base["sin_stock_cargado"] = base.get("sin_stock_cargado") and grupo.get("sin_stock_cargado")
-                # Ronda DD: si alguna de las filas que se consolidan SI hay
-                # que resaltarla (un pedido sin stock), la consolidada se
-                # resalta.
-                base["resaltar_fila"] = bool(base.get("resaltar_fila")) or bool(grupo.get("resaltar_fila"))
+                # Ronda DD.1: la fila consolidada se resalta solo si TODAS
+                # las que se juntaron eran sinteticas. Si una de ellas es
+                # stock real, el producto si tiene existencias y pintarlo
+                # entero de amarillo seria enganoso (mismo criterio que
+                # sin_stock_cargado, arriba).
+                base["resaltar_fila"] = base.get("resaltar_fila") and grupo.get("resaltar_fila")
                 if grupo["proximo_vencimiento"] and (
                     base["proximo_vencimiento"] is None
                     or grupo["proximo_vencimiento"] < base["proximo_vencimiento"]
@@ -19617,19 +19748,27 @@ def reportes_costo_producto():
 #    costos en el historico o en el sistema trae el ultimo costo."
 # ---------------------------------------------------------------------------
 
-def _bodegas_configuradas(solo_visibles=False, excluir_central=True):
+# Ronda DD.1 (2026-11-10): tope de filas de Stock Bodegas. Las bodegas de
+# control son chicas (95 filas con cuatro habilitadas), pero ahora la
+# central tambien se puede habilitar y esa sola trae ~3.500 lotes. Se
+# recorta y se avisa en pantalla, igual que el reporte de Costo Producto.
+MAX_FILAS_STOCK_BODEGAS = 1500
+
+
+def _bodegas_configuradas(solo_visibles=False):
     """Bodegas de BodegaReporte, ordenadas como se configuraron. Es la
     lista que manda sobre que se puede consultar en Stock Bodegas -- el
     usuario la edita en Configuracion > Configuracion de reportes.
 
-    La central se excluye por defecto porque ya tiene su propia pantalla
-    (Consulta de Stock) y mezclarla aca duplicaria la misma informacion con
-    dos criterios distintos."""
+    Ronda DD.1 (2026-11-10): la central ya NO se excluye. En la ronda DD se
+    forzaba apagada y encima sin poder tocarla, con el argumento de que ya
+    tenia su propia pantalla. El usuario lo corrigio: Consulta de Stock
+    muestra el SALDO de la central, y a veces quiere ver su DETALLE por
+    lote con el costo, que es otra cosa. Ahora es una bodega mas de la
+    lista: se prende y se apaga como cualquiera."""
     query = BodegaReporte.query
     if solo_visibles:
         query = query.filter(BodegaReporte.visible_en_consulta == True)  # noqa: E712
-    if excluir_central:
-        query = query.filter(BodegaReporte.codigo != BODEGA_CENTRAL)
     return query.order_by(BodegaReporte.orden, BodegaReporte.codigo).all()
 
 
@@ -19818,11 +19957,40 @@ def stock_bodegas_list():
         )
     ]
 
+    # El resumen de arriba se calcula sobre TODO antes de recortar, para
+    # que los totales por bodega sigan siendo los de verdad aunque la tabla
+    # muestre solo una parte.
+    total_filas = len(filas)
+    recortado = total_filas > MAX_FILAS_STOCK_BODEGAS
+    if recortado:
+        if bodega_sel:
+            filas = filas[:MAX_FILAS_STOCK_BODEGAS]
+        else:
+            # Ronda DD.1: el tope se REPARTE entre las bodegas que se estan
+            # mostrando. Con un corte plano, la bodega mas grande (la
+            # central, ~2.300 lotes) se comia el cupo entero y las bodegas
+            # de control -- que son justo las que esta pantalla existe para
+            # mirar -- no aparecian ni una fila. Repartiendo, cada bodega
+            # queda representada y el que quiera el detalle completo de una
+            # filtra por ella.
+            bodegas_presentes = {f["bodega_codigo"] for f in filas} or {None}
+            cupo = max(100, MAX_FILAS_STOCK_BODEGAS // len(bodegas_presentes))
+            usado = defaultdict(int)
+            recortadas = []
+            for fila in filas:
+                if usado[fila["bodega_codigo"]] >= cupo:
+                    continue
+                usado[fila["bodega_codigo"]] += 1
+                recortadas.append(fila)
+            filas = recortadas
+
     ultima_carga = db.session.query(db.func.max(StockExistencia.cargado_en)).scalar()
     ultima_carga_bodegas = db.session.query(db.func.max(StockBodegaSaldo.cargado_en)).scalar()
     return render_template(
         "stock/bodegas.html",
         filas=filas, bodegas=bodegas, resumen_bodegas=resumen_bodegas,
+        total_filas=total_filas, recortado=recortado,
+        max_filas=MAX_FILAS_STOCK_BODEGAS, bodega_central=BODEGA_CENTRAL,
         empresas=Empresa.query.order_by(Empresa.nombre).all(),
         bodega_sel=bodega_sel, empresa_sel=empresa_id, q=q,
         ultima_carga=ultima_carga, ultima_carga_bodegas=ultima_carga_bodegas,
@@ -19850,10 +20018,9 @@ def configuracion_reportes():
             nuevo_visible = bodega.codigo in visibles
             nuevo_nombre = (request.form.get(f"nombre_{bodega.codigo}", "") or "").strip()[:120]
             nuevas_notas = (request.form.get(f"notas_{bodega.codigo}", "") or "").strip()[:300]
-            if bodega.codigo == BODEGA_CENTRAL:
-                # La central no se puede apagar: es Consulta de Stock, la
-                # pantalla que usa todo el equipo comercial.
-                nuevo_visible = True
+            # Ronda DD.1: la central ya no se fuerza a visible -- se
+            # prende y se apaga como cualquier otra. Apagarla aca NO afecta
+            # a Consulta de Stock, que lee la central siempre.
             if (
                 bodega.visible_en_consulta != nuevo_visible
                 or (nuevo_nombre and bodega.nombre != nuevo_nombre)
