@@ -63,6 +63,19 @@
 </div>
 {% endif %}
 
+{# Ronda DG (2026-11-14): los códigos que ni el catálogo ni el mapeo Ergopyme
+   reconocen salen en la tabla como "(sin homologar)" y sin descripción. No es
+   un problema de stock sino de datos, así que se avisa aparte y se apunta a
+   donde se arregla. #}
+{% if resumen.sin_reconocer %}
+<div class="alert alert-secondary small">
+  <strong>{{ resumen.sin_reconocer }}</strong> código(s) de esta lista no se pueden enganchar a ningún producto
+  del catálogo: salen como <em>(sin homologar)</em> y sin descripción. Eso no se arregla comprando --
+  se arregla en <a href="{{ url_for('stock_homologacion', ver='repetidos') }}">Stock &gt; Homologación</a>,
+  escribiendo el código interno sobre el producto o creándolo en el catálogo.
+</div>
+{% endif %}
+
 <div class="row g-2 mb-3">
   <div class="col-md-3">
     <div class="card p-3 h-100">

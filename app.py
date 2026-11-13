@@ -157,8 +157,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DF"
-VERSION_SUITE_FECHA = "2026-11-13"
+VERSION_SUITE = "DG"
+VERSION_SUITE_FECHA = "2026-11-14"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -4994,7 +4994,73 @@ def registrar_cambio_orden(orden, tipo, descripcion, linea=None, campo=None,
         despues_de_envio=bool(ya_enviada),
     )
     db.session.add(cambio)
+    # Ronda DG (2026-11-14): ademas de dejar el registro, se avisa por la
+    # campanita a quien le toca hacerle seguimiento. El aviso se agrupa por
+    # minuto (ver _avisar_cambio_de_orden), asi que una edicion que toca
+    # varios campos genera UN aviso, no uno por campo.
+    try:
+        _avisar_cambio_de_orden(orden, despues_de_envio=bool(ya_enviada))
+    except Exception as exc:
+        # Un aviso que falla NUNCA puede voltear el cambio que el usuario
+        # acaba de guardar: se registra y se sigue.
+        print(f"[notificaciones] No se pudo avisar del cambio en la orden {orden.id}: {exc}")
     return cambio
+
+
+def _usuarios_a_seguir_ordenes(excluir_usuario_id=None):
+    """Ronda DG (2026-11-14, a pedido del usuario): quien recibe el aviso
+    cuando se emite o se modifica una Orden de Compra.
+
+    Pedido textual: "cada vez que alguien emita una OC, Distinto a mi
+    usuario, o se modifique una OC ya emitida, salga una notificacion para
+    poder hacerle seguimiento".
+
+    La regla que se eligio, para que no dependa de un usuario en concreto:
+    reciben el aviso los ADMINISTRADORES y quienes tengan el permiso de
+    APROBAR ORDENES -- es decir, los que de verdad tienen que hacerle
+    seguimiento a una compra. Siempre se excluye a quien hizo el cambio: a
+    nadie le sirve que le avisen de lo que acaba de hacer el mismo, y era
+    exactamente lo que el usuario pidio evitar ("distinto a mi usuario")."""
+    usuarios = (
+        Usuario.query.join(Rol)
+        .filter(
+            Usuario.activo.is_(True),
+            db.or_(Rol.es_administrador.is_(True), Rol.permiso_aprobar_orden.is_(True)),
+        )
+        .all()
+    )
+    return [u for u in usuarios if u.id != excluir_usuario_id]
+
+
+def _avisar_cambio_de_orden(orden, despues_de_envio=False):
+    """Deja el aviso en la campanita de los que siguen las ordenes.
+
+    Se agrupa por MINUTO y por usuario que lo hizo: editar una linea toca
+    varios campos y registrar_cambio_orden se llama una vez por campo, asi
+    que sin agrupar llegarian cuatro avisos de la misma edicion. El detalle
+    campo por campo ya vive en el panel de la orden (ronda DE), asi que el
+    aviso solo tiene que llevar hasta ahi."""
+    actor = current_user if getattr(current_user, "is_authenticated", False) else None
+    destinatarios = _usuarios_a_seguir_ordenes(excluir_usuario_id=actor.id if actor else None)
+    if not destinatarios:
+        return 0
+    quien = (actor.nombre_completo if actor else "Alguien")
+    marca = datetime.utcnow().strftime("%Y%m%d%H%M")
+    titulo = f"OC {orden.numero_po} modificada después de emitida"
+    if despues_de_envio:
+        titulo = f"OC {orden.numero_po} modificada DESPUÉS de enviarla al proveedor"
+    return _notificar(
+        destinatarios,
+        titulo,
+        f"{quien} cambió la orden {orden.numero_po} "
+        f"({orden.proveedor.nombre if orden.proveedor else 'sin proveedor'}). "
+        + ("El proveedor ya tiene en su poder una versión distinta. " if despues_de_envio else "")
+        + "El detalle está en el historial de la orden.",
+        url=url_for("ordenes_detalle", orden_id=orden.id),
+        icono="pencil-square" if not despues_de_envio else "exclamation-triangle",
+        clave_unica=f"oc-cambio:{orden.id}:{actor.id if actor else 0}:{marca}",
+        modulo="ordenes",
+    )
 
 
 def _etiqueta_linea_orden(linea):
@@ -7353,6 +7419,26 @@ def ordenes_aprobar(orden_id):
         if linea.producto_creado_por_esta_orden and linea.producto and not linea.producto.activo:
             linea.producto.activo = True
             activados += 1
+    # Ronda DG (2026-11-14, a pedido del usuario): aviso de EMISION. En este
+    # programa una orden se convierte en Orden de Compra definitiva cuando
+    # se aprueba (nace "Por Aprobar", ver ESTADOS_APROBACION_OC), asi que
+    # este es el momento de "se emitio una OC".
+    try:
+        _notificar(
+            _usuarios_a_seguir_ordenes(
+                excluir_usuario_id=current_user.id if getattr(current_user, "is_authenticated", False) else None),
+            f"OC {orden.numero_po} emitida",
+            f"{current_user.nombre_completo} aprobó y emitió la orden {orden.numero_po} "
+            f"({orden.proveedor.nombre if orden.proveedor else 'sin proveedor'}"
+            f"{', ' + orden.empresa.nombre if orden.empresa else ''}) "
+            f"por {len(orden.lineas.all()) if hasattr(orden.lineas, 'all') else 0} línea(s).",
+            url=url_for("ordenes_detalle", orden_id=orden.id),
+            icono="file-earmark-check",
+            clave_unica=f"oc-emitida:{orden.id}",
+            modulo="ordenes",
+        )
+    except Exception as exc:
+        print(f"[notificaciones] No se pudo avisar de la emisión de la orden {orden.id}: {exc}")
     db.session.commit()
     mensaje = f"Orden {orden.numero_po} aprobada -- ya es una Orden de Compra definitiva y aparece en Compras/Órdenes."
     if activados:
@@ -15402,15 +15488,74 @@ HITOS_DIAS_STOCK = (0, 4, 8, 12)
 MAX_FILAS_PROYECCION = 300
 
 
+def _catalogo_por_codigo_interno():
+    """Ronda DG (2026-11-14, bug reportado por el usuario): {CODIGO INTERNO
+    EN MAYUSCULA: datos del producto} armado desde el propio CATALOGO, es
+    decir desde `Producto.codigo_interno_inventario` y
+    `ProductoVariante.codigo_interno_inventario`.
+
+    Por que hace falta: el usuario reporto que en la proyeccion del S&OP
+    salian productos "(sin descripcion)" y "(sin homologar)" aunque al
+    buscarlos en el catalogo el codigo interno SI estaba escrito en la
+    variante. Tenia razon. La ronda DF resolvia la identidad de un codigo
+    mirando solo HomologacionStock y, si fallaba, el mapeo CodigoErgopyme
+    -- y nunca le preguntaba al catalogo, que es justo donde el usuario
+    habia escrito la asociacion a mano.
+
+    Esto es ademas lo que la ronda CP ya habia establecido para
+    _ventas_sin_producto: un codigo interno escrito encima de un producto o
+    de una variante CUENTA como enganchado al catalogo. La ronda DF se
+    salto esa regla y volvio a abrir el punto ciego que la CP habia
+    cerrado.
+
+    Devuelve, por codigo: la clave de forecast, el codigo del catalogo, la
+    descripcion, el proveedor y los ids -- todo lo que la proyeccion
+    necesita para mostrar la fila como corresponde."""
+    resultado = {}
+
+    def _agregar(objeto, padre, es_variante):
+        codigo = (objeto.codigo_interno_inventario or "").strip().upper()
+        if not codigo or codigo in resultado:
+            return
+        proveedor = padre.proveedor if padre else None
+        resultado[codigo] = {
+            "clave": f"V:{objeto.id}" if es_variante else f"P:{objeto.id}",
+            "codigo": (objeto.codigo or "").strip(),
+            "descripcion": (objeto.descripcion or "") or (padre.descripcion if padre else "") or "",
+            "proveedor": proveedor.nombre if proveedor else "",
+            "proveedor_id": padre.proveedor_id if padre else None,
+            "producto_id": objeto.producto_id if es_variante else objeto.id,
+            "variante_codigo": (objeto.codigo or "").strip().upper() if es_variante else None,
+        }
+
+    for producto in Producto.query.filter(Producto.codigo_interno_inventario.isnot(None)).all():
+        _agregar(producto, producto, False)
+    for variante in ProductoVariante.query.filter(
+            ProductoVariante.codigo_interno_inventario.isnot(None)).all():
+        _agregar(variante, variante.producto, True)
+    return resultado
+
+
 def _clave_forecast_por_codigo_interno():
     """{codigo_interno Ergopyme: clave_producto} -- el puente entre el mundo
     del stock/ventas (que habla en codigos internos) y el del forecast (que
     habla en productos del catalogo, ver _clave_producto_forecast).
 
-    Un codigo sin homologar cae a su propia clave "E:CODIGO", que es
-    exactamente lo que hace el forecast, asi que igual se puede proyectar y
-    comparar."""
+    Tres fuentes, en este orden:
+      1. HomologacionStock, cuando de verdad apunta a un producto o
+         variante. Es la homologacion explicita y manda.
+      2. Ronda DG: el CATALOGO (codigo_interno_inventario escrito encima
+         del producto o de la variante). Una fila de HomologacionStock que
+         existe pero quedo 'pendiente' -- sin producto ni variante -- NO
+         gana sobre esto: el catalogo sabe mas que una fila vacia.
+      3. Si nadie lo reconoce, su propia clave "E:CODIGO", igual que hace
+         el forecast, asi que se puede proyectar y comparar lo mismo.
+
+    Que el codigo resuelva a la clave del catalogo tiene un segundo efecto
+    importante: la venta de ese codigo se junta con la fila del producto en
+    vez de aparecer como una fila suelta duplicada."""
     resultado = {}
+    catalogo = _catalogo_por_codigo_interno()
     for h in HomologacionStock.query.all():
         codigo = (h.codigo_interno or "").strip()
         if not codigo:
@@ -15420,7 +15565,19 @@ def _clave_forecast_por_codigo_interno():
         elif h.producto_id:
             resultado[codigo] = f"P:{h.producto_id}"
         else:
-            resultado[codigo] = f"E:{codigo.upper()}"
+            # Fila sin producto ligado ('pendiente' o 'sin_marca'): antes de
+            # rendirse, el catalogo.
+            del_catalogo = catalogo.get(codigo.upper())
+            resultado[codigo] = del_catalogo["clave"] if del_catalogo else f"E:{codigo.upper()}"
+    # Codigos que el catalogo conoce y que no tienen ninguna fila de
+    # homologacion (el caso que reporto el usuario).
+    for codigo, datos in catalogo.items():
+        resultado.setdefault(codigo, datos["clave"])
+    # El catalogo indexa en MAYUSCULA y las ventas/stock traen el codigo tal
+    # como viene del archivo: se registra tambien la version en mayuscula
+    # para que la busqueda calce de cualquiera de las dos formas.
+    for codigo in list(resultado):
+        resultado.setdefault(codigo.upper(), resultado[codigo])
     return resultado
 
 
@@ -15563,6 +15720,7 @@ def _construir_proyeccion_stock(ciclo, proveedor_sel="", solo_alertas=False, q="
     """
     semanas = _semanas_forecast(ciclo) if ciclo else []
     clave_por_codigo = _clave_forecast_por_codigo_interno()
+    catalogo_interno = _catalogo_por_codigo_interno()
     forecast_por_clave, forecast_por_vendedor = _forecast_por_clave_y_semana(ciclo)
     llegadas_por_pv, sin_fecha_por_pv = _llegadas_por_semana(semanas)
     pedido_por_codigo, descripcion_pedido = _pedido_por_codigo()
@@ -15663,7 +15821,7 @@ def _construir_proyeccion_stock(ciclo, proveedor_sel="", solo_alertas=False, q="
     # ---- completar datos y calcular la proyeccion ----
     resultado = []
     for clave, fila in filas.items():
-        _completar_identidad_fila(fila, clave, homologador)
+        _completar_identidad_fila(fila, clave, homologador, catalogo_interno)
 
         codigos = fila["codigos_internos"] or set()
         # La rotacion del producto es la suma de la de sus codigos internos
@@ -15780,7 +15938,7 @@ def _id_variante(producto_id, variante_codigo):
     return variante.id if variante else None
 
 
-def _completar_identidad_fila(fila, clave, homologador):
+def _completar_identidad_fila(fila, clave, homologador, catalogo=None):
     """Rellena codigo, descripcion y proveedor de una fila de la proyeccion
     cuando no vinieron del stock (por ejemplo, un producto que solo esta en
     transito o solo en el forecast)."""
@@ -15806,8 +15964,19 @@ def _completar_identidad_fila(fila, clave, homologador):
             if producto.proveedor:
                 fila["proveedor"] = fila["proveedor"] or producto.proveedor.nombre
             return
-    # Codigo sin homologar: lo ultimo que queda es el mapeo Ergopyme.
     codigo_interno = clave[2:] if clave.startswith("E:") else ""
+    # Ronda DG: ANTES del mapeo Ergopyme, el catalogo -- es donde el usuario
+    # escribe el codigo interno a mano y era la fuente que faltaba
+    # consultar (ver _catalogo_por_codigo_interno).
+    del_catalogo = (catalogo or {}).get(codigo_interno.upper()) if codigo_interno else None
+    if del_catalogo:
+        fila["codigo"] = fila["codigo"] or del_catalogo["codigo"]
+        fila["descripcion"] = fila["descripcion"] or del_catalogo["descripcion"]
+        fila["proveedor"] = fila["proveedor"] or del_catalogo["proveedor"]
+        fila["producto_id"] = fila["producto_id"] or del_catalogo["producto_id"]
+        fila["variante_codigo"] = fila["variante_codigo"] or del_catalogo["variante_codigo"]
+        return
+    # Lo ultimo que queda es el mapeo Ergopyme.
     resuelto = homologador(codigo_interno) if codigo_interno else None
     if resuelto:
         proveedor_nombre, _prov_id, codigo_proveedor, descripcion = resuelto
@@ -16927,6 +17096,11 @@ def forecast_proyeccion():
 
     resumen = {
         "productos": len(filas),
+        # Ronda DG: los que ni el catalogo ni el mapeo Ergopyme reconocen.
+        # Se cuentan aparte para que no se confundan con un problema de
+        # stock: son un problema de DATOS, y se resuelven en
+        # Stock > Homologacion, no comprando.
+        "sin_reconocer": sum(1 for f in filas if f["proveedor"] == "(sin homologar)"),
         "con_quiebre": sum(1 for f in filas if f["semana_quiebre"]),
         "bajo_rotacion": sum(1 for f in filas
                              if any(a["tipo"] == "bajo_rotacion" for a in f["alertas"])),
