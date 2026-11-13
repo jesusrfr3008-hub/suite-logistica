@@ -44,8 +44,13 @@
 </div>
 <div class="text-muted small mb-3">
   El listado va ordenado por <strong>lo que hay que atender primero</strong>: entregados sin costear, luego los
-  que ya se costearon pero les falta la cuenta por pagar, después aduana y tránsito, y al final los que ya están
+  que ya se costearon pero tienen algo pendiente, después aduana y tránsito, y al final los que ya están
   cerrados. Dentro de cada grupo, lo que lleva más tiempo esperando va arriba.
+  {# Ronda DH.1 (2026-11-14, corregido por el usuario): una importación de
+     consignación no lleva factura en el costeo -- la cierra la verificación
+     de la consignación. Se dice acá para que el badge se entienda. #}
+  Una importación de <strong>consignación</strong> no genera factura en el costeo: queda cerrada cuando se
+  <strong>verifica la consignación</strong>.
 </div>
 {% endif %}
 
@@ -100,7 +105,7 @@
           <td>
             <span class="badge bg-{{ fila.color }}{% if fila.color in ('warning', 'light') %} text-dark{% endif %}"
                   data-bs-toggle="tooltip"
-                  title="{% if fila.situacion == 'falta_costear' %}Entregado y todavía sin costear: la mercadería ya está en bodega y no tiene costo asignado.{% elif fila.situacion == 'falta_factura' %}Ya costeado, pero todavía no se generó la cuenta por pagar al proveedor.{% elif fila.situacion == 'cerrado' %}Entregado, costeado y con su factura de proveedor generada. No requiere nada más.{% else %}Todavía en curso: no hay nada que costear hasta que llegue.{% endif %}">
+                  title="{% if fila.situacion == 'falta_costear' %}Entregado y todavía sin costear: la mercadería ya está en bodega y no tiene costo asignado.{% elif fila.situacion == 'falta_consignacion' %}Es consignación: no lleva factura en el costeo. Lo que falta es verificar la consignación para darla por recibida.{% elif fila.situacion == 'falta_lote' %}Consignación ya registrada, pero hay líneas sin lote real: lo consumido quedaría bajo un lote genérico.{% elif fila.situacion == 'falta_factura' %}Ya costeado, pero todavía no se generó la cuenta por pagar al proveedor.{% elif fila.situacion == 'cerrado' %}{% if fila.es_consignacion %}Entregado, costeado y con la consignación verificada. No requiere nada más.{% else %}Entregado, costeado y con su factura de proveedor generada. No requiere nada más.{% endif %}{% else %}Todavía en curso: no hay nada que costear hasta que llegue.{% endif %}">
               {% if fila.situacion == 'cerrado' %}<i class="bi bi-check-circle"></i> {% endif %}{{ fila.etiqueta }}
             </span>
           </td>

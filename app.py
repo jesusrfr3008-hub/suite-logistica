@@ -157,7 +157,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DH"
+VERSION_SUITE = "DH.1"
 VERSION_SUITE_FECHA = "2026-11-14"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -9705,34 +9705,81 @@ def _solo_seguimiento_despacho():
 # un despacho entregado sin costear es lo mas urgente (la mercaderia ya esta
 # en bodega y todavia no tiene costo), y uno entregado, costeado y facturado
 # ya no requiere nada y se va al final.
+# Ronda DH.1 (2026-11-14, corregido por el usuario): una importacion de
+# CONSIGNACION no genera factura en el costeo -- lo que la cierra es que la
+# consignacion quede verificada. La primera version de esta tabla solo
+# miraba si existia una FacturaProveedor, asi que esos despachos quedaban
+# eternamente en "Falta la factura" aunque estuvieran listos.
 PRIORIDADES_DESPACHO = {
     "falta_costear": (1, "Falta costear", "danger"),
-    "falta_factura": (2, "Falta la factura", "warning"),
-    "en_aduana": (3, "En aduana", "info"),
-    "en_transito": (4, "En tránsito", "secondary"),
-    "preparando": (5, "Preparando envío", "light"),
-    "cerrado": (6, "Cerrado", "success"),
+    "falta_consignacion": (2, "Falta verificar consignación", "warning"),
+    "falta_lote": (3, "Falta el lote", "warning"),
+    "falta_factura": (4, "Falta la factura", "warning"),
+    "en_aduana": (5, "En aduana", "info"),
+    "en_transito": (6, "En tránsito", "secondary"),
+    "preparando": (7, "Preparando envío", "light"),
+    "cerrado": (8, "Cerrado", "success"),
 }
 
 
-def _situacion_despacho(despacho, importaciones_por_despacho, importaciones_con_factura):
+def _que_le_falta_al_costeo(imp):
+    """Ronda DH.1 (2026-11-14, corregido por el usuario): que le falta a UNA
+    importacion para estar lista, con el nombre que se muestra en Despachos.
+
+    La decision de fondo NO se toma aca: se delega en
+    _estado_costeo_importacion, que es la funcion que ya sabe distinguir las
+    lineas normales (necesitan su FacturaProveedor generada) de las de
+    CONSIGNACION (necesitan quedar verificadas, consignacion_registrada, y
+    con lote real). Aca solo se traduce su resultado a una etiqueta, para que
+    no existan dos criterios distintos del mismo costeo en el programa -- que
+    es justo el error que hubo que corregir: la ronda DH miraba solo si
+    existia una FacturaProveedor y dejaba toda consignacion en "Falta la
+    factura" para siempre."""
+    estado = _estado_costeo_importacion(imp)
+    if estado == "emitido":
+        return "cerrado"
+    if estado == "falta_lote":
+        return "falta_lote"
+    # "en_proceso": falta la factura de las lineas normales, o falta verificar
+    # la consignacion. Se mira cual de las dos para poder decirlo con
+    # precision, usando los mismos criterios que _estado_costeo_importacion.
+    todas = [l for parcial in imp.parciales for l in parcial.lineas]
+    if not todas:
+        # La Importacion existe pero todavia no tiene ni una linea cargada:
+        # el costeo esta recien abierto, no es que le falte la factura.
+        return "falta_costear"
+    consignacion = [l for l in todas if _es_consignacion_parcial_linea(l)]
+    if consignacion and not imp.consignacion_registrada:
+        return "falta_consignacion"
+    if len(consignacion) == len(todas):
+        # 100% consignacion y ya registrada: lo que falta no es una factura.
+        return "falta_consignacion"
+    return "falta_factura"
+
+
+def _situacion_despacho(despacho, importaciones_por_despacho):
     """Que le falta a este despacho, en una palabra. Es lo que decide su lugar
     en el listado y lo que se muestra como badge para que el orden se explique
     solo.
 
-    El encadenamiento real del programa: un Despacho da origen a una
-    Importacion (Importacion.despacho_id) y esa Importacion, una vez costeada,
-    genera la cuenta por pagar (FacturaProveedor.importacion_id). Asi que
-    "costeado" = tiene importacion, y "facturado" = esa importacion ya genero
-    su factura."""
+    El encadenamiento real: un Despacho da origen a una Importacion
+    (Importacion.despacho_id) y esa Importacion se cierra de forma distinta
+    segun el tipo de compra -- con su cuenta por pagar si es una compra en
+    firme, o con la consignacion verificada si es consignacion. Esa diferencia
+    la resuelve _que_le_falta_al_costeo.
+
+    Un despacho con varias importaciones esta cerrado solo si TODAS lo estan;
+    si alguna tiene algo pendiente, manda la mas urgente."""
     status = (despacho.status or "").strip()
     if status == "Entregado":
         importaciones = importaciones_por_despacho.get(despacho.id, [])
         if not importaciones:
             return "falta_costear"
-        if not any(i in importaciones_con_factura for i in importaciones):
-            return "falta_factura"
-        return "cerrado"
+        situaciones = [_que_le_falta_al_costeo(imp) for imp in importaciones]
+        pendientes = [s for s in situaciones if s != "cerrado"]
+        if not pendientes:
+            return "cerrado"
+        return min(pendientes, key=lambda s: PRIORIDADES_DESPACHO[s][0])
     if status == "En aduana":
         return "en_aduana"
     if status == "En tránsito":
@@ -9753,20 +9800,16 @@ def _despachos_ordenados_por_atender():
     if not despachos:
         return []
 
-    # Dos consultas en bloque en vez de dos por cada despacho.
+    # Ronda DH.1: se traen las Importacion completas (no solo sus ids) porque
+    # _que_le_falta_al_costeo necesita mirar sus lineas para distinguir
+    # consignacion de compra en firme.
     importaciones_por_despacho = defaultdict(list)
-    for imp_id, desp_id in db.session.query(
-            Importacion.id, Importacion.despacho_id).filter(
-            Importacion.despacho_id.isnot(None)).all():
-        importaciones_por_despacho[desp_id].append(imp_id)
-    importaciones_con_factura = {
-        imp_id for (imp_id,) in db.session.query(FacturaProveedor.importacion_id).filter(
-            FacturaProveedor.importacion_id.isnot(None)).distinct().all()
-    }
+    for imp in Importacion.query.filter(Importacion.despacho_id.isnot(None)).all():
+        importaciones_por_despacho[imp.despacho_id].append(imp)
 
     filas = []
     for despacho in despachos:
-        clave = _situacion_despacho(despacho, importaciones_por_despacho, importaciones_con_factura)
+        clave = _situacion_despacho(despacho, importaciones_por_despacho)
         orden, etiqueta, color = PRIORIDADES_DESPACHO[clave]
         # Fecha con la que se ordena dentro del grupo: la de llegada estimada
         # si la hay (es la que marca cuando habia que atenderlo), si no la de
@@ -9780,6 +9823,11 @@ def _despachos_ordenados_por_atender():
             "color": color,
             "referencia": referencia,
             "importaciones": importaciones_por_despacho.get(despacho.id, []),
+            # Para poder explicar en pantalla si el despacho es de
+            # consignacion (lo que cambia que es "estar listo").
+            "es_consignacion": any(
+                o.es_consignacion for o in despacho.ordenes.all()
+            ) if hasattr(despacho.ordenes, "all") else False,
         })
 
     def _clave_orden(fila):
