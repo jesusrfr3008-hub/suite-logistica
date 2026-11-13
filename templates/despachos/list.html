@@ -28,6 +28,27 @@
   cuyas líneas ya están en "Orden Despachada" o más adelante.
 </div>
 
+{# Ronda DH (2026-11-14): el resumen por situación, que además explica de un
+   vistazo por qué el listado está ordenado así. Los grupos que requieren
+   acción van primero y son clicables para filtrar mentalmente la lista. #}
+{% if filas %}
+<div class="d-flex flex-wrap gap-2 mb-3">
+  {% for clave, datos in prioridades.items() %}
+  {% if resumen.get(clave) %}
+  <div class="card px-3 py-2 {% if clave == 'falta_costear' %}border-danger{% elif clave == 'falta_factura' %}border-warning{% endif %}">
+    <div class="small text-muted">{{ datos[1] }}</div>
+    <div class="fw-semibold fs-5 {% if clave == 'falta_costear' %}text-danger{% endif %}">{{ resumen.get(clave) }}</div>
+  </div>
+  {% endif %}
+  {% endfor %}
+</div>
+<div class="text-muted small mb-3">
+  El listado va ordenado por <strong>lo que hay que atender primero</strong>: entregados sin costear, luego los
+  que ya se costearon pero les falta la cuenta por pagar, después aduana y tránsito, y al final los que ya están
+  cerrados. Dentro de cada grupo, lo que lleva más tiempo esperando va arriba.
+</div>
+{% endif %}
+
 <div class="card p-3">
   <div class="table-responsive">
     <table class="table table-hover align-middle mb-0">
@@ -37,6 +58,9 @@
           <th>Tracking</th>
           <th>Courier</th>
           <th>Operador Logístico</th>
+          {# Ronda DH (2026-11-14): "qué falta" es la columna que explica el
+             orden del listado, así que va antes del status. #}
+          <th>Qué falta</th>
           <th>Status</th>
           <th>Fecha envío</th>
           <th>Fecha est. llegada</th>
@@ -45,12 +69,20 @@
         </tr>
       </thead>
       <tbody>
-        {% for d in despachos %}
+        {# Ronda DH (2026-11-14, a pedido del usuario): el listado se recorre
+           ya ordenado por urgencia (ver _despachos_ordenados_por_atender), y
+           cada fila trae su situación para poder mostrarla. #}
+        {% for fila in filas %}
+        {% set d = fila.despacho %}
         {# Ronda CC (2026-10-22, a pedido del usuario): los despachos ya
            entregados se distinguen a simple vista -- fila en verde suave y
            badge verde -- para separar lo que está listo de lo que sigue en
-           curso. #}
-        <tr {% if d.status == 'Entregado' %}class="table-success"{% endif %}>
+           curso.
+           Ronda DH: el verde queda SOLO para los que de verdad están cerrados
+           (entregados, costeados y facturados). Un entregado al que le falta
+           el costeo no está listo, y pintarlo de verde era justamente lo que
+           lo hacía pasar desapercibido. #}
+        <tr {% if fila.situacion == 'cerrado' %}class="table-success"{% endif %}>
           <td>{{ d.proveedores|map(attribute='nombre')|join(', ') or '-' }}</td>
           <td>
             {{ d.numero_tracking or '-' }}
@@ -65,6 +97,13 @@
           </td>
           <td>{{ d.courier or '-' }}</td>
           <td>{{ d.operador_logistico or '-' }}</td>
+          <td>
+            <span class="badge bg-{{ fila.color }}{% if fila.color in ('warning', 'light') %} text-dark{% endif %}"
+                  data-bs-toggle="tooltip"
+                  title="{% if fila.situacion == 'falta_costear' %}Entregado y todavía sin costear: la mercadería ya está en bodega y no tiene costo asignado.{% elif fila.situacion == 'falta_factura' %}Ya costeado, pero todavía no se generó la cuenta por pagar al proveedor.{% elif fila.situacion == 'cerrado' %}Entregado, costeado y con su factura de proveedor generada. No requiere nada más.{% else %}Todavía en curso: no hay nada que costear hasta que llegue.{% endif %}">
+              {% if fila.situacion == 'cerrado' %}<i class="bi bi-check-circle"></i> {% endif %}{{ fila.etiqueta }}
+            </span>
+          </td>
           <td>
             {% if d.status == 'Entregado' %}
             <span class="badge bg-success"><i class="bi bi-check-circle"></i> {{ d.status }}</span>

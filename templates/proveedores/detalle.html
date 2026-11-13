@@ -26,16 +26,40 @@
   </div>
   <div class="col-md-6">
     <div class="card p-3 h-100">
-      <h6 class="text-muted">Órdenes de compra recientes</h6>
+      {# Ronda DH (2026-11-14, a pedido del usuario): este bloque crecía sin
+         tope y estiraba la pantalla entera. Ahora se ven las últimas
+         `ordenes_visibles` y el resto queda detrás de un "Ver más"; para el
+         listado completo, con filtros, está Compras/Órdenes. #}
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h6 class="text-muted mb-0">Órdenes de compra recientes</h6>
+        {% if total_ordenes_proveedor %}
+        <span class="badge bg-light text-muted border">{{ total_ordenes_proveedor }} en total</span>
+        {% endif %}
+      </div>
       {% if ordenes %}
       <ul class="list-unstyled mb-0">
         {% for o in ordenes %}
-        <li class="d-flex justify-content-between border-bottom py-1">
+        <li class="d-flex justify-content-between border-bottom py-1 {% if loop.index > ordenes_visibles %}d-none orden-extra{% endif %}">
           <a href="{{ url_for('ordenes_detalle', orden_id=o.id) }}">{{ o.numero_po }}</a>
           <span class="badge bg-secondary badge-estado">{{ o.estado }}</span>
         </li>
         {% endfor %}
       </ul>
+      {% if ordenes|length > ordenes_visibles %}
+      <button type="button" class="btn btn-sm btn-link px-0 mt-1" id="btnVerMasOrdenes"
+              data-mostrar="Ver más ({{ ordenes|length - ordenes_visibles }})" data-ocultar="Ver menos">
+        Ver más ({{ ordenes|length - ordenes_visibles }})
+      </button>
+      {% endif %}
+      {# El link al listado completo va SIEMPRE: desde ahí se filtra y se
+         busca, que es lo que esta tarjeta no puede hacer. El aviso de
+         recorte, en cambio, solo cuando de verdad se recortó. #}
+      <div class="small text-muted mt-1">
+        {% if total_ordenes_proveedor > ordenes|length %}
+        Se muestran las {{ ordenes|length }} más recientes de {{ total_ordenes_proveedor }}.
+        {% endif %}
+        <a href="{{ url_for('ordenes_list', proveedor_id=proveedor.id, estado='todos') }}">Ver todas en Compras / Órdenes</a>
+      </div>
       {% else %}
       <p class="text-muted mb-0">Aún no hay órdenes para este proveedor.</p>
       {% endif %}
@@ -741,4 +765,22 @@
 })();
 </script>
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Ronda DH: desplegar el resto de las órdenes de la ficha. Va en el bloque
+  // de scripts porque base.html carga Bootstrap DESPUÉS del contenido (ver la
+  // ronda DF, donde un script en el contenido reventó por eso).
+  (function () {
+    const boton = document.getElementById('btnVerMasOrdenes');
+    if (!boton) return;
+    boton.addEventListener('click', function () {
+      const extras = document.querySelectorAll('.orden-extra');
+      const oculto = extras.length && extras[0].classList.contains('d-none');
+      extras.forEach(function (fila) { fila.classList.toggle('d-none', !oculto); });
+      boton.textContent = oculto ? boton.dataset.ocultar : boton.dataset.mostrar;
+    });
+  })();
+</script>
 {% endblock %}

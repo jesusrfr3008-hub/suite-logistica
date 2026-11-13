@@ -157,7 +157,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DG"
+VERSION_SUITE = "DH"
 VERSION_SUITE_FECHA = "2026-11-14"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -6509,6 +6509,13 @@ def dashboard():
 # Modulo: Mantenimiento de Proveedores
 # ---------------------------------------------------------------------------
 
+# Ronda DH (2026-11-14, a pedido del usuario): cuantas ordenes se ven de
+# entrada en la ficha del proveedor, y cuantas trae el "Ver mas". El bloque
+# crecia sin tope y hacia la pantalla interminable; para el listado completo
+# esta Compras/Ordenes filtrado por proveedor, que ademas tiene filtros.
+ORDENES_VISIBLES_FICHA_PROVEEDOR = 4
+ORDENES_EN_FICHA_PROVEEDOR = 20
+
 @app.route("/proveedores")
 @requiere_permiso("crear_orden", "generar_costeo")
 def proveedores_list():
@@ -6674,7 +6681,13 @@ def proveedores_detalle(proveedor_id):
             db.or_(Producto.codigo.ilike(f"%{q}%"), Producto.descripcion.ilike(f"%{q}%"))
         )
     productos = productos_query.order_by(Producto.codigo).all()
-    ordenes = prov.ordenes.order_by(OrdenCompra.id.desc()).limit(10).all()
+    # Ronda DH (2026-11-14, a pedido del usuario): el bloque de ordenes
+    # crecia sin tope y estiraba la pantalla ("imagina si hay 100 o 1000
+    # seria muy engorroso"). Se muestran las ultimas ORDENES_VISIBLES_PROVEEDOR
+    # y el resto queda detras de un "Ver mas"; para el listado completo esta
+    # el link a Compras/Ordenes filtrado por este proveedor.
+    total_ordenes_proveedor = prov.ordenes.count()
+    ordenes = prov.ordenes.order_by(OrdenCompra.id.desc()).limit(ORDENES_EN_FICHA_PROVEEDOR).all()
     # Ronda AO (2026-09-23, a pedido del usuario): alias de código para
     # reportes de este proveedor -- ver AliasCodigoProveedor en models.py y
     # el panel "Alias de código para reportes" en esta plantilla.
@@ -6686,6 +6699,8 @@ def proveedores_detalle(proveedor_id):
     return render_template(
         "proveedores/detalle.html", proveedor=prov, productos=productos, q=q, ordenes=ordenes,
         alias_codigo=alias_codigo,
+        total_ordenes_proveedor=total_ordenes_proveedor,
+        ordenes_visibles=ORDENES_VISIBLES_FICHA_PROVEEDOR,
     )
 
 
@@ -9678,14 +9693,122 @@ def _solo_seguimiento_despacho():
     )
 
 
+# Ronda DH (2026-11-14, a pedido del usuario): el listado de Despachos se
+# ordena por LO QUE HAY QUE ATENDER, no por el orden en que se cargaron.
+#
+# Textual: "que prime el estado primero, es decir lo mas pronto a atender de
+# primero, las entregadas que no se han costeado, en aduanas, en transito. Las
+# entregadas y que se genero la factura a pago proveedor que debe estar lista
+# y costeada de ultimas".
+#
+# El orden sale de cruzar el status del despacho con lo que falta hacerle:
+# un despacho entregado sin costear es lo mas urgente (la mercaderia ya esta
+# en bodega y todavia no tiene costo), y uno entregado, costeado y facturado
+# ya no requiere nada y se va al final.
+PRIORIDADES_DESPACHO = {
+    "falta_costear": (1, "Falta costear", "danger"),
+    "falta_factura": (2, "Falta la factura", "warning"),
+    "en_aduana": (3, "En aduana", "info"),
+    "en_transito": (4, "En tránsito", "secondary"),
+    "preparando": (5, "Preparando envío", "light"),
+    "cerrado": (6, "Cerrado", "success"),
+}
+
+
+def _situacion_despacho(despacho, importaciones_por_despacho, importaciones_con_factura):
+    """Que le falta a este despacho, en una palabra. Es lo que decide su lugar
+    en el listado y lo que se muestra como badge para que el orden se explique
+    solo.
+
+    El encadenamiento real del programa: un Despacho da origen a una
+    Importacion (Importacion.despacho_id) y esa Importacion, una vez costeada,
+    genera la cuenta por pagar (FacturaProveedor.importacion_id). Asi que
+    "costeado" = tiene importacion, y "facturado" = esa importacion ya genero
+    su factura."""
+    status = (despacho.status or "").strip()
+    if status == "Entregado":
+        importaciones = importaciones_por_despacho.get(despacho.id, [])
+        if not importaciones:
+            return "falta_costear"
+        if not any(i in importaciones_con_factura for i in importaciones):
+            return "falta_factura"
+        return "cerrado"
+    if status == "En aduana":
+        return "en_aduana"
+    if status == "En tránsito":
+        return "en_transito"
+    return "preparando"
+
+
+def _despachos_ordenados_por_atender():
+    """Los despachos con su situacion, ordenados por urgencia.
+
+    Dentro de cada grupo:
+      - los que siguen abiertos van del MAS ANTIGUO al mas nuevo (el que lleva
+        mas tiempo esperando es el que mas urge),
+      - los ya cerrados van del mas nuevo al mas antiguo (ahi lo que se busca
+        es lo ultimo que paso, no lo mas viejo).
+    """
+    despachos = Despacho.query.all()
+    if not despachos:
+        return []
+
+    # Dos consultas en bloque en vez de dos por cada despacho.
+    importaciones_por_despacho = defaultdict(list)
+    for imp_id, desp_id in db.session.query(
+            Importacion.id, Importacion.despacho_id).filter(
+            Importacion.despacho_id.isnot(None)).all():
+        importaciones_por_despacho[desp_id].append(imp_id)
+    importaciones_con_factura = {
+        imp_id for (imp_id,) in db.session.query(FacturaProveedor.importacion_id).filter(
+            FacturaProveedor.importacion_id.isnot(None)).distinct().all()
+    }
+
+    filas = []
+    for despacho in despachos:
+        clave = _situacion_despacho(despacho, importaciones_por_despacho, importaciones_con_factura)
+        orden, etiqueta, color = PRIORIDADES_DESPACHO[clave]
+        # Fecha con la que se ordena dentro del grupo: la de llegada estimada
+        # si la hay (es la que marca cuando habia que atenderlo), si no la de
+        # envio, y si no la de creacion.
+        referencia = despacho.fecha_estimada_llegada or despacho.fecha_envio
+        filas.append({
+            "despacho": despacho,
+            "situacion": clave,
+            "orden": orden,
+            "etiqueta": etiqueta,
+            "color": color,
+            "referencia": referencia,
+            "importaciones": importaciones_por_despacho.get(despacho.id, []),
+        })
+
+    def _clave_orden(fila):
+        cerrado = fila["situacion"] == "cerrado"
+        referencia = fila["referencia"]
+        if referencia is None:
+            # Sin fecha: al final de su grupo, no mezclado al principio.
+            posicion = date.max.toordinal() if not cerrado else 0
+        else:
+            posicion = referencia.toordinal() if not cerrado else -referencia.toordinal()
+        return (fila["orden"], posicion, -fila["despacho"].id)
+
+    filas.sort(key=_clave_orden)
+    return filas
+
+
 @app.route("/despachos")
 @requiere_permiso("actualizar_despacho", "seguimiento", "generar_costeo")
 def despachos_list():
-    despachos = Despacho.query.order_by(Despacho.id.desc()).all()
+    filas = _despachos_ordenados_por_atender()
     hay_candidatas = bool(_ordenes_listas_para_despachar())
+    resumen = defaultdict(int)
+    for fila in filas:
+        resumen[fila["situacion"]] += 1
     return render_template(
-        "despachos/list.html", despachos=despachos, hay_candidatas=hay_candidatas,
+        "despachos/list.html", filas=filas, despachos=[f["despacho"] for f in filas],
+        hay_candidatas=hay_candidatas,
         solo_seguimiento=_solo_seguimiento_despacho(),
+        resumen=resumen, prioridades=PRIORIDADES_DESPACHO,
     )
 
 
