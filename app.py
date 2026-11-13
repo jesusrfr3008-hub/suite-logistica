@@ -157,8 +157,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DE"
-VERSION_SUITE_FECHA = "2026-11-11"
+VERSION_SUITE = "DF"
+VERSION_SUITE_FECHA = "2026-11-13"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -15365,6 +15365,460 @@ def _semanas_forecast(ciclo):
     return semanas
 
 
+# ---------------------------------------------------------------------------
+# Ronda DF (2026-11-13), Fase 2 parte 2 del plan de S&OP: PROYECCION DE STOCK.
+#
+# Es la hoja "Stock" del SOP de Excel, hecha con los datos que el programa ya
+# tiene: saldo disponible + lo que llega en transito - lo que el equipo
+# proyecto vender, semana a semana, con los dias de stock en la semana
+# actual, +4, +8 y +12.
+#
+# Dos decisiones que tomo el usuario y que explican el diseno:
+#
+# 1. La proyeccion descuenta SOLO LO PROYECTADO por los vendedores, fiel al
+#    S&OP. No se rellenan los huecos de quien no proyecto. Eso mantiene el
+#    reporte honesto -- lo que se ve es exactamente lo que el equipo estimo --
+#    pero significa que el saldo proyectado NO es una prediccion de la
+#    realidad mientras falte gente por cargar.
+# 2. Por eso la ALERTA no mira el forecast sino la ROTACION real de los
+#    ultimos 90 dias. Un producto puede verse con saldo de sobra en la
+#    proyeccion (porque nadie lo proyecto) y estar igual a semanas de
+#    quebrar segun lo que de verdad se vende. Esa contradiccion es la
+#    informacion mas util de la pantalla, y es lo que el usuario pidio:
+#    "una alerta de acuerdo al promedio cuales productos estaremos bajo la
+#    rotacion".
+# ---------------------------------------------------------------------------
+
+# Dias de stock bajo los cuales un producto se considera en riesgo. 30 dias es
+# el mismo umbral que ya usa Consulta de Stock para pintar la columna en rojo.
+DIAS_STOCK_CRITICOS = 30
+# Hitos de la hoja Stock del SOP: semana actual, +4, +8 y +12.
+HITOS_DIAS_STOCK = (0, 4, 8, 12)
+# Tope de filas en pantalla. El catalogo real da ~700 productos y la tabla
+# tiene 24 columnas: sin recorte son 2,5 MB de HTML y el navegador se pone
+# pesado. Como las filas vienen ORDENADAS por urgencia (quiebre primero,
+# despues alertas, despues lo sano), recortar al final nunca esconde una
+# alerta -- esconde productos que estan bien.
+MAX_FILAS_PROYECCION = 300
+
+
+def _clave_forecast_por_codigo_interno():
+    """{codigo_interno Ergopyme: clave_producto} -- el puente entre el mundo
+    del stock/ventas (que habla en codigos internos) y el del forecast (que
+    habla en productos del catalogo, ver _clave_producto_forecast).
+
+    Un codigo sin homologar cae a su propia clave "E:CODIGO", que es
+    exactamente lo que hace el forecast, asi que igual se puede proyectar y
+    comparar."""
+    resultado = {}
+    for h in HomologacionStock.query.all():
+        codigo = (h.codigo_interno or "").strip()
+        if not codigo:
+            continue
+        if h.variante_id:
+            resultado[codigo] = f"V:{h.variante_id}"
+        elif h.producto_id:
+            resultado[codigo] = f"P:{h.producto_id}"
+        else:
+            resultado[codigo] = f"E:{codigo.upper()}"
+    return resultado
+
+
+def _llegadas_por_semana(semanas):
+    """Unidades en transito que se espera que lleguen, repartidas en las
+    semanas del ciclo: {(producto_id, variante_codigo): {n_semana: unidades}}.
+
+    Tres casos que hay que tratar distinto, y que son la razon de que esto no
+    sea un simple group-by:
+
+    - Llegada estimada DENTRO del horizonte -> a su semana.
+    - Llegada estimada ANTERIOR al inicio del horizonte (el embarque viene
+      atrasado) -> a la semana 1. Ya deberia estar en bodega, asi que lo
+      honesto es contarlo en lo primero que viene, no ignorarlo.
+    - SIN fecha estimada -> NO entra al flujo semanal. Se devuelve aparte
+      para mostrarlo en su propia columna: meterlo en una semana inventada
+      daria un saldo proyectado que nadie puede sostener.
+    """
+    if not semanas:
+        return {}, {}
+    inicio = semanas[0]["inicio"]
+    fin = semanas[-1]["fin"]
+    por_semana = defaultdict(lambda: defaultdict(float))
+    sin_fecha = defaultdict(float)
+
+    ETAPAS_EN_TRANSITO = ("Orden Despachada", "Internación Aduanas")
+    lineas = (
+        OrdenCompraLinea.query
+        .join(OrdenCompra)
+        .filter(
+            OrdenCompraLinea.anulada == False,  # noqa: E712
+            OrdenCompraLinea.etapa.in_(ETAPAS_EN_TRANSITO),
+            OrdenCompra.estado_aprobacion == "Aprobada",
+            OrdenCompra.estado != "Cancelada",
+        )
+        .all()
+    )
+    for linea in lineas:
+        cantidad = linea.cantidad_unidades
+        if cantidad <= 0:
+            continue
+        clave = (linea.producto_id, (linea.variante_codigo or "").strip().upper() or None)
+        # Misma cascada de fechas que _transito_por_linea, para que las dos
+        # pantallas no puedan decir cosas distintas del mismo embarque.
+        despacho = linea.orden.despacho
+        fecha = None
+        if despacho and despacho.fecha_estimada_llegada:
+            fecha = despacho.fecha_estimada_llegada
+        elif linea.fecha_estimada_despacho_confirmada:
+            fecha = linea.fecha_estimada_despacho_confirmada
+        elif linea.fecha_estimada_despacho:
+            fecha = linea.fecha_estimada_despacho
+
+        if fecha is None:
+            sin_fecha[clave] += cantidad
+            continue
+        if fecha > fin:
+            # Llega despues del horizonte: no afecta estas 13 semanas.
+            continue
+        if fecha < inicio:
+            por_semana[clave][1] += cantidad
+            continue
+        for semana in semanas:
+            if semana["inicio"] <= fecha <= semana["fin"] + timedelta(days=2):
+                # +2 dias para que un sabado o domingo caiga en la semana que
+                # termina, en vez de perderse entre dos semanas.
+                por_semana[clave][semana["n"]] += cantidad
+                break
+    return por_semana, sin_fecha
+
+
+def _forecast_por_clave_y_semana(ciclo):
+    """{clave_producto: {n_semana: unidades}} sumando TODOS los vendedores del
+    ciclo, mas el desglose por vendedor para poder responder "quien proyecto
+    esto": {clave_producto: {vendedor: [13 semanas]}}."""
+    totales = defaultdict(lambda: defaultdict(float))
+    por_vendedor = defaultdict(dict)
+    if ciclo is None:
+        return totales, por_vendedor
+    for envio in ciclo.envios.all():
+        for linea in envio.lineas.all():
+            clave = linea.clave_producto
+            semanas = linea.semanas
+            if not any(semanas):
+                continue
+            for indice, valor in enumerate(semanas, start=1):
+                totales[clave][indice] += valor or 0
+            por_vendedor[clave][envio.vendedor] = semanas
+    return totales, por_vendedor
+
+
+def _consumo_por_vendedor_y_cliente(dias=180):
+    """Para el detalle que pidio el usuario: "un detalle de las cuentas/
+    vendedor se ven afectado o afectan este numero".
+
+    Devuelve dos mapas por codigo interno:
+      - {codigo: {vendedor: unidades}}
+      - {codigo: {nombre_cliente: unidades}}
+
+    El vendedor sale del MAESTRO VIGENTE (ClienteVendedor), no del que venia
+    en la factura: si una cuenta se reasigno, su historia viaja con ella.
+    Es el mismo criterio que usa el promedio del forecast."""
+    desde = date.today() - timedelta(days=dias)
+    maestro = {
+        (c.rut or "").strip().upper(): (c.vendedor or "").strip()
+        for c in ClienteVendedor.query.all()
+    }
+    alias = _alias_codigos_internos()
+    por_vendedor = defaultdict(lambda: defaultdict(float))
+    por_cliente = defaultdict(lambda: defaultdict(float))
+    filas = (
+        VentaLinea.query
+        .filter(VentaLinea.fecha >= desde, VentaLinea.cuenta_para_rotacion == True)  # noqa: E712
+        .with_entities(VentaLinea.codigo_interno, VentaLinea.unidades,
+                       VentaLinea.rut_cliente, VentaLinea.nombre_cliente,
+                       VentaLinea.vendedor_archivo)
+        .all()
+    )
+    for codigo, unidades, rut, nombre, vendedor_archivo in filas:
+        clave = _codigo_interno_vigente(codigo, alias)
+        if not clave or not unidades:
+            continue
+        vendedor = maestro.get((rut or "").strip().upper()) or (vendedor_archivo or "").strip() or "(sin vendedor)"
+        por_vendedor[clave][vendedor] += unidades
+        por_cliente[clave][(nombre or "").strip() or "(sin nombre)"] += unidades
+    return por_vendedor, por_cliente
+
+
+def _construir_proyeccion_stock(ciclo, proveedor_sel="", solo_alertas=False, q=""):
+    """El corazon de la pantalla: una fila por producto con el saldo
+    proyectado semana a semana.
+
+    La aritmetica, por semana:
+        saldo_final = saldo_inicial + llegadas - forecast
+
+    donde el saldo inicial de la semana 1 es lo DISPONIBLE hoy, es decir
+    stock de la bodega central menos lo comprometido con clientes. No se usa
+    el stock bruto: unidades que ya tienen dueño no estan disponibles para
+    vender, y contarlas seria el error clasico de este tipo de reporte.
+    """
+    semanas = _semanas_forecast(ciclo) if ciclo else []
+    clave_por_codigo = _clave_forecast_por_codigo_interno()
+    forecast_por_clave, forecast_por_vendedor = _forecast_por_clave_y_semana(ciclo)
+    llegadas_por_pv, sin_fecha_por_pv = _llegadas_por_semana(semanas)
+    pedido_por_codigo, descripcion_pedido = _pedido_por_codigo()
+    rotacion = _rotacion_por_codigo()
+    homologador = _construir_homologador_ergopyme()
+
+    # ---- stock disponible, por clave de producto ----
+    filas = {}
+
+    def _fila(clave):
+        if clave not in filas:
+            filas[clave] = {
+                "clave": clave, "codigo": "", "descripcion": "", "proveedor": "",
+                "producto_id": None, "variante_codigo": None,
+                "codigos_internos": set(),
+                "stock": 0.0, "comprometido": 0.0, "transito_total": 0.0,
+                "transito_sin_fecha": 0.0,
+            }
+        return filas[clave]
+
+    # Stock: SOLO bodega central (ronda DD) -- lo que esta en demos, comodato
+    # o prestamo no se puede vender, asi que no puede sostener un forecast.
+    existencias = StockExistencia.query.filter(db.or_(
+        StockExistencia.bodega_codigo == BODEGA_CENTRAL,
+        StockExistencia.bodega_codigo.is_(None),
+    )).all()
+    for e in existencias:
+        codigo = (e.codigo_interno or "").strip()
+        clave = clave_por_codigo.get(codigo) or f"E:{codigo.upper()}"
+        fila = _fila(clave)
+        fila["stock"] += e.stock_fisico or 0
+        if codigo:
+            fila["codigos_internos"].add(codigo)
+        if not fila["descripcion"]:
+            fila["descripcion"] = e.descripcion or ""
+        if e.variante_id and e.variante:
+            fila["producto_id"] = e.variante.producto_id
+            fila["variante_codigo"] = (e.variante.codigo or "").strip().upper()
+            fila["codigo"] = e.variante.codigo
+            fila["descripcion"] = e.variante.descripcion or fila["descripcion"]
+            if e.variante.producto and e.variante.producto.proveedor:
+                fila["proveedor"] = e.variante.producto.proveedor.nombre
+        elif e.producto_id and e.producto:
+            fila["producto_id"] = e.producto_id
+            fila["codigo"] = e.producto.codigo
+            fila["descripcion"] = e.producto.descripcion or fila["descripcion"]
+            if e.producto.proveedor:
+                fila["proveedor"] = e.producto.proveedor.nombre
+
+    # Comprometido con clientes (por codigo interno, sin separar empresa:
+    # la proyeccion es de la compania como un todo).
+    comprometido_por_codigo = defaultdict(float)
+    for (_emp_id, codigo), cantidad in pedido_por_codigo.items():
+        comprometido_por_codigo[(codigo or "").strip()] += cantidad or 0
+    for codigo, cantidad in comprometido_por_codigo.items():
+        if not cantidad:
+            continue
+        clave = clave_por_codigo.get(codigo) or f"E:{codigo.upper()}"
+        fila = _fila(clave)
+        fila["comprometido"] += cantidad
+        fila["codigos_internos"].add(codigo)
+        if not fila["descripcion"]:
+            fila["descripcion"] = descripcion_pedido.get((None, codigo), "") or ""
+
+    # Transito (incluye productos que no tienen ninguna fila de stock).
+    for (producto_id, variante_codigo), semanas_llegada in llegadas_por_pv.items():
+        clave = f"V:{_id_variante(producto_id, variante_codigo)}" if variante_codigo else f"P:{producto_id}"
+        if clave.endswith(":None"):
+            clave = f"P:{producto_id}"
+        fila = _fila(clave)
+        fila["producto_id"] = fila["producto_id"] or producto_id
+        fila["variante_codigo"] = fila["variante_codigo"] or variante_codigo
+        fila["transito_total"] += sum(semanas_llegada.values())
+    for (producto_id, variante_codigo), cantidad in sin_fecha_por_pv.items():
+        clave = f"V:{_id_variante(producto_id, variante_codigo)}" if variante_codigo else f"P:{producto_id}"
+        if clave.endswith(":None"):
+            clave = f"P:{producto_id}"
+        fila = _fila(clave)
+        fila["producto_id"] = fila["producto_id"] or producto_id
+        fila["variante_codigo"] = fila["variante_codigo"] or variante_codigo
+        fila["transito_sin_fecha"] += cantidad
+
+    # Lo proyectado, aunque no tenga stock ni transito (un producto nuevo que
+    # el vendedor quiere empujar tiene que aparecer igual).
+    for clave in forecast_por_clave:
+        _fila(clave)
+
+    # Productos con rotacion que no aparecieron por ninguna otra via.
+    for codigo in rotacion:
+        clave = clave_por_codigo.get(codigo) or f"E:{codigo.upper()}"
+        if clave in filas:
+            filas[clave]["codigos_internos"].add(codigo)
+            continue
+        if (rotacion.get(codigo, {}).get(360) or 0) > 0:
+            fila = _fila(clave)
+            fila["codigos_internos"].add(codigo)
+
+    # ---- completar datos y calcular la proyeccion ----
+    resultado = []
+    for clave, fila in filas.items():
+        _completar_identidad_fila(fila, clave, homologador)
+
+        codigos = fila["codigos_internos"] or set()
+        # La rotacion del producto es la suma de la de sus codigos internos
+        # (una variante puede tener mas de uno por los alias de Ergopyme).
+        venta_90 = sum((rotacion.get(c, {}).get(90) or 0) for c in codigos)
+        venta_360 = sum((rotacion.get(c, {}).get(360) or 0) for c in codigos)
+        diario = sum((rotacion.get(c, {}).get("diario") or 0) for c in codigos)
+
+        disponible = (fila["stock"] or 0) - (fila["comprometido"] or 0)
+        pv = (fila["producto_id"], fila["variante_codigo"])
+        llegadas = llegadas_por_pv.get(pv, {})
+        proyectado = forecast_por_clave.get(clave, {})
+
+        saldo = disponible
+        celdas = []
+        semana_quiebre = None
+        for semana in semanas:
+            n = semana["n"]
+            entra = llegadas.get(n, 0) or 0
+            sale = proyectado.get(n, 0) or 0
+            saldo = saldo + entra - sale
+            if saldo < 0 and semana_quiebre is None:
+                semana_quiebre = n
+            celdas.append({
+                "n": n, "entra": entra, "sale": sale, "saldo": saldo,
+                "negativo": saldo < 0,
+            })
+
+        # Dias de stock en los hitos de la hoja Stock del SOP, calculados con
+        # el ritmo REAL de venta (ultimos 90 dias), no con el forecast.
+        hitos = []
+        for h in HITOS_DIAS_STOCK:
+            if h == 0:
+                saldo_hito = disponible
+            elif h <= len(celdas):
+                saldo_hito = celdas[h - 1]["saldo"]
+            else:
+                saldo_hito = celdas[-1]["saldo"] if celdas else disponible
+            dias = round(saldo_hito / diario) if diario > 0 and saldo_hito > 0 else (0 if saldo_hito <= 0 else None)
+            hitos.append({"semana": h, "saldo": saldo_hito, "dias": dias})
+
+        total_proyectado = sum(proyectado.values())
+        # ---- alertas ----
+        alertas = []
+        if semana_quiebre:
+            alertas.append({
+                "tipo": "quiebre", "nivel": "danger",
+                "texto": f"Quiebre proyectado en la semana {semana_quiebre}",
+            })
+        dias_hoy = hitos[0]["dias"] if hitos else None
+        if dias_hoy is not None and dias_hoy < DIAS_STOCK_CRITICOS and diario > 0:
+            alertas.append({
+                "tipo": "bajo_rotacion", "nivel": "danger" if dias_hoy <= 0 else "warning",
+                "texto": (f"Bajo rotación: {dias_hoy} día(s) de stock al ritmo de los últimos 90 días"
+                          if dias_hoy > 0 else "Sin stock disponible y con venta en los últimos 90 días"),
+            })
+        if venta_360 > 0 and total_proyectado <= 0:
+            alertas.append({
+                "tipo": "sin_proyectar", "nivel": "warning",
+                "texto": "Se vende pero nadie lo proyectó en este ciclo",
+            })
+        if fila["transito_sin_fecha"] > 0:
+            alertas.append({
+                "tipo": "sin_fecha", "nivel": "info",
+                "texto": (f"{fila['transito_sin_fecha']:,.0f} unidad(es) en tránsito sin fecha estimada "
+                          "-- no entran en la proyección"),
+            })
+
+        if solo_alertas and not any(a["nivel"] in ("danger", "warning") for a in alertas):
+            continue
+        if proveedor_sel and (fila["proveedor"] or "").strip().upper() != proveedor_sel.strip().upper():
+            continue
+        if q:
+            texto = f"{fila['codigo']} {fila['descripcion']} {' '.join(codigos)}".lower()
+            if q.lower() not in texto:
+                continue
+
+        resultado.append({
+            **fila,
+            "codigos_internos": sorted(codigos),
+            "disponible": disponible,
+            "celdas": celdas,
+            "hitos": hitos,
+            "venta_90": round(venta_90, 1),
+            "venta_360": round(venta_360, 1),
+            "diario": diario,
+            "total_proyectado": total_proyectado,
+            "semana_quiebre": semana_quiebre,
+            "alertas": alertas,
+            "nivel": ("danger" if any(a["nivel"] == "danger" for a in alertas)
+                      else "warning" if any(a["nivel"] == "warning" for a in alertas) else ""),
+            "vendedores_proyectaron": forecast_por_vendedor.get(clave, {}),
+        })
+
+    # Primero lo urgente: quiebre mas temprano, y entre iguales lo que mas se
+    # vende (un quiebre de algo que rota mucho duele mas).
+    resultado.sort(key=lambda f: (
+        0 if f["nivel"] == "danger" else 1 if f["nivel"] == "warning" else 2,
+        f["semana_quiebre"] or 99,
+        -(f["venta_90"] or 0),
+    ))
+    return resultado, semanas
+
+
+def _id_variante(producto_id, variante_codigo):
+    """id de una ProductoVariante a partir de (producto, codigo) -- el
+    transito se agrupa por codigo de variante y el forecast por id."""
+    if not variante_codigo:
+        return None
+    variante = ProductoVariante.query.filter(
+        ProductoVariante.producto_id == producto_id,
+        db.func.upper(ProductoVariante.codigo) == variante_codigo,
+    ).first()
+    return variante.id if variante else None
+
+
+def _completar_identidad_fila(fila, clave, homologador):
+    """Rellena codigo, descripcion y proveedor de una fila de la proyeccion
+    cuando no vinieron del stock (por ejemplo, un producto que solo esta en
+    transito o solo en el forecast)."""
+    if fila["codigo"] and fila["proveedor"]:
+        return
+    if clave.startswith("V:"):
+        variante = ProductoVariante.query.get(int(clave[2:])) if clave[2:].isdigit() else None
+        if variante:
+            fila["codigo"] = fila["codigo"] or variante.codigo
+            fila["descripcion"] = fila["descripcion"] or variante.descripcion or ""
+            fila["producto_id"] = fila["producto_id"] or variante.producto_id
+            fila["variante_codigo"] = fila["variante_codigo"] or (variante.codigo or "").strip().upper()
+            if variante.producto and variante.producto.proveedor:
+                fila["proveedor"] = fila["proveedor"] or variante.producto.proveedor.nombre
+                fila["descripcion"] = fila["descripcion"] or variante.producto.descripcion or ""
+            return
+    if clave.startswith("P:"):
+        producto = Producto.query.get(int(clave[2:])) if clave[2:].isdigit() else None
+        if producto:
+            fila["codigo"] = fila["codigo"] or producto.codigo
+            fila["descripcion"] = fila["descripcion"] or producto.descripcion or ""
+            fila["producto_id"] = fila["producto_id"] or producto.id
+            if producto.proveedor:
+                fila["proveedor"] = fila["proveedor"] or producto.proveedor.nombre
+            return
+    # Codigo sin homologar: lo ultimo que queda es el mapeo Ergopyme.
+    codigo_interno = clave[2:] if clave.startswith("E:") else ""
+    resuelto = homologador(codigo_interno) if codigo_interno else None
+    if resuelto:
+        proveedor_nombre, _prov_id, codigo_proveedor, descripcion = resuelto
+        fila["proveedor"] = fila["proveedor"] or proveedor_nombre or ""
+        fila["codigo"] = fila["codigo"] or codigo_proveedor or codigo_interno
+        fila["descripcion"] = fila["descripcion"] or descripcion or ""
+    else:
+        fila["codigo"] = fila["codigo"] or codigo_interno
+        fila["proveedor"] = fila["proveedor"] or "(sin homologar)"
+
+
 def _primer_dia_mes_hace(meses):
     """Primer dia del mes de hace `meses` meses (inclusive). Se trabaja con
     meses calendario, no con bloques de 30 dias, porque el usuario compara
@@ -16423,6 +16877,134 @@ def forecast_index():
         sugeridos=[_normalizar_nombre(n) for n in VENDEDORES_FORECAST_SUGERIDOS],
         hoy=date.today(), meses=MESES_ES,
     )
+
+
+@app.route("/forecast/proyeccion")
+@requiere_sop
+def forecast_proyeccion():
+    """Fase 2 parte 2 del plan de S&OP: la hoja "Stock" del SOP de Excel.
+
+    Saldo disponible + lo que llega en transito - lo proyectado por el
+    equipo, semana a semana, con los dias de stock en la semana actual, +4,
+    +8 y +12, y las alertas de rotacion.
+
+    Solo la ve la gerencia (o un administrador): es la foto consolidada de
+    todo el equipo, no la hoja de un vendedor."""
+    if not _ve_todo_el_equipo():
+        flash("La proyección consolidada es de gerencia -- tú ves tu propia hoja de forecast.", "warning")
+        return redirect(url_for("forecast_index"))
+
+    ciclo_id = request.args.get("ciclo_id", "").strip()
+    ciclos = ForecastCiclo.query.order_by(
+        ForecastCiclo.mes_objetivo.desc(), ForecastCiclo.id.desc()).limit(12).all()
+    ciclo = None
+    if ciclo_id.isdigit():
+        ciclo = ForecastCiclo.query.get(int(ciclo_id))
+    if ciclo is None:
+        ciclo = ciclos[0] if ciclos else None
+    if ciclo is None:
+        flash("Todavía no hay ningún ciclo de S&OP. Abre uno para poder proyectar.", "warning")
+        return redirect(url_for("forecast_index"))
+
+    proveedor_sel = request.args.get("proveedor", "").strip()
+    solo_alertas = request.args.get("solo_alertas") == "1"
+    q = request.args.get("q", "").strip()
+
+    filas, semanas = _construir_proyeccion_stock(
+        ciclo, proveedor_sel=proveedor_sel, solo_alertas=solo_alertas, q=q)
+
+    # Cobertura del ciclo: cuantos vendedores entregaron de verdad. Es lo
+    # primero que hay que saber para leer el resto -- con media planilla sin
+    # cargar, un saldo proyectado holgado no significa nada.
+    envios = ciclo.envios.all()
+    con_datos = [e for e in envios if any(l.total for l in e.lineas.all())]
+    cobertura = {
+        "total": len(envios),
+        "con_datos": len(con_datos),
+        "sin_datos": sorted(e.vendedor for e in envios if e not in con_datos),
+        "unidades": sum(l.total for e in envios for l in e.lineas.all()),
+    }
+
+    resumen = {
+        "productos": len(filas),
+        "con_quiebre": sum(1 for f in filas if f["semana_quiebre"]),
+        "bajo_rotacion": sum(1 for f in filas
+                             if any(a["tipo"] == "bajo_rotacion" for a in f["alertas"])),
+        "sin_proyectar": sum(1 for f in filas
+                             if any(a["tipo"] == "sin_proyectar" for a in f["alertas"])),
+    }
+
+    proveedores = sorted({f["proveedor"] for f in filas if f["proveedor"]})
+    # El resumen de arriba se calcula sobre TODO antes de recortar, para que
+    # los contadores sigan siendo los de verdad aunque la tabla muestre menos.
+    total_filas = len(filas)
+    recortado = total_filas > MAX_FILAS_PROYECCION
+    filas = filas[:MAX_FILAS_PROYECCION]
+    return render_template(
+        "forecast/proyeccion.html",
+        ciclo=ciclo, ciclos=ciclos, filas=filas, semanas=semanas,
+        cobertura=cobertura, resumen=resumen, proveedores=proveedores,
+        proveedor_sel=proveedor_sel, solo_alertas=solo_alertas, q=q,
+        hitos=HITOS_DIAS_STOCK, dias_criticos=DIAS_STOCK_CRITICOS,
+        total_filas=total_filas, recortado=recortado, max_filas=MAX_FILAS_PROYECCION,
+        hoy=date.today(),
+    )
+
+
+@app.route("/api/forecast/proyeccion/detalle")
+@requiere_sop
+def api_forecast_proyeccion_detalle():
+    """El detalle que pidio el usuario: "un detalle de las cuentas/vendedor
+    se ven afectado o afectan este numero".
+
+    Para UN producto devuelve dos listas:
+      - quien lo PROYECTO en este ciclo (y cuanto),
+      - quien lo VENDE de verdad (vendedores y clientes de los ultimos 180
+        dias, segun el maestro vigente).
+
+    Las dos juntas responden la pregunta que importa cuando un producto va a
+    quebrar: a quien le va a doler y quien deberia haberlo proyectado."""
+    if not _ve_todo_el_equipo():
+        return jsonify(error="Solo gerencia"), 403
+    clave = request.args.get("clave", "").strip()
+    ciclo_id = request.args.get("ciclo_id", "").strip()
+    codigos = [c for c in request.args.get("codigos", "").split(",") if c.strip()]
+    if not clave:
+        return jsonify(vendedores=[], clientes=[], proyectado=[])
+
+    ciclo = ForecastCiclo.query.get(int(ciclo_id)) if ciclo_id.isdigit() else None
+    _totales, por_vendedor = _forecast_por_clave_y_semana(ciclo)
+    proyectado = [
+        {"vendedor": vendedor, "total": round(sum(semanas), 1),
+         "semanas": [round(v, 1) for v in semanas]}
+        for vendedor, semanas in sorted(por_vendedor.get(clave, {}).items())
+        if sum(semanas)
+    ]
+
+    consumo_vendedor, consumo_cliente = _consumo_por_vendedor_y_cliente(dias=180)
+    acum_vendedor = defaultdict(float)
+    acum_cliente = defaultdict(float)
+    for codigo in codigos:
+        for vendedor, unidades in consumo_vendedor.get(codigo.strip(), {}).items():
+            acum_vendedor[vendedor] += unidades
+        for cliente, unidades in consumo_cliente.get(codigo.strip(), {}).items():
+            acum_cliente[cliente] += unidades
+
+    total_vendedores = sum(acum_vendedor.values()) or 1
+    vendedores = sorted(
+        ({"nombre": n, "unidades": round(u, 1), "porcentaje": round(100 * u / total_vendedores, 1)}
+         for n, u in acum_vendedor.items() if u > 0),
+        key=lambda d: -d["unidades"])
+    clientes = sorted(
+        ({"nombre": n, "unidades": round(u, 1)} for n, u in acum_cliente.items() if u > 0),
+        key=lambda d: -d["unidades"])[:15]
+
+    # Quien vende el producto pero NO lo proyecto: es el cruce accionable.
+    proyectaron = {p["vendedor"].strip().upper() for p in proyectado}
+    for v in vendedores:
+        v["proyecto"] = v["nombre"].strip().upper() in proyectaron
+
+    return jsonify(proyectado=proyectado, vendedores=vendedores, clientes=clientes)
 
 
 @app.route("/forecast/ciclos/nuevo", methods=["POST"])

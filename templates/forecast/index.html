@@ -11,8 +11,15 @@
     S&amp;OP · Proyección de ventas
     {% if sop_en_pruebas %}<span class="badge bg-warning text-dark">en pruebas</span>{% endif %}
   </h3>
-  {% if es_admin %}
   <div class="d-flex gap-2">
+  {# Ronda DF (2026-11-13), Fase 2 parte 2: la proyección consolidada. Es de
+     gerencia, así que solo se ofrece a quien ve todo el equipo. #}
+  {% if ve_equipo %}
+  <a href="{{ url_for('forecast_proyeccion') }}" class="btn btn-brand">
+    <i class="bi bi-graph-down-arrow me-1"></i> Proyección de stock
+  </a>
+  {% endif %}
+  {% if es_admin %}
     {# Ronda CK (2026-10-29, punto 8): el módulo queda restringido a los
        administradores hasta que el usuario lo autorice. El interruptor está
        acá para que no haga falta un despliegue para abrirlo. #}
@@ -27,8 +34,8 @@
     <button class="btn btn-primary" data-bs-toggle="collapse" data-bs-target="#panelCiclo">
       <i class="bi bi-calendar-plus me-1"></i> Abrir ciclo
     </button>
-  </div>
   {% endif %}
+  </div>
 </div>
 
 {% if sop_en_pruebas and es_admin %}

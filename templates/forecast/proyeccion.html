@@ -1,0 +1,343 @@
+{% extends "base.html" %}
+{% block title %}Proyección de stock · S&OP{% endblock %}
+{% block content %}
+
+<style>
+  /* La tabla es ancha por naturaleza (13 semanas + hitos): scroll propio y
+     encabezado pegado, el mismo tratamiento de Consulta de Stock. */
+  #tablaProyeccion th, #tablaProyeccion td {
+    white-space: nowrap;
+    vertical-align: middle;
+    font-size: 0.82rem;
+  }
+  .tabla-proyeccion-scroll { max-height: 72vh; overflow: auto; }
+  .tabla-proyeccion-scroll thead th {
+    position: sticky; top: 0; z-index: 3; background: #fff;
+    box-shadow: inset 0 -1px 0 #dee2e6;
+  }
+  /* Las dos primeras columnas quedan fijas al desplazar en horizontal: sin
+     esto, a la semana 8 ya no sabes de qué producto es la fila. */
+  #tablaProyeccion td.col-fija, #tablaProyeccion th.col-fija {
+    position: sticky; left: 0; z-index: 2; background: #fff;
+  }
+  #tablaProyeccion thead th.col-fija { z-index: 4; }
+  #tablaProyeccion td.descripcion {
+    max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+  }
+  .celda-negativa { background-color: #fdecea !important; color: #b02a37; font-weight: 600; }
+  .celda-entra { color: #0a7c3f; }
+  .fila-danger td.col-fija { box-shadow: inset 3px 0 0 #dc3545; }
+  .fila-warning td.col-fija { box-shadow: inset 3px 0 0 #f0ad4e; }
+  .hito { background-color: #f8f9fa; }
+  .dias-criticos { color: #b02a37; font-weight: 600; }
+  .mini { font-size: 0.72rem; }
+</style>
+
+<div class="d-flex justify-content-between align-items-start mb-2">
+  <div>
+    <h3 class="section-title mb-1">S&amp;OP · Proyección de stock</h3>
+    <div class="text-muted small">
+      Lo disponible hoy, más lo que llega en tránsito, menos lo que el equipo proyectó vender, semana a semana.
+      Es la hoja <strong>Stock</strong> del S&amp;OP, calculada con los datos del programa.
+    </div>
+  </div>
+  <a href="{{ url_for('forecast_index') }}" class="btn btn-sm btn-outline-secondary">&larr; Volver al S&amp;OP</a>
+</div>
+
+{# Lo primero que hay que saber para leer el resto: cuánta gente cargó. Con
+   media planilla en blanco, un saldo proyectado holgado no significa nada, y
+   el reporte tiene que decirlo antes que cualquier otra cosa. #}
+{% if cobertura.con_datos < cobertura.total %}
+<div class="alert alert-warning">
+  <div class="fw-semibold mb-1">
+    <i class="bi bi-exclamation-triangle-fill"></i>
+    Solo {{ cobertura.con_datos }} de {{ cobertura.total }} vendedor(es) proyectaron en este ciclo
+  </div>
+  <div class="small mb-0">
+    Sin cargar: <strong>{{ cobertura.sin_datos|join(', ') }}</strong>.
+    Esta proyección descuenta <strong>únicamente lo proyectado</strong>, así que para los productos que vende
+    esa gente el saldo se va a ver holgado aunque no lo esté.
+    Para esos casos mira la columna <strong>Días de stock</strong> y la alerta
+    "<em>se vende pero nadie lo proyectó</em>": esas sí usan la venta real de los últimos 90 días.
+  </div>
+</div>
+{% endif %}
+
+<div class="row g-2 mb-3">
+  <div class="col-md-3">
+    <div class="card p-3 h-100">
+      <div class="text-muted small">Productos en la proyección</div>
+      <div class="fs-4 fw-semibold">{{ resumen.productos }}</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card p-3 h-100 {% if resumen.con_quiebre %}border-danger{% endif %}">
+      <div class="text-muted small">Con quiebre proyectado</div>
+      <div class="fs-4 fw-semibold {% if resumen.con_quiebre %}text-danger{% endif %}">{{ resumen.con_quiebre }}</div>
+      <div class="text-muted mini">El saldo llega a negativo en alguna de las 13 semanas</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card p-3 h-100 {% if resumen.bajo_rotacion %}border-danger{% endif %}">
+      <div class="text-muted small">Bajo rotación</div>
+      <div class="fs-4 fw-semibold {% if resumen.bajo_rotacion %}text-danger{% endif %}">{{ resumen.bajo_rotacion }}</div>
+      <div class="text-muted mini">Menos de {{ dias_criticos }} días de stock al ritmo de los últimos 90 días</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card p-3 h-100 {% if resumen.sin_proyectar %}border-warning{% endif %}">
+      <div class="text-muted small">Se venden, nadie los proyectó</div>
+      <div class="fs-4 fw-semibold">{{ resumen.sin_proyectar }}</div>
+      <div class="text-muted mini">Tienen venta en 360 días y cero en este ciclo</div>
+    </div>
+  </div>
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-auto">
+    <label class="form-label small mb-0">Ciclo</label>
+    <select class="form-select form-select-sm" name="ciclo_id" onchange="this.form.submit()">
+      {% for c in ciclos %}
+      <option value="{{ c.id }}" {% if c.id == ciclo.id %}selected{% endif %}>
+        {{ c.nombre }} ({{ c.estado }})
+      </option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Proveedor</label>
+    <select class="form-select form-select-sm" name="proveedor" onchange="this.form.submit()">
+      <option value="">Todos</option>
+      {% for p in proveedores %}
+      <option value="{{ p }}" {% if proveedor_sel == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small mb-0">Buscar</label>
+    <input type="text" class="form-control form-control-sm" name="q" value="{{ q }}"
+           placeholder="Código o descripción...">
+  </div>
+  <div class="col-auto d-flex align-items-end">
+    <div class="form-check form-switch mb-1">
+      <input class="form-check-input" type="checkbox" name="solo_alertas" value="1"
+             id="soloAlertas" {% if solo_alertas %}checked{% endif %}
+             onchange="this.form.submit()">
+      <label class="form-check-label small" for="soloAlertas">Solo con alerta</label>
+    </div>
+  </div>
+  <div class="col-auto d-flex align-items-end">
+    <button class="btn btn-sm btn-outline-secondary mb-1" type="submit">Aplicar</button>
+  </div>
+</form>
+
+<div class="card p-3">
+  <div class="text-muted small mb-2">
+    Saldo inicial = <strong>stock de la bodega central − comprometido con clientes</strong>.
+    Cada semana suma lo que llega en tránsito y resta lo proyectado.
+    Los <strong>días de stock</strong> se calculan con la venta real de los últimos 90 días, no con el forecast.
+    Haz clic en una fila para ver quién proyecta y quién vende ese producto.
+  </div>
+
+  {% if recortado %}
+  <div class="alert alert-info small py-2">
+    Mostrando los <strong>{{ max_filas }}</strong> productos más urgentes de <strong>{{ total_filas }}</strong>.
+    Las filas vienen ordenadas por urgencia, así que <strong>no queda ninguna alerta fuera</strong> --
+    lo que se recorta son productos sin problemas. Filtra por proveedor o busca un código para ver el resto.
+  </div>
+  {% endif %}
+
+  <div class="table-responsive tabla-proyeccion-scroll">
+    <table class="table table-sm table-hover align-middle mb-0" id="tablaProyeccion">
+      <thead>
+        <tr>
+          <th class="col-fija">Producto</th>
+          <th class="text-end">Stock</th>
+          <th class="text-end">Comprom.</th>
+          <th class="text-end">Disponible</th>
+          <th class="text-end">Tránsito</th>
+          <th class="text-end" data-bs-toggle="tooltip" title="Promedio mensual de unidades vendidas en los últimos 90 días">Vta/mes 90d</th>
+          <th class="text-end">Proyectado 13 sem.</th>
+          {% for s in semanas %}
+          <th class="text-end" data-bs-toggle="tooltip" title="{{ s.rango_largo }}">{{ s.etiqueta }}</th>
+          {% endfor %}
+          {% for h in hitos %}
+          <th class="text-end hito" data-bs-toggle="tooltip"
+              title="Días de stock {% if h == 0 %}con lo disponible hoy{% else %}al final de la semana {{ h }}{% endif %}, al ritmo de venta de los últimos 90 días">
+            Días {% if h == 0 %}hoy{% else %}+{{ h }}s{% endif %}
+          </th>
+          {% endfor %}
+          <th>Alertas</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in filas %}
+        <tr class="fila-producto {% if f.nivel %}fila-{{ f.nivel }}{% endif %}"
+            data-clave="{{ f.clave }}" data-codigos="{{ f.codigos_internos|join(',') }}"
+            data-nombre="{{ f.codigo }} {{ f.descripcion }}" style="cursor: pointer;">
+          <td class="col-fija">
+            <div class="fw-semibold">{{ f.codigo or '--' }}</div>
+            <div class="text-muted mini descripcion" title="{{ f.descripcion }}">
+              {{ f.descripcion or '(sin descripción)' }}
+            </div>
+            <div class="text-muted mini">{{ f.proveedor }}</div>
+          </td>
+          <td class="text-end">{{ f.stock|round|int }}</td>
+          <td class="text-end">{{ f.comprometido|round|int }}</td>
+          <td class="text-end fw-semibold">{{ f.disponible|round|int }}</td>
+          <td class="text-end">
+            {{ f.transito_total|round|int }}
+            {% if f.transito_sin_fecha %}
+            <i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip"
+               title="{{ f.transito_sin_fecha|round|int }} unidad(es) sin fecha estimada de llegada: no entran en la proyección semanal."></i>
+            {% endif %}
+          </td>
+          <td class="text-end">{{ f.venta_90 if f.venta_90 else '-' }}</td>
+          <td class="text-end">{{ f.total_proyectado|round|int if f.total_proyectado else '-' }}</td>
+          {# El tooltip va solo donde aporta (hay movimiento o el saldo es
+             negativo): ponerlo en las 13 celdas de las 300 filas triplicaba
+             el peso del HTML sin decir nada nuevo. #}
+          {% for c in f.celdas %}
+          <td class="text-end {% if c.negativo %}celda-negativa{% endif %}"
+              {% if c.entra or c.sale or c.negativo %}data-bs-toggle="tooltip"
+              title="Entra {{ c.entra|round|int }} · Proyectado {{ c.sale|round|int }} · Saldo {{ c.saldo|round|int }}"{% endif %}>
+            {{ c.saldo|round|int }}
+            {% if c.entra %}<span class="celda-entra mini">+{{ c.entra|round|int }}</span>{% endif %}
+          </td>
+          {% endfor %}
+          {% for h in f.hitos %}
+          <td class="text-end hito {% if h.dias is not none and h.dias < dias_criticos %}dias-criticos{% endif %}">
+            {% if h.dias is none %}<span class="text-muted">--</span>
+            {% else %}{{ h.dias }}{% endif %}
+          </td>
+          {% endfor %}
+          <td>
+            {% for a in f.alertas %}
+            <span class="badge bg-{{ a.nivel }}{% if a.nivel == 'warning' %} text-dark{% endif %} mini"
+                  data-bs-toggle="tooltip" title="{{ a.texto }}">
+              {% if a.tipo == 'quiebre' %}Quiebre S{{ f.semana_quiebre }}
+              {% elif a.tipo == 'bajo_rotacion' %}Bajo rotación
+              {% elif a.tipo == 'sin_proyectar' %}Sin proyectar
+              {% else %}Tránsito sin fecha{% endif %}
+            </span>
+            {% endfor %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="99" class="text-center text-muted py-4">
+          No hay productos que calcen con este filtro.
+        </td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# Detalle por producto: quién lo proyecta y quién lo vende. Es la respuesta a
+   "qué cuentas/vendedor se ven afectados o afectan este número". #}
+<div class="modal fade" id="modalDetalle" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="detalleTitulo">Detalle</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="detalleCuerpo">
+        <div class="text-muted">Cargando...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    // La instancia del modal se crea al primer clic, no al cargar:
+    // asi la pantalla no depende del orden en que lleguen los scripts.
+    let modal = null;
+    const modalEl = document.getElementById('modalDetalle');
+    const cuerpo = document.getElementById('detalleCuerpo');
+    const titulo = document.getElementById('detalleTitulo');
+
+    document.querySelectorAll('tr.fila-producto').forEach(function (fila) {
+      fila.addEventListener('click', function () {
+        titulo.textContent = fila.dataset.nombre || 'Detalle';
+        cuerpo.innerHTML = '<div class="text-muted">Cargando...</div>';
+        if (!modal) modal = new bootstrap.Modal(modalEl);
+        modal.show();
+
+        const params = new URLSearchParams({
+          clave: fila.dataset.clave,
+          codigos: fila.dataset.codigos || '',
+          ciclo_id: '{{ ciclo.id }}',
+        });
+        fetch('{{ url_for("api_forecast_proyeccion_detalle") }}?' + params)
+          .then(function (r) { return r.json(); })
+          .then(function (d) { cuerpo.innerHTML = render(d); })
+          .catch(function () {
+            cuerpo.innerHTML = '<div class="alert alert-danger mb-0">No se pudo cargar el detalle.</div>';
+          });
+      });
+    });
+
+    function render(d) {
+      let html = '';
+
+      html += '<h6 class="fw-semibold">Quién lo proyectó en este ciclo</h6>';
+      if (!d.proyectado || !d.proyectado.length) {
+        html += '<div class="alert alert-warning small">Ningún vendedor proyectó este producto en el ciclo.</div>';
+      } else {
+        html += '<table class="table table-sm"><thead><tr class="text-muted small">' +
+                '<th>Vendedor</th><th class="text-end">Unidades 13 sem.</th></tr></thead><tbody>';
+        d.proyectado.forEach(function (p) {
+          html += '<tr><td>' + escapar(p.vendedor) + '</td><td class="text-end fw-semibold">' +
+                  p.total + '</td></tr>';
+        });
+        html += '</tbody></table>';
+      }
+
+      html += '<h6 class="fw-semibold mt-3">Quién lo vende de verdad <span class="text-muted small fw-normal">(últimos 180 días)</span></h6>';
+      if (!d.vendedores || !d.vendedores.length) {
+        html += '<div class="text-muted small">No tiene ventas registradas en los últimos 180 días.</div>';
+      } else {
+        html += '<table class="table table-sm"><thead><tr class="text-muted small">' +
+                '<th>Vendedor</th><th class="text-end">Unidades</th><th class="text-end">% del producto</th>' +
+                '<th></th></tr></thead><tbody>';
+        d.vendedores.forEach(function (v) {
+          html += '<tr><td>' + escapar(v.nombre) + '</td>' +
+                  '<td class="text-end">' + v.unidades + '</td>' +
+                  '<td class="text-end">' + v.porcentaje + '%</td>' +
+                  '<td class="text-end">' + (v.proyecto
+                    ? '<span class="badge bg-success">Lo proyectó</span>'
+                    : '<span class="badge bg-warning text-dark">No lo proyectó</span>') +
+                  '</td></tr>';
+        });
+        html += '</tbody></table>';
+        html += '<div class="text-muted small">Un vendedor que figura acá y dice "No lo proyectó" es ' +
+                'exactamente el riesgo: ese consumo no está descontado en la proyección.</div>';
+      }
+
+      html += '<h6 class="fw-semibold mt-3">Cuentas que lo compran <span class="text-muted small fw-normal">(últimos 180 días, top 15)</span></h6>';
+      if (!d.clientes || !d.clientes.length) {
+        html += '<div class="text-muted small">Sin clientes registrados en el período.</div>';
+      } else {
+        html += '<table class="table table-sm"><thead><tr class="text-muted small">' +
+                '<th>Cliente</th><th class="text-end">Unidades</th></tr></thead><tbody>';
+        d.clientes.forEach(function (c) {
+          html += '<tr><td>' + escapar(c.nombre) + '</td><td class="text-end">' + c.unidades + '</td></tr>';
+        });
+        html += '</tbody></table>';
+      }
+      return html;
+    }
+
+    function escapar(texto) {
+      const div = document.createElement('div');
+      div.textContent = texto == null ? '' : texto;
+      return div.innerHTML;
+    }
+  })();
+</script>
+{% endblock %}
