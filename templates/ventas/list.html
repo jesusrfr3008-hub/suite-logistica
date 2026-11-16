@@ -63,6 +63,17 @@
       <label class="form-label small text-muted mb-1">Hasta</label>
       <input type="date" class="form-control" name="fecha_hasta" value="{{ fecha_hasta }}">
     </div>
+    {# Ronda DI (2026-11-16): el reporte abre siempre con el año calendario en
+       curso. Este link devuelve a ese corte después de haber cambiado las
+       fechas a mano, sin tener que acordarse del 1 de enero. #}
+    <div class="col-auto">
+      <label class="form-label small text-muted mb-1">&nbsp;</label>
+      <a href="{{ url_for('ventas_list') }}" class="btn btn-outline-secondary d-block"
+         data-bs-toggle="tooltip"
+         title="Vuelve al corte por defecto: del 1 de enero a la venta más reciente cargada">
+        <i class="bi bi-calendar-range"></i> Año en curso
+      </a>
+    </div>
     <div class="col-auto">
       <label class="form-label small text-muted mb-1">Vendedor</label>
       <select class="form-select" name="vendedor">

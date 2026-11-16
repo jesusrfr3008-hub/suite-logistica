@@ -157,8 +157,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DH.1"
-VERSION_SUITE_FECHA = "2026-11-14"
+VERSION_SUITE = "DI"
+VERSION_SUITE_FECHA = "2026-11-16"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -15179,6 +15179,31 @@ def _pivot_ventas_por_producto(lineas):
     return filas, meses_columnas
 
 
+def _rango_por_defecto_ventas():
+    """Ronda DI (2026-11-16, pedido del usuario): el Reporte de Ventas abre
+    SIEMPRE con el año calendario en curso -- del 1 de enero hasta la venta
+    mas reciente que haya cargada.
+
+    Antes abria con una ventana movil de 90 dias hacia atras, que tenia dos
+    problemas: el corte cambiaba solo cada vez que se entraba (las cifras de
+    hoy no eran comparables con las de la semana pasada) y en enero dejaba
+    ver medio año anterior mezclado con el nuevo.
+
+    El "hasta" es la fecha del ultimo documento cargado, no la de hoy: si el
+    reporte de Inventarios se subio el lunes, no tiene sentido que el corte
+    llegue hasta el jueves y parezca que hubo tres dias sin ventas. Si
+    todavia no hay ninguna venta cargada, se usa hoy."""
+    hoy = date.today()
+    ultima = db.session.query(db.func.max(VentaLinea.fecha)).scalar()
+    # Una fecha futura cargada por error no debe estirar el corte mas alla
+    # de hoy; y si lo ultimo cargado es de un año anterior, igual se muestra
+    # el año en curso (vacio), que es lo que el usuario pidio ver.
+    hasta = min(ultima, hoy) if ultima else hoy
+    if hasta < date(hoy.year, 1, 1):
+        hasta = hoy
+    return date(hoy.year, 1, 1).isoformat(), hasta.isoformat()
+
+
 @app.route("/ventas/cliente/<path:clave>")
 @requiere_permiso("reportes")
 def ventas_cliente_detalle(clave):
@@ -15196,8 +15221,8 @@ def ventas_cliente_detalle(clave):
     categorias_sel = [v.strip() for v in request.args.getlist("categoria") if v.strip()]
     subcategorias_sel = [v.strip() for v in request.args.getlist("subcategoria") if v.strip()]
     if not desde_txt and not hasta_txt and "fecha_desde" not in request.args:
-        desde_txt = (date.today() - timedelta(days=90)).isoformat()
-        hasta_txt = date.today().isoformat()
+        # Ronda DI: por defecto, el año calendario en curso.
+        desde_txt, hasta_txt = _rango_por_defecto_ventas()
     desde, hasta = parse_date(desde_txt), parse_date(hasta_txt)
 
     # Ronda CZ (2026-11-06, punto 5 del pedido del usuario -- "agreguemos en
@@ -15275,8 +15300,8 @@ def ventas_list():
     categorias_sel = [v.strip() for v in request.args.getlist("categoria") if v.strip()]
     subcategorias_sel = [v.strip() for v in request.args.getlist("subcategoria") if v.strip()]
     if not desde_txt and not hasta_txt and "fecha_desde" not in request.args:
-        desde_txt = (date.today() - timedelta(days=90)).isoformat()
-        hasta_txt = date.today().isoformat()
+        # Ronda DI: por defecto, el año calendario en curso.
+        desde_txt, hasta_txt = _rango_por_defecto_ventas()
 
     desde, hasta = parse_date(desde_txt), parse_date(hasta_txt)
     # El árbol del multifiltro se arma con el corte de fechas/vendedor pero
