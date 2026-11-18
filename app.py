@@ -159,7 +159,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DK"
+VERSION_SUITE = "DK.1"
 VERSION_SUITE_FECHA = "2026-11-18"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -4869,14 +4869,63 @@ def _parsear_lente(codigo_interno, descripcion, modelos_por_prefijo):
     return modelo, potencia, cilindro
 
 
+# Ronda DK.1 (2026-11-18, corregido por el usuario): los modelos que ya se
+# conocen, con el nombre que el usuario usa. Es la fuente AUTORITATIVA de la
+# siembra -- lo que no esté acá se deduce de las descripciones.
+#
+# No es "una lista escrita a mano" de las que el mapa evita: no decide qué
+# entra al mapa (eso lo decide el prefijo del código, venga o no en esta
+# lista), solo pone el nombre bonito de los que ya se conocen para que el
+# usuario no tenga que confirmar uno por uno lo que ya sabe. Un prefijo
+# nuevo sigue entrando solo y avisando.
+#
+# 20101017 y 20101018 son los DOS "MICROPURE" a propósito: es el mismo lente,
+# el 18 es el rango de dioptrías negativas. Como la dioptría lleva el signo,
+# los dos comparten una sola fila del mapa que va de -10 a +35, que es como
+# el usuario lo mira. 20101020 es MICROPURE 123, otro lente, y va aparte.
+MODELOS_LENTE_CONOCIDOS = {
+    "20101010": "PODEYE",
+    "20101011": "ANKORIS",
+    "20101012": "FINEVISION MICRO F",
+    "20101013": "FINEVISION TORIC POD FT",
+    "20101014": "SLIMFLEX",
+    "20101015": "ISOPURE 123",
+    "20101016": "FINEVISION POD F",
+    "20101017": "MICROPURE",
+    "20101018": "MICROPURE",
+    "20101019": "PODS49 SERENITY",
+    "20101020": "MICROPURE 123",
+    "20101021": "POD F GF",
+    "20101022": "POD FT GF",
+    "20101023": "PODS49 SERENITY TORIC",
+    "20101024": "PODEYE TORIC",
+    "20102111": "ADDON A46RT",
+    "20102112": "TRIFOCAL TORIC BI-FLEX LIBERTY",
+    "20102113": "TRIFOCAL BI-FLEX LIBERTY",
+    "20102114": "ADDON A45RT",
+    "20102115": "BI-FLEX EDOF POB-MA ELON",
+    "20102116": "TRIFOCAL TORIC BI-FLEX LIBERTY PR",
+    "20102117": "TRIFOCAL TORIC ELON",
+    "20102118": "BI-FLEX T MONOFOCAL TORIC",
+    "20102119": "BI-FLEX HL MONOFOCAL FA",
+    "20102120": "TRIFOCAL BI-FLEX LIBERTY PR",
+    "20102201": "BASIS Z TRIFOCAL",
+    "20102317": "ABOTT LIO ACRILICO TECNIS",
+    "20102319": "LIO CAMARA ANTERIOR",
+}
+
+
 def _modelo_sugerido_para_prefijo(descripciones):
     """Nombre de modelo deducido de las descripciones de un prefijo: el
-    prefijo común de palabras, cortado antes del primer token numérico.
+    prefijo común de palabras.
 
-    Es SOLO una sugerencia para el aviso, nunca se aplica sola: medido contra
-    los prefijos ya conocidos acierta en 12 de 17 (confunde ISOPURE 123 con
-    ISOPURE y MICROPURE 123 con MICROPURE, porque el número del nombre es
-    indistinguible de una dioptría). Por eso el usuario la confirma."""
+    Ronda DK.1: un número que es IGUAL en todas las descripciones del prefijo
+    forma parte del nombre y se conserva; uno que varía es la dioptría y
+    corta ahí. Así "MICROPURE 123 +1.0 D" / "MICROPURE 123 +10.0 D" da
+    "MICROPURE 123" y no "MICROPURE", que era el error que obligaba al
+    usuario a corregirlo a mano. Solo se conserva un número entero y pelado
+    (sin signo, sin decimales y sin D/C pegada), para no tragarse jamás una
+    dioptría."""
     palabras = [d.split(" ") for d in descripciones if d]
     if not palabras:
         return ""
@@ -4887,6 +4936,11 @@ def _modelo_sugerido_para_prefijo(descripciones):
             break
         palabra = palabras[0][i]
         if re.match(r"^[+-]?\d", palabra):
+            # Constante en TODAS las descripciones del prefijo, y con forma
+            # de número de modelo (123) y no de dioptría (+1.0, 07.00D).
+            if len(palabras) > 1 and re.fullmatch(r"\d+", palabra):
+                comun.append(palabra)
+                continue
             break
         comun.append(palabra)
     return " ".join(comun).strip(" -")
@@ -4910,7 +4964,7 @@ def seed_modelos_lente():
     desde el aviso del mapa) NUNCA se pisan.
 
     Idempotente: solo crea lo que falta."""
-    ya = {m.prefijo for m in ModeloLente.query.all()}
+    existentes = {m.prefijo: m for m in ModeloLente.query.all()}
     por_prefijo = defaultdict(list)
     proveedor_de = {}
     for fila in CodigoErgopyme.query.with_entities(
@@ -4918,11 +4972,34 @@ def seed_modelos_lente():
         CodigoErgopyme.proveedor_nombre,
     ).all():
         prefijo = _prefijo_modelo_lente(fila[0])
-        if prefijo is None or prefijo in ya:
+        if prefijo is None:
             continue
         por_prefijo[prefijo].append(re.sub(r"\s+", " ", (fila[1] or "").strip()))
         if fila[2] and prefijo not in proveedor_de:
             proveedor_de[prefijo] = fila[2].strip()
+
+    # Ronda DK.1: los modelos que ya se conocen se graban con el nombre del
+    # usuario, sin pedirle que confirme nada. Si una ronda anterior los dejó
+    # con el nombre deducido (o marcados "revisar"), se corrigen acá -- pero
+    # NUNCA se pisa lo que el usuario escribió a mano desde la pantalla.
+    corregidos = 0
+    for prefijo, nombre in MODELOS_LENTE_CONOCIDOS.items():
+        fila = existentes.get(prefijo)
+        if fila is None:
+            db.session.add(ModeloLente(
+                prefijo=prefijo, modelo=nombre,
+                proveedor_nombre=proveedor_de.get(prefijo), origen="conocido"))
+            corregidos += 1
+        elif fila.origen != "manual" and (fila.modelo != nombre or fila.origen == "revisar"):
+            fila.modelo = nombre
+            fila.origen = "conocido"
+            corregidos += 1
+    if corregidos:
+        db.session.commit()
+        print(f"[seed] Modelos de lente conocidos: {corregidos} prefijo(s) con su nombre definitivo.")
+
+    ya = {m.prefijo for m in ModeloLente.query.all()}
+    por_prefijo = {k: v for k, v in por_prefijo.items() if k not in ya}
 
     # Un mismo nombre deducido para DOS prefijos distintos es una señal de
     # alarma, no un detalle: el mapa agrupa sus filas por nombre de modelo,
@@ -4940,6 +5017,8 @@ def seed_modelos_lente():
             sugeridos[prefijo] = nombre
     repetidos = {n for n in sugeridos.values()
                  if list(sugeridos.values()).count(n) > 1}
+    # Un nombre que coincide con uno de los CONOCIDOS no es una colisión
+    # dudosa: el conocido manda y este prefijo nuevo necesita confirmación.
     nombres_ya_usados = {m.modelo for m in ModeloLente.query.all()}
 
     creados = a_revisar = 0
