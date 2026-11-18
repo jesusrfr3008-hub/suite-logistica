@@ -296,7 +296,7 @@
     return disp <= 0 || disp < d.r90;
   };
 
-  function construir(){
+  function construir(recentrar = true){
     const mapa = new Map();
     DATOS.forEach(d => mapa.set(`${d.p}|${d.m}|${d.c}|${d.d}`, d));
 
@@ -333,6 +333,7 @@
     }<th class="ml-der">${estado.quiebres?"Quiebres":"Total"}</th></tr>`;
 
     const totalCol = new Array(dioptrias.length).fill(0);
+    const totalesFila = [];
     let granTotal = 0, proveedorActual = null;
     const lineas = [];
 
@@ -364,6 +365,7 @@
       const etiqueta = (cil==="null" || cil==="")
         ? modelo : `${modelo} <span class="ml-cil">CYL ${num(cil)}</span>`;
       lineas.push(`<tr><th>${etiqueta}</th>${celdas}<td class="ml-der">${fmtN(totalFila)}</td></tr>`);
+      totalesFila.push(totalFila);
     });
 
     $("#mlTabla tbody").innerHTML = lineas.join("") ||
@@ -379,6 +381,57 @@
     if(estado.quiebres) aviso.textContent =
       "Viendo solo quiebres: se ocultan las dioptrías sin ningún quiebre, y lo que está " +
       "normal se deja en blanco. La columna de la derecha cuenta quiebres, no unidades.";
+
+    // Ronda DK.2 (a pedido del usuario): abrir mirando donde esta el grueso.
+    // Con 91 columnas de dioptria, abrir pegado al borde izquierdo deja a la
+    // vista justo la zona vacia (las dioptrias extremas casi no tienen
+    // stock). Se encuadra en el centro de masa, y se vuelve a encuadrar cada
+    // vez que cambian los datos -- filtros incluidos.
+    if(recentrar) requestAnimationFrame(() => encuadrar(totalCol, totalesFila));
+  }
+
+  function centroide(pesos){
+    let suma = 0, acumulado = 0;
+    pesos.forEach((w,i) => { const v = Math.max(0, w); suma += v; acumulado += v*i; });
+    return suma > 0 ? Math.round(acumulado/suma) : null;
+  }
+
+  function encuadrar(totalCol, totalesFila){
+    const marco = document.querySelector(".ml-marco");
+    if(!marco) return;
+    const caja = marco.getBoundingClientRect();
+
+    const ci = centroide(totalCol);
+    if(ci !== null){
+      const th = marco.querySelector(`thead th[data-c="${ci}"]`);
+      const esq = marco.querySelector("thead th.ml-esq");
+      const der = marco.querySelector("thead th.ml-der");
+      if(th){
+        // El centro util es el hueco entre las dos columnas fijas.
+        const anchoEsq = esq ? esq.offsetWidth : 0;
+        const anchoDer = der ? der.offsetWidth : 0;
+        const centro = anchoEsq + (marco.clientWidth - anchoEsq - anchoDer)/2;
+        const r = th.getBoundingClientRect();
+        const pos = (r.left - caja.left) + marco.scrollLeft + r.width/2;
+        marco.scrollLeft = Math.max(0, pos - centro);
+      }
+    }
+
+    const fi = centroide(totalesFila);
+    if(fi !== null){
+      const filas = marco.querySelectorAll("tbody tr:not(.ml-seccion)");
+      const tr = filas[fi];
+      const cab = marco.querySelector("thead");
+      const pie = marco.querySelector("tfoot");
+      if(tr){
+        const altoCab = cab ? cab.offsetHeight : 0;
+        const altoPie = pie ? pie.offsetHeight : 0;
+        const centro = altoCab + (marco.clientHeight - altoCab - altoPie)/2;
+        const r = tr.getBoundingClientRect();
+        const pos = (r.top - caja.top) + marco.scrollTop + r.height/2;
+        marco.scrollTop = Math.max(0, pos - centro);
+      }
+    }
   }
 
   function abrirDetalle(d){
@@ -429,7 +482,7 @@
       x.classList.toggle("btn-outline-secondary", !activo);
     });
     estado.modo = b.dataset.modo;
-    construir();
+    construir(false);   // mismas celdas: no se mueve de donde estaba mirando
   });
   $("#mlQuiebres").addEventListener("click", e=>{
     estado.quiebres = !estado.quiebres;
