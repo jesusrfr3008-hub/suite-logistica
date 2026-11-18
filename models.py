@@ -3120,3 +3120,59 @@ class Notificacion(db.Model):
 
     def __repr__(self):
         return f"<Notificacion {self.usuario_id} {self.titulo!r}>"
+
+
+# ---------------------------------------------------------------------------
+# Ronda DK (2026-11-18): Mapa de Lentes
+# ---------------------------------------------------------------------------
+# Linea del codigo interno de Ergopyme que corresponde a lentes intraoculares.
+# Los dos primeros digitos son la LINEA del producto (ver
+# PREFIJOS_SIN_ROTACION arriba, que excluye 30/60/80/90 de la rotacion por ser
+# equipos, servicios y repuestos). El analisis de los 1.993 codigos del
+# maestro confirmo la estructura completa del codigo:
+#
+#   2 0 1 0 1 0 1 7 1 8 5 0
+#   └─┬─┘ └─┬─┘ └─┬─┘ └──┬──┘
+#     │     │     │      └── atributo: dioptria (y cilindro si es torico)
+#     │     │     └───────── MODELO dentro de ese proveedor  (17 = MICROPURE)
+#     │     └─────────────── PROVEEDOR                       (10 = BVI PHYSIOL)
+#     └───────────────────── LINEA + subfamilia              (20 10 = lentes)
+#
+# Los digitos 5-6 identifican al proveedor en TODAS las lineas, no solo en
+# lentes (301111, 401111 y 701111 son los tres DORC): consistencia medida de
+# 1.854/1.884 codigos con marca, el 98,4%.
+LINEA_LENTES = "20"
+LARGO_PREFIJO_MODELO_LENTE = 8
+
+
+class ModeloLente(db.Model):
+    """Ronda DK (2026-11-18): que modelo de lente es cada prefijo de 8
+    digitos del codigo interno de Ergopyme.
+
+    Vive en la BASE DE DATOS y no en una lista escrita en el codigo a
+    proposito. La planilla que el usuario mantiene a mano tenia 21 modelos
+    cuando el maestro de codigos ya tenia 27 -- FINEVISION MICRO F, SLIMFLEX,
+    BI-FLEX HL MONOFOCAL FA, BASIS Z TRIFOCAL, ABOTT LIO ACRILICO TECNIS y
+    LIO CAMARA ANTERIOR no estaban. Con una lista fija en el codigo, esos seis
+    modelos habrian desaparecido del mapa en silencio, que es exactamente el
+    agujero que costo las rondas CP y DG.
+
+    Asi, cuando aparece un prefijo nuevo el mapa lo AVISA y deja resolverlo
+    desde la misma pantalla (ver mapa_lentes_registrar_modelo en app.py), sin
+    esperar un despliegue.
+    """
+    __tablename__ = "modelos_lente"
+
+    id = db.Column(db.Integer, primary_key=True)
+    prefijo = db.Column(db.String(12), unique=True, nullable=False, index=True)
+    modelo = db.Column(db.String(120), nullable=False)
+    proveedor_nombre = db.Column(db.String(120))
+    # "semilla" = vino del maestro de codigos al arrancar; "manual" = lo
+    # confirmo el usuario desde el aviso del mapa. Las manuales no se pisan.
+    origen = db.Column(db.String(10), default="semilla")
+    activo = db.Column(db.Boolean, default=True)
+    creado_en = db.Column(db.DateTime, default=datetime.utcnow)
+    actualizado_en = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ModeloLente {self.prefijo} {self.modelo!r}>"

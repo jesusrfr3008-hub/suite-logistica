@@ -1,0 +1,461 @@
+{% extends "base.html" %}
+{% block title %}Mapa de Lentes · Suite Logística{% endblock %}
+{% block content %}
+{# Ronda DK (2026-11-18, a pedido del usuario): rejilla de modelo+cilindro
+   (filas) x dioptría (columnas) con el stock consolidado de las dos
+   empresas. Vive en Consulta de Stock: el equipo comercial lo ve, y a
+   propósito NO trae precios ni costos, solo unidades y rotación.
+
+   La rejilla se arma en el navegador porque los filtros, el mapa de calor,
+   el modo quiebres y el modal trabajan sobre el mismo conjunto de datos: ir
+   al servidor por cada clic haría la pantalla inservible con 68 columnas. #}
+<style>
+  .ml-marco{background:#fff;border:1px solid #dee2e6;border-radius:.5rem;
+    overflow:auto;max-height:72vh}
+  .ml-tabla{border-collapse:separate;border-spacing:0;font-size:.78rem;
+    width:max-content;margin:0;font-variant-numeric:tabular-nums}
+  .ml-tabla th,.ml-tabla td{padding:0;text-align:center}
+  .ml-tabla thead th{position:sticky;top:0;z-index:3;background:#fff;
+    border-bottom:1px solid #dee2e6;font-weight:600;font-size:.72rem;
+    color:#6c757d;padding:7px 4px;min-width:42px}
+  .ml-tabla thead th.ml-esq{left:0;z-index:5;text-align:left;padding-left:12px;
+    min-width:230px;border-right:1px solid #dee2e6}
+  .ml-tabla thead th.ml-der{right:0;z-index:5;border-left:1px solid #dee2e6;
+    min-width:66px;text-align:right;padding-right:10px}
+  .ml-tabla thead th.ml-cruz{background:#e7f3f5;color:#0d7d8c}
+  .ml-tabla tbody th{position:sticky;left:0;z-index:2;background:#fff;
+    text-align:left;padding:5px 10px 5px 12px;font-weight:500;font-size:.76rem;
+    white-space:nowrap;border-right:1px solid #dee2e6;border-bottom:1px solid #dee2e6}
+  .ml-tabla tbody tr:hover>th{background:#e7f3f5}
+  .ml-tabla tbody td{border-bottom:1px solid #dee2e6;border-right:1px solid #dee2e6}
+  .ml-tabla tbody td.ml-der{position:sticky;right:0;z-index:2;background:#fff;
+    text-align:right;font-weight:700;padding:5px 10px;border-left:1px solid #dee2e6}
+  .ml-tabla tfoot th,.ml-tabla tfoot td{position:sticky;bottom:0;z-index:4;
+    background:#fff;border-top:2px solid #dee2e6;font-weight:700;font-size:.75rem;
+    padding:6px 4px}
+  .ml-tabla tfoot th.ml-esq{left:0;z-index:6;text-align:left;padding-left:12px;
+    border-right:1px solid #dee2e6}
+  .ml-tabla tfoot td.ml-der{right:0;z-index:6;text-align:right;padding-right:10px;
+    border-left:1px solid #dee2e6}
+  .ml-tabla tr.ml-seccion th,.ml-tabla tr.ml-seccion td{background:#e7f3f5;
+    border-bottom:1px solid #dee2e6}
+  .ml-tabla tr.ml-seccion th{color:#0d7d8c;font-weight:700;font-size:.7rem;
+    letter-spacing:.07em;text-transform:uppercase;z-index:2}
+  .ml-celda{width:100%;height:28px;border:0;background:transparent;font:inherit;
+    font-size:.78rem;color:#212529;cursor:pointer;display:flex;align-items:center;
+    justify-content:center;gap:2px;font-variant-numeric:tabular-nums}
+  .ml-celda:focus-visible{outline:2px solid #0d7d8c;outline-offset:-2px}
+  .ml-cil{color:#0d7d8c;font-weight:700}
+  /* Sin código creado para esa dioptría: el hueco del rango se ve */
+  .ml-vacia{background:repeating-linear-gradient(45deg,transparent,transparent 5px,
+    #f1f3f5 5px,#f1f3f5 6px)}
+  /* En modo quiebres, lo normal se deja en blanco para que el ojo solo
+     encuentre lo que falta (pedido del usuario) */
+  .ml-neutra{background:#fff}
+  .ml-n0{background:#f1f3f5}.ml-n1{background:#d6ecef}.ml-n2{background:#a9dbe1}
+  .ml-n3{background:#6cc3cd}.ml-n4{background:#2ea3b2}
+  .ml-n5{background:#0d7d8c;color:#fff}
+  .ml-cero{background:#fbe9e7;box-shadow:inset 0 -3px 0 #c0392b;font-weight:700;color:#c0392b}
+  .ml-bajo{background:#fdf3e2;box-shadow:inset 0 -3px 0 #b7791f;font-weight:700;color:#b7791f}
+  .ml-comp::after{content:"•";color:#b7791f;font-weight:700}
+  .ml-tr::after{content:"→";color:#0d7d8c;font-size:.7rem;font-weight:700}
+  .ml-sel{outline:2px solid #212529;outline-offset:-2px}
+  .ml-leyenda{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:.72rem;color:#6c757d}
+  .ml-leyenda span{display:flex;align-items:center;gap:4px}
+  .ml-ficha{width:13px;height:13px;border-radius:3px;border:1px solid #dee2e6;display:inline-block}
+  .ml-fila-det{display:flex;justify-content:space-between;gap:10px;padding:5px 0;
+    border-bottom:1px solid #eee;font-size:.85rem}
+  .ml-fila-det:last-of-type{border-bottom:0}
+  .ml-fila-det .k{color:#6c757d}
+  .ml-fila-det .v{font-weight:600;font-variant-numeric:tabular-nums}
+</style>
+
+<div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-0">Mapa de Lentes</h3>
+    <div class="text-muted small">
+      Stock consolidado de las dos empresas, por modelo, cilindro y dioptría.
+      Es el stock de la bodega central, el mismo que muestra Consulta de Stock.
+      Solo unidades y rotación: esta pantalla no trae precios ni costos.
+    </div>
+  </div>
+</div>
+
+{% if avisos.hay %}
+{# Plegado por defecto: lo que el equipo comercial viene a ver es el mapa, y
+   además solo quien tiene Inventarios puede resolver estos avisos. El
+   resumen de una línea basta para saber que hay algo que atender. #}
+<details class="card p-3 mb-3 border-warning">
+  <summary class="fw-semibold text-warning-emphasis" style="cursor:pointer;">
+    <i class="bi bi-exclamation-triangle"></i> Hay lentes que el mapa no puede ubicar
+    <span class="text-muted fw-normal small">
+      ({% if avisos.sin_modelo %}{{ avisos.sin_modelo|length }} prefijo(s) sin registrar{% endif %}{%
+         if avisos.sin_modelo and avisos.por_confirmar %}, {% endif %}{%
+         if avisos.por_confirmar %}{{ avisos.por_confirmar|length }} por confirmar{% endif %}{%
+         if avisos.sin_lectura_total %}{% if avisos.sin_modelo or avisos.por_confirmar %}, {% endif %}{{ avisos.sin_lectura_total }} sin dioptría legible{% endif %})
+    </span>
+  </summary>
+  <div class="mt-3">
+
+  {% if avisos.sin_modelo %}
+  <div class="text-muted small mb-2">
+    Estos códigos son de lentes, pero sus 8 primeros dígitos no están registrados como
+    modelo, así que no entran al mapa. <strong>Se resuelve acá mismo:</strong> confirma o
+    corrige el nombre y quedan dentro.
+  </div>
+  <div class="table-responsive mb-3">
+    <table class="table table-sm align-middle mb-0">
+      <thead><tr class="text-muted small">
+        <th>Prefijo</th><th>Códigos</th><th>Unidades</th><th>Ejemplo de descripción</th>
+        <th style="min-width:260px;">Modelo</th>
+      </tr></thead>
+      <tbody>
+        {% for a in avisos.sin_modelo %}
+        <tr>
+          <td><code>{{ a.prefijo }}</code></td>
+          <td>{{ a.codigos }}</td>
+          <td>{{ a.unidades }}</td>
+          <td class="small text-muted">{{ a.ejemplos|join(' · ') }}</td>
+          <td>
+            {% if puede_resolver %}
+            <form method="post" action="{{ url_for('mapa_lentes_registrar_modelo') }}" class="d-flex gap-1">
+              <input type="hidden" name="prefijo" value="{{ a.prefijo }}">
+              <input type="text" class="form-control form-control-sm" name="modelo"
+                     value="{{ a.sugerido }}" placeholder="Nombre del modelo" required>
+              <button class="btn btn-sm btn-brand">Guardar</button>
+            </form>
+            {% else %}
+            <span class="text-muted small">
+              Sugerido: <strong>{{ a.sugerido or '(no se pudo deducir)' }}</strong> —
+              lo registra alguien con permiso de Inventarios.
+            </span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if avisos.por_confirmar %}
+  <div class="text-muted small mb-2">
+    <strong>Por confirmar:</strong> estos prefijos quedaron con el mismo nombre de modelo al
+    leerlo de las descripciones, y el mapa agrupa por nombre — si de verdad son lentes
+    distintos se fusionarían en una sola fila. Confirma el nombre de cada uno.
+  </div>
+  <div class="table-responsive mb-2">
+    <table class="table table-sm align-middle mb-0">
+      <thead><tr class="text-muted small">
+        <th>Prefijo</th><th>Proveedor</th><th style="min-width:300px;">Modelo</th>
+      </tr></thead>
+      <tbody>
+        {% for a in avisos.por_confirmar %}
+        <tr>
+          <td><code>{{ a.prefijo }}</code></td>
+          <td class="small text-muted">{{ a.proveedor }}</td>
+          <td>
+            {% if puede_resolver %}
+            <form method="post" action="{{ url_for('mapa_lentes_registrar_modelo') }}" class="d-flex gap-1">
+              <input type="hidden" name="prefijo" value="{{ a.prefijo }}">
+              <input type="text" class="form-control form-control-sm" name="modelo"
+                     value="{{ a.modelo }}" required>
+              <button class="btn btn-sm btn-outline-secondary">Confirmar</button>
+            </form>
+            {% else %}
+            <span class="small">{{ a.modelo }}</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if avisos.sin_lectura %}
+  <div class="alert alert-secondary small mb-0">
+    <strong>{{ avisos.sin_lectura_total }} código(s)</strong> tienen su modelo reconocido pero
+    de su descripción no se puede leer la dioptría, así que no se pueden ubicar en una columna.
+    <strong>Esto no se arregla desde la Suite:</strong> hay que corregir la descripción en
+    Ergopyme, que es de donde viene.
+    <div class="mt-1" style="max-height:120px;overflow-y:auto;">
+      {% for f in avisos.sin_lectura %}
+      <div><code>{{ f.codigo }}</code> — {{ f.descripcion or '(sin descripción)' }}</div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  </div>
+</details>
+{% endif %}
+
+<form class="row g-2 mb-3 align-items-end" method="get" id="mlFiltros">
+  <div class="col-auto">
+    <label class="form-label small text-muted mb-1">Proveedor</label>
+    <select class="form-select form-select-sm" name="proveedor" onchange="this.form.submit()">
+      <option value="">Todos</option>
+      {% for p in proveedores %}
+      <option value="{{ p }}" {% if p == proveedor_sel %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small text-muted mb-1">Modelo</label>
+    <select class="form-select form-select-sm" name="modelo" onchange="this.form.submit()">
+      <option value="">Todos</option>
+      {% for m in modelos_disponibles %}
+      <option value="{{ m }}" {% if m == modelo_sel %}selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small text-muted mb-1">Buscar</label>
+    <input type="search" class="form-control form-control-sm" name="q" value="{{ q }}"
+           placeholder="código o descripción">
+  </div>
+  <div class="col-auto">
+    <label class="form-label small text-muted mb-1">Mapa de calor</label>
+    <div class="btn-group btn-group-sm" id="mlHeat" role="group">
+      <button type="button" class="btn btn-brand" data-modo="stock">Stock</button>
+      <button type="button" class="btn btn-outline-secondary" data-modo="rot">Rotación</button>
+    </div>
+  </div>
+  <div class="col-auto">
+    <label class="form-label small text-muted mb-1">Filtros</label>
+    <div class="d-flex gap-2">
+      <a class="btn btn-sm {{ 'btn-brand' if solo_consignacion else 'btn-outline-secondary' }}"
+         href="{{ url_for('mapa_lentes', proveedor=proveedor_sel, modelo=modelo_sel, q=q,
+                          consignacion='' if solo_consignacion else '1') }}">
+        Solo consignación
+      </a>
+      <button type="button" class="btn btn-sm btn-outline-secondary" id="mlQuiebres"
+              aria-pressed="false"
+              title="Deja solo las filas y las dioptrías donde el stock está en cero, en negativo, o por debajo de lo que se vende en un mes">
+        Solo quiebres
+      </button>
+      <button class="btn btn-sm btn-outline-secondary" type="submit">Buscar</button>
+    </div>
+  </div>
+</form>
+
+<div class="alert alert-info py-2 small" id="mlAvisoModo" hidden></div>
+
+<div class="ml-marco">
+  <table class="ml-tabla" id="mlTabla"><thead></thead><tbody></tbody><tfoot></tfoot></table>
+</div>
+<div class="ml-leyenda">
+  <span><i class="ml-ficha" style="background:#d6ecef"></i> poco</span>
+  <span><i class="ml-ficha" style="background:#6cc3cd"></i> medio</span>
+  <span><i class="ml-ficha" style="background:#0d7d8c"></i> mucho</span>
+  <span><i class="ml-ficha" style="background:#fbe9e7;border-bottom:3px solid #c0392b"></i> en cero o negativo</span>
+  <span><i class="ml-ficha" style="background:#fdf3e2;border-bottom:3px solid #b7791f"></i> bajo la rotación del mes</span>
+  <span><i class="ml-ficha ml-vacia"></i> no existe ese código</span>
+  <span>• hay compromiso</span>
+  <span>→ viene en tránsito</span>
+</div>
+<div class="text-muted small mt-2" style="max-width:90ch;">
+  La celda muestra el <strong>disponible</strong> = stock − comprometido. Si hay 3 en stock y 1
+  comprometido muestra 2 con el punto naranjo; si el compromiso supera al stock sale negativo.
+  Hay <strong>quiebre</strong> cuando el disponible está en cero o negativo, o cuando queda menos
+  de lo que se vende en un mes. <strong>Haz clic en cualquier celda</strong> para ver su detalle.
+</div>
+
+<div class="modal fade" id="mlDetalle" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="mlTitulo"></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="mlCuerpo"></div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+{# El script usa el global `bootstrap` (Modal), así que va acá, DESPUÉS del
+   bundle -- en {% block content %} reventaría con ReferenceError antes de
+   que cargue, matando todos los manejadores de la página (pasó en la ronda DF). #}
+<script>
+(function(){
+  const DATOS = {{ datos_json|safe }};
+  const ESCALA = {{ escala_json|safe }};
+  const PUEDE_SEGUIMIENTO = {{ 'true' if puede_seguimiento else 'false' }};
+  const URL_DESPACHO = "{{ url_for('despachos_list') }}";
+
+  const estado = {modo:"stock", quiebres:false, sel:null};
+  const $ = s => document.querySelector(s);
+  const num = v => (v===null||v===undefined) ? "" : String(v).replace(/\.0$/,"");
+  let modal = null;
+
+  const esQuiebre = d => {
+    const disp = d.st - d.co;
+    return disp <= 0 || disp < d.r90;
+  };
+
+  function construir(){
+    const mapa = new Map();
+    DATOS.forEach(d => mapa.set(`${d.p}|${d.m}|${d.c}|${d.d}`, d));
+
+    let claves = [...new Set(DATOS.map(d => `${d.p}|${d.m}|${d.c}`))];
+    let dioptrias = ESCALA.slice();
+
+    if(estado.quiebres){
+      const q = DATOS.filter(esQuiebre);
+      const filasQ = new Set(q.map(d => `${d.p}|${d.m}|${d.c}`));
+      const diopQ = new Set(q.map(d => d.d));
+      claves = claves.filter(k => filasQ.has(k));
+      dioptrias = dioptrias.filter(p => diopQ.has(p));
+    }
+
+    // Orden: proveedor, modelo alfabético, cilindro numérico.
+    const norm = s => (s||"").normalize("NFD").replace(/[̀-ͯ]/g,"")
+                        .replace(/\s+/g," ").trim().toUpperCase();
+    claves.sort((a,b)=>{
+      const [pa,ma,ca]=a.split("|"), [pb,mb,cb]=b.split("|");
+      if(norm(pa)!==norm(pb)) return norm(pa)<norm(pb)?-1:1;
+      if(norm(ma)!==norm(mb)) return norm(ma)<norm(mb)?-1:1;
+      const na = ca==="null"?-Infinity:parseFloat(ca);
+      const nb = cb==="null"?-Infinity:parseFloat(cb);
+      return na-nb;
+    });
+
+    const valor = d => estado.modo==="rot" ? d.r90 : (d.st - d.co);
+    const tope = Math.max(1, ...DATOS.map(d => Math.max(0, valor(d))));
+    const nivel = v => v<=0 ? 0 : Math.min(5, Math.ceil(v/tope*5));
+    const fmtN = n => (estado.modo==="rot" && !estado.quiebres) ? n.toFixed(1) : Math.round(n);
+
+    $("#mlTabla thead").innerHTML = `<tr><th class="ml-esq">Modelo y cilindro</th>${
+      dioptrias.map((p,ci)=>`<th data-c="${ci}">${num(p)}</th>`).join("")
+    }<th class="ml-der">${estado.quiebres?"Quiebres":"Total"}</th></tr>`;
+
+    const totalCol = new Array(dioptrias.length).fill(0);
+    let granTotal = 0, proveedorActual = null;
+    const lineas = [];
+
+    claves.forEach(k=>{
+      const [proveedor,modelo,cil] = k.split("|");
+      if(proveedor !== proveedorActual){
+        proveedorActual = proveedor;
+        lineas.push(`<tr class="ml-seccion"><th class="ml-esq">${proveedor}</th>` +
+          `<td colspan="${dioptrias.length+1}"></td></tr>`);
+      }
+      let totalFila = 0;
+      const celdas = dioptrias.map((p,ci)=>{
+        const d = mapa.get(`${proveedor}|${modelo}|${cil}|${p}`);
+        if(!d) return `<td data-c="${ci}"><div class="ml-celda ml-vacia"></div></td>`;
+        const disp = d.st - d.co;
+        const enCero = disp <= 0;
+        const bajoRot = !enCero && disp < d.r90;
+        if(estado.quiebres && !enCero && !bajoRot)
+          return `<td data-c="${ci}" class="ml-neutra"></td>`;
+        const cls = ["ml-celda", enCero ? "ml-cero" : (bajoRot ? "ml-bajo" : "ml-n"+nivel(valor(d)))];
+        if(d.co) cls.push("ml-comp");
+        if(enCero && d.tr) cls.push("ml-tr");
+        const n = estado.quiebres ? 1 : (estado.modo==="rot" ? d.r90 : disp);
+        totalFila += n; totalCol[ci] += n; granTotal += n;
+        const texto = estado.modo==="rot" ? d.r90.toFixed(1) : disp;
+        return `<td data-c="${ci}"><button type="button" class="${cls.join(" ")}" ` +
+               `data-k="${proveedor}|${modelo}|${cil}|${p}">${texto}</button></td>`;
+      }).join("");
+      const etiqueta = (cil==="null" || cil==="")
+        ? modelo : `${modelo} <span class="ml-cil">CYL ${num(cil)}</span>`;
+      lineas.push(`<tr><th>${etiqueta}</th>${celdas}<td class="ml-der">${fmtN(totalFila)}</td></tr>`);
+    });
+
+    $("#mlTabla tbody").innerHTML = lineas.join("") ||
+      `<tr><td class="text-center text-muted py-4">Nada que mostrar con estos filtros.</td></tr>`;
+    $("#mlTabla tfoot").innerHTML = claves.length
+      ? `<tr><th class="ml-esq">${estado.quiebres?"Quiebres":"Total"}</th>${
+          totalCol.map(n=>`<td>${fmtN(n)}</td>`).join("")
+        }<td class="ml-der">${fmtN(granTotal)}</td></tr>`
+      : "";
+
+    const aviso = $("#mlAvisoModo");
+    aviso.hidden = !estado.quiebres;
+    if(estado.quiebres) aviso.textContent =
+      "Viendo solo quiebres: se ocultan las dioptrías sin ningún quiebre, y lo que está " +
+      "normal se deja en blanco. La columna de la derecha cuenta quiebres, no unidades.";
+  }
+
+  function abrirDetalle(d){
+    if(!d) return;
+    const disp = d.st - d.co;
+    const f = (k,v,c="") => `<div class="ml-fila-det"><span class="k">${k}</span>` +
+      `<span class="v ${c}">${v}</span></div>`;
+    $("#mlTitulo").textContent = d.m + (d.c!==null ? ` · CYL ${num(d.c)}` : "");
+    const transito = (d.dt||[]).map(t =>
+      `${t.cantidad} un. — ${t.etapa}${t.fecha ? `, llegada estimada ${t.fecha}` : ", sin fecha estimada"}`
+    ).join("<br>");
+    $("#mlCuerpo").innerHTML = `
+      <div class="text-muted small mb-2">
+        Dioptría ${num(d.d)} · ${d.p}<br>${d.cod}<br>${d.ds||""}
+      </div>
+      ${f("Stock físico", d.st)}
+      ${f("Comprometido", d.co, d.co ? "text-danger" : "")}
+      ${f("Disponible", disp, disp<=0 ? "text-danger" : "text-success")}
+      ${f("En tránsito", d.tr)}
+      ${f("En OC por confirmar", d.pc)}
+      ${f("En consignación", d.cs)}
+      ${f("Rotación 90 días (un./mes)", d.r90.toFixed(1))}
+      ${f("Rotación 180 días", d.r180.toFixed(1))}
+      ${f("Rotación 360 días", d.r360.toFixed(1))}
+      ${f("Días de stock", d.r90 > 0 ? Math.round(Math.max(0,disp)/(d.r90/30)) : "—")}
+      ${disp>0 && disp<d.r90 ? `<div class="alert alert-warning py-2 small mt-2 mb-0">
+        Quedan <strong>${disp}</strong> y se venden <strong>${d.r90.toFixed(1)}</strong> al mes:
+        menos de un mes de stock.</div>` : ""}
+      ${d.tr ? `<div class="alert alert-info py-2 small mt-2 mb-0">${transito}
+        ${PUEDE_SEGUIMIENTO && d.dp && d.dp.length
+          ? `<div class="mt-1"><a href="${URL_DESPACHO}">Ver en Despachos</a></div>` : ""}
+        </div>` : ""}
+      ${disp<=0 && !d.tr ? `<div class="alert alert-danger py-2 small mt-2 mb-0">
+        Sin stock y <strong>nada en camino</strong>.${d.r90>0
+          ? ` Se vende ${d.r90.toFixed(1)} un./mes.` : ""}</div>` : ""}
+    `;
+    if(!modal) modal = new bootstrap.Modal(document.getElementById("mlDetalle"));
+    modal.show();
+  }
+
+  const porClave = new Map(DATOS.map(d => [`${d.p}|${d.m}|${d.c}|${d.d}`, d]));
+
+  $("#mlHeat").addEventListener("click", e=>{
+    const b = e.target.closest("button"); if(!b) return;
+    [...e.currentTarget.children].forEach(x=>{
+      const activo = x === b;
+      x.classList.toggle("btn-brand", activo);
+      x.classList.toggle("btn-outline-secondary", !activo);
+    });
+    estado.modo = b.dataset.modo;
+    construir();
+  });
+  $("#mlQuiebres").addEventListener("click", e=>{
+    estado.quiebres = !estado.quiebres;
+    e.currentTarget.setAttribute("aria-pressed", estado.quiebres);
+    e.currentTarget.classList.toggle("btn-brand", estado.quiebres);
+    e.currentTarget.classList.toggle("btn-outline-secondary", !estado.quiebres);
+    construir();
+  });
+  // Al pasar el cursor no se abre nada: solo se ilumina la columna, para no
+  // perder de vista en qué dioptría estás en una rejilla tan ancha.
+  $("#mlTabla").addEventListener("mouseover", e=>{
+    const td = e.target.closest("td[data-c]");
+    document.querySelectorAll("#mlTabla thead th.ml-cruz").forEach(x=>x.classList.remove("ml-cruz"));
+    if(!td) return;
+    const th = document.querySelector(`#mlTabla thead th[data-c="${td.dataset.c}"]`);
+    if(th) th.classList.add("ml-cruz");
+  });
+  $("#mlTabla").addEventListener("click", e=>{
+    const b = e.target.closest(".ml-celda[data-k]"); if(!b) return;
+    document.querySelectorAll(".ml-celda.ml-sel").forEach(x=>x.classList.remove("ml-sel"));
+    b.classList.add("ml-sel");
+    estado.sel = b.dataset.k;
+    abrirDetalle(porClave.get(b.dataset.k));
+  });
+
+  construir();
+})();
+</script>
+{% endblock %}

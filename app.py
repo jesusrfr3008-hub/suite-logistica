@@ -2,6 +2,7 @@ import csv
 import glob
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -54,6 +55,7 @@ from models import (
     VentaLinea, ClienteVendedor, codigo_cuenta_para_rotacion, PREFIJOS_SIN_ROTACION,
     ForecastCiclo, ForecastEnvio, ForecastLinea, ForecastCambio, Notificacion,
     ParametroSistema, AliasCodigoInterno, SEMANAS_FORECAST,
+    ModeloLente, LINEA_LENTES, LARGO_PREFIJO_MODELO_LENTE,
 )
 from seed_data import seed_from_excel
 import costing
@@ -157,7 +159,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DJ"
+VERSION_SUITE = "DK"
 VERSION_SUITE_FECHA = "2026-11-18"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -4772,6 +4774,193 @@ def reparar_codigos_877pety_ronda_aq():
         )
 
 
+# ---------------------------------------------------------------------------
+# Ronda DK (2026-11-18, a pedido del usuario): Mapa de Lentes
+# ---------------------------------------------------------------------------
+# Todo esto vive ANTES del bloque de arranque a propósito: seed_modelos_lente
+# se llama desde ahí, y una función de seed escrita DESPUÉS del bloque es un
+# NameError en producción que ni el import ni las pruebas detectan (pasó en
+# las rondas CO, CP y DB). Ver chequeo_arranque.py.
+
+_NUM_LENTE = r"[+-]?\d+(?:[.,]\d+)?"
+
+
+def _numero_lente(texto):
+    """Un número de la descripción, con coma o con punto -- el usuario fue
+    explícito: "en los cilindros hay algunos códigos que están con , en lugar
+    de . asume que es lo mismo, no son distintos"."""
+    try:
+        return float(str(texto).replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+
+
+def _prefijo_modelo_lente(codigo_interno):
+    """Los 8 primeros dígitos del código interno, que son los que identifican
+    el modelo. Devuelve None si el código no es de la línea de lentes."""
+    codigo = re.sub(r"\s", "", str(codigo_interno or ""))
+    if not codigo.startswith(LINEA_LENTES) or len(codigo) < LARGO_PREFIJO_MODELO_LENTE:
+        return None
+    prefijo = codigo[:LARGO_PREFIJO_MODELO_LENTE]
+    return prefijo if prefijo.isdigit() else None
+
+
+def _parsear_lente(codigo_interno, descripcion, modelos_por_prefijo):
+    """Modelo, dioptría y cilindro de un lente.
+
+    El MODELO sale del prefijo de 8 dígitos del código (dato duro, tabla
+    ModeloLente). La DIOPTRÍA y el CILINDRO salen de la DESCRIPCIÓN, no del
+    código: el sufijo del código cambia de formato según el modelo y hasta
+    trunca el cilindro (en TRIFOCAL TORIC ELON, "22" en realidad es 2,25), y
+    hay códigos mal cargados con un dígito de menos. La descripción sí los
+    dice completos.
+
+    Medido contra las 554 filas del archivo Stock_Lentes_29-09-2026: 554/554
+    en modelo, 554/554 en dioptría y 554/554 en cilindro -- y acierta en 6
+    filas donde la fórmula de la planilla del usuario devolvía basura
+    (".50D", ".25D") por tener corrido el desplazamiento del MID().
+
+    Devuelve (modelo, potencia, cilindro). modelo None = el prefijo no está
+    registrado todavía (el mapa lo avisa, ver _avisos_mapa_lentes)."""
+    prefijo = _prefijo_modelo_lente(codigo_interno)
+    if prefijo is None:
+        return None, None, None
+    modelo = modelos_por_prefijo.get(prefijo)
+    if modelo is None:
+        return None, None, None
+
+    texto = re.sub(r"\s+", " ", str(descripcion or "").strip())
+    # El nombre del modelo al principio puede traer números propios
+    # (ISOPURE 123, MICROPURE 123, ADDON A46RT): se recorta antes de buscar.
+    sin_nombre = texto
+    for variante in (modelo, modelo.replace(" ", "  ")):
+        if sin_nombre.upper().startswith(variante.upper()):
+            sin_nombre = sin_nombre[len(variante):]
+            break
+    else:
+        sin_nombre = re.sub(r"^[A-Z\- ]*\d{3}\b", "", sin_nombre)
+
+    # Cilindro: lo que acompaña a CYL, o un número pegado a "C" (ANKORIS).
+    cilindro = None
+    antes = sin_nombre
+    for patron in (rf"CYL\s*({_NUM_LENTE})",
+                   rf"({_NUM_LENTE})\s*D?\s*CYL",
+                   rf"({_NUM_LENTE})\s*C(?:\b|$)"):
+        encontrado = re.search(patron, sin_nombre, re.I)
+        if encontrado:
+            cilindro = _numero_lente(encontrado.group(1))
+            antes = sin_nombre[:encontrado.start()]
+            break
+
+    # Dioptría: el número que lleva la D, y si no el último antes del CYL.
+    # El signo importa: MICROPURE llega hasta -10,00 D.
+    potencia = None
+    con_d = re.search(rf"([+-]?)\s*(\d+(?:[.,]\d+)?)\s*D(?:\b|$)", antes, re.I)
+    if con_d:
+        potencia = _numero_lente(con_d.group(2))
+        if potencia is not None and con_d.group(1) == "-":
+            potencia = -potencia
+    else:
+        suelto = re.search(r"([+-]?)(\d+(?:[.,]\d+)?)(?!.*\d)", antes)
+        if suelto:
+            potencia = _numero_lente(suelto.group(2))
+            if potencia is not None and suelto.group(1) == "-":
+                potencia = -potencia
+    return modelo, potencia, cilindro
+
+
+def _modelo_sugerido_para_prefijo(descripciones):
+    """Nombre de modelo deducido de las descripciones de un prefijo: el
+    prefijo común de palabras, cortado antes del primer token numérico.
+
+    Es SOLO una sugerencia para el aviso, nunca se aplica sola: medido contra
+    los prefijos ya conocidos acierta en 12 de 17 (confunde ISOPURE 123 con
+    ISOPURE y MICROPURE 123 con MICROPURE, porque el número del nombre es
+    indistinguible de una dioptría). Por eso el usuario la confirma."""
+    palabras = [d.split(" ") for d in descripciones if d]
+    if not palabras:
+        return ""
+    comun = []
+    for i in range(min(len(p) for p in palabras)):
+        distintas = {p[i] for p in palabras}
+        if len(distintas) != 1:
+            break
+        palabra = palabras[0][i]
+        if re.match(r"^[+-]?\d", palabra):
+            break
+        comun.append(palabra)
+    return " ".join(comun).strip(" -")
+
+
+def _modelos_lente_por_prefijo(incluir_inactivos=False):
+    """{prefijo: modelo} desde ModeloLente."""
+    query = ModeloLente.query
+    if not incluir_inactivos:
+        query = query.filter(ModeloLente.activo.is_(True))
+    return {m.prefijo: m.modelo for m in query.all()}
+
+
+def seed_modelos_lente():
+    """Ronda DK (2026-11-18): siembra ModeloLente leyendo el MAESTRO de
+    códigos (CodigoErgopyme), no una lista escrita a mano.
+
+    Para cada prefijo de 8 dígitos de la línea de lentes que todavía no esté
+    registrado, se propone el nombre deducido de sus descripciones y se graba
+    como "semilla". Las filas con origen "manual" (confirmadas por el usuario
+    desde el aviso del mapa) NUNCA se pisan.
+
+    Idempotente: solo crea lo que falta."""
+    ya = {m.prefijo for m in ModeloLente.query.all()}
+    por_prefijo = defaultdict(list)
+    proveedor_de = {}
+    for fila in CodigoErgopyme.query.with_entities(
+        CodigoErgopyme.codigo_interno, CodigoErgopyme.descripcion,
+        CodigoErgopyme.proveedor_nombre,
+    ).all():
+        prefijo = _prefijo_modelo_lente(fila[0])
+        if prefijo is None or prefijo in ya:
+            continue
+        por_prefijo[prefijo].append(re.sub(r"\s+", " ", (fila[1] or "").strip()))
+        if fila[2] and prefijo not in proveedor_de:
+            proveedor_de[prefijo] = fila[2].strip()
+
+    # Un mismo nombre deducido para DOS prefijos distintos es una señal de
+    # alarma, no un detalle: el mapa agrupa sus filas por nombre de modelo,
+    # así que dos prefijos con el mismo nombre se fusionarían en una sola
+    # fila. Pasa de verdad -- 20101017 y 20101018 son los dos MICROPURE (el
+    # mismo lente en rangos de dioptría distintos, y ahí la fusión es
+    # correcta), pero 20101020 es MICROPURE 123, otro lente, y el nombre
+    # deducido le queda igual porque el "123" del nombre es indistinguible
+    # de una dioptría. Esos se graban igual (nada desaparece) pero quedan
+    # marcados "revisar" para que el mapa los muestre en sus avisos.
+    sugeridos = {}
+    for prefijo, descripciones in por_prefijo.items():
+        nombre = _modelo_sugerido_para_prefijo(descripciones)
+        if nombre:
+            sugeridos[prefijo] = nombre
+    repetidos = {n for n in sugeridos.values()
+                 if list(sugeridos.values()).count(n) > 1}
+    nombres_ya_usados = {m.modelo for m in ModeloLente.query.all()}
+
+    creados = a_revisar = 0
+    for prefijo, nombre in sugeridos.items():
+        dudoso = nombre in repetidos or nombre in nombres_ya_usados
+        db.session.add(ModeloLente(
+            prefijo=prefijo, modelo=nombre,
+            proveedor_nombre=proveedor_de.get(prefijo),
+            origen="revisar" if dudoso else "semilla",
+        ))
+        creados += 1
+        if dudoso:
+            a_revisar += 1
+    if creados:
+        db.session.commit()
+        print(f"[seed] Modelos de lente: {creados} prefijo(s) nuevo(s) registrado(s) "
+              f"desde el maestro de códigos"
+              + (f", {a_revisar} por confirmar (nombre repetido)." if a_revisar else "."))
+    return creados
+
+
 def _paso_arranque_seguro(nombre, funcion):
     """Ronda AN (2026-09-23, incidente en producción): antes, un error
     dentro de CUALQUIERA de estos pasos de arranque (seed_*/reparar_*) hacía
@@ -4818,6 +5007,8 @@ with app.app_context():
     _paso_arranque_seguro("reparar_variantes_physiol_ronda_ae", reparar_variantes_physiol_ronda_ae)
     _paso_arranque_seguro("reparar_codigo_padre_ankoris_ronda_au", reparar_codigo_padre_ankoris_ronda_au)
     _paso_arranque_seguro("seed_codigos_ergopyme", seed_codigos_ergopyme)
+    # Ronda DK: va DESPUES de seed_codigos_ergopyme porque lee de ese maestro.
+    _paso_arranque_seguro("seed_modelos_lente", seed_modelos_lente)
     _paso_arranque_seguro("reparar_alias_codigo_proveedor_ronda_ao", reparar_alias_codigo_proveedor_ronda_ao)
     _paso_arranque_seguro("seed_compras_historicas", seed_compras_historicas)
     _paso_arranque_seguro("reparar_lotes_historico_ronda_by", reparar_lotes_historico_ronda_by)
@@ -21268,6 +21459,201 @@ def _ultimo_costo_por_lote():
     return resultado
 
 
+# ===========================================================================
+# Ronda DK (2026-11-18, a pedido del usuario): Mapa de Lentes
+# ===========================================================================
+# Rejilla de modelo+cilindro (filas) x dioptria (columnas) con el stock
+# consolidado de las dos empresas, para ver de un vistazo donde hay y donde
+# falta. Vive en Consulta de Stock, con el permiso del equipo comercial:
+# SOLO unidades y rotacion, nunca precios ni costos.
+#
+# Decisiones tomadas con el usuario antes de construirlo:
+#  - El stock es el de la BODEGA CENTRAL, el mismo criterio que ya usa
+#    Consulta de Stock desde la ronda DD, para que los dos numeros cuadren.
+#  - Las columnas son la escala completa de 0,5 en 0,5 entre la dioptria
+#    minima y la maxima de cada modelo, exista o no el codigo: asi un hueco
+#    del rango se VE, en vez de simplemente no estar.
+#  - El drill-down al despacho respeta el permiso de seguimiento (ronda X).
+#  - La rotacion es la de 90 dias (igual que el resto de la Suite), con 180
+#    y 360 en el detalle.
+#  - Hay QUIEBRE cuando el disponible esta en cero o negativo, o cuando queda
+#    menos de lo que se vende en un mes. Se mide sobre el stock TOTAL, con la
+#    consignacion adentro, nunca por separado.
+
+PASO_DIOPTRIA = 0.5
+MAX_DIOPTRIAS_FILA = 160   # tope defensivo por si una descripcion trae basura
+
+
+def _escala_dioptrias(valores):
+    """La escala completa de 0,5 en 0,5 entre el minimo y el maximo de
+    `valores`. El usuario la eligio sobre "solo las dioptrias que existen"
+    justamente para que se vea el hueco del rango."""
+    limpios = sorted({v for v in valores if v is not None})
+    if not limpios:
+        return []
+    paso = PASO_DIOPTRIA
+    inicio = math.floor(limpios[0] / paso) * paso
+    fin = math.ceil(limpios[-1] / paso) * paso
+    cantidad = int(round((fin - inicio) / paso)) + 1
+    if cantidad > MAX_DIOPTRIAS_FILA:
+        return limpios
+    escala = [round(inicio + i * paso, 2) for i in range(cantidad)]
+    # Una dioptria que exista fuera de la grilla de 0,5 (ej. 1,25) no se
+    # pierde: se agrega aunque rompa el paso.
+    return sorted(set(escala) | set(limpios))
+
+
+def _mapa_lentes_datos(solo_consignacion=False):
+    """Todo lo que el Mapa de Lentes necesita, por (modelo, cilindro,
+    dioptria), consolidado entre empresas.
+
+    Cada numero sale de la MISMA fuente que ya lo calcula en otra pantalla
+    -- la regla que costo las rondas DH.1 y DJ: antes de mostrar un numero
+    que ya existe en otro lado, usar la tabla de la que sale el que ya esta.
+    """
+    modelos = _modelos_lente_por_prefijo()
+
+    # --- Stock fisico de la bodega central, consolidado entre empresas ---
+    stock_por_codigo = defaultdict(float)
+    descripcion_de = {}
+    for codigo, descripcion, fisico, bodega in db.session.query(
+        StockExistencia.codigo_interno, StockExistencia.descripcion,
+        StockExistencia.stock_fisico, StockExistencia.bodega_codigo,
+    ).all():
+        clave = (codigo or "").strip()
+        if not clave or _normalizar_bodega(bodega) != BODEGA_CENTRAL:
+            continue
+        stock_por_codigo[clave] += fisico or 0
+        if descripcion and clave not in descripcion_de:
+            descripcion_de[clave] = descripcion
+
+    # --- Comprometido (notas de pedido), consolidado ---
+    comprometido_por_codigo = defaultdict(float)
+    for codigo, cantidad in db.session.query(
+        PedidoComprometido.codigo_interno, PedidoComprometido.cantidad
+    ).all():
+        clave = (codigo or "").strip()
+        if clave:
+            comprometido_por_codigo[clave] += cantidad or 0
+
+    # --- Transito y OC por confirmar, por codigo interno ---
+    transito_por_codigo = defaultdict(float)
+    detalle_transito = defaultdict(list)
+    despacho_de_codigo = defaultdict(set)
+    por_confirmar_por_codigo = defaultdict(float)
+    for linea in (OrdenCompraLinea.query
+                  .join(OrdenCompra)
+                  .filter(OrdenCompraLinea.anulada.is_(False),
+                          OrdenCompra.estado != "Cancelada")
+                  .all()):
+        producto = linea.producto
+        if producto is None:
+            continue
+        codigo = (producto.codigo_interno_inventario or "").strip()
+        if linea.variante_codigo:
+            variante = next((v for v in producto.variantes
+                             if (v.codigo or "").strip().upper()
+                             == linea.variante_codigo.strip().upper()), None)
+            if variante and (variante.codigo_interno_inventario or "").strip():
+                codigo = variante.codigo_interno_inventario.strip()
+        if not codigo:
+            continue
+        cantidad = linea.cantidad_unidades or 0
+        if cantidad <= 0:
+            continue
+        aprobacion = (linea.orden.estado_aprobacion or "").strip()
+        etapa = (linea.etapa or "").strip()
+        if aprobacion == "Por Aprobar":
+            por_confirmar_por_codigo[codigo] += cantidad
+        elif aprobacion == "Aprobada" and etapa in ("Orden Despachada", "Internación Aduanas"):
+            transito_por_codigo[codigo] += cantidad
+            despacho = linea.orden.despacho
+            fecha = None
+            if despacho and despacho.fecha_estimada_llegada:
+                fecha = despacho.fecha_estimada_llegada
+            elif linea.fecha_estimada_despacho_confirmada:
+                fecha = linea.fecha_estimada_despacho_confirmada
+            elif linea.fecha_estimada_despacho:
+                fecha = linea.fecha_estimada_despacho
+            detalle_transito[codigo].append({
+                "cantidad": int(cantidad),
+                "etapa": etapa,
+                "fecha": fecha.strftime("%d-%m-%Y") if fecha else None,
+            })
+            if despacho:
+                despacho_de_codigo[codigo].add(despacho.id)
+
+    # --- Consignacion vigente (ronda DJ: recibido menos consumido) ---
+    consignacion_por_codigo = defaultdict(float)
+    for lote in ConsignacionPendienteLote.query.all():
+        codigo = (lote.codigo_interno or "").strip()
+        if codigo and lote.cantidad_en_stock > 0:
+            consignacion_por_codigo[codigo] += lote.cantidad_en_stock
+
+    rotacion = _rotacion_por_codigo()
+
+    # --- Se arma una celda por (modelo, cilindro, dioptria) ---
+    celdas = {}
+    sin_modelo = defaultdict(lambda: {"codigos": [], "descripciones": [], "unidades": 0.0})
+    sin_lectura = []
+    codigos_de_lente = set(stock_por_codigo) | set(consignacion_por_codigo)
+    for codigo in sorted(codigos_de_lente):
+        prefijo = _prefijo_modelo_lente(codigo)
+        if prefijo is None:
+            continue   # no es un lente
+        descripcion = (descripcion_de.get(codigo) or "").strip()
+        modelo, potencia, cilindro = _parsear_lente(codigo, descripcion, modelos)
+        if modelo is None:
+            aviso = sin_modelo[prefijo]
+            aviso["codigos"].append(codigo)
+            if descripcion and descripcion not in aviso["descripciones"]:
+                aviso["descripciones"].append(descripcion)
+            aviso["unidades"] += stock_por_codigo.get(codigo, 0)
+            continue
+        if potencia is None:
+            sin_lectura.append({"codigo": codigo, "descripcion": descripcion,
+                                "modelo": modelo})
+            continue
+        clave = (modelo, cilindro, potencia)
+        celda = celdas.setdefault(clave, {
+            "modelo": modelo, "cilindro": cilindro, "dioptria": potencia,
+            "codigos": [], "descripcion": descripcion,
+            "stock": 0.0, "comprometido": 0.0, "transito": 0.0,
+            "por_confirmar": 0.0, "consignacion": 0.0,
+            "detalle_transito": [], "despachos": set(),
+        })
+        celda["codigos"].append(codigo)
+        celda["stock"] += stock_por_codigo.get(codigo, 0)
+        celda["comprometido"] += comprometido_por_codigo.get(codigo, 0)
+        celda["transito"] += transito_por_codigo.get(codigo, 0)
+        celda["por_confirmar"] += por_confirmar_por_codigo.get(codigo, 0)
+        celda["consignacion"] += consignacion_por_codigo.get(codigo, 0)
+        celda["detalle_transito"].extend(detalle_transito.get(codigo, []))
+        celda["despachos"].update(despacho_de_codigo.get(codigo, set()))
+        datos_rot = rotacion.get(codigo, {})
+        for ventana in (90, 180, 360):
+            celda[f"rot_{ventana}"] = round(
+                celda.get(f"rot_{ventana}", 0) + (datos_rot.get(ventana) or 0), 1)
+
+    if solo_consignacion:
+        celdas = {k: c for k, c in celdas.items() if c["consignacion"] > 0}
+
+    filas = []
+    for celda in celdas.values():
+        celda["disponible"] = round(celda["stock"] - celda["comprometido"], 2)
+        celda["rot_90"] = celda.get("rot_90", 0)
+        celda["rot_180"] = celda.get("rot_180", 0)
+        celda["rot_360"] = celda.get("rot_360", 0)
+        celda["despachos"] = sorted(celda["despachos"])
+        filas.append(celda)
+
+    return {
+        "celdas": filas,
+        "sin_modelo": sin_modelo,
+        "sin_lectura": sin_lectura,
+    }
+
+
 @app.route("/stock/bodegas")
 @requiere_permiso("stock_bodegas")
 def stock_bodegas_list():
@@ -21445,6 +21831,157 @@ def stock_bodegas_list():
         ultima_carga=ultima_carga, ultima_carga_bodegas=ultima_carga_bodegas,
         hay_bodegas_habilitadas=bool(codigos_habilitados),
     )
+
+
+def _avisos_mapa_lentes(datos):
+    """Ronda DK (2026-11-18, pedido explícito del usuario: "si tiene que
+    salir aviso si no está en el prefijo que indique, además me diga dónde
+    resolverlo... que no solo muestre el aviso del error sino también dónde
+    solucionarlo, y valida que exista la solución").
+
+    Tres clases de problema, cada una con su salida verificada:
+
+    1. PREFIJO SIN MODELO -- el código es de un lente pero sus 8 dígitos no
+       están registrados. Se resuelve EN EL MISMO AVISO: trae el nombre
+       sugerido desde las descripciones y un botón que lo guarda
+       (mapa_lentes_registrar_modelo). La solución siempre existe porque va
+       incluida.
+    2. MODELOS POR CONFIRMAR -- dos prefijos distintos con el mismo nombre
+       deducido. El mapa agrupa por nombre, así que se fusionarían. Se
+       resuelve en el mismo aviso, renombrando.
+    3. DESCRIPCIÓN ILEGIBLE -- el modelo se reconoce pero de la descripción
+       no sale la dioptría. Esto NO tiene arreglo dentro de la Suite: hay que
+       corregir la descripción en Ergopyme. Se dice así, sin mandar a nadie
+       a una pantalla que no lo resuelve."""
+    sin_modelo = []
+    for prefijo, info in sorted(datos["sin_modelo"].items()):
+        sin_modelo.append({
+            "prefijo": prefijo,
+            "codigos": len(info["codigos"]),
+            "unidades": int(round(info["unidades"])),
+            "ejemplos": info["descripciones"][:3],
+            "sugerido": _modelo_sugerido_para_prefijo(info["descripciones"]),
+        })
+    por_confirmar = [
+        {"prefijo": m.prefijo, "modelo": m.modelo,
+         "proveedor": m.proveedor_nombre or ""}
+        for m in ModeloLente.query.filter_by(origen="revisar")
+        .order_by(ModeloLente.modelo, ModeloLente.prefijo).all()
+    ]
+    return {
+        "sin_modelo": sin_modelo,
+        "por_confirmar": por_confirmar,
+        "sin_lectura": sorted(datos["sin_lectura"], key=lambda f: f["codigo"])[:40],
+        "sin_lectura_total": len(datos["sin_lectura"]),
+        "hay": bool(sin_modelo or por_confirmar or datos["sin_lectura"]),
+    }
+
+
+@app.route("/stock/mapa-lentes")
+@requiere_permiso("consultar_stock", "inventarios", "reportes")
+def mapa_lentes():
+    """Ronda DK (2026-11-18): Mapa de Lentes -- modelo y cilindro en las
+    filas, dioptría en las columnas, para ver de un vistazo qué hay y qué
+    falta. Mismo permiso que Consulta de Stock: el equipo comercial lo ve, y
+    a propósito NO trae ni precios ni costos, solo unidades y rotación."""
+    proveedor_sel = (request.args.get("proveedor") or "").strip()
+    modelo_sel = (request.args.get("modelo") or "").strip()
+    q = (request.args.get("q") or "").strip()
+    solo_consignacion = request.args.get("consignacion") == "1"
+
+    datos = _mapa_lentes_datos(solo_consignacion=solo_consignacion)
+    celdas = datos["celdas"]
+
+    proveedor_de_modelo = {
+        m.modelo: (m.proveedor_nombre or "Sin proveedor")
+        for m in ModeloLente.query.all()
+    }
+    for celda in celdas:
+        celda["proveedor"] = proveedor_de_modelo.get(celda["modelo"], "Sin proveedor")
+
+    proveedores = sorted({c["proveedor"] for c in celdas})
+    if proveedor_sel:
+        celdas = [c for c in celdas if c["proveedor"] == proveedor_sel]
+    modelos_disponibles = sorted({c["modelo"] for c in celdas})
+    if modelo_sel:
+        celdas = [c for c in celdas if c["modelo"] == modelo_sel]
+    if q:
+        texto = q.lower()
+        celdas = [c for c in celdas
+                  if texto in f"{c['modelo']} {c['descripcion']} {' '.join(c['codigos'])}".lower()]
+
+    # Ronda X (2026-09-13, punto 5): Consulta de Stock a secas NO navega a la
+    # orden ni al despacho -- solo ve cuanto viene y para cuando. El drill-down
+    # al seguimiento queda para quien tiene ese permiso, como se decidio con
+    # el usuario antes de construir esta ronda.
+    puede_seguimiento = (current_user.tiene_permiso("seguimiento")
+                         or current_user.tiene_permiso("actualizar_despacho"))
+
+    # La rejilla se arma en el navegador (ver mapa_lentes.html): acá solo se
+    # entregan las celdas y la escala de dioptrías ya resuelta.
+    escala = _escala_dioptrias([c["dioptria"] for c in celdas])
+    payload = [
+        {
+            "p": c["proveedor"], "m": c["modelo"], "c": c["cilindro"], "d": c["dioptria"],
+            "st": int(round(c["stock"])), "co": int(round(c["comprometido"])),
+            "tr": int(round(c["transito"])), "pc": int(round(c["por_confirmar"])),
+            "cs": int(round(c["consignacion"])),
+            "r90": c["rot_90"], "r180": c["rot_180"], "r360": c["rot_360"],
+            "cod": c["codigos"][0] if c["codigos"] else "",
+            "ds": c["descripcion"],
+            "dt": c["detalle_transito"],
+            "dp": c["despachos"] if puede_seguimiento else [],
+        }
+        for c in celdas
+    ]
+
+    return render_template(
+        "stock/mapa_lentes.html",
+        datos_json=json.dumps(payload, ensure_ascii=False),
+        escala_json=json.dumps(escala),
+        proveedores=proveedores, modelos_disponibles=modelos_disponibles,
+        proveedor_sel=proveedor_sel, modelo_sel=modelo_sel, q=q,
+        solo_consignacion=solo_consignacion,
+        avisos=_avisos_mapa_lentes(datos),
+        puede_resolver=current_user.tiene_permiso("inventarios"),
+        puede_seguimiento=puede_seguimiento,
+    )
+
+
+@app.route("/stock/mapa-lentes/modelo", methods=["POST"])
+@requiere_permiso("inventarios")
+def mapa_lentes_registrar_modelo():
+    """Ronda DK: resuelve un aviso del mapa SIN salir de la pantalla --
+    registra (o corrige) el modelo de un prefijo. Queda con origen "manual",
+    así que la siembra de arranque no lo vuelve a pisar nunca."""
+    prefijo = re.sub(r"\s", "", request.form.get("prefijo") or "")
+    nombre = re.sub(r"\s+", " ", (request.form.get("modelo") or "").strip())
+    volver = url_for("mapa_lentes")
+    if not prefijo.isdigit() or len(prefijo) != LARGO_PREFIJO_MODELO_LENTE:
+        flash(f"El prefijo debe ser de {LARGO_PREFIJO_MODELO_LENTE} dígitos.", "warning")
+        return redirect(volver)
+    if not nombre:
+        flash("Escribe el nombre del modelo.", "warning")
+        return redirect(volver)
+
+    fila = ModeloLente.query.filter_by(prefijo=prefijo).first()
+    if fila is None:
+        fila = ModeloLente(prefijo=prefijo)
+        db.session.add(fila)
+        accion = "registrado"
+    else:
+        accion = "actualizado"
+    fila.modelo = nombre
+    fila.origen = "manual"
+    fila.activo = True
+    if not fila.proveedor_nombre:
+        maestro = CodigoErgopyme.query.filter(
+            CodigoErgopyme.codigo_interno.like(f"{prefijo}%")).first()
+        if maestro:
+            fila.proveedor_nombre = maestro.proveedor_nombre
+    db.session.commit()
+    flash(f"Modelo {accion}: {prefijo} = {nombre}. Sus lentes ya aparecen en el mapa.", "success")
+    return redirect(volver)
 
 
 @app.route("/configuracion/reportes", methods=["GET", "POST"])
