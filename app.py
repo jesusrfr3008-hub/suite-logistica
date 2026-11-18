@@ -157,8 +157,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DI"
-VERSION_SUITE_FECHA = "2026-11-16"
+VERSION_SUITE = "DJ"
+VERSION_SUITE_FECHA = "2026-11-18"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -17991,6 +17991,202 @@ def api_stock_valorizado_cargar_auto():
     ), 200
 
 
+class _FilaConsignacionVigente:
+    """Ronda DJ (2026-11-18): una fila de "Stock en Consignación" calculada,
+    con la misma forma que tenían las filas de StockConsignacionVigente para
+    que la plantilla y el export no tengan que cambiar de lenguaje."""
+
+    __slots__ = ("proveedor", "codigo_proveedor", "codigo_interno", "descripcion",
+                 "lote", "fecha_vencimiento", "cantidad", "costo_pmp",
+                 "recibida", "consumida", "actualizado_en", "origen")
+
+    def __init__(self, **kw):
+        for campo in self.__slots__:
+            setattr(self, campo, kw.get(campo))
+
+
+def _datos_de_lote_consignacion(proveedor_ids):
+    """Ronda DJ (2026-11-18): vencimiento y costo de cada lote de
+    consignación, que ConsignacionPendienteLote no guarda.
+
+    Se busca en tres fuentes, en orden de confianza:
+      1. El archivo inicial del proveedor (StockConsignacionVigente): trae
+         vencimiento y costo PMP reales, pero solo de los lotes de la foto
+         de partida.
+      2. Carga Lotes del costeo (ParcialLineaLote): es donde queda el
+         vencimiento de todo lo que entró por importación.
+      3. El Stock de Ergopyme (StockExistencia): último recurso para un lote
+         que llegó sin vencimiento en el costeo.
+    Para el costo, si el lote no venía en el archivo inicial se usa el PMP
+    del código en Stock Valorizado.
+
+    Devuelve dos diccionarios: vencimientos por (proveedor_id, lote) y por
+    lote suelto, y costos por código interno."""
+    vencimiento_por_lote = {}
+    costo_por_lote = {}
+
+    # 3) Stock de Ergopyme -- se carga primero para que las fuentes mejores
+    #    lo pisen después.
+    for codigo, lote, venc in db.session.query(
+        StockExistencia.codigo_interno, StockExistencia.codigo_lote,
+        StockExistencia.fecha_vencimiento,
+    ).filter(StockExistencia.fecha_vencimiento.isnot(None)).all():
+        clave = (codigo or "").strip().upper(), (lote or "").strip().upper()
+        if clave[1]:
+            vencimiento_por_lote.setdefault(clave, venc)
+
+    # 2) Carga Lotes del costeo
+    for lote, venc in db.session.query(
+        ParcialLineaLote.codigo_lote, ParcialLineaLote.fecha_vencimiento,
+    ).filter(ParcialLineaLote.fecha_vencimiento.isnot(None)).all():
+        texto = (lote or "").strip().upper()
+        if texto:
+            vencimiento_por_lote[(None, texto)] = venc
+
+    # 1) El archivo inicial del proveedor (la fuente más confiable)
+    for fila in StockConsignacionVigente.query.filter(
+        StockConsignacionVigente.proveedor_id.in_(proveedor_ids or [-1])
+    ).all():
+        texto = (fila.lote or "").strip().upper()
+        if not texto:
+            continue
+        if fila.fecha_vencimiento:
+            vencimiento_por_lote[(None, texto)] = fila.fecha_vencimiento
+        if fila.costo_pmp:
+            costo_por_lote[texto] = fila.costo_pmp
+
+    costo_por_codigo = {
+        (c or "").strip().upper(): pmp
+        for c, pmp in db.session.query(
+            StockValorizado.codigo_interno, StockValorizado.pmp_total
+        ).all() if pmp
+    }
+    return vencimiento_por_lote, costo_por_lote, costo_por_codigo
+
+
+def _filas_stock_consignacion(proveedor_sel="", q=""):
+    """Ronda DJ (2026-11-18, reportado por el usuario: "si descargo el
+    reporte y busco los ultimos productos importados en consignacion
+    250529AH656D011, 250702AH085I007, 260930AI784W001 no estan en ese
+    reporte").
+
+    Tenía razón y la causa era de fondo: esta pantalla leía
+    StockConsignacionVigente, que es la foto del archivo que el proveedor
+    mandó UNA vez (la última carga fue el 07-10-2026) y que nada vuelve a
+    tocar. Todo el movimiento real -- lo que entra al costear una OC de
+    consignación y lo que sale cuando baja del Stock de Ergopyme -- vive en
+    ConsignacionPendienteLote. Las dos tablas llevaban seis semanas
+    separándose.
+
+    Desde esta ronda el stock consignado se CALCULA del flujo real:
+    cantidad_recibida - cantidad_consumida (ver
+    ConsignacionPendienteLote.cantidad_en_stock), que es exactamente el
+    mismo criterio que ya usaba el toggle Propio/Consignación de Stock
+    Valorizado -- por eso ahora los dos cuadran. El archivo del proveedor
+    pasa a ser la base de partida y la herramienta de conciliación, no la
+    fuente (ver stock_consignacion_cargar)."""
+    query = ConsignacionPendienteLote.query
+    if proveedor_sel:
+        query = query.join(Proveedor).filter(
+            db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
+    lotes = query.all()
+    lotes = [l for l in lotes if l.cantidad_en_stock > 0.0001]
+
+    proveedor_ids = {l.proveedor_id for l in lotes}
+    vencimientos, costo_lote, costo_codigo = _datos_de_lote_consignacion(proveedor_ids)
+
+    filas = []
+    for lote in lotes:
+        texto_lote = (lote.codigo_lote or "").strip()
+        clave_lote = texto_lote.upper()
+        codigo = (lote.codigo_interno or "").strip().upper()
+        venc = (vencimientos.get((None, clave_lote))
+                or vencimientos.get((codigo, clave_lote)))
+        costo = costo_lote.get(clave_lote) or costo_codigo.get(codigo)
+        filas.append(_FilaConsignacionVigente(
+            proveedor=lote.proveedor,
+            codigo_proveedor=lote.codigo_proveedor or lote.codigo_interno,
+            codigo_interno=lote.codigo_interno,
+            descripcion=lote.descripcion,
+            lote=texto_lote,
+            fecha_vencimiento=venc,
+            cantidad=lote.cantidad_en_stock,
+            costo_pmp=costo,
+            recibida=lote.cantidad_recibida or 0,
+            consumida=lote.cantidad_consumida or 0,
+            actualizado_en=lote.actualizado_en,
+            origen=lote,
+        ))
+
+    if q:
+        texto = q.strip().lower()
+        filas = [f for f in filas if texto in " ".join(filter(None, [
+            (f.codigo_proveedor or ""), (f.codigo_interno or ""),
+            (f.descripcion or ""), (f.lote or ""),
+        ])).lower()]
+
+    filas.sort(key=lambda f: ((f.codigo_proveedor or ""),
+                              f.fecha_vencimiento or date.max))
+    return filas
+
+
+def _conciliar_consignacion_con_archivo(proveedor_sel=""):
+    """Ronda DJ (2026-11-18): compara lo que el sistema CALCULA hoy contra
+    la última foto que mandó el proveedor (StockConsignacionVigente).
+
+    Desde esta ronda el archivo ya no pisa los números -- el usuario fue
+    explícito en que lo suyo fue entregar el stock inicial y que de ahí en
+    adelante el movimiento tiene que ser automático. Así que el archivo pasa
+    a servir para lo que de verdad sirve: auditar que el automático no se
+    haya desviado.
+
+    Tres grupos:
+      - "solo_sistema": el sistema lo tiene en consignación y el archivo no
+        (típico: entró por una importación posterior a la foto del
+        proveedor, o el proveedor ya lo dio por facturado).
+      - "solo_archivo": el proveedor lo tiene y el sistema no (típico: se
+        consumió y todavía no se le informa, o nunca se registró su
+        entrada).
+      - "difiere": ambos lo tienen con distinta cantidad."""
+    calculadas = {}
+    for fila in _filas_stock_consignacion(proveedor_sel):
+        clave = (fila.proveedor.nombre.upper(), (fila.lote or "").strip().upper())
+        calculadas[clave] = fila
+
+    query = StockConsignacionVigente.query
+    if proveedor_sel:
+        query = query.join(Proveedor).filter(
+            db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
+    del_archivo = {}
+    for fila in query.all():
+        clave = (fila.proveedor.nombre.upper(), (fila.lote or "").strip().upper())
+        del_archivo[clave] = fila
+
+    solo_sistema, solo_archivo, difiere = [], [], []
+    for clave in set(calculadas) | set(del_archivo):
+        cal = calculadas.get(clave)
+        arc = del_archivo.get(clave)
+        if cal is not None and arc is None:
+            solo_sistema.append(cal)
+        elif arc is not None and cal is None:
+            solo_archivo.append(arc)
+        elif round(cal.cantidad, 4) != round(arc.cantidad or 0, 4):
+            difiere.append({"fila": cal, "cantidad_sistema": cal.cantidad,
+                            "cantidad_archivo": arc.cantidad or 0})
+
+    orden = lambda f: (f.codigo_proveedor or "", f.lote or "")  # noqa: E731
+    solo_sistema.sort(key=orden)
+    solo_archivo.sort(key=lambda f: (f.codigo_proveedor or "", f.lote or ""))
+    difiere.sort(key=lambda d: orden(d["fila"]))
+    return {
+        "solo_sistema": solo_sistema,
+        "solo_archivo": solo_archivo,
+        "difiere": difiere,
+        "hay_archivo": bool(del_archivo),
+        "cuadra": not solo_sistema and not solo_archivo and not difiere,
+    }
+
+
 @app.route("/stock-consignacion")
 @requiere_permiso("reportes")
 def stock_consignacion_list():
@@ -18006,22 +18202,27 @@ def stock_consignacion_list():
     q = request.args.get("q", "").strip()
     proveedor_obj = Proveedor.query.filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper()).first() if proveedor_sel else None
 
-    query = StockConsignacionVigente.query
-    if proveedor_sel:
-        query = query.join(Proveedor).filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
-    if q:
-        like = f"%{q}%"
-        query = query.filter(db.or_(
-            StockConsignacionVigente.codigo_proveedor.ilike(like),
-            StockConsignacionVigente.descripcion.ilike(like),
-            StockConsignacionVigente.lote.ilike(like),
-        ))
-    filas = query.order_by(StockConsignacionVigente.codigo_proveedor, StockConsignacionVigente.fecha_vencimiento).all()
+    # Ronda DJ: calculado del flujo real (entradas por costeo, salidas por
+    # consumo detectado), ya no la foto del ultimo archivo cargado.
+    filas = _filas_stock_consignacion(proveedor_sel, q)
 
-    proveedores_disponibles = sorted({f.proveedor.nombre for f in StockConsignacionVigente.query.all()})
+    proveedores_disponibles = sorted({
+        p for (p,) in db.session.query(Proveedor.nombre)
+        .join(ConsignacionPendienteLote,
+              ConsignacionPendienteLote.proveedor_id == Proveedor.id)
+        .distinct().all()
+    })
     cantidad_total = sum(f.cantidad or 0 for f in filas)
     valor_total = sum((f.cantidad or 0) * (f.costo_pmp or 0) for f in filas)
-    ultima_carga = db.session.query(db.func.max(StockConsignacionVigente.cargado_en)).scalar()
+    # Ronda DJ: "Ultima actualizacion" pasa a ser el ultimo MOVIMIENTO real
+    # (un costeo que registro recepcion, un consumo detectado al subir el
+    # Stock, una facturacion), no la fecha en que se subio un archivo. Era
+    # justo la pregunta del usuario: "cual es la logica de actualizacion".
+    ultimo_movimiento = db.session.query(
+        db.func.max(ConsignacionPendienteLote.actualizado_en)).scalar()
+    ultima_carga_archivo = db.session.query(
+        db.func.max(StockConsignacionVigente.cargado_en)).scalar()
+    ultima_carga = ultimo_movimiento or ultima_carga_archivo
 
     # Ronda BE (2026-10-07, a pedido del usuario): lo ya CONSUMIDO (detectado
     # solo, vía baja de Stock) que todavía no se le informó al proveedor en
@@ -18039,6 +18240,12 @@ def stock_consignacion_list():
         if f.cantidad_pendiente_informar > 0.0001
     ]
 
+    # Ronda DJ: conciliacion contra el archivo del proveedor, a pedido (solo
+    # se calcula cuando se pide, porque recorre las dos tablas enteras).
+    conciliacion = None
+    if request.args.get("conciliar") == "1":
+        conciliacion = _conciliar_consignacion_con_archivo(proveedor_sel)
+
     reportes_query = ConsignacionReporteProveedor.query
     if proveedor_sel:
         reportes_query = reportes_query.join(Proveedor).filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
@@ -18048,6 +18255,7 @@ def stock_consignacion_list():
         "stock/consignacion.html", filas=filas, proveedor_sel=proveedor_sel, q=q,
         proveedor_obj=proveedor_obj,
         proveedores_disponibles=proveedores_disponibles, ultima_carga=ultima_carga,
+        ultima_carga_archivo=ultima_carga_archivo, conciliacion=conciliacion,
         cantidad_total=cantidad_total, valor_total=valor_total,
         pendientes_informar=pendientes_informar, reportes_enviados=reportes_enviados,
         hoy=date.today().isoformat(),
@@ -18302,6 +18510,31 @@ def stock_consignacion_cargar():
         )
         return redirect(url_for("stock_consignacion_list"))
 
+    # Ronda DJ (2026-11-18, decidido con el usuario): el archivo del
+    # proveedor deja de ser la fuente del stock consignado y pasa a ser la
+    # base de partida + la herramienta de conciliacion. Se sigue guardando
+    # en StockConsignacionVigente porque es de donde salen el vencimiento y
+    # el costo PMP reales de cada lote, pero el stock que se muestra y se
+    # reporta ya se calcula del flujo (ver _filas_stock_consignacion).
+    #
+    # La siembra de abajo (que SI mueve los numeros vivos) queda reservada
+    # para el caso que la justifica: un proveedor que todavia no tiene nada
+    # registrado, es decir su primera foto. Si ya viene operando, el archivo
+    # no toca un solo numero -- justo lo que pidio el usuario: "yo te
+    # entregue el inicial, y el resto debia trabajar automatico".
+    nombres_del_archivo = {
+        (f.get("proveedor_nombre") or "").strip().upper() for f in filas
+    } - {""}
+    proveedores_del_archivo = {
+        pid for (pid,) in db.session.query(Proveedor.id)
+        .filter(db.func.upper(Proveedor.nombre).in_(nombres_del_archivo)).all()
+    } if nombres_del_archivo else set()
+    ya_operando = {
+        pid for (pid,) in db.session.query(ConsignacionPendienteLote.proveedor_id)
+        .filter(ConsignacionPendienteLote.proveedor_id.in_(proveedores_del_archivo or [-1]))
+        .distinct().all()
+    }
+
     resumen = _cargar_stock_consignacion(filas)
     db.session.commit()
 
@@ -18315,13 +18548,26 @@ def stock_consignacion_cargar():
     # reinicie el servidor de nuevo, se corre otra vez acá mismo, justo
     # después de cargar el archivo -- es idempotente (ver la función), así
     # que no duplica nada si ya se había sembrado antes.
-    sembrados = reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09()
+    # Ronda DJ: solo se siembra si NINGUN proveedor del archivo venia
+    # operando -- si ya hay movimiento registrado, el archivo no lo pisa.
+    sembrados = 0
+    if proveedores_del_archivo and not ya_operando:
+        sembrados = reparar_sembrar_consignacion_pendiente_lote_medicontur_23_09()
 
-    mensaje = f"Stock en consignación actualizado: {resumen['lotes']} lote(s) de {resumen['proveedores']} proveedor(es)."
+    mensaje = (
+        f"Archivo del proveedor cargado: {resumen['lotes']} lote(s) de "
+        f"{resumen['proveedores']} proveedor(es)."
+    )
     if sembrados:
         mensaje += (
-            f" Además, se sembraron {sembrados} lote(s) nuevos en el reporte de consignación pendiente por "
-            "informar/facturar, comparando esta foto contra el stock actual."
+            f" Como este proveedor todavía no tenía movimiento registrado, se tomó como stock de partida: "
+            f"{sembrados} lote(s) sembrados."
+        )
+    elif ya_operando:
+        mensaje += (
+            " No se cambió ningún número del stock en consignación: este proveedor ya viene operando con el "
+            "flujo automático (entradas al costear, salidas al bajar del Stock). El archivo quedó abajo, en "
+            "la conciliación, para que compares."
         )
     if resumen["no_encontrados"]:
         mensaje += (
@@ -18329,7 +18575,9 @@ def stock_consignacion_cargar():
             "esas filas no se cargaron."
         )
     flash(mensaje, "warning" if resumen["no_encontrados"] else "success")
-    return redirect(url_for("stock_consignacion_list"))
+    # Ronda DJ: después de cargar, lo útil es ver en qué difiere el archivo
+    # de lo que el sistema calculó -- que es para lo que sirve ahora.
+    return redirect(url_for("stock_consignacion_list", conciliar="1"))
 
 
 def _exportar_consignacion_consumida(proveedor_sel=""):
@@ -18397,10 +18645,11 @@ def stock_consignacion_exportar():
     if tipo == "consumo":
         return _exportar_consignacion_consumida(request.args.get("proveedor", "").strip())
     proveedor_sel = request.args.get("proveedor", "").strip()
-    query = StockConsignacionVigente.query
-    if proveedor_sel:
-        query = query.join(Proveedor).filter(db.func.upper(Proveedor.nombre) == proveedor_sel.upper())
-    filas = query.order_by(StockConsignacionVigente.codigo_proveedor, StockConsignacionVigente.fecha_vencimiento).all()
+    # Ronda DJ (2026-11-18): la misma fuente calculada que la pantalla. Antes
+    # salia de StockConsignacionVigente (la foto del ultimo archivo), por eso
+    # al proveedor se le mandaba un reporte sin los lotes que habian entrado
+    # por importacion despues de esa carga.
+    filas = _filas_stock_consignacion(proveedor_sel)
 
     wb = openpyxl.Workbook()
     ws = wb.active

@@ -6,10 +6,19 @@
   <div>
     <h3 class="section-title mb-0">Stock en Consignación</h3>
     <div class="text-muted small">
-      Stock que sigue siendo del proveedor (todavía no se compró), lote por lote, tal como lo
-      reporta el proveedor -- alimenta el toggle Propio/Consignación de Stock Valorizado y el
-      Reporte de Consignación para enviarle al proveedor.
-      {% if ultima_carga %}Última actualización: {{ ultima_carga | hora_cl }} (hora de Chile).{% else %}Todavía no se ha cargado ningún archivo de consignación.{% endif %}
+      {# Ronda DJ (2026-11-18): esta pantalla leía la foto del último archivo
+         cargado, que no se movía nunca. Ahora el stock se calcula del flujo
+         real, así que la explicación cambia junto con el dato. #}
+      Stock que sigue siendo del proveedor (todavía no se compró), lote por lote. Se calcula solo:
+      <strong>entra</strong> al costear una importación de una OC marcada Consignación y
+      <strong>sale</strong> cuando el lote baja del Stock de Ergopyme (se consumió). Es la misma
+      cuenta que usa el toggle Propio/Consignación de Stock Valorizado, y la base del reporte que
+      se le manda al proveedor.
+      {% if ultima_carga %}Último movimiento: {{ ultima_carga | hora_cl }} (hora de Chile).{% else %}Todavía no hay movimiento de consignación registrado.{% endif %}
+      {% if ultima_carga_archivo %}
+      <span class="text-muted">· Último archivo del proveedor: {{ ultima_carga_archivo | hora_cl }}
+        (<a href="{{ url_for('stock_consignacion_list', proveedor=proveedor_sel, q=q, conciliar='1') }}">conciliar</a>).</span>
+      {% endif %}
     </div>
   </div>
   <div class="d-flex gap-2">
@@ -67,7 +76,9 @@
   <div class="col-auto">
     <div class="card p-2 px-3">
       <div class="text-muted small">Unidades totales</div>
-      <div class="fs-5 fw-semibold">{{ cantidad_total }}</div>
+      {# Ronda DJ: la cantidad viene de una resta (recibido - consumido), asi
+         que puede llegar como float -- se muestra entera cuando lo es. #}
+      <div class="fs-5 fw-semibold">{{ cantidad_total | round | int }}</div>
     </div>
   </div>
   <div class="col-auto">
@@ -100,16 +111,88 @@
           <td title="{{ f.descripcion }}">{{ f.descripcion }}</td>
           <td>{{ f.lote or '-' }}</td>
           <td>{{ f.fecha_vencimiento.strftime('%d-%m-%Y') if f.fecha_vencimiento else '-' }}</td>
-          <td class="text-end">{{ f.cantidad or 0 }}</td>
+          <td class="text-end">{{ (f.cantidad or 0) | round | int }}</td>
           <td class="text-end">{{ "{:,.0f}".format(f.costo_pmp).replace(",", ".") if f.costo_pmp is not none else '-' }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="7" class="text-center text-muted py-4">Sin datos de consignación cargados todavía.</td></tr>
+        <tr><td colspan="7" class="text-center text-muted py-4">No hay stock en consignación vigente con este filtro.</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </div>
+
+{# Ronda DJ (2026-11-18): conciliación contra el archivo del proveedor. El
+   archivo ya no manda sobre los números -- sirve para auditar que el flujo
+   automático no se haya desviado. #}
+{% if conciliacion %}
+<div class="card p-3 mb-3">
+  <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-1">
+    <div class="fw-semibold">Conciliación con el archivo del proveedor</div>
+    <a href="{{ url_for('stock_consignacion_list', proveedor=proveedor_sel, q=q) }}"
+       class="btn btn-sm btn-outline-secondary">Ocultar</a>
+  </div>
+  {% if not conciliacion.hay_archivo %}
+  <div class="alert alert-info mb-0">
+    Todavía no se ha cargado ningún archivo de este proveedor para comparar.
+  </div>
+  {% elif conciliacion.cuadra %}
+  <div class="alert alert-success mb-0">
+    Cuadra lote por lote con el archivo del proveedor.
+  </div>
+  {% else %}
+  <div class="text-muted small mb-2">
+    Lo que el sistema calculó contra la última foto que mandó el proveedor. Las diferencias son
+    normales si el archivo es anterior a la última importación o al último consumo informado:
+    esto es para que puedas explicarlas, no para que el archivo pise los números.
+  </div>
+  <div class="row g-3">
+    <div class="col-md-4">
+      <div class="fw-semibold small mb-1">
+        Solo en el sistema ({{ conciliacion.solo_sistema|length }})
+      </div>
+      <div class="text-muted mini mb-1">Entró por importación después de la foto del proveedor, o él ya lo dio por facturado.</div>
+      <ul class="list-unstyled small mb-0" style="max-height: 240px; overflow-y: auto;">
+        {% for f in conciliacion.solo_sistema %}
+        <li class="border-bottom py-1">{{ f.codigo_proveedor }} · lote {{ f.lote or '-' }} · {{ f.cantidad | round | int }}</li>
+        {% else %}
+        <li class="text-muted">Nada.</li>
+        {% endfor %}
+      </ul>
+    </div>
+    <div class="col-md-4">
+      <div class="fw-semibold small mb-1">
+        Solo en el archivo ({{ conciliacion.solo_archivo|length }})
+      </div>
+      <div class="text-muted mini mb-1">Se consumió y todavía no se le informa, o nunca se registró su entrada.</div>
+      <ul class="list-unstyled small mb-0" style="max-height: 240px; overflow-y: auto;">
+        {% for f in conciliacion.solo_archivo %}
+        <li class="border-bottom py-1">{{ f.codigo_proveedor }} · lote {{ f.lote or '-' }} · {{ f.cantidad | round | int }}</li>
+        {% else %}
+        <li class="text-muted">Nada.</li>
+        {% endfor %}
+      </ul>
+    </div>
+    <div class="col-md-4">
+      <div class="fw-semibold small mb-1">
+        Distinta cantidad ({{ conciliacion.difiere|length }})
+      </div>
+      <div class="text-muted mini mb-1">Mismo lote en los dos, con cantidades que no calzan.</div>
+      <ul class="list-unstyled small mb-0" style="max-height: 240px; overflow-y: auto;">
+        {% for d in conciliacion.difiere %}
+        <li class="border-bottom py-1">
+          {{ d.fila.codigo_proveedor }} · lote {{ d.fila.lote or '-' }} ·
+          sistema {{ d.cantidad_sistema | round | int }} / archivo {{ d.cantidad_archivo | round | int }}
+        </li>
+        {% else %}
+        <li class="text-muted">Nada.</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
 
 <div class="card p-3 mb-3">
   <div class="fw-semibold mb-1">Consumido, pendiente de informar al proveedor ({{ pendientes_informar|length }})</div>
@@ -221,20 +304,30 @@
     <div class="modal-content">
       <form method="post" action="{{ url_for('stock_consignacion_cargar') }}" enctype="multipart/form-data">
         <div class="modal-header">
-          <h5 class="modal-title">Cargar stock en consignación vigente</h5>
+          <h5 class="modal-title">Cargar el archivo del proveedor</h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
           <p class="text-muted small">
-            Sube el archivo .xlsx que entrega el proveedor con su stock en consignación vigente por
-            lote (columnas Proveedor, Código, Código interno Ergopyme, Descripción, Lote, Vencimiento,
-            Cantidad, Costo PMP). <strong>Reemplaza</strong> solo los lotes de el/los proveedor(es)
-            que traiga ese archivo -- los de otros proveedores cargados antes no se tocan.
+            Sube el archivo .xlsx que entrega el proveedor con su stock en consignación por lote
+            (columnas Proveedor, Código, Código interno Ergopyme, Descripción, Lote, Vencimiento,
+            Cantidad, Costo PMP).
           </p>
+          {# Ronda DJ (2026-11-18): el archivo dejó de pisar los números. #}
+          <div class="alert alert-info small mb-3">
+            <strong>No cambia el stock en consignación.</strong> Ese se calcula solo con las entradas
+            por costeo y las salidas por consumo. El archivo sirve para <strong>conciliar</strong>: al
+            cargarlo verás en qué lotes difiere de lo que el sistema calculó. También se usa para el
+            vencimiento y el costo PMP de cada lote.
+            <div class="mt-1">
+              Única excepción: si un proveedor todavía no tiene ningún movimiento registrado, el
+              archivo se toma como su <strong>stock de partida</strong>.
+            </div>
+          </div>
           <input type="file" class="form-control" name="archivo" accept=".xlsx,.xls" required>
         </div>
         <div class="modal-footer">
-          <button type="submit" class="btn btn-brand">Cargar y reemplazar</button>
+          <button type="submit" class="btn btn-brand">Cargar y conciliar</button>
         </div>
       </form>
     </div>
