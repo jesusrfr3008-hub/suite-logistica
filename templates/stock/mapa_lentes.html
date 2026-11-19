@@ -291,7 +291,13 @@
   const num = v => (v===null||v===undefined) ? "" : String(v).replace(/\.0$/,"");
   let modal = null;
 
+  // Ronda DK.3: hay quiebre si no queda nada (incluido el negativo por
+  // compromiso), o si queda menos de lo que se vende en un mes. Un codigo
+  // que nunca se ha movido -- sin stock, sin compromiso, sin transito y sin
+  // venta -- NO es un quiebre: no falta, simplemente no se usa.
+  const sinMovimiento = d => d.v === 1;
   const esQuiebre = d => {
+    if(sinMovimiento(d)) return false;
     const disp = d.st - d.co;
     return disp <= 0 || disp < d.r90;
   };
@@ -347,18 +353,23 @@
       let totalFila = 0;
       const celdas = dioptrias.map((p,ci)=>{
         const d = mapa.get(`${proveedor}|${modelo}|${cil}|${p}`);
+        // Sin codigo creado para esa dioptria: no hay nada que contar.
         if(!d) return `<td data-c="${ci}"><div class="ml-celda ml-vacia"></div></td>`;
         const disp = d.st - d.co;
-        const enCero = disp <= 0;
-        const bajoRot = !enCero && disp < d.r90;
+        const quieto = sinMovimiento(d);
+        const enCero = !quieto && disp <= 0;
+        const bajoRot = !quieto && !enCero && disp < d.r90;
         if(estado.quiebres && !enCero && !bajoRot)
           return `<td data-c="${ci}" class="ml-neutra"></td>`;
-        const cls = ["ml-celda", enCero ? "ml-cero" : (bajoRot ? "ml-bajo" : "ml-n"+nivel(valor(d)))];
+        // El codigo existe pero nunca se movio: se sigue viendo vacio, y aun
+        // asi se puede abrir para ver que no hay nada en camino ni vendido.
+        const cls = ["ml-celda", quieto ? "ml-vacia"
+                     : (enCero ? "ml-cero" : (bajoRot ? "ml-bajo" : "ml-n"+nivel(valor(d))))];
         if(d.co) cls.push("ml-comp");
         if(enCero && d.tr) cls.push("ml-tr");
         const n = estado.quiebres ? 1 : (estado.modo==="rot" ? d.r90 : disp);
         totalFila += n; totalCol[ci] += n; granTotal += n;
-        const texto = estado.modo==="rot" ? d.r90.toFixed(1) : disp;
+        const texto = quieto ? "" : (estado.modo==="rot" ? d.r90.toFixed(1) : disp);
         return `<td data-c="${ci}"><button type="button" class="${cls.join(" ")}" ` +
                `data-k="${proveedor}|${modelo}|${cil}|${p}">${texto}</button></td>`;
       }).join("");
@@ -464,9 +475,14 @@
         ${PUEDE_SEGUIMIENTO && d.dp && d.dp.length
           ? `<div class="mt-1"><a href="${URL_DESPACHO}">Ver en Despachos</a></div>` : ""}
         </div>` : ""}
-      ${disp<=0 && !d.tr ? `<div class="alert alert-danger py-2 small mt-2 mb-0">
-        Sin stock y <strong>nada en camino</strong>.${d.r90>0
-          ? ` Se vende ${d.r90.toFixed(1)} un./mes.` : ""}</div>` : ""}
+      ${disp<=0 && !d.tr && d.r90>0 ? `<div class="alert alert-danger py-2 small mt-2 mb-0">
+        Sin stock y <strong>nada en camino</strong>. Se vende ${d.r90.toFixed(1)} un./mes:
+        <strong>hay que reponerlo</strong>.</div>` : ""}
+      ${disp<=0 && !d.tr && !d.r90 && !d.co ? `<div class="alert alert-secondary py-2 small mt-2 mb-0">
+        Este código existe en el catálogo pero <strong>no tiene nada</strong>: ni stock, ni
+        compromiso, ni nada en camino, y no registra venta en los últimos 90 días.</div>` : ""}
+      ${disp<0 && !d.r90 ? `<div class="alert alert-danger py-2 small mt-2 mb-0">
+        Hay <strong>${d.co} comprometido(s)</strong> y no queda stock para cubrirlos.</div>` : ""}
     `;
     if(!modal) modal = new bootstrap.Modal(document.getElementById("mlDetalle"));
     modal.show();

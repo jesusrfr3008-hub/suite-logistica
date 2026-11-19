@@ -159,7 +159,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DK.2"
+VERSION_SUITE = "DK.3"
 VERSION_SUITE_FECHA = "2026-11-18"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -21561,6 +21561,14 @@ def _ultimo_costo_por_lote():
 
 PASO_DIOPTRIA = 0.5
 MAX_DIOPTRIAS_FILA = 160   # tope defensivo por si una descripcion trae basura
+# Ronda DK.3: rango clinicamente posible de una lente intraocular. Hay
+# descripciones del maestro cuyo numero NO es una potencia sino parte del
+# nombre del modelo ("BASIS Z TRIFOCAL 690MY"), y sin este corte abrian
+# columnas de 690 y 860 dioptrias que ensucian toda la rejilla. Lo que cae
+# fuera no se inventa: se lista como "sin dioptria legible" para que alguien
+# corrija la descripcion en Ergopyme.
+DIOPTRIA_MINIMA = -30.0
+DIOPTRIA_MAXIMA = 45.0
 
 
 def _escala_dioptrias(valores):
@@ -21608,12 +21616,15 @@ def _mapa_lentes_datos(solo_consignacion=False):
 
     # --- Comprometido (notas de pedido), consolidado ---
     comprometido_por_codigo = defaultdict(float)
-    for codigo, cantidad in db.session.query(
-        PedidoComprometido.codigo_interno, PedidoComprometido.cantidad
+    for codigo, cantidad, descripcion in db.session.query(
+        PedidoComprometido.codigo_interno, PedidoComprometido.cantidad,
+        PedidoComprometido.descripcion,
     ).all():
         clave = (codigo or "").strip()
         if clave:
             comprometido_por_codigo[clave] += cantidad or 0
+            if descripcion and clave not in descripcion_de:
+                descripcion_de[clave] = descripcion
 
     # --- Transito y OC por confirmar, por codigo interno ---
     transito_por_codigo = defaultdict(float)
@@ -21640,6 +21651,10 @@ def _mapa_lentes_datos(solo_consignacion=False):
         cantidad = linea.cantidad_unidades or 0
         if cantidad <= 0:
             continue
+        if codigo not in descripcion_de:
+            texto = (linea.variante_descripcion or producto.descripcion or "").strip()
+            if texto:
+                descripcion_de[codigo] = texto
         aprobacion = (linea.orden.estado_aprobacion or "").strip()
         etapa = (linea.etapa or "").strip()
         if aprobacion == "Por Aprobar":
@@ -21668,14 +21683,52 @@ def _mapa_lentes_datos(solo_consignacion=False):
         codigo = (lote.codigo_interno or "").strip()
         if codigo and lote.cantidad_en_stock > 0:
             consignacion_por_codigo[codigo] += lote.cantidad_en_stock
+            if lote.descripcion and codigo not in descripcion_de:
+                descripcion_de[codigo] = lote.descripcion
 
     rotacion = _rotacion_por_codigo()
 
+    # Ronda DK.3: la descripcion es lo que permite leer la dioptria, asi que
+    # se toma de DONDE SEA que el codigo este descrito. Antes salia solo del
+    # stock, de modo que un lente que solo tenia compromiso o venta quedaba
+    # "sin dioptria legible" y no llegaba al mapa -- que es justo el caso que
+    # el usuario necesita ver para saber que comprar.
+    for codigo, descripcion in db.session.query(
+        VentaLinea.codigo_interno, VentaLinea.descripcion
+    ).filter(VentaLinea.codigo_interno.isnot(None)).distinct().all():
+        clave = (codigo or "").strip()
+        if clave and descripcion and clave not in descripcion_de:
+            descripcion_de[clave] = descripcion
+
     # --- Se arma una celda por (modelo, cilindro, dioptria) ---
+    #
+    # Ronda DK.3 (2026-11-19, reportado por el usuario): el universo de
+    # codigos ya NO es solo "lo que tiene fila en el stock". Antes, un lente
+    # que no tenia fila en StockExistencia no existia para el mapa, por mas
+    # que tuviera unidades comprometidas, algo en transito o venta reciente
+    # -- justo los que el usuario necesita ver ("para saber donde debo
+    # completar o que debo comprar"). Ahora entra todo lo que es un lente y
+    # aparece en CUALQUIERA de las fuentes, mas el catalogo maestro, que es
+    # el que sabe que codigos existen aunque nunca se hayan movido.
     celdas = {}
     sin_modelo = defaultdict(lambda: {"codigos": [], "descripciones": [], "unidades": 0.0})
     sin_lectura = []
-    codigos_de_lente = set(stock_por_codigo) | set(consignacion_por_codigo)
+    codigos_de_lente = (
+        set(stock_por_codigo) | set(consignacion_por_codigo)
+        | set(comprometido_por_codigo) | set(transito_por_codigo)
+        | set(por_confirmar_por_codigo) | set(rotacion)
+    )
+    for codigo, descripcion_maestro in db.session.query(
+        CodigoErgopyme.codigo_interno, CodigoErgopyme.descripcion
+    ).all():
+        clave = (codigo or "").strip()
+        if not clave or _prefijo_modelo_lente(clave) is None:
+            continue
+        codigos_de_lente.add(clave)
+        # La descripcion del stock manda (es la que el usuario ve); la del
+        # maestro cubre a los codigos que nunca aparecieron en una carga.
+        if descripcion_maestro and clave not in descripcion_de:
+            descripcion_de[clave] = descripcion_maestro
     for codigo in sorted(codigos_de_lente):
         prefijo = _prefijo_modelo_lente(codigo)
         if prefijo is None:
@@ -21689,7 +21742,7 @@ def _mapa_lentes_datos(solo_consignacion=False):
                 aviso["descripciones"].append(descripcion)
             aviso["unidades"] += stock_por_codigo.get(codigo, 0)
             continue
-        if potencia is None:
+        if potencia is None or not (DIOPTRIA_MINIMA <= potencia <= DIOPTRIA_MAXIMA):
             sin_lectura.append({"codigo": codigo, "descripcion": descripcion,
                                 "modelo": modelo})
             continue
@@ -22008,6 +22061,13 @@ def mapa_lentes():
             "r90": c["rot_90"], "r180": c["rot_180"], "r360": c["rot_360"],
             "cod": c["codigos"][0] if c["codigos"] else "",
             "ds": c["descripcion"],
+            # Ronda DK.3: el codigo existe pero no tiene NADA -- ni stock, ni
+            # compromiso, ni transito, ni venta. Se sigue dibujando como
+            # celda vacia (el usuario fue explicito: "esta bien que salga asi
+            # ya que no hay nada") pero ahora se puede abrir igual.
+            "v": 1 if (c["stock"] == 0 and c["comprometido"] == 0
+                       and c["transito"] == 0 and c["por_confirmar"] == 0
+                       and c["consignacion"] == 0 and c["rot_90"] == 0) else 0,
             "dt": c["detalle_transito"],
             "dp": c["despachos"] if puede_seguimiento else [],
         }
