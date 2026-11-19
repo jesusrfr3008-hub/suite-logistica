@@ -479,8 +479,9 @@
         Sin stock y <strong>nada en camino</strong>. Se vende ${d.r90.toFixed(1)} un./mes:
         <strong>hay que reponerlo</strong>.</div>` : ""}
       ${disp<=0 && !d.tr && !d.r90 && !d.co ? `<div class="alert alert-secondary py-2 small mt-2 mb-0">
-        Este código existe en el catálogo pero <strong>no tiene nada</strong>: ni stock, ni
-        compromiso, ni nada en camino, y no registra venta en los últimos 90 días.</div>` : ""}
+        Hoy <strong>no hay nada</strong> de este código: ni stock, ni compromiso, ni nada en
+        camino. Aparece en el mapa porque figura en el reporte de stock o porque tuvo venta en
+        los últimos 12 meses.</div>` : ""}
       ${disp<0 && !d.r90 ? `<div class="alert alert-danger py-2 small mt-2 mb-0">
         Hay <strong>${d.co} comprometido(s)</strong> y no queda stock para cubrirlos.</div>` : ""}
     `;

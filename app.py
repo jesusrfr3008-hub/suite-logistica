@@ -159,7 +159,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DK.3"
+VERSION_SUITE = "DK.4"
 VERSION_SUITE_FECHA = "2026-11-18"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -21702,33 +21702,42 @@ def _mapa_lentes_datos(solo_consignacion=False):
 
     # --- Se arma una celda por (modelo, cilindro, dioptria) ---
     #
-    # Ronda DK.3 (2026-11-19, reportado por el usuario): el universo de
-    # codigos ya NO es solo "lo que tiene fila en el stock". Antes, un lente
-    # que no tenia fila en StockExistencia no existia para el mapa, por mas
-    # que tuviera unidades comprometidas, algo en transito o venta reciente
-    # -- justo los que el usuario necesita ver ("para saber donde debo
-    # completar o que debo comprar"). Ahora entra todo lo que es un lente y
-    # aparece en CUALQUIERA de las fuentes, mas el catalogo maestro, que es
-    # el que sabe que codigos existen aunque nunca se hayan movido.
+    # Ronda DK.4 (2026-11-19, precisado por el usuario): el universo del mapa
+    # es exactamente "LO TENGO, LO DEBO, O LO HE VENDIDO".
+    #
+    #   lo tengo   -> stock en bodega central y consignacion vigente
+    #   lo debo    -> comprometido, en transito y en OC por confirmar
+    #   lo vendi   -> con venta en los ultimos 12 meses (la ventana de 360
+    #                 dias de _rotacion_por_codigo, la misma con la que se
+    #                 calcula la rotacion en toda la Suite)
+    #
+    # La ronda DK.3 metio ademas el catalogo maestro COMPLETO, y eso llenaba
+    # la rejilla de codigos creados que nadie usa. El usuario fue explicito:
+    # "no quiero que se embasure con codigos que no se usan, solo lo
+    # necesario". Un lente agotado SI entra -- por la puerta de la venta --
+    # que era el caso que importaba: la venta trae su codigo de Ergopyme y su
+    # descripcion con dioptria y cilindro, asi que alcanza para ubicarlo.
+    #
+    # El maestro se sigue usando, pero SOLO como diccionario de
+    # descripciones para los codigos que ya entraron por alguna de las tres
+    # puertas; nunca como puerta de entrada.
     celdas = {}
     sin_modelo = defaultdict(lambda: {"codigos": [], "descripciones": [], "unidades": 0.0})
     sin_lectura = []
     codigos_de_lente = (
-        set(stock_por_codigo) | set(consignacion_por_codigo)
-        | set(comprometido_por_codigo) | set(transito_por_codigo)
-        | set(por_confirmar_por_codigo) | set(rotacion)
+        set(stock_por_codigo) | set(consignacion_por_codigo)        # lo tengo
+        | set(comprometido_por_codigo) | set(transito_por_codigo)   # lo debo
+        | set(por_confirmar_por_codigo)
+        | set(rotacion)                                             # lo vendi
     )
-    for codigo, descripcion_maestro in db.session.query(
-        CodigoErgopyme.codigo_interno, CodigoErgopyme.descripcion
-    ).all():
-        clave = (codigo or "").strip()
-        if not clave or _prefijo_modelo_lente(clave) is None:
-            continue
-        codigos_de_lente.add(clave)
-        # La descripcion del stock manda (es la que el usuario ve); la del
-        # maestro cubre a los codigos que nunca aparecieron en una carga.
-        if descripcion_maestro and clave not in descripcion_de:
-            descripcion_de[clave] = descripcion_maestro
+    faltan_descripcion = {c for c in codigos_de_lente if not descripcion_de.get(c)}
+    if faltan_descripcion:
+        for codigo, descripcion_maestro in db.session.query(
+            CodigoErgopyme.codigo_interno, CodigoErgopyme.descripcion
+        ).filter(CodigoErgopyme.codigo_interno.in_(faltan_descripcion)).all():
+            clave = (codigo or "").strip()
+            if clave and descripcion_maestro:
+                descripcion_de[clave] = descripcion_maestro
     for codigo in sorted(codigos_de_lente):
         prefijo = _prefijo_modelo_lente(codigo)
         if prefijo is None:
