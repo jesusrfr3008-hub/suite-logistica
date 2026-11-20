@@ -52,7 +52,13 @@
     table { width: 100%; border-collapse: collapse; font-size: 11px; }
     thead { display: table-header-group; }
     tr { page-break-inside: avoid; }
-    th, td { border: 1px solid #ccc; padding: 5px 7px; }
+    th, td { border: 1px solid #ccc; padding: 4px 6px; }
+    /* Ronda DL.1 (2026-11-20, a pedido del usuario: "achica un poco esas
+       columnas, la plantilla se ve muy estirada"): las numéricas se ajustan
+       a su contenido y la descripción se queda con todo el sobrante. */
+    th.col-cod, td.col-cod { width: 12%; }
+    th.num, td.num { width: 9%; white-space: nowrap; }
+    th.col-dto, td.col-dto { width: 6%; }
     th { background: #212529; color: #fff; font-weight: 600; text-align: center; }
     td.num, th.num { text-align: right; }
     tbody tr:nth-child(even) { background: #f7f9fb; }
@@ -118,23 +124,32 @@
   <table>
     <thead>
       <tr>
-        <th>Código</th>
+        <th class="col-cod">Código</th>
         <th>Descripción</th>
-        <th class="num">Cant. Cajas</th>
-        <th class="num">Cant. Unidades</th>
+        <th class="num">Cajas</th>
+        <th class="num">Unidades</th>
+        {# Ronda DL.1 (2026-11-20, a pedido del usuario): "en la fila el precio
+           caja vas a dejar el de la lista de precio, el porcentaje de
+           descuento, y en subtotal el precio con el descuento aplicado".
+           Antes "Precio Caja" traía el precio NETO con el descuento al lado,
+           así que parecía que el descuento no se había aplicado y la base no
+           se veía por ninguna parte. Sin columnas nuevas: las mismas tres,
+           leídas de corrido -- lista, descuento, y el resultado. #}
         <th class="num">Precio Caja</th>
-        {% if tiene_descuento %}<th class="num">Descuento</th>{% endif %}
+        {% if tiene_descuento %}<th class="num col-dto">Dto.</th>{% endif %}
         <th class="num">Subtotal</th>
       </tr>
     </thead>
     <tbody>
       {% for l in lineas %}
       <tr>
-        <td>{{ l.codigo_mostrar }}</td>
+        <td class="col-cod">{{ l.codigo_mostrar }}</td>
         <td>{{ l.descripcion_oc }}</td>
         <td class="num">{{ l.cantidad_cajas|numero_flex }}</td>
         <td class="num">{{ l.cantidad_unidades|numero_flex }}</td>
-        <td class="num">{{ l.precio_unitario_pactado|numero_flex }}</td>
+        {# Precio de LISTA: el neto ya se ve en el subtotal de la derecha. Una
+           línea sin descuento no tiene lista guardada, y ahí lista = neto. #}
+        <td class="num">{{ (l.precio_unitario_lista or l.precio_unitario_pactado)|numero_flex }}</td>
         {% if tiene_descuento %}
         <td class="num">
           {% if l.descuento_tipo == 'porcentaje' %}-{{ l.descuento_valor|numero_flex }}%
@@ -147,6 +162,19 @@
       {% endfor %}
     </tbody>
     <tfoot>
+      {# Ronda DL.1: el pie se lee como una factura -- primero lo que suman
+         los precios de lista, después lo que se descontó, y recién ahí el
+         total. Así se puede comprobar la resta a simple vista. #}
+      {% if tiene_descuento %}
+      <tr>
+        <td colspan="{{ 6 if tiene_descuento else 5 }}" style="text-align:right;">Subtotal (sin descuento)</td>
+        <td class="num">{{ subtotal_sin_descuento|numero_flex }}</td>
+      </tr>
+      <tr>
+        <td colspan="{{ 6 if tiene_descuento else 5 }}" style="text-align:right;">Descuento</td>
+        <td class="num">-{{ descuento_total|numero_flex }}</td>
+      </tr>
+      {% endif %}
       <tr>
         <td colspan="{{ 6 if tiene_descuento else 5 }}" style="text-align:right;">TOTAL</td>
         <td class="num">{{ orden.total|numero_flex }} {{ orden.moneda }}</td>

@@ -159,7 +159,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DL"
+VERSION_SUITE = "DL.1"
 VERSION_SUITE_FECHA = "2026-11-20"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -9734,7 +9734,12 @@ def ordenes_imprimir(orden_id):
         return redirect(url_for("ordenes_simple_list"))
     sort_sel, dir_sel = _orden_lineas_de_request()
     lineas = _ordenar_lineas_orden(orden.lineas.all(), sort_sel, dir_sel)
-    return render_template("ordenes/imprimir.html", orden=orden, lineas=lineas)
+    subtotal_sin_descuento, descuento_total = _totales_descuento_orden(lineas)
+    return render_template(
+        "ordenes/imprimir.html", orden=orden, lineas=lineas,
+        subtotal_sin_descuento=subtotal_sin_descuento,
+        descuento_total=descuento_total,
+    )
 
 
 # Plantilla de correo por defecto (ronda L, punto 1, 2026-09-09): se usa
@@ -9809,6 +9814,26 @@ def construir_correo_oc(orden):
     return asunto, cuerpo
 
 
+def _totales_descuento_orden(lineas):
+    """Ronda DL.1 (2026-11-20, a pedido del usuario): el pie de la OC pasa a
+    leerse como una factura -- "subtotal (el que va sin descuento), luego
+    abajo Descuento, la suma de los descuentos, y mas abajo el total".
+
+    El subtotal sin descuento se calcula con el precio de LISTA de cada
+    linea; donde no hay descuento, lista y neto son el mismo numero, asi que
+    la linea aporta lo mismo a los dos lados y el descuento de esa linea es
+    cero. La resta siempre cierra contra orden.total."""
+    sin_descuento = 0.0
+    for linea in lineas:
+        if getattr(linea, "anulada", False):
+            continue
+        cantidad = linea.cantidad_cajas or 0
+        lista = linea.precio_unitario_lista or linea.precio_unitario_pactado or 0
+        sin_descuento += cantidad * lista
+    neto = sum((l.subtotal or 0) for l in lineas if not getattr(l, "anulada", False))
+    return round(sin_descuento, 2), round(sin_descuento - neto, 2)
+
+
 def generar_pdf_orden(orden, sort="", direccion="asc"):
     """Genera el PDF de una Orden de Compra como ARCHIVO en disco (ronda L,
     punto 1, 2026-09-09: hace falta un archivo real para poder adjuntarlo a
@@ -9839,11 +9864,14 @@ def generar_pdf_orden(orden, sort="", direccion="asc"):
         if os.path.isfile(candidato):
             logo_abs_path = candidato.replace("\\", "/")
 
+    subtotal_sin_descuento, descuento_total = _totales_descuento_orden(lineas)
     html = render_template(
         "ordenes/pdf_oc.html",
         orden=orden,
         lineas=lineas,
         logo_abs_path=logo_abs_path,
+        subtotal_sin_descuento=subtotal_sin_descuento,
+        descuento_total=descuento_total,
         fecha_generacion=datetime.now().strftime("%Y-%m-%d %H:%M"),
     )
 
