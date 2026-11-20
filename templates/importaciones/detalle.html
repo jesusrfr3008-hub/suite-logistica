@@ -916,6 +916,28 @@
               "Flete, Seguro y otros ítems de la factura" de esta pantalla, no acá.
             </div>
           </div>
+          {# Ronda DL (2026-11-20, a pedido del usuario): el reporte operacional
+             saca el operador del despacho, pero una importación creada directo
+             en Costeo no tiene despacho y quedaba en "(sin operador)" sin
+             forma de arreglarlo. #}
+          <div class="col-12">
+            <label class="form-label">Operador logístico</label>
+            <input class="form-control" name="operador_logistico" list="listaOperadores"
+                   value="{{ imp.operador_logistico or '' }}"
+                   placeholder="{{ operador_deducido or 'Se deduce del despacho' }}">
+            <datalist id="listaOperadores">
+              {% for o in operadores_conocidos %}<option value="{{ o }}">{% endfor %}
+            </datalist>
+            <div class="form-text">
+              Quién puso el transporte, como sale en el Reporte Operacional.
+              {% if imp.despacho %}Déjalo vacío para que se deduzca del despacho
+              ({{ imp.despacho.operador_logistico or imp.despacho.courier or 'sin operador' }}).
+              {% else %}Esta importación no viene de un despacho, así que si no lo escribes
+              acá queda como "(sin operador)".{% endif %}
+              Si el flete venía en la factura del proveedor, el reporte dice PROVEEDOR
+              sin importar lo que pongas acá.
+            </div>
+          </div>
           <div class="col-12"><label class="form-label">Notas</label><textarea class="form-control" name="notas" rows="2">{{ imp.notas or '' }}</textarea></div>
         </div>
         <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>
@@ -938,9 +960,11 @@
               {% for r in regimenes.keys() %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
             </select>
           </div>
+          {# Ronda DL (2026-11-20): un parcial nuevo nace Aéreo, que es como
+             llega la mayoría de los embarques; se cambia si hace falta. #}
           <div class="col-6"><label class="form-label">Vía</label>
             <select class="form-select" name="via_embarque">
-              {% for v in vias %}<option value="{{ v }}">{{ v }}</option>{% endfor %}
+              {% for v in vias %}<option value="{{ v }}" {% if v == via_por_defecto %}selected{% endif %}>{{ v }}</option>{% endfor %}
             </select>
           </div>
           <div class="col-12"><label class="form-label">Notas</label><textarea class="form-control" name="notas" rows="2"></textarea></div>

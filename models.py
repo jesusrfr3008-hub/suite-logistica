@@ -1928,6 +1928,8 @@ REGIMENES_PARCIAL = {
 }
 
 VIAS_EMBARQUE = ["Marítimo", "Aéreo", "Terrestre"]
+# Ronda DL (2026-11-20): la via con la que nace un parcial nuevo.
+VIA_EMBARQUE_POR_DEFECTO = "Aéreo"
 
 # Condicion de compra pactada con el proveedor (Incoterm simplificado).
 # Renombrado de "FOB" a "EXW" el 2026-08-27 (mas ajustado al Incoterm real
@@ -2013,6 +2015,14 @@ class Importacion(db.Model):
     # crea FacturaProveedor, así que el guard normal -- por grupo, via
     # facturas_pago -- no alcanza a proteger este caso).
     consignacion_registrada = db.Column(db.Boolean, default=False)
+    # Ronda DL (2026-11-20, a pedido del usuario): quien puso el transporte
+    # de esta importacion, cuando no se puede deducir del despacho. El
+    # reporte operacional lo saca de Despacho.operador_logistico (o del
+    # courier), pero una Importacion creada directo en Costeo no tiene
+    # despacho y quedaba como "(sin operador)" sin forma de corregirlo. Si
+    # esta escrito, MANDA sobre el del despacho -- asi tambien sirve para
+    # corregir uno que quedo mal.
+    operador_logistico = db.Column(db.String(200))
     numero_factura = db.Column(db.String(80))
     fecha_factura = db.Column(db.Date, nullable=True)
     moneda_factura = db.Column(db.String(10), default="EURO")  # moneda en que vienen los Valor Unitario de las lineas
@@ -2121,7 +2131,11 @@ class Parcial(db.Model):
     # calculado (no como una tasa) y a veces cubren varios parciales a la
     # vez. Ver costing.py.
     advalorem_pct = db.Column(db.Float, default=6.0)
-    via_embarque = db.Column(db.String(20), default="Marítimo")
+    # Ronda DL (2026-11-20, a pedido del usuario): "en la edicion del costeo
+    # sale por defecto Maritimo, favor que por defecto venga marcado Aereo y
+    # se pueda cambiar luego si es necesario". La mayoria de los embarques de
+    # lentes llegan por aire.
+    via_embarque = db.Column(db.String(20), default=VIA_EMBARQUE_POR_DEFECTO)
     honorarios_agente = db.Column(db.Float, default=0)
     honorarios_referencia = db.Column(db.String(120))
     notas = db.Column(db.Text)

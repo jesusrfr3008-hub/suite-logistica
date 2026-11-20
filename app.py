@@ -37,7 +37,7 @@ from models import (
     ESTADOS_OC, ETAPAS_LINEA, TIPOS_DOCUMENTO_ORDEN,
     Importacion, Parcial, ParcialLinea, ParcialLineaLote, GastoImportacion, GastoDocumento,
     ImportacionDocumento,
-    REGIMENES_PARCIAL, VIAS_EMBARQUE, CONDICIONES_COMPRA, CONCEPTOS_GASTO,
+    REGIMENES_PARCIAL, VIAS_EMBARQUE, VIA_EMBARQUE_POR_DEFECTO, CONDICIONES_COMPRA, CONCEPTOS_GASTO,
     CONCEPTOS_ITEM_FACTURA, TIPOS_DOCUMENTO_GASTO,
     Despacho, ESTADOS_DESPACHO,
     CargoAdicionalImportacion, TipoCambioMensual,
@@ -159,8 +159,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DK.4"
-VERSION_SUITE_FECHA = "2026-11-18"
+VERSION_SUITE = "DL"
+VERSION_SUITE_FECHA = "2026-11-20"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -5040,6 +5040,55 @@ def seed_modelos_lente():
     return creados
 
 
+# Couriers que SOLO operan carga aerea en esta empresa. Nace en la ronda DL
+# (2026-11-20) con el reporte del usuario: "hay una operacion de DHL que
+# viene del historico marcado como maritimo y DHL es solo aereo".
+COURIERS_SOLO_AEREO = ("DHL", "FEDEX", "UPS", "TNT")
+
+
+def reparar_via_courier_aereo_ronda_dl():
+    """Ronda DL (2026-11-20, a pedido del usuario): corrige la via de
+    embarque de las operaciones hechas por un courier que solo vuela.
+
+    Toca dos lados, porque el Reporte Operacional mezcla las dos fuentes:
+      - CompraHistorica.tipo_flete == "MARITIMO" con transporte de courier.
+      - Parcial.via_embarque == "Maritimo" cuando el despacho de esa
+        importacion viaja por uno de esos couriers.
+
+    Idempotente y acotada: solo cambia filas que hoy dicen maritimo y cuyo
+    transporte es uno de COURIERS_SOLO_AEREO. Una via terrestre o una ya
+    aerea no se tocan."""
+    cambios_historico = 0
+    for fila in CompraHistorica.query.filter(
+        db.func.upper(db.func.coalesce(CompraHistorica.tipo_flete, "")) == "MARITIMO"
+    ).all():
+        transporte = (fila.transporte or "").strip().upper()
+        if any(c in transporte for c in COURIERS_SOLO_AEREO):
+            fila.tipo_flete = "AEREO"
+            cambios_historico += 1
+
+    cambios_parciales = 0
+    for parcial in Parcial.query.filter(Parcial.via_embarque == "Marítimo").all():
+        importacion = parcial.importacion
+        despacho = importacion.despacho if importacion else None
+        if despacho is None:
+            continue
+        transporte = " ".join(filter(None, [
+            (despacho.courier or "").strip().upper(),
+            (despacho.operador_logistico or "").strip().upper(),
+        ]))
+        if any(c in transporte for c in COURIERS_SOLO_AEREO):
+            parcial.via_embarque = "Aéreo"
+            cambios_parciales += 1
+
+    if cambios_historico or cambios_parciales:
+        db.session.commit()
+        print(f"[reparar_ronda_dl] Vía corregida a AÉREO: {cambios_historico} fila(s) del "
+              f"histórico y {cambios_parciales} parcial(es) que viajaban por courier aéreo "
+              f"pero figuraban como marítimos.")
+    return cambios_historico + cambios_parciales
+
+
 def _paso_arranque_seguro(nombre, funcion):
     """Ronda AN (2026-09-23, incidente en producción): antes, un error
     dentro de CUALQUIERA de estos pasos de arranque (seed_*/reparar_*) hacía
@@ -5088,6 +5137,7 @@ with app.app_context():
     _paso_arranque_seguro("seed_codigos_ergopyme", seed_codigos_ergopyme)
     # Ronda DK: va DESPUES de seed_codigos_ergopyme porque lee de ese maestro.
     _paso_arranque_seguro("seed_modelos_lente", seed_modelos_lente)
+    _paso_arranque_seguro("reparar_via_courier_aereo_ronda_dl", reparar_via_courier_aereo_ronda_dl)
     _paso_arranque_seguro("reparar_alias_codigo_proveedor_ronda_ao", reparar_alias_codigo_proveedor_ronda_ao)
     _paso_arranque_seguro("seed_compras_historicas", seed_compras_historicas)
     _paso_arranque_seguro("reparar_lotes_historico_ronda_by", reparar_lotes_historico_ronda_by)
@@ -8569,9 +8619,32 @@ def _ordenar_lineas_orden(lineas, sort, direccion="asc"):
     return sorted(lineas, key=ORDENES_LINEAS_SORT[sort], reverse=(direccion == "desc"))
 
 
+def _ordenes_detalle_seguimiento(orden_id):
+    """Ronda DL (2026-11-20): la orden vista por alguien que solo tiene el
+    permiso de Seguimiento. Articulos, cantidades, fechas y etapa -- ni un
+    precio, ni un subtotal, ni el total de la orden."""
+    orden = OrdenCompra.query.get_or_404(orden_id)
+    sort_sel, dir_sel = _orden_lineas_de_request()
+    lineas = _ordenar_lineas_orden(orden.lineas.all(), sort_sel, dir_sel)
+    return render_template(
+        "ordenes/detalle_seguimiento.html",
+        orden=orden, lineas=lineas, despacho=orden.despacho,
+        unidades_totales=sum(l.cantidad_unidades or 0 for l in lineas if not l.anulada),
+    )
+
+
 @app.route("/ordenes/<int:orden_id>")
-@requiere_permiso("crear_orden", "aprobar_orden", "actualizar_despacho")
+@requiere_permiso("crear_orden", "aprobar_orden", "actualizar_despacho", "seguimiento")
 def ordenes_detalle(orden_id):
+    # Ronda DL (2026-11-20, a pedido del usuario): un perfil que SOLO tiene
+    # "seguimiento" ahora puede ver QUE se pidio y en que etapa va cada
+    # linea -- articulos y cantidades, nunca precios ni el valor de la
+    # compra. Se le sirve una pantalla APARTE y no esta misma con los
+    # precios escondidos: en una plantilla con precios en una docena de
+    # lugares basta olvidar un {% if %} para filtrar justo lo que no se
+    # puede filtrar. Ver ordenes/detalle_seguimiento.html.
+    if _solo_seguimiento_despacho():
+        return _ordenes_detalle_seguimiento(orden_id)
     # Ronda AN (2026-09-23, corrección, a pedido del usuario): esta pantalla
     # (y el listado /ordenes) estaban SOLO bajo crear_orden/aprobar_orden --
     # un usuario con únicamente actualizar_despacho no podía ni siquiera
@@ -9059,6 +9132,33 @@ def ordenes_linea_actualizar(orden_id, linea_id):
         linea.fecha_disponibilidad_confirmada = parse_date(fecha_disp)
     if fecha_desp_conf:
         linea.fecha_estimada_despacho_confirmada = parse_date(fecha_desp_conf)
+    # Ronda DL (2026-11-20, a pedido del usuario: "en la emision de OC ya
+    # hecha, quiero editarla pero agregarle un descuento a los productos y no
+    # me permite"). El descuento existia solo al AGREGAR un producto (ver
+    # ordenes_linea_nueva), asi que a una linea ya creada no habia forma de
+    # ponerselo. Mismo criterio que alli: el precio pactado que se guarda es
+    # el NETO, y estos campos dejan registrado de donde salio -- lo que hace
+    # que la OC impresa pueda mostrar "precio de lista menos N%".
+    if "descuento_tipo" in request.form:
+        precio_lista_txt = (request.form.get("precio_unitario_lista") or "").strip()
+        tipo_txt = (request.form.get("descuento_tipo") or "").strip()
+        valor_txt = (request.form.get("descuento_valor") or "").strip()
+        tipo = tipo_txt if tipo_txt in ("porcentaje", "monto") else None
+        valor = float(valor_txt) if valor_txt else None
+        if tipo and valor:
+            lista = float(precio_lista_txt) if precio_lista_txt else (
+                linea.precio_unitario_lista or linea.precio_unitario_pactado or 0)
+            neto = lista * (1 - valor / 100.0) if tipo == "porcentaje" else lista - valor
+            linea.precio_unitario_lista = round(lista, 4)
+            linea.descuento_tipo = tipo
+            linea.descuento_valor = valor
+            linea.precio_unitario_pactado = round(max(0.0, neto), 4)
+        else:
+            # Sin descuento: se limpia el rastro y el precio pactado queda
+            # tal como lo dejo el campo de precio del formulario.
+            linea.precio_unitario_lista = None
+            linea.descuento_tipo = None
+            linea.descuento_valor = None
     # Ronda BU (2026-10-19, punto 1 del pedido del usuario): nota opcional
     # de la línea, editable igual que el resto de los campos -- se puede
     # dejar vacía para borrarla. Ver OrdenCompraLinea.nota/descripcion_oc.
@@ -10728,6 +10828,7 @@ def importaciones_detalle(importacion_id):
     return render_template(
         "importaciones/detalle.html", imp=imp, resultado=resultado,
         regimenes=REGIMENES_PARCIAL, vias=VIAS_EMBARQUE,
+        via_por_defecto=VIA_EMBARQUE_POR_DEFECTO,
         condiciones=CONDICIONES_COMPRA, conceptos_gasto=CONCEPTOS_GASTO,
         conceptos_item_factura=CONCEPTOS_ITEM_FACTURA, tipos_cambio=tipos_cambio,
         tipos_documento_gasto=TIPOS_DOCUMENTO_GASTO, empresas=empresas,
@@ -10736,6 +10837,9 @@ def importaciones_detalle(importacion_id):
         info_consignacion=info_consignacion,
         lineas_sin_lote=lineas_sin_lote,
         registro_consignacion=registro_consignacion,
+        # Ronda DL: para el campo de operador logistico del modal de edicion.
+        operador_deducido=_operador_transporte_importacion(imp),
+        operadores_conocidos=_operadores_logisticos_conocidos(),
     )
 
 
@@ -10763,6 +10867,9 @@ def importaciones_editar(importacion_id):
     else:
         imp.tipo_cambio_moneda_usd = float(request.form.get("tipo_cambio_moneda_usd") or 1)
     imp.notas = request.form.get("notas", "").strip()
+    # Ronda DL: operador logistico de la importacion (ver
+    # _operador_transporte_importacion). Vacio = se deduce del despacho.
+    imp.operador_logistico = request.form.get("operador_logistico", "").strip() or None
     db.session.commit()
     flash("Datos de la importación actualizados.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
@@ -11299,7 +11406,7 @@ def parciales_nuevo(importacion_id):
         numero_parcial=request.form.get("numero_parcial", "").strip(),
         referencia=request.form.get("referencia", "").strip(),
         tipo_regimen=request.form.get("tipo_regimen", "General"),
-        via_embarque=request.form.get("via_embarque", "Marítimo"),
+        via_embarque=request.form.get("via_embarque", VIA_EMBARQUE_POR_DEFECTO),
         notas=request.form.get("notas", "").strip(),
     )
     db.session.add(parcial)
@@ -11315,7 +11422,7 @@ def parciales_editar(parcial_id):
     parcial.numero_parcial = request.form.get("numero_parcial", "").strip()
     parcial.referencia = request.form.get("referencia", "").strip()
     parcial.tipo_regimen = request.form.get("tipo_regimen", "General")
-    parcial.via_embarque = request.form.get("via_embarque", "Marítimo")
+    parcial.via_embarque = request.form.get("via_embarque", VIA_EMBARQUE_POR_DEFECTO)
     parcial.notas = request.form.get("notas", "").strip()
     db.session.commit()
     flash(f"Parcial '{parcial.numero_parcial or parcial.referencia}' actualizado.", "success")
@@ -20462,6 +20569,23 @@ def _completar_tipo_flete(filas):
     return completadas
 
 
+def _operadores_logisticos_conocidos():
+    """Ronda DL (2026-11-20): los operadores ya usados, para ofrecerlos como
+    sugerencia al corregir el de una importacion y no terminar con el mismo
+    operador escrito de cinco formas distintas."""
+    nombres = set()
+    for (valor,) in db.session.query(Despacho.operador_logistico).distinct().all():
+        if valor and valor.strip():
+            nombres.add(valor.strip().upper())
+    for (valor,) in db.session.query(Despacho.courier).distinct().all():
+        if valor and valor.strip():
+            nombres.add(valor.strip().upper())
+    for (valor,) in db.session.query(Importacion.operador_logistico).distinct().all():
+        if valor and valor.strip():
+            nombres.add(valor.strip().upper())
+    return sorted(nombres)
+
+
 def _operador_transporte_importacion(importacion):
     """Ronda BY (2026-10-20, punto 3 del pedido del usuario: "si es CIF diga
     Proveedor, sino indique el Operador logistico"): quién puso el
@@ -20483,6 +20607,12 @@ def _operador_transporte_importacion(importacion):
     )
     if tiene_flete_en_factura and not tiene_flete_gasto:
         return "PROVEEDOR"
+    # Ronda DL (2026-11-20): lo escrito a mano en la Importacion manda. Es la
+    # unica forma de arreglar un "(sin operador)" cuando la importacion se
+    # creo directo en Costeo y no tiene despacho del cual deducirlo.
+    propio = (importacion.operador_logistico or "").strip()
+    if propio:
+        return propio.upper()
     despacho = importacion.despacho
     if despacho:
         operador = (despacho.operador_logistico or "").strip() or (despacho.courier or "").strip()
@@ -20535,8 +20665,28 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
         # operador logístico del despacho.
         transporte_importacion = _operador_transporte_importacion(importacion)
         tipo_flete_despacho = _tipo_flete_por_despacho(importacion.despacho)
+        # Ronda DL (2026-11-20, a pedido del usuario): "para el reporte de
+        # compra al proveedor, en este embarque tengo varias facturas, unas
+        # de Accuvision y otra de Accumedical, pero como solo se modifica la
+        # empresa compradora en pago a proveedores, no tengo como
+        # identificar de esa importacion cual compro cada empresa".
+        #
+        # La empresa compradora ya esta por factura: al generar la cuenta por
+        # pagar, cada FacturaProveedor queda con su empresa_id y su
+        # factura_embarque_id. Como cada ParcialLinea tambien lleva su
+        # factura_embarque_id, se puede bajar la empresa al nivel de la
+        # LINEA en vez de pintar toda la importacion con una sola. No se
+        # agrega un segundo lugar donde mantenerlo: se lee del unico que ya
+        # existe, que es Pago Proveedores.
+        empresa_por_factura_embarque = {}
+        for factura_pago in importacion.facturas_pago:
+            if factura_pago.empresa:
+                empresa_por_factura_embarque[factura_pago.factura_embarque_id] = (
+                    factura_pago.empresa.nombre.upper())
         for info in costeo["lineas"]:
             linea = info["linea"]
+            empresa_linea = empresa_por_factura_embarque.get(
+                linea.factura_embarque_id) or empresa_nombre
             codigo_interno = _codigo_interno_homologado(linea) or ""
             derechos_usd = (info["derechos_clp"] / tc_aduanero) if tc_aduanero else 0.0
             otros_usd = (info["otros_gastos_clp"] / tc_aduanero) if tc_aduanero else 0.0
@@ -20583,7 +20733,7 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
                 "derechos_moneda": derechos_usd * tc_moneda_usd,
                 "otros_gastos_usd": otros_usd,
                 "otros_gastos_moneda": otros_usd * tc_moneda_usd,
-                "empresa_compradora": empresa_nombre,
+                "empresa_compradora": empresa_linea,
                 "categoria": "",
                 # Ronda BY (2026-10-20, punto 3): aéreo/marítimo sale de la
                 # vía de embarque del Parcial (DIN) de esta línea -- el

@@ -844,6 +844,40 @@
                opcional de esta línea -- si se carga, se refleja en la
                descripción del producto en la emisión/impresión de la OC y
                su PDF (no en Despacho/Costeo). -->
+          {# Ronda DL (2026-11-20, a pedido del usuario): el descuento existía
+             solo al agregar un producto, así que a una línea ya creada no
+             había forma de ponérselo. El precio pactado de arriba es el NETO;
+             acá se deja registrado de dónde salió. #}
+          <div class="col-12"><hr><div class="text-muted small mb-1">Descuento del proveedor</div></div>
+          <div class="col-4">
+            <label class="form-label">Precio de lista</label>
+            <input type="number" step="0.01" min="0" class="form-control campo-dto-lista"
+                   name="precio_unitario_lista" data-linea="{{ l.id }}"
+                   value="{{ l.precio_unitario_lista or '' }}"
+                   placeholder="{{ l.precio_unitario_pactado }}">
+          </div>
+          <div class="col-4">
+            <label class="form-label">Descuento</label>
+            <select class="form-select campo-dto-tipo" name="descuento_tipo" data-linea="{{ l.id }}">
+              <option value="">Sin descuento</option>
+              <option value="porcentaje" {% if l.descuento_tipo == 'porcentaje' %}selected{% endif %}>Porcentaje (%)</option>
+              <option value="monto" {% if l.descuento_tipo == 'monto' %}selected{% endif %}>Monto por caja</option>
+            </select>
+          </div>
+          <div class="col-4">
+            <label class="form-label">Valor</label>
+            <input type="number" min="0" step="0.01" class="form-control campo-dto-valor"
+                   name="descuento_valor" data-linea="{{ l.id }}"
+                   value="{{ l.descuento_valor or '' }}" placeholder="0"
+                   {% if not l.descuento_tipo %}disabled{% endif %}>
+          </div>
+          <div class="col-12">
+            <div class="form-text" id="avisoDto{{ l.id }}">
+              Si pones un descuento, el <strong>precio/caja pactado</strong> de arriba se
+              recalcula solo a partir del precio de lista, y la OC impresa muestra de dónde
+              salió. Déjalo en "Sin descuento" para fijar el precio a mano.
+            </div>
+          </div>
           <div class="col-12"><hr><label class="form-label">Nota (opcional, sale en la OC y su PDF)</label><input type="text" class="form-control" name="nota_linea" value="{{ l.nota or '' }}" placeholder="Ej. empaque reforzado, coordinar con bodega"></div>
         </div>
       </form>
@@ -861,6 +895,36 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+// Ronda DL (2026-11-20): descuento en "Editar línea". Habilita el valor solo
+// cuando hay tipo elegido y muestra en vivo el precio neto que va a quedar,
+// para que nadie guarde a ciegas.
+document.querySelectorAll('.campo-dto-tipo').forEach(sel => {
+  const id = sel.dataset.linea;
+  const valor = document.querySelector(`.campo-dto-valor[data-linea="${id}"]`);
+  const lista = document.querySelector(`.campo-dto-lista[data-linea="${id}"]`);
+  const aviso = document.getElementById('avisoDto' + id);
+  const precio = document.querySelector(`#formLinea${id} input[name="precio_unitario_pactado"]`);
+  const recalcular = () => {
+    const tipo = sel.value;
+    valor.disabled = !tipo;
+    if (!tipo) { valor.value = ''; return; }
+    const base = parseFloat(lista.value || lista.placeholder || 0);
+    const v = parseFloat(valor.value || 0);
+    if (!base || !v) return;
+    const neto = tipo === 'porcentaje' ? base * (1 - v / 100) : base - v;
+    if (aviso && neto >= 0) {
+      aviso.innerHTML = 'Quedará en <strong>' + neto.toFixed(2) +
+        '</strong> por caja (lista ' + base.toFixed(2) + ' menos ' +
+        (tipo === 'porcentaje' ? v + '%' : v) + ').';
+    }
+    if (precio && neto >= 0) precio.value = neto.toFixed(2);
+  };
+  sel.addEventListener('change', recalcular);
+  valor.addEventListener('input', recalcular);
+  lista.addEventListener('input', recalcular);
+});
+</script>
 <script>
 function actualizarContadorSeleccionadas() {
   const n = document.querySelectorAll('.check-linea-det:checked').length;

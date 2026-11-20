@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}{{ orden.numero_po }} · Seguimiento · Suite Logística{% endblock %}
+{% block content %}
+{# Ronda DL (2026-11-20, a pedido del usuario): "el perfil de los usuarios que
+   pueden ver el seguimiento de despachos permite que vean los artículos y
+   cantidades de la orden, mas no precio, o valor de la compra".
+
+   Es una pantalla APARTE a propósito, no la de siempre con los precios
+   escondidos: en una plantilla de 900 líneas con precios en una docena de
+   lugares, basta olvidar un {% raw %}{% if %}{% endraw %} para filtrar
+   exactamente lo que no se puede filtrar. Acá el precio sencillamente no
+   existe -- no hay nada que esconder, y la prueba de la ronda lo verifica
+   buscando el total de la orden en el HTML. #}
+
+<div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="section-title mb-0">{{ orden.numero_po }}</h3>
+    <div class="text-muted small">
+      {{ orden.proveedor.nombre }}{% if orden.empresa %} · {{ orden.empresa.nombre }}{% endif %}
+      {% if orden.fecha_emision %} · Emitida el {{ orden.fecha_emision.strftime('%d-%m-%Y') }}{% endif %}
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    {% if despacho %}
+    <a href="{{ url_for('despachos_detalle', despacho_id=despacho.id) }}" class="btn btn-outline-secondary">
+      <i class="bi bi-arrow-left"></i> Volver al despacho
+    </a>
+    {% else %}
+    <a href="{{ url_for('despachos_list') }}" class="btn btn-outline-secondary">
+      <i class="bi bi-arrow-left"></i> Despachos
+    </a>
+    {% endif %}
+  </div>
+</div>
+
+<div class="alert alert-info py-2 small">
+  Vista de <strong>seguimiento</strong>: qué se pidió y en qué etapa va cada línea.
+  No incluye precios ni valores de la compra.
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="row g-3">
+    <div class="col-auto">
+      <div class="text-muted small">Estado de la orden</div>
+      <div class="fw-semibold">{{ orden.estado }}</div>
+    </div>
+    <div class="col-auto">
+      <div class="text-muted small">Líneas</div>
+      <div class="fw-semibold">{{ lineas|length }}</div>
+    </div>
+    <div class="col-auto">
+      <div class="text-muted small">Unidades pedidas</div>
+      <div class="fw-semibold">{{ unidades_totales|round(0)|int }}</div>
+    </div>
+    {% if despacho %}
+    <div class="col-auto">
+      <div class="text-muted small">Despacho</div>
+      <div class="fw-semibold">{{ despacho.numero_tracking or '-' }}
+        {% if despacho.courier %}<span class="text-muted small">· {{ despacho.courier }}</span>{% endif %}
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="text-muted small">Llegada estimada</div>
+      <div class="fw-semibold">
+        {{ despacho.fecha_estimada_llegada.strftime('%d-%m-%Y') if despacho.fecha_estimada_llegada else '-' }}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card p-3 mb-3">
+  <div class="fw-semibold mb-2">Artículos de la orden</div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr class="text-muted small">
+          <th>Código</th>
+          <th>Descripción</th>
+          <th class="text-end">Cant. cajas</th>
+          <th class="text-end">Unidades</th>
+          <th>Fecha est. despacho</th>
+          <th>Etapa</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for l in lineas %}
+        <tr class="{% if l.anulada %}table-secondary text-muted{% endif %}">
+          <td>{{ l.codigo_mostrar }}</td>
+          <td style="max-width:320px;">
+            {{ l.descripcion_mostrar }}
+            {% if l.nota %}<br><span class="text-muted small">Nota: {{ l.nota }}</span>{% endif %}
+          </td>
+          <td class="text-end">{{ l.cantidad_cajas }}</td>
+          <td class="text-end">{{ l.cantidad_unidades }}</td>
+          <td>{{ l.fecha_estimada_despacho_confirmada or l.fecha_estimada_despacho or '-' }}</td>
+          <td>
+            {% if l.anulada %}<span class="badge bg-dark">Anulada</span>
+            {% elif l.etapa == 'Recibido' %}<span class="badge bg-success">{{ l.etapa }}</span>
+            {% elif l.etapa == 'Internación Aduanas' %}<span class="badge bg-info text-dark">{{ l.etapa }}</span>
+            {% elif l.etapa == 'Orden Despachada' %}<span class="badge bg-primary">{{ l.etapa }}</span>
+            {% elif l.etapa == 'Orden Confirmada' %}<span class="badge bg-secondary">{{ l.etapa }}</span>
+            {% else %}<span class="badge bg-light text-dark border">{{ l.etapa }}</span>{% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted py-4">Esta orden no tiene líneas.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if orden.notas %}
+<div class="card p-3 mb-3">
+  <div class="fw-semibold mb-1">Notas de la orden</div>
+  <div class="text-muted small">{{ orden.notas }}</div>
+</div>
+{% endif %}
+
+{% endblock %}
