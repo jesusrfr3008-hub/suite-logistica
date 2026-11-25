@@ -96,6 +96,19 @@
         </div>
       </div>
     </a>
+    {% elif current_user.tiene_permiso('reportes_medio') %}
+    {# Ronda DM (2026-11-25): el nivel Medio NO ve el Reporte de Ventas, así
+       que la tarjeta no puede entrar por ahí -- apunta a Compras Proveedor,
+       que es el primero de los cuatro que sí abre. #}
+    <a href="{{ url_for('reportes_compras_proveedor') }}" class="card card-module p-3 h-100 text-decoration-none">
+      <div class="d-flex align-items-center gap-3">
+        <i class="bi bi-bar-chart-fill fs-2 text-brand"></i>
+        <div>
+          <div class="fw-semibold">Reportes</div>
+          <div class="text-muted small">Compras a proveedor, stock valorizado, costo por producto y reporte operacional.</div>
+        </div>
+      </div>
+    </a>
     {% else %}
     <div class="card card-module disabled p-3 h-100">
       <div class="d-flex align-items-center gap-3">

@@ -95,29 +95,46 @@
             <a class="nav-link {% if request.endpoint == 'stock_bodegas_list' %}active{% endif %}" href="{{ url_for('stock_bodegas_list') }}">Stock Bodegas</a>
           </li>
           {% endif %}
+          {# Ronda DM (2026-11-25, a pedido del usuario): el menú de Reportes
+             pasa a tener dos niveles. "puede_reportes" es el Avanzado (ve
+             todo, como siempre) y "puede_reportes_medio" abre solo los
+             cuatro reportes que el usuario enumeró: Compras Proveedor,
+             Stock Valorizado, Consulta Costo Producto y Reporte
+             Operacional. Avanzado implica Medio (ver Rol.tiene() en
+             models.py), así que acá no hace falta el "or". #}
           {% set puede_reportes = current_user.tiene_permiso('reportes') %}
+          {% set puede_reportes_medio = current_user.tiene_permiso('reportes_medio') %}
           {% set puede_pagos_proveedores = current_user.tiene_permiso('pagos_proveedores') %}
-          {% if puede_reportes or puede_pagos_proveedores %}
+          {% if puede_reportes_medio or puede_pagos_proveedores %}
           <li class="nav-item dropdown">
             <a class="nav-link dropdown-toggle {% if request.endpoint and ('reportes' in request.endpoint or 'pagos_proveedores' in request.endpoint) %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown">Reportes</a>
             <ul class="dropdown-menu">
-              {% if puede_reportes %}
+              {% if puede_reportes_medio %}
               <li><a class="dropdown-item" href="{{ url_for('reportes_compras_proveedor') }}">Compras Proveedor</a></li>
               {% endif %}
               {% if puede_pagos_proveedores %}
               <li><a class="dropdown-item" href="{{ url_for('pagos_proveedores_list') }}">Pago Proveedores</a></li>
               {% endif %}
-              {% if puede_reportes %}
+              {% if puede_reportes_medio %}
               <li><a class="dropdown-item" href="{{ url_for('stock_valorizado_list') }}">Stock Valorizado</a></li>
+              {% endif %}
+              {% if puede_reportes %}
               <li><a class="dropdown-item" href="{{ url_for('stock_consignacion_list') }}">Consignación</a></li>
+              {% endif %}
               {# Ronda BY (2026-10-20, a pedido del usuario): reportes nuevos.
                  "Consignación por producto y lote" se retiró en la ronda BZ:
                  el usuario señaló que la pantalla de Consignación de arriba ya
                  cubría eso con su propio botón de descarga. #}
+              {% if puede_reportes_medio %}
               <li><a class="dropdown-item" href="{{ url_for('reportes_costo_producto') }}">Consulta Costo Producto</a></li>
-              {# Ronda CE (2026-10-26): Reporte de Ventas y su maestro Cliente/Vendedor. #}
+              {% endif %}
+              {# Ronda CE (2026-10-26): Reporte de Ventas y su maestro Cliente/Vendedor.
+                 Ronda DM: quedan SOLO para el nivel Avanzado. #}
+              {% if puede_reportes %}
               <li><a class="dropdown-item" href="{{ url_for('ventas_list') }}">Reporte de Ventas</a></li>
               <li><a class="dropdown-item" href="{{ url_for('ventas_clientes') }}">Cliente / Vendedor</a></li>
+              {% endif %}
+              {% if puede_reportes_medio %}
               <li><a class="dropdown-item" href="{{ url_for('reportes_operacional') }}">Reporte Operacional</a></li>
               {% endif %}
             </ul>

@@ -23,7 +23,23 @@ PERMISOS_DISPONIBLES = [
     ("generar_costeo", "Generar Costeo"),
     ("orden_simple", "Creación de Orden Simple (sin ver precios de proveedor)"),
     ("inventarios", "Inventarios"),
-    ("reportes", "Acceso a Reportes"),
+    ("reportes", "Reportes Avanzado (ve TODOS los reportes)"),
+    # Ronda DM (2026-11-25, a pedido del usuario): "necesito que la consulta
+    # de reporte tenga otro nivel, en este momento sale el perfil que
+    # consulta reporte o no.. El perfil consulta reporte Avanzado el que ve
+    # todo. El perfil consulta reporte Medio el que ve los que te menciono"
+    # (Compras Proveedor, Stock Valorizado, Consulta costo producto y
+    # Reporte Operacional). Hasta esta ronda "reportes" era todo o nada: o
+    # veias los nueve reportes o ninguno.
+    #
+    # Es un nivel de CONSULTA: abre esos cuatro reportes en modo lectura. Lo
+    # que modifica datos dentro de ellos -- cargar el archivo de Stock
+    # Valorizado y crear/editar ajustes manuales de Compras Proveedor --
+    # sigue exigiendo Avanzado, porque reemplazar la foto del inventario o
+    # inventar una Nota de Credito no es consultar.
+    #
+    # No hace falta tildar los dos: Avanzado implica Medio (ver Rol.tiene()).
+    ("reportes_medio", "Reportes Medio (solo los 4 reportes de consulta)"),
     ("seguimiento", "Seguimiento de despachos (solo ver estado/tracking)"),
     # Ronda V (2026-09-12): perfil amplio, pensado para colaboradores que NO
     # necesitan crear/aprobar ordenes ni ver costeos -- solo consultar cuanto
@@ -57,6 +73,32 @@ PERMISOS_DISPONIBLES = [
     ("forecast_gerencia", "Forecast: ver el de todo el equipo comercial"),
 ]
 
+# Ronda DM (2026-11-25): los cuatro reportes que abre el nivel Medio, tal
+# como el usuario los enumero. Esta lista NO es la que manda -- lo que manda
+# es el decorador @requiere_permiso("reportes", "reportes_medio") de cada
+# ruta en app.py. Esta existe para que la pantalla de Perfiles le diga al
+# administrador que esta tildando, y para que agregar un quinto reporte al
+# nivel Medio sea un cambio de dos lineas (esta, y el decorador de la ruta).
+# La prueba de la ronda compara las dos cosas y falla si se desalinean.
+REPORTES_NIVEL_MEDIO = [
+    "Compras Proveedor",
+    "Stock Valorizado",
+    "Consulta Costo Producto",
+    "Reporte Operacional",
+]
+
+# Los reportes que quedan SOLO para Avanzado -- se nombran para que la
+# pantalla de Perfiles muestre de forma explicita lo que el nivel Medio no
+# abre, en lugar de dejarlo a la deduccion del administrador.
+REPORTES_SOLO_AVANZADO = [
+    "Reporte de Ventas",
+    "Cliente / Vendedor",
+    "Consignación",
+    "Costeo de Importaciones",
+    "Carga del archivo de Stock Valorizado",
+    "Ajustes manuales de Compras Proveedor",
+]
+
 
 class Rol(db.Model):
     """Perfil de acceso (ronda R, 2026-09-12): un conjunto de permisos
@@ -78,6 +120,12 @@ class Rol(db.Model):
     permiso_orden_simple = db.Column(db.Boolean, default=False)
     permiso_inventarios = db.Column(db.Boolean, default=False)
     permiso_reportes = db.Column(db.Boolean, default=False)
+    # Ronda DM (2026-11-25): nivel Medio de reportes -- ver
+    # PERMISOS_DISPONIBLES y REPORTES_NIVEL_MEDIO arriba. Nace apagado para
+    # todos los roles: nadie gana acceso por el solo hecho de desplegar esta
+    # ronda, y los perfiles que YA tenian "reportes" siguen viendo todo
+    # porque Avanzado implica Medio en tiene().
+    permiso_reportes_medio = db.Column(db.Boolean, default=False)
     permiso_seguimiento = db.Column(db.Boolean, default=False)
     # Ronda V (2026-09-12): consulta de saldos de Stock -- ver PERMISOS_
     # DISPONIBLES arriba.
@@ -103,11 +151,28 @@ class Rol(db.Model):
         PERMISOS_DISPONIBLES) -- un Rol administrador siempre da True."""
         if self.es_administrador:
             return True
+        # Ronda DM (2026-11-25): Avanzado implica Medio. Se resuelve ACA y no
+        # al guardar el perfil a proposito: asi los perfiles que ya existian
+        # antes de esta ronda (con permiso_reportes tildado y la columna
+        # nueva en NULL) siguen abriendo los cuatro reportes sin que nadie
+        # tenga que volver a entrar a Configuración > Perfiles a re-guardarlos.
+        if permiso == "reportes_medio" and bool(self.permiso_reportes):
+            return True
         return bool(getattr(self, f"permiso_{permiso}", False))
 
     @property
     def permisos_activos(self):
-        return [nombre for codigo, nombre in PERMISOS_DISPONIBLES if self.tiene(codigo)]
+        activos = []
+        for codigo, nombre in PERMISOS_DISPONIBLES:
+            if not self.tiene(codigo):
+                continue
+            # Ronda DM: un perfil Avanzado no se lista ademas como Medio --
+            # seria redundante y en la pantalla de Perfiles se leeria como si
+            # tuviera dos accesos distintos a reportes.
+            if codigo == "reportes_medio" and self.tiene("reportes"):
+                continue
+            activos.append(nombre)
+        return activos
 
     def __repr__(self):
         return f"<Rol {self.nombre}>"

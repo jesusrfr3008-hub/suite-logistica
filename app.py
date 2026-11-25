@@ -42,6 +42,7 @@ from models import (
     Despacho, ESTADOS_DESPACHO,
     CargoAdicionalImportacion, TipoCambioMensual,
     Usuario, Rol, PERMISOS_DISPONIBLES,
+    REPORTES_NIVEL_MEDIO, REPORTES_SOLO_AVANZADO,
     HomologacionStock, StockExistencia, StockValorizado, PedidoComprometido,
     StockConsignacionVigente, StockComprometidoBodega, ConsignacionPendienteLote,
     StockBodegaSaldo, BodegaReporte,
@@ -159,8 +160,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DL.1"
-VERSION_SUITE_FECHA = "2026-11-20"
+VERSION_SUITE = "DM"
+VERSION_SUITE_FECHA = "2026-11-25"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -784,6 +785,12 @@ def ensure_schema_migrations():
             ("permiso_forecast", "BOOLEAN DEFAULT 0"),
             # Ronda CI (2026-10-28): gerencia ve el forecast de todo el equipo.
             ("permiso_forecast_gerencia", "BOOLEAN DEFAULT 0"),
+            # Ronda DM (2026-11-25): nivel Medio de reportes. Va escrito aca
+            # ademas de quedar cubierto por ensure_columnas_de_modelos()
+            # justamente porque es un PERMISO: asi nace con DEFAULT 0 (falso
+            # explicito) y no en NULL. Ningun perfil gana acceso al
+            # desplegar; el administrador lo tilda cuando quiera.
+            ("permiso_reportes_medio", "BOOLEAN DEFAULT 0"),
         ],
         # Ronda CH (2026-10-27): puente entre la cuenta de acceso y el
         # nombre del ejecutivo en el reporte de ventas -- ver
@@ -13552,7 +13559,12 @@ def empresas_logo(empresa_id):
 @requiere_admin
 def roles_list():
     roles = Rol.query.order_by(Rol.nombre).all()
-    return render_template("configuracion/roles.html", roles=roles, permisos=PERMISOS_DISPONIBLES)
+    # Ronda DM (2026-11-25): las dos listas van a la pantalla para que el
+    # administrador vea, al tildar cada nivel de reportes, exactamente que
+    # abre y que no -- en vez de tener que deducirlo del nombre del permiso.
+    return render_template(
+        "configuracion/roles.html", roles=roles, permisos=PERMISOS_DISPONIBLES,
+        reportes_medio=REPORTES_NIVEL_MEDIO, reportes_avanzado=REPORTES_SOLO_AVANZADO)
 
 
 def _guardar_permisos_rol(rol, form):
@@ -13568,6 +13580,14 @@ def _guardar_permisos_rol(rol, form):
     # solo necesita ver saldos).
     if rol.permiso_inventarios:
         rol.permiso_consultar_stock = True
+    # Ronda DM (2026-11-25): "reportes" (Avanzado) implica "reportes_medio",
+    # pero eso NO se copia aca a proposito -- se resuelve en Rol.tiene(), que
+    # es lo que leen todas las rutas y plantillas. La diferencia importa: si
+    # lo copiaramos aca, los perfiles que ya existian antes de esta ronda
+    # quedarian con la columna nueva en falso hasta que alguien los volviera
+    # a guardar a mano, y mientras tanto un Avanzado no abriria sus propios
+    # cuatro reportes. Resolviendolo en tiene() funciona desde el primer
+    # arranque y sin tocar un solo dato.
 
 
 @app.route("/configuracion/perfiles/nuevo", methods=["POST"])
@@ -18219,13 +18239,19 @@ def forecast_autorizar_edicion(envio_id):
 
 
 @app.route("/stock-valorizado")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def stock_valorizado_list():
     """Ronda AM (2026-09-19): pantalla de Stock Valorizado -- costo/valor
     de inventario por código (Accuvision, Accumedical y total combinado).
     Separada a propósito de /stock (Consulta de Stock, permiso
     "consultar_stock"/"inventarios") porque trae datos de costo que esos
     usuarios no deben ver -- acá se exige el permiso "reportes".
+
+    Ronda DM (2026-11-25): tambien la abre el nivel "reportes_medio". OJO:
+    stock_valorizado_cargar (el POST que REEMPLAZA por completo la foto del
+    inventario) sigue exigiendo "reportes" a secas, y la plantilla esconde el
+    boton de carga a quien solo tiene Medio -- consultar el valorizado y
+    reemplazarlo son dos cosas muy distintas.
 
     El filtro "vista" es el botón de 3 fases que pidió el usuario:
     - "desactivado": solo stock propio, EXCLUYE los códigos que hoy
@@ -21078,8 +21104,23 @@ def _filas_reporte_compras(proveedor=None, empresa=None, fecha_desde=None, fecha
 
 
 @app.route("/reportes")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def reportes_index():
+    """Ronda DM (2026-11-25, a pedido del usuario): el acceso a reportes pasa
+    a tener dos niveles.
+
+    - "reportes" (Avanzado): los nueve reportes, como siempre.
+    - "reportes_medio" (Medio): solo los cuatro que el usuario enumero --
+      Compras Proveedor, Stock Valorizado, Consulta Costo Producto y Reporte
+      Operacional. Ver REPORTES_NIVEL_MEDIO en models.py.
+
+    Las rutas de esos cuatro llevan @requiere_permiso("reportes",
+    "reportes_medio") (el decorador exige AL MENOS UNO), asi que Avanzado
+    sigue entrando a todo sin cambios. Las de Ventas, Cliente/Vendedor,
+    Consignación y Costeo de Importaciones quedaron intactas con "reportes"
+    a secas, igual que las dos acciones que ESCRIBEN dentro de los cuatro
+    (cargar el archivo de Stock Valorizado y los ajustes manuales de Compras
+    Proveedor): el nivel Medio es de consulta."""
     return redirect(url_for("reportes_compras_proveedor"))
 
 
@@ -21100,7 +21141,7 @@ def _rango_fechas_reporte_compras():
 
 
 @app.route("/reportes/compras-proveedor")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def reportes_compras_proveedor():
     """Ronda AA (2026-09-13), resumen rediseñado en ronda AB (2026-09-14):
     primer reporte del menú "Reportes" -- combina el histórico de compras a
@@ -21174,7 +21215,7 @@ def reportes_compras_proveedor():
 
 
 @app.route("/reportes/compras-proveedor/<path:proveedor>")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def reportes_compras_proveedor_detalle(proveedor):
     """Ronda AB (2026-09-14): vista "análisis por productos" al entrar a un
     proveedor específico -- tabla dinámica (como la tabla dinámica de Excel
@@ -21601,7 +21642,7 @@ MAX_PRODUCTOS_COSTO = 150
 
 
 @app.route("/reportes/costo-producto")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def reportes_costo_producto():
     """Ronda BY (2026-10-20, punto 2 del pedido del usuario): consulta del
     costo de un producto, con el último costo ingresado a la vista y todo
@@ -22381,7 +22422,7 @@ def configuracion_reportes():
 
 
 @app.route("/api/reportes/costo-producto/historial")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def api_costo_producto_historial():
     """Ronda BY (2026-10-20, punto 2e): los siguientes 10 costeos de un
     producto para el botón "Ver más"."""
@@ -22429,7 +22470,7 @@ def api_costo_producto_historial():
 
 
 @app.route("/api/reportes/costo-producto/sugerencias")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def api_costo_producto_sugerencias():
     """Ronda BY (2026-10-20, punto 2c, "texto predictivo"): sugerencias de
     producto Y de lote mientras se escribe. Consulta directo las tablas
@@ -22751,7 +22792,7 @@ def _contexto_reporte_operacional():
 
 
 @app.route("/reportes/operacional")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def reportes_operacional():
     return render_template("reportes/operacional.html", **_contexto_reporte_operacional())
 
@@ -22831,7 +22872,7 @@ def _escribir_fila_reporte(ws, fila, valores, formatos, negrita=False, relleno=N
 
 
 @app.route("/reportes/operacional/descargar")
-@requiere_permiso("reportes")
+@requiere_permiso("reportes", "reportes_medio")
 def reportes_operacional_descargar():
     """Ronda CC (2026-10-22, punto 3): baja a Excel las secciones marcadas
     del Reporte Operacional, con los MISMOS filtros que se están viendo en

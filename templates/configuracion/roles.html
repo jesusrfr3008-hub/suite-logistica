@@ -75,6 +75,19 @@
             <div class="form-check">
               <input class="form-check-input" type="checkbox" name="permiso_{{ codigo }}" id="nuevoPerm{{ codigo }}">
               <label class="form-check-label" for="nuevoPerm{{ codigo }}">{{ nombre }}</label>
+              {# Ronda DM (2026-11-25, a pedido del usuario): los dos niveles
+                 de reportes llevan una nota al pie del check, para que el
+                 administrador sepa que esta asignando sin salir de aca. #}
+              {% if codigo == 'reportes' %}
+              <div class="text-muted small ms-4">
+                Los 4 del nivel Medio <strong>más</strong>: {{ reportes_avanzado|join(', ') }}.
+              </div>
+              {% elif codigo == 'reportes_medio' %}
+              <div class="text-muted small ms-4">
+                Solo consulta de: {{ reportes_medio|join(', ') }}.
+                No hace falta tildarlo si ya marcaste Avanzado.
+              </div>
+              {% endif %}
             </div>
           </div>
           {% endfor %}
@@ -106,6 +119,19 @@
             <div class="form-check">
               <input class="form-check-input" type="checkbox" name="permiso_{{ codigo }}" id="editPerm{{ codigo }}{{ r.id }}" {% if r['permiso_' ~ codigo] %}checked{% endif %}>
               <label class="form-check-label" for="editPerm{{ codigo }}{{ r.id }}">{{ nombre }}</label>
+              {# Ronda DM (2026-11-25, a pedido del usuario): los dos niveles
+                 de reportes llevan una nota al pie del check, para que el
+                 administrador sepa que esta asignando sin salir de aca. #}
+              {% if codigo == 'reportes' %}
+              <div class="text-muted small ms-4">
+                Los 4 del nivel Medio <strong>más</strong>: {{ reportes_avanzado|join(', ') }}.
+              </div>
+              {% elif codigo == 'reportes_medio' %}
+              <div class="text-muted small ms-4">
+                Solo consulta de: {{ reportes_medio|join(', ') }}.
+                No hace falta tildarlo si ya marcaste Avanzado.
+              </div>
+              {% endif %}
             </div>
           </div>
           {% endfor %}

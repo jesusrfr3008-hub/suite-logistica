@@ -63,7 +63,11 @@
 {% macro facturas_tabla(prod, proveedor_obj) %}
 <div class="d-flex justify-content-between align-items-center mb-1">
   <div class="fw-semibold small">Facturas de {{ prod.codigo }}</div>
-  {% if proveedor_obj %}
+  {# Ronda DM (2026-11-25): ajustar el reporte es crear una Nota de Crédito
+     que el sistema no tiene registrada -- queda en el nivel Avanzado. El
+     nivel Medio consulta el reporte y ve los ajustes ya cargados, pero no
+     los crea ni los edita. #}
+  {% if proveedor_obj and current_user.tiene_permiso('reportes') %}
   <a class="btn btn-outline-secondary btn-sm"
      href="{{ url_for('reportes_ajuste_compra_nuevo', proveedor=proveedor_obj.nombre, codigo_producto=prod.codigo, descripcion=prod.descripcion, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}">
     <i class="bi bi-pencil-square"></i> Ajustar este reporte
@@ -346,7 +350,9 @@
       <i class="bi bi-info-circle text-muted" data-bs-toggle="tooltip"
          title="Correcciones de Notas de Crédito reales del proveedor que nunca se registraron en el sistema. Solo afectan este reporte -- nunca Cuentas por Pagar."></i>
     </div>
-    {% if proveedor_obj %}
+    {# Ronda DM (2026-11-25): ver la nota del macro de facturas -- crear
+       ajustes es del nivel Avanzado. #}
+    {% if proveedor_obj and current_user.tiene_permiso('reportes') %}
     <a class="btn btn-brand btn-sm"
        href="{{ url_for('reportes_ajuste_compra_nuevo', proveedor=proveedor_obj.nombre, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}">
       <i class="bi bi-plus-lg"></i> Nuevo ajuste
@@ -385,10 +391,12 @@
           <td>{{ a.numero_referencia or '-' }}</td>
           <td class="small text-muted">{{ a.motivo or '-' }}</td>
           <td class="text-end">
+            {% if current_user.tiene_permiso('reportes') %}
             <a class="btn btn-outline-secondary btn-sm"
                href="{{ url_for('reportes_ajuste_compra_editar', ajuste_id=a.id, fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}">
               <i class="bi bi-pencil"></i>
             </a>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}

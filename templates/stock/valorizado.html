@@ -40,9 +40,15 @@
     </div>
   </div>
   <div class="d-flex gap-2">
+    {# Ronda DM (2026-11-25): el nivel Medio de reportes consulta el
+       valorizado pero no lo reemplaza -- la carga sustituye POR COMPLETO la
+       foto del inventario, así que el botón (y la ruta de carga) siguen
+       siendo del nivel Avanzado. #}
+    {% if current_user.tiene_permiso('reportes') %}
     <button class="btn btn-outline-brand" data-bs-toggle="modal" data-bs-target="#modalCargarValorizado">
       <i class="bi bi-upload"></i> Cargar reporte
     </button>
+    {% endif %}
   </div>
 </div>
 
@@ -162,6 +168,7 @@
   </div>
 </div>
 
+{% if current_user.tiene_permiso('reportes') %}
 <div class="modal fade" id="modalCargarValorizado" tabindex="-1">
   <div class="modal-dialog">
     <div class="modal-content">
@@ -184,6 +191,7 @@
     </div>
   </div>
 </div>
+{% endif %}
 
 {% endblock %}
 
