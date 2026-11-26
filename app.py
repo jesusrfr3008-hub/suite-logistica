@@ -160,8 +160,8 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DM"
-VERSION_SUITE_FECHA = "2026-11-25"
+VERSION_SUITE = "DN"
+VERSION_SUITE_FECHA = "2026-11-26"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
 # Ronda BK (2026-10-08, punto 2 del pedido del usuario): respaldo PDF de la
@@ -21214,18 +21214,22 @@ def reportes_compras_proveedor():
     )
 
 
-@app.route("/reportes/compras-proveedor/<path:proveedor>")
-@requiere_permiso("reportes", "reportes_medio")
-def reportes_compras_proveedor_detalle(proveedor):
-    """Ronda AB (2026-09-14): vista "análisis por productos" al entrar a un
-    proveedor específico -- tabla dinámica (como la tabla dinámica de Excel
-    que trajo el usuario de referencia): filas = código de proveedor,
-    columnas = meses, valores = Total Invoice en la MONEDA DE COMPRA
-    (columna R del histórico, tal cual, sin convertir). Con buscador con
-    texto predictivo, flechas de orden por columna, expandir una fila para
-    ver las facturas, y el resumen de arriba recalculándose en vivo (JS)
-    según lo que quede visible en la tabla -- ver
-    reportes/compras_proveedor_detalle.html."""
+def _corte_compras_proveedor(proveedor):
+    """Ronda DN (2026-11-26): el corte de compras de UN proveedor -- las
+    filas con los filtros que estan puestos en la pantalla, mas la moneda
+    dominante y la paridad representativa con las que se expresan los
+    totales.
+
+    Se extrajo de reportes_compras_proveedor_detalle para que la descarga a
+    Excel (reportes_compras_proveedor_descargar) parta EXACTAMENTE del mismo
+    conjunto de filas que la pantalla. Si cada una armara su propio corte,
+    bastaria con que una cambiara un filtro para que el Excel dejara de
+    cuadrar con el total que el usuario esta mirando en la tarjeta -- y un
+    reporte que no cuadra con la pantalla de la que salio es peor que no
+    tenerlo.
+
+    Devuelve None cuando el corte quedo vacio (el que llama decide si
+    redirige o avisa)."""
     empresa = request.args.get("empresa", "").strip()
     fecha_desde_txt, fecha_hasta_txt = _rango_fechas_reporte_compras()
     fecha_desde = parse_date(fecha_desde_txt)
@@ -21246,8 +21250,7 @@ def reportes_compras_proveedor_detalle(proveedor):
     # derechos/otros gastos de esas líneas sí se pagaron de verdad.
     filas = [f for f in filas if not f.get("es_consignacion")]
     if not filas:
-        flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
-        return redirect(url_for("reportes_compras_proveedor"))
+        return None
 
     totales = _totales_reporte(filas, proveedor_nombre=proveedor)
     # Ronda AC (2026-09-14): TODA la página (tarjetas de arriba, el
@@ -21258,7 +21261,47 @@ def reportes_compras_proveedor_detalle(proveedor):
     # misma pantalla. Las celdas mes a mes siguen mostrando el monto
     # ORIGINAL de cada factura, sin convertir (así lo pidió el usuario).
     moneda_dominante = totales["moneda"]
-    paridad_representativa = _paridad_representativa_eur(filas) if moneda_dominante == "EUR" else 1.0
+    return {
+        "filas": filas,
+        "totales": totales,
+        "empresa": empresa,
+        "fecha_desde_txt": fecha_desde_txt,
+        "fecha_hasta_txt": fecha_hasta_txt,
+        "fecha_desde": fecha_desde,
+        "fecha_hasta": fecha_hasta,
+        "moneda_dominante": moneda_dominante,
+        "paridad_representativa": (
+            _paridad_representativa_eur(filas) if moneda_dominante == "EUR" else 1.0),
+    }
+
+
+@app.route("/reportes/compras-proveedor/<path:proveedor>")
+@requiere_permiso("reportes", "reportes_medio")
+def reportes_compras_proveedor_detalle(proveedor):
+    """Ronda AB (2026-09-14): vista "análisis por productos" al entrar a un
+    proveedor específico -- tabla dinámica (como la tabla dinámica de Excel
+    que trajo el usuario de referencia): filas = código de proveedor,
+    columnas = meses, valores = Total Invoice en la MONEDA DE COMPRA
+    (columna R del histórico, tal cual, sin convertir). Con buscador con
+    texto predictivo, flechas de orden por columna, expandir una fila para
+    ver las facturas, y el resumen de arriba recalculándose en vivo (JS)
+    según lo que quede visible en la tabla -- ver
+    reportes/compras_proveedor_detalle.html.
+
+    Ronda DN (2026-11-26): el corte (filas + moneda dominante + paridad) lo
+    arma _corte_compras_proveedor, compartido con la descarga a Excel."""
+    corte = _corte_compras_proveedor(proveedor)
+    if corte is None:
+        flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
+        return redirect(url_for("reportes_compras_proveedor"))
+
+    filas = corte["filas"]
+    totales = corte["totales"]
+    empresa = corte["empresa"]
+    fecha_desde_txt, fecha_hasta_txt = corte["fecha_desde_txt"], corte["fecha_hasta_txt"]
+    fecha_desde, fecha_hasta = corte["fecha_desde"], corte["fecha_hasta"]
+    moneda_dominante = corte["moneda_dominante"]
+    paridad_representativa = corte["paridad_representativa"]
 
     # --- Arma la tabla dinámica: producto (código de proveedor) x mes ---
     # Ronda AC (2026-09-14): el "Total" de cada producto (y los montos que
@@ -22869,6 +22912,208 @@ def _escribir_fila_reporte(ws, fila, valores, formatos, negrita=False, relleno=N
         ws.row_dimensions[fila].outlineLevel = nivel
         ws.row_dimensions[fila].hidden = False
     return fila + 1
+
+
+@app.route("/reportes/compras-proveedor/<path:proveedor>/descargar")
+@requiere_permiso("reportes", "reportes_medio")
+def reportes_compras_proveedor_descargar(proveedor):
+    """Ronda DN (2026-11-26, a pedido del usuario): "generar un reporte que
+    se descargue en excel y que detalle, factura, fecha, monto, ademas si se
+    desea incluir detalle, que traiga las unidades de los productos
+    comprados en cada invoice que compone las compras del periodo
+    seleccionado. por cantidad y valor.. Si se marca detallado indique lo
+    solicitado".
+
+    Dos modos, con el mismo corte que esta viendo la pantalla
+    (_corte_compras_proveedor):
+      - Resumen: la hoja "Facturas", una fila por factura.
+      - Detallado (?detallado=1): esa misma hoja MAS "Detalle por producto",
+        con las unidades y el valor de cada producto dentro de cada factura
+        y un subtotal por factura que cuadra fila a fila con la primera hoja.
+
+    Sobre las dos columnas de monto, que es lo unico que puede confundir:
+    la pantalla muestra cada celda mes a mes en la MONEDA ORIGINAL de la
+    factura y las tarjetas de arriba en la moneda dominante del proveedor
+    (euros para MEDICONTUR). El Excel trae las dos, en columnas separadas y
+    rotuladas, justamente para que se vea de donde sale la diferencia: la
+    columna "Total Invoice (<moneda>)" es la que suma el total de la tarjeta.
+
+    Vive aca abajo, lejos del resto de las rutas de Compras Proveedor,
+    porque usa los ayudantes de Excel (_hoja_reporte_operacional y
+    _escribir_fila_reporte) que se definen justo arriba.
+
+    Esta en el nivel Medio de reportes (ronda DM): es una descarga de lo que
+    ese perfil ya puede ver en pantalla, no una pantalla nueva."""
+    corte = _corte_compras_proveedor(proveedor)
+    if corte is None:
+        flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
+        return redirect(url_for("reportes_compras_proveedor"))
+
+    detallado = request.args.get("detallado") in ("1", "true", "on", "si")
+    moneda = corte["moneda_dominante"]
+    paridad_rep = corte["paridad_representativa"]
+    simbolo = SIMBOLOS_MONEDA.get(moneda, moneda)
+    fmt_monto = f'"{simbolo}"#,##0.00'
+    fmt_unidades = "#,##0"
+    fmt_unitario = f'"{simbolo}"#,##0.0000'
+
+    def en_moneda(valor_usd, fila):
+        return _valor_en_moneda_dominante(
+            valor_usd, fila.get("moneda_operacion") or "USD", moneda,
+            fila.get("paridad") or 1.0, paridad_rep)
+
+    # --- Agrupa las filas del corte por factura -----------------------------
+    # Una "factura" acá puede ser también un movimiento negativo (una Nota de
+    # Crédito o un ajuste manual, que entran al reporte con su propia
+    # etiqueta en el campo `factura` -- ver _filas_ajustes_compra_proveedor).
+    # Se incluyen igual, y por eso la columna Origen: el usuario tiene que
+    # poder explicar un monto negativo sin salir del Excel.
+    facturas = {}
+    for f in corte["filas"]:
+        clave = (f.get("factura") or "(sin factura)").strip() or "(sin factura)"
+        info = facturas.get(clave)
+        if info is None:
+            info = facturas[clave] = {
+                "factura": clave,
+                "fecha": f.get("fecha_factura"),
+                "origenes": set(),
+                "empresas": set(),
+                "monedas": set(),
+                "unidades": 0.0,
+                "monto_original": 0.0,
+                "total": 0.0,
+                "flete": 0.0,
+                "derechos": 0.0,
+                "otros": 0.0,
+                "lineas": [],
+            }
+        # La fecha de la factura es la MAS ANTIGUA de sus líneas: todas las
+        # líneas de una misma factura comparten fecha en el histórico, pero
+        # si alguna viniera distinta conviene que mande la de emisión.
+        if f.get("fecha_factura") and (info["fecha"] is None or f["fecha_factura"] < info["fecha"]):
+            info["fecha"] = f["fecha_factura"]
+        if f.get("origen"):
+            info["origenes"].add(f["origen"])
+        if (f.get("empresa_compradora") or "").strip():
+            info["empresas"].add(f["empresa_compradora"].strip())
+        info["monedas"].add(f.get("moneda_operacion") or "USD")
+        info["unidades"] += f.get("unidades") or 0
+        info["monto_original"] += f.get("total_invoice") or 0
+        info["total"] += en_moneda(f.get("total_usd"), f)
+        info["flete"] += en_moneda(f.get("flete_usd"), f)
+        info["derechos"] += en_moneda(f.get("derechos_usd"), f)
+        info["otros"] += en_moneda(f.get("otros_gastos_usd"), f)
+        info["lineas"].append(f)
+
+    lista = sorted(facturas.values(), key=lambda i: (i["fecha"] or date.min, i["factura"]))
+
+    def texto(conjunto):
+        return " / ".join(sorted(conjunto)) if conjunto else "-"
+
+    procesado = datetime.now(ZONA_CHILE)
+    filtros = [f"Proveedor: {proveedor}"]
+    if corte["empresa"]:
+        filtros.append(f"Empresa: {corte['empresa']}")
+    filtros.append(
+        f"Período: {corte['fecha_desde_txt'] or 'inicio'} a {corte['fecha_hasta_txt'] or 'hoy'}")
+    filtros.append(f"Moneda del reporte: {moneda}")
+    filtros.append("Consignación excluida (todavía no es compra en firme)")
+    filtros.append(f"Procesado el {procesado.strftime('%d-%m-%Y %H:%M')} (hora de Chile)")
+    subtitulo = " · ".join(filtros)
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    # --- Hoja 1: una fila por factura --------------------------------------
+    encabezados = [
+        "N° Factura", "Fecha", "Origen", "Empresa compradora", "Unidades",
+        "Moneda original", "Monto (moneda original)", f"Total Invoice ({moneda})",
+        f"Flete ({moneda})", f"Derechos ({moneda})", f"Otros costos ({moneda})",
+    ]
+    formatos = [None, None, None, None, fmt_unidades, None,
+                fmt_monto, fmt_monto, fmt_monto, fmt_monto, fmt_monto]
+    ws, fila = _hoja_reporte_operacional(
+        wb, "Facturas", subtitulo, encabezados,
+        [22, 13, 16, 20, 11, 14, 20, 18, 15, 15, 16])
+
+    for inf in lista:
+        fila = _escribir_fila_reporte(ws, fila, [
+            inf["factura"],
+            inf["fecha"].strftime("%d-%m-%Y") if inf["fecha"] else "-",
+            texto(inf["origenes"]), texto(inf["empresas"]), inf["unidades"],
+            texto(inf["monedas"]), inf["monto_original"], inf["total"],
+            inf["flete"], inf["derechos"], inf["otros"],
+        ], formatos)
+
+    # El total general sale de `totales`, el MISMO diccionario que alimenta
+    # las tarjetas de la pantalla -- no de volver a sumar acá. Así el Excel
+    # no puede mostrar un total distinto al que el usuario vio al pedirlo.
+    t = corte["totales"]
+    # La columna de monto original NO se totaliza cuando el corte mezcla
+    # monedas: sumar euros con dólares daría un número que no significa
+    # nada. En ese caso la celda queda vacía y el total de verdad es el de
+    # la columna siguiente, que está toda en la misma moneda.
+    monedas_del_corte = {m for inf in lista for m in inf["monedas"]}
+    total_original = (sum(i["monto_original"] for i in lista)
+                      if len(monedas_del_corte) == 1 else None)
+    _escribir_fila_reporte(ws, fila, [
+        f"TOTAL · {len(lista)} factura(s)", "", "", "",
+        sum(i["unidades"] for i in lista), "", total_original,
+        t["total_invoice"], t["flete"], t["derechos"], t["otros_gastos"],
+    ], formatos, negrita=True, relleno=_RELLENO_SUBTOTAL_REPORTE)
+
+    # --- Hoja 2: el detalle por producto, solo si se pidió ------------------
+    if detallado:
+        enc_det = [
+            "N° Factura", "Fecha", "Código producto", "Descripción", "Unidades",
+            f"Valor unitario ({moneda})", "Moneda original",
+            "Monto (moneda original)", f"Total Invoice ({moneda})",
+        ]
+        fmt_det = [None, None, None, None, fmt_unidades, fmt_unitario,
+                   None, fmt_monto, fmt_monto]
+        ws2, fila2 = _hoja_reporte_operacional(
+            wb, "Detalle por producto", subtitulo, enc_det,
+            [22, 13, 20, 46, 11, 18, 14, 20, 18])
+
+        for inf in lista:
+            # El subtotal va ARRIBA de sus líneas (summaryBelow = False en
+            # _hoja_reporte_operacional) y repite exactamente los números de
+            # la hoja "Facturas" para esa misma factura.
+            fila2 = _escribir_fila_reporte(ws2, fila2, [
+                inf["factura"],
+                inf["fecha"].strftime("%d-%m-%Y") if inf["fecha"] else "-",
+                f"{len(inf['lineas'])} producto(s)",
+                f"Total de la factura · {texto(inf['origenes'])} · {texto(inf['empresas'])}",
+                inf["unidades"], None, texto(inf["monedas"]),
+                inf["monto_original"], inf["total"],
+            ], fmt_det, negrita=True, relleno=_RELLENO_SUBTOTAL_REPORTE)
+
+            for f in sorted(inf["lineas"], key=lambda x: -(x.get("total_invoice") or 0)):
+                unidades = f.get("unidades") or 0
+                total_linea = en_moneda(f.get("total_usd"), f)
+                fila2 = _escribir_fila_reporte(ws2, fila2, [
+                    "", "",
+                    (f.get("codigo_producto") or "(sin código)").strip(),
+                    (f.get("descripcion") or "").strip(),
+                    unidades,
+                    (total_linea / unidades) if unidades else None,
+                    f.get("moneda_operacion") or "USD",
+                    f.get("total_invoice") or 0,
+                    total_linea,
+                ], fmt_det, nivel=1)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    sufijo = "_detallado" if detallado else ""
+    nombre_proveedor = re.sub(r"[^A-Za-z0-9]+", "_", proveedor).strip("_") or "proveedor"
+    nombre_archivo = (f"Compras_{nombre_proveedor}_"
+                      f"{corte['fecha_desde_txt'] or 'inicio'}_a_"
+                      f"{corte['fecha_hasta_txt'] or 'hoy'}{sufijo}.xlsx")
+    return send_file(
+        buffer, as_attachment=True, download_name=nombre_archivo,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.route("/reportes/operacional/descargar")

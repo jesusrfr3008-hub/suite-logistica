@@ -150,6 +150,33 @@
     <a href="{{ url_for('reportes_compras_proveedor_detalle', proveedor=proveedor, fecha_desde='', fecha_hasta='') }}" class="btn btn-outline-secondary">Quitar filtros</a>
   </div>
   {% endif %}
+  {# Ronda DN (2026-11-26, a pedido del usuario): descarga a Excel de las
+     facturas del período, con un check para que además traiga las unidades
+     y el valor de cada producto dentro de cada factura.
+
+     Va DENTRO de la fila de filtros, al lado de "Filtrar", porque el Excel
+     sale justamente con esos filtros -- tenerlo arriba, separado, invitaba a
+     leerlo como una descarga de "todo". El link se rearma en JS (ver el
+     bloque scripts) con lo que esté escrito en los campos: si se armara acá
+     con los valores del render, cambiar una fecha y bajar el Excel sin
+     volver a apretar Filtrar daría en silencio el período anterior. #}
+  <div class="col-auto ms-auto">
+    <label class="form-label small mb-0 d-block">&nbsp;</label>
+    <div class="d-flex align-items-center gap-2">
+      <div class="form-check form-switch mb-0">
+        <input class="form-check-input" type="checkbox" id="chk-detallado">
+        <label class="form-check-label small" for="chk-detallado">
+          Detallado
+          <i class="bi bi-info-circle text-muted" data-bs-toggle="tooltip"
+             title="Agrega una segunda hoja con los productos de cada factura: unidades, valor unitario y monto."></i>
+        </label>
+      </div>
+      <a id="btn-descargar-compras" class="btn btn-outline-brand"
+         href="{{ url_for('reportes_compras_proveedor_descargar', proveedor=proveedor) }}">
+        <i class="bi bi-file-earmark-excel"></i> Descargar Excel
+      </a>
+    </div>
+  </div>
 </form>
 
 <div class="row g-3 mb-3">
@@ -618,6 +645,36 @@ document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
   });
 
   recalcularResumen();
+
+  // Ronda DN (2026-11-26): el link de "Descargar Excel" se rearma con los
+  // filtros que estén PUESTOS en el formulario de arriba, no con los del
+  // último render. Así, si el usuario cambia una fecha y baja el Excel sin
+  // apretar Filtrar, el archivo igual corresponde a lo que escribió --
+  // mucho mejor que entregarle en silencio el período anterior.
+  var botonDescarga = document.getElementById('btn-descargar-compras');
+  var chkDetallado = document.getElementById('chk-detallado');
+  if (botonDescarga) {
+    var baseDescarga = botonDescarga.getAttribute('href');
+    var formularioFiltros = document.querySelector('form.row.g-2');
+    var armarLink = function () {
+      var params = new URLSearchParams();
+      if (formularioFiltros) {
+        ['empresa', 'fecha_desde', 'fecha_hasta'].forEach(function (nombre) {
+          var campo = formularioFiltros.querySelector('[name="' + nombre + '"]');
+          if (campo && campo.value) { params.set(nombre, campo.value); }
+        });
+      }
+      if (chkDetallado && chkDetallado.checked) { params.set('detallado', '1'); }
+      var qs = params.toString();
+      botonDescarga.setAttribute('href', baseDescarga + (qs ? '?' + qs : ''));
+    };
+    armarLink();
+    if (chkDetallado) { chkDetallado.addEventListener('change', armarLink); }
+    if (formularioFiltros) {
+      formularioFiltros.addEventListener('change', armarLink);
+      formularioFiltros.addEventListener('input', armarLink);
+    }
+  }
 })();
 </script>
 {% endblock %}
