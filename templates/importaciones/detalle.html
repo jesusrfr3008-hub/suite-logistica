@@ -938,6 +938,35 @@
               sin importar lo que pongas acá.
             </div>
           </div>
+          {# Ronda DO (2026-11-26, a pedido del usuario): hasta esta ronda una
+             reposición de la bodega de consignación costeada en el sistema
+             entraba al reporte de Compras Proveedor como compra en firme.
+             Ya se corrigió para que se deduzca de la OC de origen, pero una
+             importación creada directo en Costeo (sin despacho, sin OC) no
+             tiene de dónde deducirlo -- este selector es la forma de
+             decirlo a mano. #}
+          <div class="col-12">
+            <label class="form-label">¿Es reposición de consignación?</label>
+            {% set marca_cons = 'si' if imp.es_consignacion is true else ('no' if imp.es_consignacion is false else '') %}
+            <select class="form-select" name="es_consignacion_manual">
+              <option value="" {% if marca_cons == '' %}selected{% endif %}>
+                Automático{% if clasificacion_consignacion %} — hoy: {{
+                  'toda la importación es consignación' if clasificacion_consignacion.estado == 'total'
+                  else ('%d de %d líneas son consignación' % (clasificacion_consignacion.lineas_consignacion, clasificacion_consignacion.lineas_total) if clasificacion_consignacion.estado == 'parcial'
+                  else 'compra en firme') }}{% endif %}
+              </option>
+              <option value="si" {% if marca_cons == 'si' %}selected{% endif %}>Sí — toda la importación es consignación</option>
+              <option value="no" {% if marca_cons == 'no' %}selected{% endif %}>No — toda la importación es compra en firme</option>
+            </select>
+            <div class="form-text">
+              La mercadería en consignación sigue siendo del proveedor hasta que se consume, así que
+              <strong>no cuenta como compra</strong> en el reporte de Compras Proveedor — recién entra ahí cuando
+              se factura el consumo. El flete, derechos y otros gastos de traerla sí se pagaron: el resumen de
+              Compras Proveedor los sigue sumando (el detalle por producto, no).
+              En <em>Automático</em> se deduce de la Orden de Compra de origen; usa Sí/No solo cuando esa deducción
+              no aplique o esté equivocada.
+            </div>
+          </div>
           <div class="col-12"><label class="form-label">Notas</label><textarea class="form-control" name="notas" rows="2">{{ imp.notas or '' }}</textarea></div>
         </div>
         <div class="modal-footer"><button type="submit" class="btn btn-brand">Guardar</button></div>

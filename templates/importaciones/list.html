@@ -62,7 +62,25 @@
           <td>{{ imp.empresa.nombre if imp.empresa else '-' }}</td>
           <td>{{ imp.numero_correlativo_inventario or '-' }}</td>
           <td>{{ imp.proveedor.nombre }}</td>
-          <td>{{ imp.numero_factura or '-' }}</td>
+          <td>
+            {{ imp.numero_factura or '-' }}
+            {# Ronda DO (2026-11-26): una reposición de la bodega de
+               consignación NO es una compra al proveedor -- hasta esta
+               ronda eso no se veía en ninguna pantalla y el reporte de
+               Compras Proveedor la contaba igual. Ahora se marca acá. #}
+            {% set cons = consignacion[imp.id] %}
+            {% if cons.estado == 'total' %}
+            <span class="badge bg-warning text-dark" data-bs-toggle="tooltip"
+                  title="Reposición de consignación: la mercadería sigue siendo del proveedor hasta que se consuma. NO cuenta como compra en el reporte de Compras Proveedor.{% if cons.manual is not none %} Marcada a mano.{% endif %}">
+              <i class="bi bi-box-seam"></i> Consignación
+            </span>
+            {% elif cons.estado == 'parcial' %}
+            <span class="badge bg-warning-subtle text-warning-emphasis border border-warning" data-bs-toggle="tooltip"
+                  title="{{ cons.lineas_consignacion }} de {{ cons.lineas_total }} líneas son consignación -- solo esas quedan fuera del reporte de Compras Proveedor.">
+              <i class="bi bi-box-seam"></i> Consignación parcial
+            </span>
+            {% endif %}
+          </td>
           <td>{{ imp.fecha_factura or '-' }}</td>
           <td>{{ imp.parciales.count() }}</td>
           <td class="text-end">{{ "%.2f"|format(resumenes[imp.id].fob_usd) }}</td>

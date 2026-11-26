@@ -160,7 +160,7 @@ ACCIONES_HISTORIAL_FORECAST = (
 )
 ACCIONES_HISTORIAL_OBSOLETAS = ("edicion", "copia_ciclo_anterior")
 
-VERSION_SUITE = "DN"
+VERSION_SUITE = "DO"
 VERSION_SUITE_FECHA = "2026-11-26"
 DOCUMENTOS_DIR = os.path.join(BASE_DIR, "data", "documentos")
 EXTENSIONES_PERMITIDAS = {".pdf", ".jpg", ".jpeg", ".png"}
@@ -730,6 +730,12 @@ def ensure_schema_migrations():
             # líneas son de consignación (no se genera FacturaProveedor, así
             # que el guard de "ya tiene factura" no alcanza a protegerla).
             ("consignacion_registrada", "BOOLEAN DEFAULT 0"),
+            # Ronda DO (2026-11-26): interruptor manual de consignación por
+            # Importación. SIN default a propósito -- nace en NULL, que es
+            # "automático" (que cada línea decida según su OC). Un DEFAULT 0
+            # significaría "esta importación NO es consignación" y apagaría
+            # la detección automática para todas las que ya existen.
+            ("es_consignacion", "BOOLEAN"),
         ],
         "proveedores": [
             ("codigo_sistema_inventario", "VARCHAR(50)"),
@@ -10686,14 +10692,22 @@ def importaciones_list():
     proveedores = Proveedor.query.filter_by(activo=True).order_by(Proveedor.nombre).all()
     resumenes = {}
     estados = {}
+    # Ronda DO (2026-11-26): si una importación es reposición de
+    # consignación, eso tiene que VERSE en la lista. El defecto que reportó
+    # el usuario (reposiciones contadas como compra al proveedor) pudo vivir
+    # meses justamente porque esa condición no se mostraba en ninguna
+    # pantalla: no había dónde notarla.
+    consignacion = {}
     for imp in importaciones:
         resultado = costing.calcular_costeo(imp)
         resumenes[imp.id] = resultado["totales"]
         estados[imp.id] = _estado_costeo_importacion(imp)
+        consignacion[imp.id] = _clasificacion_consignacion_importacion(imp)
     hay_despachos_pendientes = bool(_despachos_pendientes_de_costeo())
     return render_template(
         "importaciones/list.html", importaciones=importaciones, proveedores=proveedores,
         proveedor_sel=proveedor_id, resumenes=resumenes, estados=estados,
+        consignacion=consignacion,
         hay_despachos_pendientes=hay_despachos_pendientes,
     )
 
@@ -10875,6 +10889,9 @@ def importaciones_detalle(importacion_id):
         # Ronda DL: para el campo de operador logistico del modal de edicion.
         operador_deducido=_operador_transporte_importacion(imp),
         operadores_conocidos=_operadores_logisticos_conocidos(),
+        # Ronda DO (2026-11-26): para que el selector de consignación pueda
+        # decir en qué quedó hoy la deducción automática.
+        clasificacion_consignacion=_clasificacion_consignacion_importacion(imp),
     )
 
 
@@ -10905,6 +10922,19 @@ def importaciones_editar(importacion_id):
     # Ronda DL: operador logistico de la importacion (ver
     # _operador_transporte_importacion). Vacio = se deduce del despacho.
     imp.operador_logistico = request.form.get("operador_logistico", "").strip() or None
+    # Ronda DO (2026-11-26): interruptor manual de consignación. "" (o el
+    # campo ausente) = automático, que es NULL en la base -- no False, que
+    # significaría "esta importación NO es consignación" y apagaría la
+    # deducción automática para siempre.
+    marca = (request.form.get("es_consignacion_manual") or "").strip()
+    antes = imp.es_consignacion
+    imp.es_consignacion = {"si": True, "no": False}.get(marca, None)
+    if imp.es_consignacion != antes:
+        # Cambiar esta marca cambia qué líneas son consignación, así que el
+        # ledger de stock consignado tiene que recalcularse en el acto -- si
+        # no, la bodega de consignación quedaría con un saldo que ya no
+        # corresponde a lo que el costeo dice.
+        _sincronizar_consignacion_recibida(imp)
     db.session.commit()
     flash("Datos de la importación actualizados.", "success")
     return redirect(url_for("importaciones_detalle", importacion_id=imp.id))
@@ -10936,15 +10966,64 @@ def _es_consignacion_parcial_linea(linea):
     consignación de sus líneas hermanas (las que sí trazan a una OC) de la
     MISMA Importación, salvo que se haya marcado explícitamente
     excluir_de_consignacion=True al agregarla (porque de verdad es una
-    compra real, no consignación)."""
+    compra real, no consignación).
+
+    Ronda DO (2026-11-26, a pedido del usuario): si la Importación trae el
+    interruptor manual Importacion.es_consignacion puesto (True o False, ver
+    models.py), ESE manda sobre la deducción automática. Se resuelve acá
+    adentro y no en cada pantalla a propósito: esta función es la única
+    definición de "esta línea es consignación" en todo el programa, así que
+    el interruptor vale a la vez para el reporte de compras, el ledger de
+    stock consignado y el guard de "Generar factura". Si se hubiera parchado
+    solo el reporte, el usuario habría visto el número corregido mientras el
+    stock de consignación seguía mal por detrás.
+
+    El orden es del más específico al más general: la exclusión de UNA línea
+    gana sobre el interruptor de TODA la importación, que a su vez gana sobre
+    la deducción automática."""
     if getattr(linea, "excluir_de_consignacion", False):
         return False
+    importacion = linea.parcial.importacion if linea.parcial else None
+    manual = getattr(importacion, "es_consignacion", None) if importacion else None
+    if manual is not None:
+        return bool(manual)
     if _oc_de_linea_es_consignacion(linea):
         return True
     if linea.orden_compra_linea_id is None and linea.parcial and linea.parcial.importacion:
         hermanas = [l for p in linea.parcial.importacion.parciales for l in p.lineas]
         return any(_oc_de_linea_es_consignacion(h) for h in hermanas if h.id != linea.id)
     return False
+
+
+def _clasificacion_consignacion_importacion(imp):
+    """Ronda DO (2026-11-26): cómo se comporta HOY una Importación frente a
+    la consignación, para poder mostrarlo en pantalla. Devuelve un dict con:
+
+      estado  -- "ninguna"  : ninguna línea es consignación (compra en firme)
+                 "total"    : TODAS sus líneas son consignación
+                 "parcial"  : algunas sí y otras no (caso legítimo: un
+                              embarque que trae reposición y compra junta)
+      manual  -- el valor del interruptor Importacion.es_consignacion
+                 (None = automático), para que la pantalla pueda distinguir
+                 "lo dedujo el sistema" de "lo marcó una persona"
+      lineas_consignacion / lineas_total -- el conteo, para el tooltip
+
+    No decide nada: solo lee lo que ya decide _es_consignacion_parcial_linea,
+    que sigue siendo la única definición de "esta línea es consignación"."""
+    lineas = [l for p in imp.parciales for l in p.lineas]
+    de_consignacion = [l for l in lineas if _es_consignacion_parcial_linea(l)]
+    if not lineas or not de_consignacion:
+        estado = "ninguna"
+    elif len(de_consignacion) == len(lineas):
+        estado = "total"
+    else:
+        estado = "parcial"
+    return {
+        "estado": estado,
+        "manual": imp.es_consignacion,
+        "lineas_consignacion": len(de_consignacion),
+        "lineas_total": len(lineas),
+    }
 
 
 def _desglose_lotes_linea_consignacion(linea):
@@ -20802,11 +20881,43 @@ def _compras_sistema(proveedor=None, fecha_desde=None, fecha_hasta=None):
                 "tipo_flete": _tipo_flete_normalizado(info["parcial"].via_embarque) or tipo_flete_despacho,
                 "homologado": True,
                 "via_ergopyme": False,
-                # Ronda AH (2026-09-16): las compras hechas DESDE la
-                # plataforma todavía no tienen forma de marcarse como
-                # consignación (pendiente -- ver punto 4, checkbox en la
-                # Orden de Compra) -- por ahora ninguna lo es.
-                "es_consignacion": False,
+                # Ronda DO (2026-11-26) -- DEFECTO GRAVE, reportado por el
+                # usuario: "las filas resaltadas en rojo, que el numero de
+                # factura es una fecha, son ingresos de importaciones en
+                # consignacion, es decir la reposicion de la bodega de
+                # consignacion, el cual muchas veces lo validamos que no
+                # podian computar como compras al proveedor".
+                #
+                # Tenía razón. Hasta esta ronda esto decía False a secas,
+                # con el comentario "las compras hechas DESDE la plataforma
+                # todavía no tienen forma de marcarse como consignación
+                # (pendiente)" -- de la ronda AH, 2026-09-16. Pero desde la
+                # ronda AX (2026-09-30) SÍ existe esa forma:
+                # _es_consignacion_parcial_linea, que ya decide línea por
+                # línea leyendo la OC de origen y que el resto del programa
+                # usa hace rondas para el stock en consignación. El False
+                # quemado quedó acá, olvidado, y el efecto es serio: cada
+                # reposición de la bodega de consignación costeada en el
+                # sistema entró al reporte como compra en firme al
+                # proveedor, inflando el total.
+                #
+                # Peor todavía, era un doble conteo en el tiempo: la misma
+                # mercadería volvía a entrar al reporte -- esta vez con
+                # razón -- cuando se consumía y el proveedor emitía su
+                # factura (ver _filas_facturas_consignacion_proveedor).
+                #
+                # Ahora se pregunta de verdad.
+                #
+                # Ojo con dónde se nota: el RESUMEN por proveedor saca estas
+                # líneas solo del Total Invoice y les sigue sumando flete,
+                # derechos y otros gastos (regla explícita del usuario en la
+                # ronda AH: esos se pagaron igual para traer la mercadería).
+                # El DETALLE por producto, en cambio, las saca por completo,
+                # también de esos gastos -- también decisión deliberada de la
+                # ronda AH. Esta ronda NO cambia ninguna de las dos: solo
+                # hace que las importaciones del sistema se clasifiquen bien,
+                # igual que ya se clasificaban las del histórico.
+                "es_consignacion": _es_consignacion_parcial_linea(linea),
                 "fue_consignacion": False,
             })
     return filas
@@ -21248,30 +21359,59 @@ def _corte_compras_proveedor(proveedor):
     # siguen apareciendo en el resumen por proveedor (con su propio botón
     # Consignación -- ver reportes_compras_proveedor) porque el flete/
     # derechos/otros gastos de esas líneas sí se pagaron de verdad.
-    filas = [f for f in filas if not f.get("es_consignacion")]
+    #
+    # Ronda DO (2026-11-26): lo que se excluye ya no se tira en silencio --
+    # se cuenta y se muestra. El defecto que reporto el usuario (reposiciones
+    # de consignacion contadas como compra) pudo pasar meses inadvertido
+    # porque la pantalla nunca dijo cuanto estaba dejando afuera: si el
+    # numero hubiera estado a la vista, un cero con MEDICONTUR -- que compra
+    # en consignacion todos los meses -- habria saltado solo.
     if not filas:
         return None
+    de_consignacion = [f for f in filas if f.get("es_consignacion")]
+    filas_todas, filas = filas, [f for f in filas if not f.get("es_consignacion")]
 
-    totales = _totales_reporte(filas, proveedor_nombre=proveedor)
     # Ronda AC (2026-09-14): TODA la página (tarjetas de arriba, el
     # resumen que se recalcula en vivo por JS, y la columna "Total" de
     # cada producto en la tabla dinámica) usa la MISMA moneda dominante --
-    # la que ya resolvió _totales_reporte para este proveedor+rango de
-    # fechas -- para que nunca aparezcan dos monedas distintas en una
-    # misma pantalla. Las celdas mes a mes siguen mostrando el monto
-    # ORIGINAL de cada factura, sin convertir (así lo pidió el usuario).
-    moneda_dominante = totales["moneda"]
+    # para que nunca aparezcan dos monedas distintas en una misma pantalla.
+    # Las celdas mes a mes siguen mostrando el monto ORIGINAL de cada
+    # factura, sin convertir (así lo pidió el usuario).
+    #
+    # Ronda DO (2026-11-26): la moneda se resuelve sobre TODAS las filas del
+    # proveedor, consignación incluida, y no sobre las que quedan después de
+    # filtrar. Dos razones: un período en que todo fue consignación dejaría
+    # la lista vacía y _moneda_dominante caería a USD para un proveedor que
+    # factura en euros; y la moneda de la pantalla no debería cambiar por
+    # excluir filas, que es una decisión contable, no cambiaria.
+    moneda_dominante = _moneda_dominante(filas_todas, proveedor)
+    paridad_rep = _paridad_representativa_eur(filas_todas) if moneda_dominante == "EUR" else 1.0
+    totales = _totales_en_moneda(filas, moneda_dominante, paridad_rep)
+    consignacion_excluida = {
+        "lineas": len(de_consignacion),
+        "unidades": sum(f.get("unidades") or 0 for f in de_consignacion),
+        "monto": sum(
+            _valor_en_moneda_dominante(
+                f.get("total_usd"), f.get("moneda_operacion") or "USD", moneda_dominante,
+                f.get("paridad") or 1.0, paridad_rep)
+            for f in de_consignacion),
+        "facturas": sorted({(f.get("factura") or "").strip() for f in de_consignacion if (f.get("factura") or "").strip()}),
+    }
     return {
         "filas": filas,
+        # Ronda DO: True cuando el proveedor SÍ tuvo movimiento en el período
+        # pero fue todo consignación. No es lo mismo que "no hay nada": el
+        # mensaje de la pantalla tiene que poder decirlo bien.
+        "solo_consignacion": not filas,
         "totales": totales,
+        "consignacion_excluida": consignacion_excluida,
         "empresa": empresa,
         "fecha_desde_txt": fecha_desde_txt,
         "fecha_hasta_txt": fecha_hasta_txt,
         "fecha_desde": fecha_desde,
         "fecha_hasta": fecha_hasta,
         "moneda_dominante": moneda_dominante,
-        "paridad_representativa": (
-            _paridad_representativa_eur(filas) if moneda_dominante == "EUR" else 1.0),
+        "paridad_representativa": paridad_rep,
     }
 
 
@@ -21293,6 +21433,16 @@ def reportes_compras_proveedor_detalle(proveedor):
     corte = _corte_compras_proveedor(proveedor)
     if corte is None:
         flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
+        return redirect(url_for("reportes_compras_proveedor"))
+    if corte["solo_consignacion"]:
+        # Ronda DO (2026-11-26): decirlo como es. "No hay compras" a secas
+        # haria pensar que no llego nada del proveedor, cuando en realidad
+        # llego mercaderia -- en consignacion, que todavia no es compra.
+        e = corte["consignacion_excluida"]
+        flash(
+            f'Todo lo que llegó de "{proveedor}" en este período fue consignación '
+            f'({e["lineas"]} línea(s), {e["unidades"]:,.0f} unidad(es)): todavía no es compra '
+            f'al proveedor, entra al reporte cuando se consuma y él la facture.', "info")
         return redirect(url_for("reportes_compras_proveedor"))
 
     filas = corte["filas"]
@@ -21467,6 +21617,9 @@ def reportes_compras_proveedor_detalle(proveedor):
         agrupado_por_padre=bool(mapa_padre), ajustes=ajustes,
         empresas=Empresa.query.order_by(Empresa.nombre).all(),
         empresa_sel=empresa, fecha_desde=fecha_desde_txt, fecha_hasta=fecha_hasta_txt,
+        # Ronda DO (2026-11-26): lo que quedó fuera por consignación, a la
+        # vista. Ver _corte_compras_proveedor.
+        consignacion_excluida=corte["consignacion_excluida"],
     )
 
 
@@ -22945,8 +23098,19 @@ def reportes_compras_proveedor_descargar(proveedor):
     Esta en el nivel Medio de reportes (ronda DM): es una descarga de lo que
     ese perfil ya puede ver en pantalla, no una pantalla nueva."""
     corte = _corte_compras_proveedor(proveedor)
-    if corte is None:
-        flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
+    if corte is None or corte["solo_consignacion"]:
+        # Ronda DO: si todo fue consignación no hay nada que bajar como
+        # compra -- se manda al resumen con la explicación, igual que la
+        # pantalla, en vez de entregar un Excel con una sola fila de total
+        # en cero que no se explica sola.
+        if corte is None:
+            flash(f'No hay compras registradas para el proveedor "{proveedor}" con esos filtros.', "warning")
+        else:
+            e = corte["consignacion_excluida"]
+            flash(
+                f'Todo lo que llegó de "{proveedor}" en este período fue consignación '
+                f'({e["lineas"]} línea(s), {e["unidades"]:,.0f} unidad(es)): no hay compras '
+                f'que descargar todavía.', "info")
         return redirect(url_for("reportes_compras_proveedor"))
 
     detallado = request.args.get("detallado") in ("1", "true", "on", "si")
@@ -23017,7 +23181,18 @@ def reportes_compras_proveedor_descargar(proveedor):
     filtros.append(
         f"Período: {corte['fecha_desde_txt'] or 'inicio'} a {corte['fecha_hasta_txt'] or 'hoy'}")
     filtros.append(f"Moneda del reporte: {moneda}")
-    filtros.append("Consignación excluida (todavía no es compra en firme)")
+    # Ronda DO (2026-11-26): decir CUÁNTO se dejó afuera por consignación, no
+    # solo que se dejó algo. Con el número a la vista, el usuario puede
+    # cruzarlo contra lo que él sabe que repuso en el período.
+    excl = corte["consignacion_excluida"]
+    if excl["lineas"]:
+        filtros.append(
+            f"Consignación EXCLUIDA: {excl['lineas']} línea(s), "
+            f"{excl['unidades']:,.0f} unidad(es), {simbolo}{excl['monto']:,.2f} "
+            f"— no es compra hasta que se consuma y el proveedor la facture"
+            + (f" (facturas: {', '.join(excl['facturas'])})" if excl["facturas"] else ""))
+    else:
+        filtros.append("Sin líneas en consignación en este período")
     filtros.append(f"Procesado el {procesado.strftime('%d-%m-%Y %H:%M')} (hora de Chile)")
     subtitulo = " · ".join(filtros)
 

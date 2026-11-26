@@ -2088,6 +2088,23 @@ class Importacion(db.Model):
     # esta escrito, MANDA sobre el del despacho -- asi tambien sirve para
     # corregir uno que quedo mal.
     operador_logistico = db.Column(db.String(200))
+    # Ronda DO (2026-11-26, a pedido del usuario): interruptor MANUAL de
+    # consignacion a nivel de toda la Importacion. Tres estados a proposito:
+    #   None  -> automatico: cada linea decide por su cuenta segun la OC de
+    #            origen (ver _es_consignacion_parcial_linea en app.py). Es el
+    #            valor con el que nacen todas, y el comportamiento de siempre.
+    #   True  -> TODA la importacion es reposicion de consignacion.
+    #   False -> TODA la importacion es compra en firme, aunque alguna linea
+    #            trace a una OC marcada consignacion.
+    #
+    # Existe porque la deteccion automatica depende de que la Importacion
+    # trace hasta una OrdenCompra con es_consignacion=True, y hay
+    # importaciones creadas directo en Costeo (sin despacho, sin OC) donde
+    # esa traza no existe. Sin este campo, una reposicion de consignacion de
+    # ese tipo no habria forma de marcarla, y seguiria contando como compra
+    # al proveedor en el reporte -- que es exactamente el problema que el
+    # usuario reporto.
+    es_consignacion = db.Column(db.Boolean, nullable=True, default=None)
     numero_factura = db.Column(db.String(80))
     fecha_factura = db.Column(db.Date, nullable=True)
     moneda_factura = db.Column(db.String(10), default="EURO")  # moneda en que vienen los Valor Unitario de las lineas

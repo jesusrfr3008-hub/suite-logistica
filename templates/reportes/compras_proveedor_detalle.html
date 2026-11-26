@@ -215,6 +215,26 @@
   </div>
 </div>
 
+{# Ronda DO (2026-11-26, a pedido del usuario): hasta esta ronda las
+   reposiciones de la bodega de consignación costeadas en el sistema se
+   contaban como compra en firme al proveedor. Ya no. Y lo que queda afuera
+   se dice con su monto: el error pudo pasar meses inadvertido justamente
+   porque la pantalla nunca mostró cuánto estaba excluyendo. #}
+{% if consignacion_excluida and consignacion_excluida.lineas %}
+<div class="alert alert-warning py-2 small mb-3">
+  <i class="bi bi-box-seam"></i>
+  <strong>Fuera de este total: {{ totales.simbolo }} {{ consignacion_excluida.monto | moneda }}</strong>
+  en consignación ({{ consignacion_excluida.lineas }} línea(s), {{ consignacion_excluida.unidades | round(0) | int }} unidad(es){% if consignacion_excluida.facturas %} ·
+  {{ consignacion_excluida.facturas[:6] | join(', ') }}{% if consignacion_excluida.facturas | length > 6 %} y {{ consignacion_excluida.facturas | length - 6 }} más{% endif %}{% endif %}).
+  Esa mercadería sigue siendo del proveedor: entra como compra recién cuando se consume y él la factura.
+  <br>
+  En <strong>esta</strong> pantalla esas líneas quedan fuera por completo, también de Flete, Derechos y Otros costos.
+  El flete y los gastos de traerla sí se pagaron: aparecen en
+  <a href="{{ url_for('reportes_compras_proveedor', fecha_desde=fecha_desde, fecha_hasta=fecha_hasta) }}">Compras Proveedor</a>,
+  que los suma siempre.
+</div>
+{% endif %}
+
 <div class="card p-3">
   <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
     <div class="fw-semibold">Análisis por productos (código proveedor × mes)</div>
